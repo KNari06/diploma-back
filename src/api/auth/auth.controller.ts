@@ -19,6 +19,7 @@ import {
 } from '@/services/auth/auth.service';
 import { notifyAdminsOfNewUser } from '@/services/auth/new-user-notification.service';
 import { EmailService } from '@/services/core/email.service';
+import { SelfServeProvisioningService } from '@/services/core/self-serve-provisioning.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -79,10 +80,21 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
     const result = await signInWithEmail(email, password);
 
+    // Self-serve PLG: also provision on login, not just first signup/verify.
+    // Covers the case where a user signed up while AUTO_APPROVE_SIGNUP was off
+    // (left pending) and the flag was later turned on — their next email/
+    // password login then approves + provisions them. No-op when the flag is
+    // off; idempotent; best-effort (never throws).
+    const provisioned = await SelfServeProvisioningService.provision(result.user.id);
+    const effectiveStatus = provisioned ? 'approved' : result.user.status;
+
     res.json({
       success: true,
       message: 'Login successful',
-      data: result,
+      data: {
+        ...result,
+        user: { ...result.user, status: effectiveStatus },
+      },
     });
   } catch (error: any) {
     logger.error('Login error', error);
@@ -284,6 +296,13 @@ export const completeOAuthHandler = async (req: Request, res: Response): Promise
     // Exchange code for tokens
     const result = await exchangeCodeForSession(code, codeVerifier, redirectUri);
 
+    // Self-serve PLG: approve + provision workspace/project on first auth.
+    // No-op unless AUTO_APPROVE_SIGNUP is set. Best-effort, never throws.
+    // Returns true only when the user is genuinely approved, so the response
+    // never claims approval after a silent provisioning failure.
+    const provisioned = await SelfServeProvisioningService.provision(result.user.id);
+    const effectiveStatus = provisioned ? 'approved' : result.user.status;
+
     res.json({
       success: true,
       data: {
@@ -298,7 +317,7 @@ export const completeOAuthHandler = async (req: Request, res: Response): Promise
           name: result.user.name,
           avatar: result.user.avatar,
           role: result.user.role,
-          status: result.user.status,
+          status: effectiveStatus,
         },
       },
     });
@@ -874,12 +893,21 @@ export const verifyEmail = async (req: Request, res: Response): Promise<void> =>
       });
     }
 
+    // Self-serve PLG: approve + provision workspace/project on first auth.
+    // No-op unless AUTO_APPROVE_SIGNUP is set. Best-effort, never throws.
+    // Returns true only when the user is genuinely approved, so the response
+    // never claims approval after a silent provisioning failure.
+    const provisioned = await SelfServeProvisioningService.provision(data.user.id);
+    const effectiveStatus = provisioned
+      ? 'approved'
+      : userData?.status || 'pending_approval';
+
     const user = {
       id: data.user.id,
       email: data.user.email || '',
       name: userData?.name || data.user.user_metadata?.name,
       role: userData?.role || 'user',
-      status: userData?.status || 'pending_approval',
+      status: effectiveStatus,
       avatar: userData?.avatar_url || data.user.user_metadata?.avatar_url,
     };
 

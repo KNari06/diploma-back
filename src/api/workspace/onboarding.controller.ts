@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { WorkspaceService } from '@/services/core/workspace.service';
+import { saveWorkspaceProfile } from '@/services/core/db/self-serve.db';
 import { WorkspaceOnboardingRequest, WorkspaceOnboardingResponse } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
@@ -473,5 +474,56 @@ export const getOnboarding = async (req: Request, res: Response): Promise<void> 
       message: 'Failed to get onboarding data',
       timestamp: new Date().toISOString(),
     });
+  }
+};
+
+/**
+ * PUT /api/v1/workspaces/profile
+ * Lightweight B2C profile capture (role + goal/source) shown as a one-time
+ * modal on the dashboard for self-serve users. Unlike saveOnboarding it does
+ * NOT require name/baseUrls and does NOT set onboarding_completed — it only
+ * sets profile_completed so the modal stops re-appearing. Stored in
+ * workspace.settings via the self-serve db sublayer.
+ */
+export const saveProfile = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    if (!userId || !UUID_REGEX.test(userId)) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { role, goal, source } = req.body ?? {};
+    const validRoles = ['qaEngineer', 'developer', 'productManager', 'teamLead', 'cto', 'other'];
+
+    if (role !== undefined && !validRoles.includes(role)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid field: role',
+        message: `Field role must be one of: ${validRoles.join(', ')}`,
+      });
+      return;
+    }
+    for (const [key, val] of Object.entries({ goal, source })) {
+      if (val !== undefined && (typeof val !== 'string' || val.length > 500)) {
+        res.status(400).json({
+          success: false,
+          error: `Invalid field: ${key}`,
+          message: `Field ${key} must be a string with max 500 characters`,
+        });
+        return;
+      }
+    }
+
+    const { workspace_id } = await WorkspaceService.checkOrCreateWorkspace(userId);
+    await saveWorkspaceProfile(workspace_id, userId, { role, goal, source });
+    await cache.del(`qait:cache:onboarding:${userId}`);
+
+    res.json({ success: true, data: { workspace_id, profile_completed: true } });
+  } catch (error) {
+    logger.error('[ONBOARDING] Error saving profile', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({ success: false, error: 'Failed to save profile' });
   }
 };

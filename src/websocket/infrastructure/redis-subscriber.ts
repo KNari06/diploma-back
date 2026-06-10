@@ -69,7 +69,7 @@ class WebSocketRedisSubscriber {
 
         case 'test:progress':
           // ✅ FIX #4: Unified test:progress handling (removed duplicate case below)
-          // This can come from emitToUser (intelligent-test-orchestrator) or emitTestProgress
+          // This can come from emitToUser or emitTestProgress
           if (target?.userId) {
             // Emit to user if userId is in target (from emitToUser fallback)
             wsService.emitToUser(target.userId, 'test:progress', payload);

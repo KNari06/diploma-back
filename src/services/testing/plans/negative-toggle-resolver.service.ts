@@ -1,5 +1,6 @@
-import { supabaseAdmin } from '@/db/supabase';
 import type { ExpandedTestCase, NegativeMeta } from '@/types/testing.types';
+import * as negativeDb from '@/services/testing/negative/db/negative.db';
+import type { PlanItemToggleRow } from '@/services/testing/negative/db/negative.db';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -19,45 +20,9 @@ export class NegativeToggleResolverService {
     flowId?: string,
     moduleId?: string,
   ): Promise<boolean> {
-    // Fetch all plan items for this plan in one query
-    const { data: items } = await supabaseAdmin
-      .from('regression_plan_items')
-      .select('item_type, test_case_id, flow_id, module_id, negative_testing_enabled')
-      .eq('plan_id', planId);
-
-    if (!items || items.length === 0) return false;
-
-    // 1. Check test_case-level item
-    // null means "inherit from parent"; true/false are explicit overrides.
-    const testCaseItem = items.find(
-      (i) => i.item_type === 'test_case' && i.test_case_id === testCaseId,
-    );
-    if (testCaseItem != null && testCaseItem.negative_testing_enabled !== null) {
-      return testCaseItem.negative_testing_enabled;
-    }
-
-    // 2. Check flow-level item
-    if (flowId) {
-      const flowItem = items.find(
-        (i) => i.item_type === 'flow' && i.flow_id === flowId,
-      );
-      if (flowItem != null && flowItem.negative_testing_enabled !== null) {
-        return flowItem.negative_testing_enabled;
-      }
-    }
-
-    // 3. Check module-level item
-    if (moduleId) {
-      const moduleItem = items.find(
-        (i) => i.item_type === 'module' && i.module_id === moduleId,
-      );
-      if (moduleItem != null && moduleItem.negative_testing_enabled !== null) {
-        return moduleItem.negative_testing_enabled;
-      }
-    }
-
-    // Default: disabled
-    return false;
+    const items = await negativeDb.getPlanItemsForToggle(planId);
+    if (items.length === 0) return false;
+    return this.resolveFromItems(items, testCaseId, flowId, moduleId);
   }
 
   /**
@@ -71,12 +36,8 @@ export class NegativeToggleResolverService {
     if (positiveTestCases.length === 0) return [];
 
     // Fetch all plan items once
-    const { data: planItems } = await supabaseAdmin
-      .from('regression_plan_items')
-      .select('item_type, test_case_id, flow_id, module_id, negative_testing_enabled')
-      .eq('plan_id', planId);
-
-    if (!planItems || planItems.length === 0) return [];
+    const planItems = await negativeDb.getPlanItemsForToggle(planId);
+    if (planItems.length === 0) return [];
 
     // Determine which test cases have negatives enabled
     const enabledTestCaseIds: string[] = [];
@@ -98,19 +59,8 @@ export class NegativeToggleResolverService {
     if (enabledTestCaseIds.length === 0) return [];
 
     // Fetch negative test cases for enabled parents (only fresh ones)
-    const { data: negatives, error } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('id, name, flow_id, source_intent_test_case_id, negative_meta')
-      .eq('is_negative', true)
-      .is('negative_stale_reason', null)
-      .in('source_intent_test_case_id', enabledTestCaseIds);
-
-    if (error) {
-      logger.error('[NEGATIVE_TOGGLE] Failed to fetch negative test cases', { error: error.message });
-      return [];
-    }
-
-    if (!negatives || negatives.length === 0) return [];
+    const negatives = await negativeDb.getFreshNegativesBySources(enabledTestCaseIds);
+    if (negatives.length === 0) return [];
 
     // Build parent lookup for moduleId/flowId
     const parentMap = new Map<string, ExpandedTestCase>();
@@ -138,13 +88,7 @@ export class NegativeToggleResolverService {
    * Resolve toggle from pre-fetched plan items (no DB call).
    */
   private static resolveFromItems(
-    items: Array<{
-      item_type: string;
-      test_case_id: string | null;
-      flow_id: string | null;
-      module_id: string | null;
-      negative_testing_enabled: boolean | null;
-    }>,
+    items: PlanItemToggleRow[],
     testCaseId: string,
     flowId?: string,
     moduleId?: string,
@@ -188,20 +132,8 @@ export class NegativeToggleResolverService {
     planId: string,
   ): Promise<string[]> {
     // Get plan items
-    const { data: planItems, error: planItemsError } = await supabaseAdmin
-      .from('regression_plan_items')
-      .select('item_type, test_case_id, flow_id, module_id, negative_testing_enabled')
-      .eq('plan_id', planId);
-
-    if (planItemsError) {
-      logger.error('[NEGATIVE_TOGGLE] Failed to fetch plan items for getEnabledTestCaseIds', {
-        planId,
-        error: planItemsError.message,
-      });
-      return [];
-    }
-
-    if (!planItems) return [];
+    const planItems = await negativeDb.getPlanItemsForToggle(planId);
+    if (planItems.length === 0) return [];
 
     // Expand plan to get all test cases
     let expanded: import('@/types/testing.types').ExpandedTestCase[];

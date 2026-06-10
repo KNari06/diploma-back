@@ -5,13 +5,17 @@ import {
   applyDoctorFindingHandler,
   cancelRun,
   createShareLink,
+  deleteNegative,
   dismissDoctorFinding,
   generateNegatives,
   getDoctorFindingSnapshots,
   getExecutionDetail,
   getNegatives,
+  getNegativesEstimate,
   getNegativesStatus,
   getPlanHealth,
+  regenerateNegatives,
+  setNegativeEnabled,
   getRunDoctorFindings,
   getRunExecutions,
   getRunReport,
@@ -789,5 +793,15 @@ router.get('/plans/:planId/negatives', requireAuth, getNegatives);
 
 // Get generation status (for reconnecting users)
 router.get('/plans/:planId/negatives/status', requireAuth, getNegativesStatus);
+
+// Pre-run estimate of extra test count / minutes from negatives
+router.get('/plans/:planId/negatives/estimate', requireAuth, getNegativesEstimate);
+
+// Regenerate negatives for one source test case in the plan
+router.post('/plans/:planId/sources/:testCaseId/regenerate-negatives', requireAuth, regenerateNegatives);
+
+// Per-negative control (enable/disable, delete)
+router.patch('/negatives/:negativeId', requireAuth, setNegativeEnabled);
+router.delete('/negatives/:negativeId', requireAuth, deleteNegative);
 
 export default router;

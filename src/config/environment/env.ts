@@ -194,6 +194,19 @@ const envSchema = z.object({
   FEATURE_ORG_CREDITS_ENABLED: z.string().transform(v => v === 'true').default('true'),
 
   // ──────────────────────────────────────────────────────────────────
+  // Self-serve PLG signup. Default false keeps the B2B flow intact
+  // (manual admin approval + business-email gate). When true:
+  //   - new users are provisioned approved on first auth (status set to
+  //     'approved', overriding the users.status column default), with a
+  //     default workspace + project so they skip the onboarding wizard
+  //   - the business-email gate accepts personal domains (Gmail etc.);
+  //     the disposable-domain block stays on as anti-abuse
+  // The requireApproved middleware is left in place — flipping this off
+  // restores gated behaviour with no code change.
+  // ──────────────────────────────────────────────────────────────────
+  AUTO_APPROVE_SIGNUP: z.string().transform(v => v === 'true').default('false'),
+
+  // ──────────────────────────────────────────────────────────────────
   // Per-test-case chat (Phase 1-8 backend, frontend integration TBD).
   //
   // When false (default), POST /chat with `testCaseId` returns 404
@@ -261,6 +274,11 @@ const envSchema = z.object({
   SCREENSHOT_QUALITY: z.string().transform(Number).default('75'),
   // Screenshots older than this (days) are pruned by the artifact-retention job.
   SCREENSHOT_RETENTION_DAYS: z.string().transform(Number).default('30'),
+  // Local editor / forensic logs in test_logs/editor/ older than this (days) are
+  // pruned by the artifact-retention job's local sweep. These are debug artifacts
+  // (editor traces + per-apply forensic jsonl/ds/html triplets) that otherwise
+  // grow without bound — ~16 files per editor session, no upstream cleanup.
+  EDITOR_LOG_RETENTION_DAYS: z.string().transform(Number).default('3'),
 
   // Phase B1: mobile-editor force-route. When `true` (default), chat
   // requests carrying `context.mobileEditorMode=true` with a non-empty

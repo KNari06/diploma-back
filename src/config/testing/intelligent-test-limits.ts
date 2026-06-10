@@ -45,6 +45,16 @@ export const INTELLIGENT_TEST_LIMITS = {
 } as const;
 
 /**
+ * Fixed credit cost of one autonomous exploration ("magic first test")
+ * discovery run on the 'quick' preset (~2-min browser + LLM survey). Charged
+ * once on successful completion in exploration-run.job.ts; running the
+ * discovered tests is billed separately, per step. Single source of truth —
+ * the /explorations/start credit gate requires this same amount so a user who
+ * passes the gate can actually afford the charge (free tier has grace = 0).
+ */
+export const EXPLORATION_DISCOVERY_CREDITS = 10;
+
+/**
  * Lite Engine Feature Flags (Manus L2-L4-L5 Alignment)
  *
  * Controls advanced AI agent behaviors:

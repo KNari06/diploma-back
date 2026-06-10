@@ -129,6 +129,41 @@ export const DEFAULT_EXPLORATION_BUDGET: ExplorationBudget = {
   maxFlowsPerPage: 3,
 };
 
+/**
+ * Budget presets selectable at exploration start.
+ *
+ * - 'quick': onboarding / "magic first test". Caps total wall-clock at ~2 min
+ *   so a self-serve user gets a starter pack of a few tests fast, trading
+ *   coverage for time-to-value. Survey shallow, few flows.
+ * - 'full': the default thorough sweep (DEFAULT_EXPLORATION_BUDGET).
+ *
+ * A preset resolves to a Partial<ExplorationBudget> that is shallow-merged
+ * over DEFAULT_EXPLORATION_BUDGET by the engine, so omitted fields fall back
+ * to defaults.
+ */
+export type ExplorationPreset = 'quick' | 'full';
+
+export const EXPLORATION_PRESETS: Record<ExplorationPreset, Partial<ExplorationBudget>> = {
+  quick: {
+    totalTimeoutMs: 2 * 60 * 1000,
+    perFlowTimeoutMs: 45 * 1000,
+    maxSurveyPages: 3,
+    maxFlows: 5,
+    maxTotalPipelineRounds: 25,
+    maxFlowsPerPage: 2,
+  },
+  // Spread so callers can't mutate DEFAULT_EXPLORATION_BUDGET through this ref.
+  full: { ...DEFAULT_EXPLORATION_BUDGET },
+};
+
+/**
+ * Build a unique exploration run id. Single source of format for every call
+ * site (chat confirmation + REST start) so ids stay greppable.
+ */
+export function generateExplorationId(userId: string): string {
+  return `expl-${Date.now()}-${userId.slice(0, 8)}`;
+}
+
 export const DEFAULT_MAX_CONCURRENCY = 5;
 
 /** Desktop user agent — re-exported from centralized config */

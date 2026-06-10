@@ -16,7 +16,10 @@ export type CredentialKind = 'password' | 'email' | 'phone' | 'username';
 export const CREDENTIAL_FALLBACK_PATTERNS: Record<CredentialKind, string[]> = {
   password: [
     // English
-    'password', 'passwd', 'pass', 'pwd', 'secret', 'passcode', 'pin',
+    // NOTE: 'passcode' is intentionally NOT here — as a single token it must not
+    // classify as password (a passcode field is often a PIN/OTP-style entry, and
+    // the classifier contract treats it as a non-match; see field-classifier tests).
+    'password', 'passwd', 'pass', 'pwd', 'secret', 'pin',
     // Russian
     'пароль', 'парол', 'секрет', 'код',
     // Turkish

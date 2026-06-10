@@ -1,9 +1,9 @@
 import type { NegativeGenerationJobData } from '@/config/infrastructure/queues';
-import { NegativeTestGeneratorService } from '@/services/testing/negative/negative-test-generator.service';
+import { NegativeGenerationService } from '@/services/testing/negative/negative-generation.service';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { Job } from 'bullmq';
-import { supabaseAdmin } from '@/db/supabase';
+import * as negativeDb from '@/services/testing/negative/db/negative.db';
 
 /**
  * BullMQ job handler for generating negative test cases.
@@ -36,20 +36,7 @@ export async function processNegativeGeneration(
     const testCaseId = testCaseIds[i];
 
     // Get test case name for progress events
-    const { data: tc, error: tcError } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('name')
-      .eq('id', testCaseId)
-      .maybeSingle();
-
-    if (tcError) {
-      logger.warn('[NEGATIVE_GEN_JOB] Failed to fetch test case name', {
-        testCaseId,
-        error: tcError.message,
-      });
-    }
-
-    const testCaseName = tc?.name || 'Unknown';
+    const testCaseName = (await negativeDb.getTestCaseName(testCaseId)) || 'Unknown';
 
     // Emit generating progress
     webSocketService.emitToUser(userId, 'negatives:generation:progress', {
@@ -62,13 +49,11 @@ export async function processNegativeGeneration(
     });
 
     try {
-      // Check if test case already has fresh negatives
-      const existingCount = await NegativeTestGeneratorService.getNegativeCount(testCaseId);
-      if (existingCount > 0) {
-        logger.info('[NEGATIVE_GEN_JOB] Skipping — already has fresh negatives', {
-          testCaseId,
-          existingCount,
-        });
+      // Check-then-generate under the shared per-source mutex so this job and
+      // an interactive regenerate can't both generate for the same source.
+      const result = await NegativeGenerationService.generateForSourceGuarded(testCaseId, userId);
+      if (result.skipped) {
+        logger.info('[NEGATIVE_GEN_JOB] Skipping — already has fresh negatives', { testCaseId });
 
         webSocketService.emitToUser(userId, 'negatives:generation:progress', {
           planId,
@@ -83,12 +68,7 @@ export async function processNegativeGeneration(
         continue;
       }
 
-      // Generate negatives
-      const createdIds = await NegativeTestGeneratorService.generateForTestCase(
-        testCaseId,
-        userId,
-      );
-
+      const createdIds = result.createdIds;
       totalGenerated += createdIds.length;
 
       // Emit completed progress
