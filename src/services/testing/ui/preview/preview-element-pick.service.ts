@@ -745,11 +745,16 @@ function buildOverlayScript(callbackName: string): string {
       let rect;
       try { rect = el.getBoundingClientRect(); } catch (e) { return; }
       if (!rect || (rect.width === 0 && rect.height === 0)) { root.style.display='none'; tip.style.display='none'; return; }
+      // getBoundingClientRect() already includes ancestor CSS zoom, but the
+      // overlay div lives INSIDE the zoomed root, so the browser re-applies
+      // that zoom to our px values — divide once to land on the element
+      // (sites like mamaznaet.kz set zoom on <html> to scale their layout).
+      const z = root.currentCSSZoom || 1;
       root.style.display = 'block';
-      root.style.left = rect.left + 'px';
-      root.style.top = rect.top + 'px';
-      root.style.width = rect.width + 'px';
-      root.style.height = rect.height + 'px';
+      root.style.left = (rect.left / z) + 'px';
+      root.style.top = (rect.top / z) + 'px';
+      root.style.width = (rect.width / z) + 'px';
+      root.style.height = (rect.height / z) + 'px';
 
       const label = describeElement(el);
       tip.textContent = label;
@@ -758,10 +763,10 @@ function buildOverlayScript(callbackName: string): string {
       // P8 — width heuristic is approximate; max-width:320px CSS caps
       // it for wide-char strings (CJK/emoji) so overflow is impossible.
       const tw = Math.min(320, label.length * 7 + 16);
-      let tx = rect.left;
-      let ty = rect.top - 22;
-      if (ty < 0) ty = rect.bottom + 4;
-      if (tx + tw > window.innerWidth) tx = Math.max(0, window.innerWidth - tw - 4);
+      let tx = rect.left / z;
+      let ty = rect.top / z - 22;
+      if (ty < 0) ty = rect.bottom / z + 4;
+      if (tx + tw > window.innerWidth / z) tx = Math.max(0, window.innerWidth / z - tw - 4);
       tip.style.left = tx + 'px';
       tip.style.top = ty + 'px';
     }
@@ -829,15 +834,18 @@ function buildOverlayScript(callbackName: string): string {
       try {
         if (lastTargetEl) {
           const r = lastTargetEl.getBoundingClientRect();
+          // Same CSS-zoom compensation as paint() — the badge is appended
+          // to the (possibly zoomed) root, so divide rect values once.
+          const z = root.currentCSSZoom || 1;
           // P18 — if the element is at the very top, place the badge
           // below it instead so it stays on-screen.
-          const above = r.top - 28;
-          const top = above >= 0 ? above : Math.min(window.innerHeight - 28, r.bottom + 4);
+          const above = r.top / z - 28;
+          const top = above >= 0 ? above : Math.min(window.innerHeight / z - 28, r.bottom / z + 4);
           const badge = document.createElement('div');
           badge.textContent = '\\u2713 Recorded';
           badge.setAttribute('style', [
             'position:fixed','z-index:2147483647',
-            'left:' + Math.max(0, r.left) + 'px','top:' + top + 'px',
+            'left:' + Math.max(0, r.left / z) + 'px','top:' + top + 'px',
             'background:#10b981','color:#fff','padding:4px 8px',
             'border-radius:4px','font:12px/1.4 ui-sans-serif, system-ui, sans-serif',
             'box-shadow:0 4px 12px rgba(0,0,0,.25)','pointer-events:none',
