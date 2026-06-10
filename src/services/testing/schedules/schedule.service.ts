@@ -770,24 +770,24 @@ export class ScheduleService {
     const result = new Date(guess.getTime() - diffMinutes * 60 * 1000);
 
     // DST spring-forward gap guard.
-    //   On the DST-forward day in a behind-UTC tz (e.g. NY 2026-03-08
-    //   2:30 AM doesn't exist — the clock jumps 2:00 → 3:00), the
-    //   single-step Newton correction above lands one DAY too early
-    //   instead of one HOUR too late. Detect by checking that the
-    //   resulting UTC instant still maps back to the SAME calendar
-    //   day in the target tz. If it doesn't, the requested wall-clock
-    //   time is non-existent — return EPOCH so the caller's
-    //   `targetUtc > now` comparison fails and the dayOffset loop
-    //   advances to the next day (where the cron rule may fire at
-    //   the same hour:minute, valid by then).
+    //   On the DST-forward day (e.g. NY 2026-03-08 2:30 AM doesn't exist — the
+    //   clock jumps 2:00 → 3:00), the requested wall-clock time is non-existent;
+    //   the single-step Newton correction can't land on it. Detect that by
+    //   verifying the result maps back to the requested HOUR:MINUTE in the
+    //   target tz. If it doesn't, the local time is non-existent — return EPOCH
+    //   so `targetUtc > now` fails and the dayOffset loop advances (POSIX cron
+    //   SKIPS non-existent local times rather than firing twice).
     //
-    //   We intentionally don't try to "round forward" to 3:00 AM:
-    //   POSIX cron behaviour is to SKIP non-existent local times, and
-    //   that's what users expect (a daily 2:30 AM cron fires every day
-    //   except the one DST day per year — better than two runs on the
-    //   fall-back day).
+    //   IMPORTANT: verify HOUR:MINUTE, NOT the calendar day. A correct result
+    //   legitimately rolls to the next calendar day for late hours in a positive
+    //   UTC offset (e.g. 23:00 Asia/Almaty = 18:00 UTC, which is the *next* day
+    //   in UTC terms after the Newton step). The old `verify.day !== day` check
+    //   false-positived on EVERY such time, returning EPOCH → the whole cron was
+    //   misclassified "unsatisfiable" → schedules at hour ≥ (24 - offset) in any
+    //   ahead-of-UTC tz (incl. Asia/Almaty UTC+5, so any time ≥ 19:00) silently
+    //   never got created. That was the root cause of "I set 23:00 and nothing runs".
     const verify = this.datePartsInTimezone(result, tz);
-    if (verify.day !== day || verify.month !== month) {
+    if (verify.hour !== hour || verify.minute !== minute) {
       return new Date(0);
     }
     return result;
