@@ -70,23 +70,41 @@ setTimeout(() => {
   }
 }, 5000);
 
-// Redis connection configuration
+// Redis connection configuration.
+//
+// This is a LONG-LIVED process (api/worker/scheduler), so the connection must
+// SURVIVE transient drops, not give up. Azure Cache for Redis behind a Private
+// Endpoint drops idle TCP flows (NAT) and rotates nodes during patch/failover,
+// surfacing as `read ECONNRESET`. The previous config returned null from
+// retryStrategy after 3 tries → ioredis stopped reconnecting FOREVER, leaving a
+// zombie process (queue not consumed, schedules claimed but never run) until a
+// manual restart. Fixes:
+//   - retryStrategy never returns null — reconnect forever with a capped backoff.
+//   - reconnectOnError reconnects on READONLY (failover) and ECONNRESET.
+//   - keepAlive sends TCP keepalive so the Private Endpoint NAT doesn't reap idle
+//     connections (the root trigger of the ECONNRESET storm).
 const redisConnection = new IORedis(env.REDIS_URL, {
   password: env.REDIS_PASSWORD || undefined,
   maxRetriesPerRequest: 3,
   enableReadyCheck: false,
   connectTimeout: 10000, // 10 seconds
+  keepAlive: 30000, // TCP keepalive every 30s — prevents idle-NAT reaping
   retryStrategy: (times) => {
-    if (times > 3) { // Reduced from 10 to 3
-      logger.warn(`❌ Redis connection failed after ${times} retries. Stopping.`);
-      return null; // Stop retrying
+    // Never stop: exponential-ish backoff capped at 5s. A long-lived service
+    // must keep trying to reconnect across maintenance/failover windows.
+    const delay = Math.min(times * 500, 5000);
+    if (times <= 5 || times % 20 === 0) {
+      logger.warn(`⏳ Redis reconnect attempt ${times}, next in ${delay}ms`);
     }
-    const delay = Math.min(times * 1000, 3000); // Max 3 seconds between retries
-    logger.info(`⏳ Redis retry attempt ${times} in ${delay}ms...`);
     return delay;
   },
+  reconnectOnError: (err: Error) => {
+    const msg = err.message || '';
+    // Reconnect on failover (READONLY) and on connection resets.
+    if (msg.includes('READONLY') || msg.includes('ECONNRESET')) return true;
+    return false;
+  },
   lazyConnect: true, // Don't connect immediately
-  reconnectOnError: null, // Don't auto-reconnect on specific errors
 });
 
 // Handle Redis connection errors gracefully
@@ -127,8 +145,12 @@ redisConnection.connect()
     }
   });
 
-// Redis connection for BullMQ
-// Note: BullMQ requires maxRetriesPerRequest to be null
+// Redis connection for BullMQ.
+// Note: BullMQ requires maxRetriesPerRequest to be null.
+// Same survival policy as redisConnection above — workers are long-lived and
+// must reconnect across Azure Redis drops (ECONNRESET) instead of dying into a
+// zombie that no longer consumes the queue. Never return null from
+// retryStrategy; add keepAlive + reconnectOnError.
 export const connection = {
   host: env.REDIS_HOST,
   port: env.REDIS_PORT,
@@ -136,12 +158,17 @@ export const connection = {
   maxRetriesPerRequest: null, // Required by BullMQ
   enableReadyCheck: false,
   connectTimeout: 10000, // 10 seconds timeout
+  keepAlive: 30000, // TCP keepalive — prevents Private-Endpoint NAT idle reaping
   retryStrategy: (times: number) => {
-    if (times > 3) {
-      logger.error(`❌ BullMQ Redis connection failed after ${times} attempts`);
-      return null; // Stop retrying
+    const delay = Math.min(times * 500, 5000);
+    if (times <= 5 || times % 20 === 0) {
+      logger.warn(`⏳ BullMQ Redis reconnect attempt ${times}, next in ${delay}ms`);
     }
-    return Math.min(times * 1000, 3000);
+    return delay; // never null — keep reconnecting
+  },
+  reconnectOnError: (err: Error) => {
+    const msg = err.message || '';
+    return msg.includes('READONLY') || msg.includes('ECONNRESET');
   },
 };
 

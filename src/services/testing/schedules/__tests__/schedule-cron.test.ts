@@ -77,6 +77,28 @@ describe('ScheduleService.calculateNextRun', () => {
     expect(next.getUTCHours()).toBe(4);
   });
 
+  // Regression (Bug #3): a LATE-hour cron in a positive-offset tz used to be
+  // misclassified "unsatisfiable" because the DST-gap guard compared the
+  // calendar DAY instead of HOUR:MINUTE — the Newton correction legitimately
+  // rolls 23:00 Asia/Almaty to the NEXT UTC day (18:00Z), which the guard read
+  // as a non-existent local time and returned EPOCH for every candidate.
+  // Effect: any schedule at hour >= (24 - offset) silently never fired
+  // ("I set 23:00 and nothing runs"). Guard now verifies HOUR:MINUTE.
+  it('resolves a late-hour cron in a +offset tz (23:00 Asia/Almaty → 18:00 UTC), not unsatisfiable', () => {
+    const iso = ScheduleService.calculateNextRun('0 23 * * *', 'Asia/Almaty');
+    const d = new Date(iso);
+    expect(d.getUTCHours()).toBe(18); // 23:00 +05:00 == 18:00Z
+    expect(d.getUTCMinutes()).toBe(0);
+    // and it actually reads back as 23:00 in Almaty
+    const hh = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Almaty', hour: '2-digit', hour12: false }).format(d);
+    expect(hh).toBe('23');
+  });
+
+  it('resolves the boundary hour 19:00 Asia/Almaty (= 14:00 UTC)', () => {
+    const d = new Date(ScheduleService.calculateNextRun('0 19 * * *', 'Asia/Almaty'));
+    expect(d.getUTCHours()).toBe(14);
+  });
+
   it('falls back to UTC on an unknown timezone', () => {
     const utc = new Date(ScheduleService.calculateNextRun('0 9 * * *', 'UTC')).getUTCHours();
     const bogus = new Date(ScheduleService.calculateNextRun('0 9 * * *', 'Mars/Olympus')).getUTCHours();
