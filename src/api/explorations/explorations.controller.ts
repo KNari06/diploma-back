@@ -8,6 +8,17 @@ import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { NotFoundError, ValidationError } from '@/types';
 import { ExplorationRunService } from '@/services/testing/exploration/exploration-run.service';
+import { QueueManager } from '@/config/infrastructure/queues';
+import { WorkspaceService } from '@/services/core/workspace.service';
+import { ProjectContextService } from '@/services/utils/project-context.service';
+import {
+  DEFAULT_EXPLORATION_BUDGET,
+  EXPLORATION_PRESETS,
+  generateExplorationId,
+  type ExplorationPreset,
+} from '@/agent/core/lite/exploration/types';
+import { sanitizeUrl } from '@/utils/validation/validation';
+import { projectBelongsToWorkspace } from '@/services/core/db/self-serve.db';
 
 interface AuthenticatedRequest extends Request {
   user?: { id: string; email: string; role: string };
@@ -327,5 +338,105 @@ export async function runDiscoveredTestCases(req: AuthenticatedRequest, res: Res
       return;
     }
     handleError(res, error, 'Failed to run discovered test cases');
+  }
+}
+
+/**
+ * Start an autonomous exploration from a URL — the self-serve "magic first
+ * test" entrypoint. Validates the URL, resolves the target project (explicit
+ * projectId, else the user's default project in their active workspace), and
+ * enqueues an exploration job. Returns immediately with the explorationId;
+ * progress and discovered test cases are read via the GET endpoints / WS.
+ *
+ * POST /api/v1/explorations/start
+ * Body: { url: string, projectId?: string, preset?: 'quick' | 'full', scopeHint?: string }
+ */
+export async function startExploration(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const userId = getUserId(req);
+    const { url, projectId: bodyProjectId, preset, scopeHint } = req.body ?? {};
+
+    // Validate URL (http/https only) — sanitizeUrl throws ValidationError otherwise.
+    let entryUrl: string;
+    try {
+      entryUrl = sanitizeUrl(url);
+    } catch {
+      res.status(400).json({ success: false, error: 'A valid http(s) url is required' });
+      return;
+    }
+
+    // Resolve preset → budget. Default to 'quick' for the onboarding flow;
+    // unknown values fall back to 'quick' rather than erroring.
+    const resolvedPreset: ExplorationPreset = preset === 'full' ? 'full' : 'quick';
+    const budget = EXPLORATION_PRESETS[resolvedPreset];
+
+    // Resolve the target project. Explicit projectId wins (ownership checked
+    // by getDefaultProject's workspace scoping when omitted). For self-serve
+    // users we auto-resolve their default project in the active workspace —
+    // P0.3 guarantees one exists.
+    const workspaceId = await WorkspaceService.getActiveWorkspaceForUser(userId);
+    if (!workspaceId) {
+      res.status(409).json({
+        success: false,
+        error: 'No workspace found. Complete onboarding first.',
+      });
+      return;
+    }
+
+    let projectId = typeof bodyProjectId === 'string' ? bodyProjectId : undefined;
+    if (projectId) {
+      // IDOR guard: an explicit projectId must belong to the caller's active
+      // workspace, otherwise a user could start explorations against another
+      // user's project (which the job handler would then write under).
+      const owns = await projectBelongsToWorkspace(projectId, workspaceId);
+      if (!owns) {
+        res.status(403).json({ success: false, error: 'Project not found' });
+        return;
+      }
+    } else {
+      const defaultProject = await ProjectContextService.getDefaultProject(workspaceId, userId);
+      if (!defaultProject) {
+        res.status(409).json({
+          success: false,
+          error: 'No project found in workspace.',
+        });
+        return;
+      }
+      projectId = defaultProject.id;
+    }
+
+    const explorationId = generateExplorationId(userId);
+
+    await QueueManager.addExplorationJob({
+      explorationId,
+      entryUrl,
+      projectId,
+      userId,
+      workspaceId,
+      scopeHint: typeof scopeHint === 'string' ? scopeHint : undefined,
+      budget,
+      maxConcurrency: 5,
+    });
+
+    logger.info('[EXPLORATIONS_API] Exploration started', {
+      explorationId,
+      entryUrl,
+      projectId,
+      preset: resolvedPreset,
+      userId,
+    });
+
+    res.status(202).json({
+      success: true,
+      data: {
+        explorationId,
+        entryUrl,
+        projectId,
+        preset: resolvedPreset,
+        budgetMs: budget.totalTimeoutMs ?? DEFAULT_EXPLORATION_BUDGET.totalTimeoutMs,
+      },
+    });
+  } catch (error) {
+    handleError(res, error, 'Failed to start exploration');
   }
 }

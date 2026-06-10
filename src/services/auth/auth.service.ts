@@ -104,14 +104,21 @@ export async function signUpWithEmail(
   // Business-email gate — block free providers (Gmail, Yandex, etc.) and
   // disposable services (Mailinator et al.). Mirrored on the frontend so
   // most users never hit this path; this is the authoritative check.
+  //
+  // Self-serve PLG (AUTO_APPROVE_SIGNUP): accept personal domains so solo
+  // devs / QA on Gmail can sign up. The disposable-domain block stays on as
+  // anti-abuse regardless of the flag.
   const businessCheck = validateBusinessEmail(email);
   if (!businessCheck.ok) {
-    const code = BUSINESS_EMAIL_ERROR_CODES[businessCheck.reason];
-    const message =
-      businessCheck.reason === 'disposable'
-        ? 'Disposable email addresses are not allowed. Please use your work email.'
-        : 'Please use a work email. Free providers like Gmail, Yahoo or Outlook are not accepted.';
-    throw new BusinessEmailError(code, message);
+    const allowPersonal = env.AUTO_APPROVE_SIGNUP && businessCheck.reason === 'free';
+    if (!allowPersonal) {
+      const code = BUSINESS_EMAIL_ERROR_CODES[businessCheck.reason];
+      const message =
+        businessCheck.reason === 'disposable'
+          ? 'Disposable email addresses are not allowed. Please use your work email.'
+          : 'Please use a work email. Free providers like Gmail, Yahoo or Outlook are not accepted.';
+      throw new BusinessEmailError(code, message);
+    }
   }
 
   try {
