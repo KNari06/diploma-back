@@ -102,6 +102,23 @@ export class TestSchedulerJobHandler {
   }
 
   /**
+   * Wait for any in-flight tick to finish (bounded). Call on graceful shutdown
+   * BEFORE process.exit so a deploy landing inside the claim→dispatch window
+   * doesn't abandon a just-claimed (and, for one_time, already-deactivated)
+   * schedule mid-flight — which would lose that run with no record. A hard
+   * kill (SIGKILL/OOM) can still interrupt; this only covers graceful stops.
+   */
+  static async waitForIdle(timeoutMs = 10000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.isRunning && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (this.isRunning) {
+      logger.warn('[TEST_SCHEDULER] waitForIdle timed out with a tick still running');
+    }
+  }
+
+  /**
    * Process all due schedules
    */
   static async processSchedules(): Promise<void> {

@@ -119,13 +119,26 @@ export async function handleManageScheduleIntent(
       args.project_id = projectId;
     }
 
-    if (manage.name) args.name = manage.name;
     if (manage.cronExpression) args.cron_expression = manage.cronExpression;
     if (manage.runAt) args.run_at = manage.runAt;
     if (manage.timezone) args.timezone = manage.timezone;
     // plan_id / module_id accept a name OR uuid; the tool resolves it.
     if (manage.planName) args.plan_id = manage.planName;
     if (manage.moduleName) args.module_id = manage.moduleName;
+
+    // The schedule's name (`manage.name`) means different args depending on the
+    // action: for CREATE it's the new schedule's name; for update/activate/
+    // deactivate/delete it identifies WHICH schedule, and the tool expects that
+    // as `schedule_id` (which accepts a name OR uuid and resolves it). Without
+    // this mapping the id-based actions always failed "Missing required field:
+    // schedule_id" after the user confirmed.
+    if (manage.name) {
+      if (action === 'create') {
+        args.name = manage.name;
+      } else {
+        args.schedule_id = manage.name;
+      }
+    }
 
     await runManageTool({
       toolName: 'qa_manage_schedule',

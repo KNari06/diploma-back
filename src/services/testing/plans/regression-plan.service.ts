@@ -698,6 +698,21 @@ export class RegressionPlanService {
     if (automationConfig !== undefined) updates.automation_config = automationConfig;
     if (notificationsEnabled !== undefined) updates.notifications_enabled = notificationsEnabled;
 
+    // Capture the CURRENT automation_config before we overwrite it, so a later
+    // syncSchedule failure can revert the row instead of leaving drift (see the
+    // rollback in the automationConfig block below). Only needed when we're
+    // actually changing automation_config.
+    let priorAutomationConfig: unknown = undefined;
+    if (automationConfig !== undefined) {
+      const { data: prior } = await supabaseAdmin
+        .from('regression_plans')
+        .select('automation_config')
+        .eq('id', id)
+        .eq('user_id', userId)
+        .maybeSingle();
+      priorAutomationConfig = prior?.automation_config ?? null;
+    }
+
     // Mobile build pinning. The two fields can move together or
     // separately — caller might just toggle the mode, or just swap
     // which build is pinned. Switching mode to 'latest' clears the
@@ -759,19 +774,36 @@ export class RegressionPlanService {
     const plan = this.mapToRegressionPlan(data);
 
     // Re-sync schedule and git integration when automation config changes.
-    // A failed enabled-schedule sync throws (no longer swallowed) and propagates
-    // to the controller → user sees a real error instead of an "updated" plan
-    // whose schedule silently didn't take effect.
+    // syncSchedule THROWS on a failed enabled-schedule sync. The plan row above
+    // already persisted the new automation_config (which may say the schedule is
+    // enabled), so on a throw we must REVERT automation_config + schedule_id to
+    // their prior values — otherwise the plan shows an enabled schedule in the UI
+    // with no/stale test_schedules row (the exact silent drift create() rolls
+    // back). We rethrow so the user still gets a real error.
     if (automationConfig !== undefined) {
-      const scheduleId = await this.syncSchedule(plan, automationConfig?.schedule);
-      await this.syncGitIntegration(plan, automationConfig?.gitTriggers);
+      const priorScheduleId = plan.scheduleId;
+      try {
+        const scheduleId = await this.syncSchedule(plan, automationConfig?.schedule);
+        await this.syncGitIntegration(plan, automationConfig?.gitTriggers);
 
-      if (scheduleId !== plan.scheduleId) {
+        if (scheduleId !== plan.scheduleId) {
+          await supabaseAdmin
+            .from('regression_plans')
+            .update({ schedule_id: scheduleId })
+            .eq('id', plan.id);
+          plan.scheduleId = scheduleId || undefined;
+        }
+      } catch (syncErr) {
+        logger.error('[REGRESSION_PLAN_SERVICE] Schedule sync failed on update — reverting automation_config', {
+          planId: plan.id,
+          error: syncErr instanceof Error ? syncErr.message : String(syncErr),
+        });
         await supabaseAdmin
           .from('regression_plans')
-          .update({ schedule_id: scheduleId })
-          .eq('id', plan.id);
-        plan.scheduleId = scheduleId || undefined;
+          .update({ automation_config: priorAutomationConfig ?? null, schedule_id: priorScheduleId ?? null })
+          .eq('id', plan.id)
+          .eq('user_id', userId);
+        throw syncErr;
       }
     }
 
