@@ -307,6 +307,8 @@ export interface UpdateTestFlowParams {
 /**
  * Test schedule - cron-based scheduling for test runs
  */
+export type ScheduleType = 'recurring' | 'one_time';
+
 export interface TestSchedule {
   id: string;
   projectId: string;
@@ -314,7 +316,10 @@ export interface TestSchedule {
   name: string;
   moduleId?: string;
   planId?: string;
-  cronExpression: string;
+  // recurring: set; one_time: undefined (use runAt instead).
+  scheduleType: ScheduleType;
+  cronExpression?: string;
+  runAt?: string;
   timezone: string;
   isActive: boolean;
   parameters: Record<string, any>;
@@ -324,13 +329,15 @@ export interface TestSchedule {
 }
 
 /**
- * Params for creating a test schedule
+ * Params for creating a test schedule.
+ * Provide exactly one of cronExpression (recurring) or runAt (one_time).
  */
 export interface CreateTestScheduleParams {
   projectId: string;
   userId: string;
   name: string;
-  cronExpression: string;
+  cronExpression?: string;
+  runAt?: string;
   timezone?: string;
   moduleId?: string;
   planId?: string;
@@ -345,6 +352,7 @@ export interface UpdateTestScheduleParams {
   userId: string;
   name?: string;
   cronExpression?: string;
+  runAt?: string;
   timezone?: string;
   parameters?: Record<string, any>;
   isActive?: boolean;
@@ -1356,6 +1364,10 @@ export interface DueSchedule {
   scheduleId: string;
   projectId: string;
   userId: string;
+  // recurring schedules retry on the next occurrence; a one_time schedule has
+  // already been deactivated by claimDueSchedule and will NOT retry — the
+  // scheduler branches its failure notification on this.
+  scheduleType: ScheduleType;
   // 'suite' is surfaced so the scheduler can reject it explicitly — there is
   // no runSuite() execution path, so a suite schedule must NOT be silently
   // misrouted to runPlan() (which would self-deactivate it as "target deleted").

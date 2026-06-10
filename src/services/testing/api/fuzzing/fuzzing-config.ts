@@ -92,6 +92,13 @@ export const XSS_PAYLOADS = [
 ] as const;
 
 /**
+ * Baseline reflected-XSS probe — the canonical payload other features inject
+ * when they need ONE deterministic XSS string (e.g. negative test generation).
+ * Named explicitly so reordering XSS_PAYLOADS can't silently change behavior.
+ */
+export const CANONICAL_XSS_PAYLOAD = '<script>alert(1)</script>';
+
+/**
  * Curated command injection payloads (safe probes)
  */
 export const COMMAND_INJECTION_PAYLOADS = [

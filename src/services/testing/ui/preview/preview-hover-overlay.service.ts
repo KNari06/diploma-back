@@ -270,20 +270,25 @@ function buildHoverScript(mode: HoverOverlayMode): string {
         tip.style.display = 'none';
         return;
       }
+      // getBoundingClientRect() already includes ancestor CSS zoom, but the
+      // overlay div lives INSIDE the zoomed root, so the browser re-applies
+      // that zoom to our px values — divide once to land on the element
+      // (sites like mamaznaet.kz set zoom on <html> to scale their layout).
+      const z = root.currentCSSZoom || 1;
       root.style.display = 'block';
-      root.style.left = rect.left + 'px';
-      root.style.top = rect.top + 'px';
-      root.style.width = rect.width + 'px';
-      root.style.height = rect.height + 'px';
+      root.style.left = (rect.left / z) + 'px';
+      root.style.top = (rect.top / z) + 'px';
+      root.style.width = (rect.width / z) + 'px';
+      root.style.height = (rect.height / z) + 'px';
 
       const label = describeElement(el);
       tip.textContent = label;
       tip.style.display = 'block';
       const tw = Math.min(280, label.length * 7 + 12);
-      let tx = rect.left;
-      let ty = rect.top - 20;
-      if (ty < 0) ty = rect.bottom + 4;
-      if (tx + tw > window.innerWidth) tx = Math.max(0, window.innerWidth - tw - 4);
+      let tx = rect.left / z;
+      let ty = rect.top / z - 20;
+      if (ty < 0) ty = rect.bottom / z + 4;
+      if (tx + tw > window.innerWidth / z) tx = Math.max(0, window.innerWidth / z - tw - 4);
       tip.style.left = tx + 'px';
       tip.style.top = ty + 'px';
     }

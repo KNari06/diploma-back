@@ -1,5 +1,12 @@
 /**
- * Per-step screenshot retention sweep.
+ * Per-step screenshot retention sweep (+ local editor/forensic log sweep).
+ *
+ * Two independent prunes run in the same nightly tick:
+ *   1. Storage: per-step screenshots under `${userId}/step-screenshots/...`
+ *      older than SCREENSHOT_RETENTION_DAYS (the original purpose, below).
+ *   2. Local FS: editor/forensic debug logs in `test_logs/editor/` older than
+ *      EDITOR_LOG_RETENTION_DAYS (default 3) — these had NO cleanup and grow
+ *      ~16 files per editor session (1 trace + 5 forensic triplets).
  *
  * Per-step screenshots are captured for EVERY step (web + mobile) when
  * SCREENSHOT_EACH_STEP_ENABLED is on (default). They live under
@@ -8,12 +15,15 @@
  * touches. Without pruning, per-step images grow without bound (runs × steps).
  *
  * This nightly sweep walks every user's `step-screenshots/` subtree and removes
- * objects older than SCREENSHOT_RETENTION_DAYS. Runs in the scheduler process
- * (single-instance, not horizontally scaled — same reasoning as the other
- * sweeps), so no distributed lock is needed. Best-effort: storage errors log
+ * objects older than SCREENSHOT_RETENTION_DAYS. Runs in the scheduler bundle
+ * — local scheduler container, or the prod worker behind the Redis leader lock
+ * (`src/scheduler/leader.ts`), which is what keeps it single-instance when the
+ * worker scales out. Best-effort: storage errors log
  * and continue, never throw fatally.
  */
 
+import fs from 'fs';
+import path from 'path';
 import { env } from '@/config/environment/env';
 import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
 import { supabaseAdmin } from '@/db/supabase';
@@ -27,6 +37,13 @@ const PAGE = 1000;
 const MAX_DEPTH = 6;
 /** Subfolder under each user prefix that holds per-step screenshots. */
 const STEP_PREFIX = 'step-screenshots';
+/**
+ * Local debug-log dir pruned by the same sweep. Holds editor traces
+ * (`<date>_editor_<sid>.jsonl`) + per-apply forensic triplets
+ * (`<sid>_forensic_<ts>.jsonl` / `_ds.json` / `_html.html`). ~16 files per
+ * editor session with no other cleanup — grows without bound. Flat directory.
+ */
+const EDITOR_LOG_DIR = path.join(process.cwd(), 'test_logs', 'editor');
 
 export class ArtifactRetentionJob {
   private static intervalId: NodeJS.Timeout | null = null;
@@ -84,13 +101,19 @@ export class ArtifactRetentionJob {
       for (const userId of userPrefixes) {
         removed += await this.pruneOldFiles(bucket, `${userId}/${STEP_PREFIX}`, cutoffMs, 0);
       }
+      // Local editor/forensic debug logs — separate filesystem sweep, its own
+      // (shorter) TTL. Best-effort: errors log and never affect the storage result.
+      const localRemoved = await this.pruneLocalEditorLogs(startedAt);
+
       logger.info('[ARTIFACT_RETENTION] Sweep complete', {
         removed,
+        localRemoved,
         users: userPrefixes.length,
         retentionDays: ScreenshotCaptureFeature.getRetentionDays(),
+        editorLogRetentionDays: this.getEditorLogRetentionDays(),
         durationMs: Date.now() - startedAt,
       });
-      return { removed, skipped: false };
+      return { removed: removed + localRemoved, skipped: false };
     } catch (error) {
       logger.error('[ARTIFACT_RETENTION] Sweep error', {
         error: error instanceof Error ? error.message : String(error),
@@ -178,6 +201,55 @@ export class ArtifactRetentionJob {
 
       if (entries.length < PAGE) break;
       offset += PAGE;
+    }
+    return removed;
+  }
+
+  /** Editor-log TTL in days, from env, clamped to a sane floor of 1. */
+  private static getEditorLogRetentionDays(): number {
+    const d = env.EDITOR_LOG_RETENTION_DAYS;
+    return Number.isFinite(d) && d >= 1 ? d : 3;
+  }
+
+  /**
+   * Prune local editor/forensic debug logs older than the editor-log TTL.
+   * Flat directory, so a single readdir + per-file mtime check. Best-effort:
+   * a missing dir is a no-op; per-file stat/unlink errors log and continue.
+   * Uses mtime (write time) — these files are written once and never touched,
+   * so mtime is effectively their creation time.
+   */
+  private static async pruneLocalEditorLogs(nowMs: number): Promise<number> {
+    const cutoffMs = nowMs - this.getEditorLogRetentionDays() * 24 * 60 * 60 * 1000;
+    let removed = 0;
+    let names: string[];
+    try {
+      names = await fs.promises.readdir(EDITOR_LOG_DIR);
+    } catch (error) {
+      // ENOENT = dir never created (no editor sessions yet) — not an error.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        logger.debug('[ARTIFACT_RETENTION] editor-log readdir failed', {
+          dir: EDITOR_LOG_DIR,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      return 0;
+    }
+
+    for (const name of names) {
+      const filePath = path.join(EDITOR_LOG_DIR, name);
+      try {
+        const stat = await fs.promises.stat(filePath);
+        if (!stat.isFile()) continue;
+        if (stat.mtimeMs < cutoffMs) {
+          await fs.promises.unlink(filePath);
+          removed++;
+        }
+      } catch (error) {
+        logger.debug('[ARTIFACT_RETENTION] editor-log prune entry failed', {
+          file: name,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
     return removed;
   }

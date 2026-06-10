@@ -7,12 +7,11 @@ import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { getActionIcon, type TestStepCompletedPayload } from '@/websocket/types/types';
 import { BrowserContext, Page } from 'playwright';
-import { IntelligentTestOrchestrator } from '../../core/intelligent-test-orchestrator';
-import { LiteEngine, ModeRouter } from '../../core/lite';
+import { LiteEngine } from '../../core/lite';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
 import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
 import { supabaseAdmin } from '@/db/supabase';
-import { captureStepScreenshot, saveIntelligentTestResults, uploadArtifacts, uploadIntelligentTestScreenshots } from '../artifacts/artifacts-handler';
+import { captureStepScreenshot, saveIntelligentTestResults, uploadArtifacts } from '../artifacts/artifacts-handler';
 import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
 import { uploadScreenshotBufferToStorage } from '@/services/storage/test-artifacts-storage.service';
 import { collectArtifactsAndCleanup } from '../artifacts/test-cleanup';
@@ -23,13 +22,13 @@ import { navigateToUrl } from '../execution/navigation-handler';
 import { RequestTracker } from '../execution/request-tracker';
 import { getBrowserWithProgress, setupBrowserContext } from '../setup/browser-setup';
 import { buildAllHintsWithMetadata } from '../setup/hints-builder';
-import { buildIntelligentTestConfig } from '../setup/test-config-builder';
 import { checkTestCancelled } from '../utils/test-cancellation-checker';
 import { ReplayTraceWriter } from './replay-trace-writer';
 import { createRunKey, TestRunRegistry } from './test-run-registry';
 import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import { waitForStepReadiness, shouldSkipLookaheadAfter } from '@/services/testing/ui/preview/step-readiness.service';
 import { runV1WithShadow } from '@/services/testing/ui/preview/step-readiness-v2.service';
+// eslint-disable-next-line no-duplicate-imports
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import type { IntentStep, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { setupThirdPartyBlocker } from '../execution/third-party-blocker';
@@ -42,6 +41,7 @@ import {
 } from '@/services/test-resource';
 import { createCommandExecutorRecipeRunner } from '@/services/test-resource/runtime/recipe-executor';
 import { runScenarioSetups } from '@/services/test-resource/runtime/scenario-setup-runner';
+import { composeStepDescription } from '@/agent/playwright/core/step-description';
 
 /**
  * Resolve workspaceId from projectId (for AI usage tracking).
@@ -951,7 +951,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               return isMutating && (isServerError || isRequestFailed);
             });
 
-            const stepDescription = intentMeta?.elementDescription || action;
+            const stepDescription = composeStepDescription(command, action);
             const actionType = (command as any).intentMeta?.actionType as string | undefined;
             const networkVerdict = shouldFailOnCriticalNetworkErrors({
               actionType,
@@ -1644,7 +1644,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               browser: testData.browser,
               step: currentStepIndex,
               attempt: retryAttempt,
-              stepDescription: intentMeta?.elementDescription || action,
+              stepDescription: composeStepDescription(command, action),
               success: false,
               timestamp: new Date().toISOString(),
               runtimeMeta: executor.redactRuntimeMeta(finalMeta),
@@ -2027,24 +2027,10 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       throw new Error('Regression test requires commands for replay. Record test steps before running.');
     }
 
-    // Continue with existing Lite/Pro mode selection...
-    // Determine which mode to use (Lite vs Pro)
-    const modeSelection = ModeRouter.selectMode({
-      goal,
-      url: testData.url,
-      userId: testData.userId,
-      userMode: testData.mode || 'lite', // Pass user-selected mode from frontend
-    });
-
-    logger.info('[PLAYWRIGHT] Selected test mode', {
-      testId: testData.testId,
-      mode: modeSelection.mode,
-      reason: modeSelection.reason,
-    });
-
+    // Lite Engine is the only execution path (Pro Mode removed).
     let intelligentResult: any;
 
-    if (modeSelection.mode === 'lite') {
+    {
       // Use Lite Engine
       logger.info('[PLAYWRIGHT] Starting Lite Engine execution', {
         testId: testData.testId,
@@ -2199,62 +2185,22 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           stepCount: liteResult.executedSteps.length,
         });
       }
-    } else {
-      // Use Pro Mode (existing IntelligentTestOrchestrator)
-      logger.info('[PLAYWRIGHT] Starting Pro Mode execution', {
-        testId: testData.testId,
-        goal,
-        hintsCount: hints.length,
-      });
-
-      const intelligentConfig = buildIntelligentTestConfig(testData, goal, hints, retryCount);
-      const orchestrator = new IntelligentTestOrchestrator(
-        intelligentConfig,
-        testData.userId,
-        testData.testId
-      );
-
-      intelligentResult = await orchestrator.execute(browser, page);
-
-      logger.info('[PLAYWRIGHT] Pro Mode completed', {
-        testId: testData.testId,
-        success: intelligentResult.success,
-        pagesVisited: intelligentResult.pagesVisited,
-        actionsTaken: intelligentResult.actionsTaken,
-        duration: `${Math.round(intelligentResult.duration / 1000)}s`,
-        cost: `$${intelligentResult.cost.toFixed(3)}`,
-      });
     }
 
-    // Save results and upload artifacts
-    // For Lite mode, create a minimal config for compatibility
-    const finalConfig = modeSelection.mode === 'lite'
-      ? { mode: 'lite', goal, startUrl: testData.url, hints: [] }
-      : buildIntelligentTestConfig(testData, goal, hints, retryCount);
+    // Save results and upload artifacts (Lite mode minimal config)
+    const finalConfig = { mode: 'lite', goal, startUrl: testData.url, hints: [] };
 
     await saveIntelligentTestResults(testData, intelligentResult, finalConfig);
 
-    // Upload screenshots:
-    // - Lite mode: screenshots already uploaded as URLs, just extract them
-    // - Pro mode: screenshots are base64, need to upload to storage
-    let screenshotUrls: string[] = [];
-    if (intelligentResult._liteMode) {
-      // Lite mode: screenshots are already URLs
-      screenshotUrls = (intelligentResult.screenshots || [])
-        .map((s: { screenshot?: string }) => s.screenshot)
-        .filter((url: string | undefined): url is string => !!url);
+    // Lite mode: screenshots are already uploaded as URLs, just extract them
+    const screenshotUrls: string[] = (intelligentResult.screenshots || [])
+      .map((s: { screenshot?: string }) => s.screenshot)
+      .filter((url: string | undefined): url is string => !!url);
 
-      logger.debug('[PLAYWRIGHT] Lite mode: using pre-uploaded screenshot URLs', {
-        testId: testData.testId,
-        count: screenshotUrls.length,
-      });
-    } else {
-      // Pro mode: upload base64 screenshots to storage
-      screenshotUrls = await uploadIntelligentTestScreenshots(
-        testData,
-        intelligentResult.screenshots || []
-      );
-    }
+    logger.debug('[PLAYWRIGHT] Lite mode: using pre-uploaded screenshot URLs', {
+      testId: testData.testId,
+      count: screenshotUrls.length,
+    });
 
     // Stop video streaming
     if (videoStreamService?.isActive()) {

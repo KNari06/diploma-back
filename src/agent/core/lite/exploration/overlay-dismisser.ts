@@ -151,6 +151,8 @@ const CLOSE_TIEBREAK_WORDS = [
   'got it', 'i understand', 'ok', 'okay',
   'no thanks', 'not now', 'maybe later',
   'skip', 'decline', 'reject', 'reject all', 'deny',
+  // kk
+  'жабу', 'жабыңыз', 'түсінікті', 'бас тарту', 'өткізіп жіберу', 'кейінірек', 'келіспеймін',
   '×', '✕', '✖', '✗',
 ];
 

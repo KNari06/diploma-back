@@ -441,7 +441,8 @@ describe('Intent test-case scope partition', () => {
   //   (a) are migrated to use ChatPersistence/dual-emit (general_chat,
   //       editor_action, needs_clarification), or
   //   (b) don't write to chat tables at all (analyze_failure,
-  //       coverage_analysis, test_recommendations — they only res.json).
+  //       coverage_analysis, test_recommendations, flaky_report — they
+  //       only res.json).
   // Whitelisting keeps the partition explicit so adding a new intent
   // forces a deliberate classification.
   const ALLOWED_IN_TEST_CASE_SCOPE = new Set([
@@ -451,6 +452,11 @@ describe('Intent test-case scope partition', () => {
     'analyze_failure',
     'coverage_analysis',
     'test_recommendations',
+    // Read-only workspace analytics: routes qa_detect_flaky_tests through
+    // runManageTool (read tool → no confirm gating, no chat-table writes),
+    // identical to the three analytics intents above. Safe inside a test
+    // case — it only res.json()s a flakiness report.
+    'flaky_report',
     // Mobile editor agents — parallel to web's editor_action. They operate
     // on the LIVE emulator attached to the test-case editor, so they must
     // work in test-case scope. Migrated to ChatPersistence (store threaded

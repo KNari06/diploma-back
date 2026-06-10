@@ -69,7 +69,7 @@ class WebSocketRedisSubscriber {
 
         case 'test:progress':
           // ✅ FIX #4: Unified test:progress handling (removed duplicate case below)
-          // This can come from emitToUser (intelligent-test-orchestrator) or emitTestProgress
+          // This can come from emitToUser or emitTestProgress
           if (target?.userId) {
             // Emit to user if userId is in target (from emitToUser fallback)
             wsService.emitToUser(target.userId, 'test:progress', payload);
@@ -149,10 +149,11 @@ class WebSocketRedisSubscriber {
 
         // Chat events
         // `target.testCaseId` is forwarded into the third arg of each
-        // emit method. When non-empty, the emit method dual-broadcasts
-        // to both `chat:<sessionId>` and `chat:tc:<testCaseId>` rooms,
-        // covering the lazy-create window where the frontend has
-        // subscribed by testCaseId but no session row exists yet.
+        // emit method. When non-empty, the emit method routes EXCLUSIVELY
+        // to `chat:tc:<testCaseId>` (never also to `chat:<sessionId>`) so
+        // an editor chat message cannot leak into a global chat that
+        // shares the socket. This also covers the lazy-create window where
+        // the frontend subscribed by testCaseId but no session row exists.
         case 'chat:message':
           if (target?.sessionId || payload.sessionId) {
             wsService.emitChatMessage(

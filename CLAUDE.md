@@ -14,7 +14,7 @@
 |---|---|---|
 | API | [src/index.ts](src/index.ts) | HTTP + Socket.IO server. Owns preview sessions (live browsers). |
 | Worker | [src/worker/index.ts](src/worker/index.ts) | BullMQ consumer. Runs all background jobs (replay, AI analysis, exploration). |
-| Scheduler | [src/scheduler/index.ts](src/scheduler/index.ts) | Cron triggers — enqueues regression runs. |
+| Scheduler | [src/scheduler/index.ts](src/scheduler/index.ts) | Cron + one-time triggers — enqueues regression runs. Local: own container. Prod: hosted in the worker behind a Redis leader lock (`SCHEDULER_IN_WORKER`, [leader.ts](src/scheduler/leader.ts)). |
 
 Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 
@@ -33,6 +33,7 @@ Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 | [src/websocket/](src/websocket/) | Socket.IO server + handlers. Most events live in `handlers/preview.handler.ts`. | ⏳ TODO |
 | [src/services/testing/](src/services/testing/) | Non-preview testing services (regression, plans, results, executions, fixtures, exploration). | — |
 | [src/services/test-resource/](src/services/test-resource/) | Polymorphic test resources — `auth` (logins), `environment`, `secret` adapters live here; `data_fixture` queued. | ✅ |
+| src/services/chat/ | Chat-side context + tracing: `editor-context.service.ts` (live page DOM/console/network → chat), `chat-test-trace.service.ts` (per-test-case chat JSONL trace → `test_logs/chat_test/`). | — |
 | [src/services/kb/](src/services/kb/) | Knowledge base (skills, patterns) for auto-learn. | — |
 | [src/services/skills/](src/services/skills/) | Skill registry — composable test capabilities. | — |
 | src/services/mobile/ | Mobile runner integration (scrcpy, redroid, a11y agent). | — |
@@ -59,6 +60,7 @@ When you need to… | Open
 …resolve a descriptor ("payment tests","smoke") → test IDs | `src/services/testing/resolver/test-query-resolver.service.ts`; consumed via `shared/intent-target-resolution.ts`
 …change request-understanding (ANALYZE/ENRICH/IMPROVE) | `src/ai/prompts/request-understanding-prompts.ts`
 …add a chat management op (schedule/module/plan) | new `manage_*` intent calling `qa_manage_*` through `executeTool` (see `regression/shared/manage-tool.helper.ts`)
+…add/change a yes-no / cancel / approval keyword (ru/en/kk) | `src/config/testing/intent-keywords.ts` (single source — NEVER inline a new list). Consumers: intent-fast-path, confirmation-classifier, compound-queue, manage-tool.helper. See Hard invariant #17.
 …add/modify a BullMQ job | `src/jobs/<name>.job.ts` and register in `src/worker/index.ts`
 …add a REST route | `src/api/<domain>/` (route + controller + service), wire in `src/index.ts`
 …add a WS event | `src/websocket/handlers/<handler>.ts`. Preview events go in `preview.handler.ts`.
@@ -66,6 +68,7 @@ When you need to… | Open
 …run AI agent (LiteEngine) | `src/agent/core/lite/lite-engine.ts` → `MultiAgentOrchestrator` in `agents/`
 …run autonomous site exploration | `src/agent/core/lite/exploration/exploration-engine.ts`
 …trace AI cost / token usage | `src/services/ai/cost/`, `src/services/ai/tracking/`
+…work on the per-test-case ("AI Agent inside a test case") chat | `src/api/chat/chat.controller.ts` (testCaseId branch), `src/api/chat/general/handler.ts` (editor flow + trace), `src/services/chat/chat-test-trace.service.ts` — see Hard invariant #16
 …check DB schema | `supabase-migrations/supabase-schema.sql`
 
 ---
@@ -128,12 +131,16 @@ from a runner-side pool (warmup → cold-start fallback) and released in the
 finally block. See `mobile-test-run.job.ts` for the full lifecycle.
 
 ### Scheduled cron
-`src/scheduler/index.ts` ticks every 60s
-→ `TestSchedulerJobHandler.processSchedules()` → `claimDueSchedule()` (atomic)
+Scheduler bundle ticks every 60s (the `TestSchedulerJobHandler` loop)
+→ `processSchedules()` → `claimDueSchedule()` (atomic)
 → routes to `RegressionRunService.runPlan() | runModule() | runFlow()`
 → same web / mobile branches as above.
 
-Also in the scheduler process (24h sweeps, single-instance): `ArtifactRetentionJob` ([artifact-retention.job.ts](src/jobs/artifact-retention.job.ts)) prunes `${userId}/step-screenshots/...` older than `SCREENSHOT_RETENTION_DAYS`. Per-step screenshot knobs live in [env.ts](src/config/environment/env.ts) / [config/features/screenshot-capture.ts](src/config/features/screenshot-capture.ts): `SCREENSHOT_EACH_STEP_ENABLED` (default ON), `SCREENSHOT_FORMAT` (`webp`/`jpeg`), `SCREENSHOT_QUALITY`, `SCREENSHOT_RETENTION_DAYS`. Final/bug screenshots (`${userId}/screenshots/...`) are a SEPARATE prefix the retention job never touches.
+**Where the bundle runs:** local docker-compose runs a dedicated `scheduler` container ([src/scheduler/index.ts](src/scheduler/index.ts)). In prod the SAME bundle runs INSIDE the worker process, gated by `SCHEDULER_IN_WORKER=true` and a Redis **leader lock** ([src/scheduler/leader.ts](src/scheduler/leader.ts), key `${QUEUE_PREFIX}scheduler:leader`, 90s TTL / 30s refresh; acquire = `SET NX EX`, renew/release = atomic Lua compare-and-expire / compare-and-del) so one worker replica runs it at N>1. Guarantee is at-most-one in steady state, not hard mutex (a >90s leader stall opens a ≤30s double-run window, bounded because the sweeps are idempotent and schedule claims are atomic). Default OFF, so the two never fight; the lock is the backstop if both ever run against one Redis.
+
+**Schedule types:** a `test_schedules` row is either **recurring** (`schedule_type='recurring'`, a 5-field `cron_expression` + `timezone`; `claimDueSchedule` advances `next_run_at` to the next occurrence) or **one_time** (`schedule_type='one_time'`, an absolute `run_at`; `claimDueSchedule` fires once then flips `is_active=false`). Due-detection is identical for both (`next_run_at <= NOW()`); only the claim/advance step differs. Create/update accept exactly one of `cronExpression` or `runAt` ([schedule.service.ts](src/services/testing/schedules/schedule.service.ts), [schedules.controller.ts](src/api/schedules/schedules.controller.ts), `qa_manage_schedule`).
+
+Also in the scheduler bundle (24h sweeps, single-instance — now guarded by the leader lock when hosted in the worker): `ArtifactRetentionJob` ([artifact-retention.job.ts](src/jobs/artifact-retention.job.ts)) prunes `${userId}/step-screenshots/...` older than `SCREENSHOT_RETENTION_DAYS`. Per-step screenshot knobs live in [env.ts](src/config/environment/env.ts) / [config/features/screenshot-capture.ts](src/config/features/screenshot-capture.ts): `SCREENSHOT_EACH_STEP_ENABLED` (default ON), `SCREENSHOT_FORMAT` (`webp`/`jpeg`), `SCREENSHOT_QUALITY`, `SCREENSHOT_RETENTION_DAYS`. Final/bug screenshots (`${userId}/screenshots/...`) are a SEPARATE prefix the retention job never touches.
 
 ### Chat → test creation / management (intent-driven router)
 POST `/api/chat/message` → `handleChat()` ([src/api/chat/chat.controller.ts](src/api/chat/chat.controller.ts))
@@ -153,6 +160,13 @@ general_chat, needs_clarification, save_test, run_regression, run_plan, run_modu
 add_to_plan, analyze_failure, test_recommendations, coverage_analysis, editor_action, mobile_test, mobile_action,
 mobile_agent, **flaky_report, manage_schedule, manage_module, manage_plan** (the last 4 added in the management phase;
 they call existing `qa_manage_*` tools through `executeTool`, not the SubAgentPipeline).
+
+### Self-serve "magic first test" (PLG, gated by `AUTO_APPROVE_SIGNUP`)
+Sign up → first auth (`verifyEmail` / `completeOAuthHandler` in [auth.controller.ts](src/api/auth/auth.controller.ts))
+→ `SelfServeProvisioningService.provision()` ([self-serve-provisioning.service.ts](src/services/core/self-serve-provisioning.service.ts)) — approve user + create workspace+project + grant trial credits/plan (no-op unless flag on; never throws)
+→ POST `/api/v1/explorations/start` ([explorations.controller.ts](src/api/explorations/explorations.controller.ts)) `{ url, projectId?, preset? }`, gated by `requireApproved` + `requireCredits`
+→ validate URL + IDOR-guard projectId → `QueueManager.addExplorationJob()` on the `'quick'` budget preset (~2 min, [types.ts](src/agent/core/lite/exploration/types.ts) `EXPLORATION_PRESETS`)
+→ returns `202 { explorationId }` → poll GET `/api/v1/explorations/:id` for discovered test cases → one-click `POST /:id/run-discovered`.
 
 ---
 
@@ -175,6 +189,8 @@ These are codified across the codebase. Also see [.claude/rules/critical-pattern
 13. **Chat write/management ops go through `executeTool`, never the raw skill or a hand-rolled confirm.** The `manage_*` intent handlers call `qa_manage_*` via `executeTool` ([src/services/skills/tool-executor.ts](src/services/skills/tool-executor.ts)) so the centralized confirm-preview guard (in `SkillRegistry`, keyed `sessionId:toolName`), loop-detection, retry, and timeout all apply. Two-phase confirm is deterministic: turn 1 → `confirm:false` (preview, op cached in Redis via [manage-confirmation.ts](src/api/chat/regression/shared/manage-confirmation.ts)), turn 2 "yes" → re-run the SAME cached args with `confirm:true`. Never write on the first turn; never echo the tool's LLM-targeted "WRITE operation requires confirmation" message to the user (surface a human preview instead).
 14. **Chat pending-state (manage-confirm / compound-queue) is Redis-keyed by `chatSessionId` ONLY (no userId fallback) and MUST be cleared on cancel + error.** A userId fallback leaks a pending flow across the user's other sessions. `/chat/cancel` and the controller's error path both call `clearPendingCompound`. The compound splitter advances **after** a step succeeds — never before (a clarification/confirm answer must retry the same step, not drive the next one).
 15. **Unicode word boundaries: use `(?![\p{L}\p{N}])`, never `\b`, for affirmative/cancel/keyword regex.** JS `\b` is ASCII-only, so `\bда\b` / `\bхватит\b` never match Cyrillic. This bit the confirmation classifier and the compound cancel-phrase regex; both now use the unicode lookahead.
+16. **Per-test-case chat (`testCaseId` present) is the editor surface — three rules hold together.** (a) **Exclusive WS routing:** `emitChatMessage`/`emitChatProcessingStep`/`emitChatTestUpdate` with a `testCaseId` route ONLY to `chat:tc:<testCaseId>`, never also to `chat:<sessionId>` ([websocket.service.ts](src/websocket/core/websocket.service.ts)); `subscribe:chat:testcase` joins ONLY that room (never `chat:<sid>`). Both global and editor `Chat` share ONE socket, so emitting an editor event to `chat:<sid>` would surface it in the global chat. The frontend filter is the second guard: a global chat accepts a `chat:*` event only when `event.sessionId` matches its live ref OR the pending `localStorage` id (first-message window) — an event with another sessionId is dropped ([homeSocketBindings.ts](../qai-frontend/apps/desktop/src/renderer/app/home/realtime/homeSocketBindings.ts)). (b) **mode is forced to `'editor'`** in the controller for tc-scope ([chat.controller.ts](src/api/chat/chat.controller.ts)) so the executor's editor flow (generate steps → confirm → run on preview → save) activates; the lite/pro toggle is a global-chat concept and must never reach a tc-chat. (c) **Scope-awareness:** `testCaseId`/`testCaseName` are threaded into `buildExecutorPrompt` + a system-prompt TEST-CASE SCOPE block so "save/update" edits THIS test case (`qa_update_test_case_steps`), not a duplicate (`qa_create_test_case`). Trace for analysis: `ChatTestTraceService` → `test_logs/chat_test/` (best-effort, scrubs `{{secrets.*}}`/inline creds, TTL-evicted).
+17. **Chat control-word lists (affirmative / cancel / rejection / chitchat / confirmation-markers) live ONLY in [intent-keywords.ts](src/config/testing/intent-keywords.ts) — never inline.** They were duplicated across four call sites (intent-fast-path, confirmation-classifier, compound-queue, manage-tool.helper) and Kazakh kept getting forgotten. The `MultiLangList` type makes `{en,ru,kk}` REQUIRED (build fails if a language is dropped); a contract test asserts anchors + unicode-boundary behavior. These lists are an **optimization + regex fallback, NOT the classifier** — the LLM (`parseUserIntent` GPT pass / Gemini→OpenAI in confirmation-classifier) is the language-agnostic source of truth and covers the long tail. Keep buckets to high-frequency anchor forms; do not chase completeness. Build regexes via `toBoundaryRegex` (unicode `(?![\p{L}\p{N}])`, never ASCII `\b` — see #15). Note: this is the chat-intent control-word registry; DOM/element-text keyword lists (submit/close/destructive matched in `page.evaluate`) stay local to their services by design.
 
 ---
 

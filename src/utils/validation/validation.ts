@@ -161,12 +161,14 @@ export const sanitizeUrl = (url: string): string => {
       throw new ValidationError('Only HTTP and HTTPS protocols are allowed');
     }
 
-    // Basic security: prevent localhost/private network access in production
-    const hostname = parsed.hostname.toLowerCase();
-    // const forbiddenHosts = ['localhost', '127.0.0.1', '0.0.0.0', '::1'];
-    // if (forbiddenHosts.includes(hostname)) {
-      // throw new ValidationError('Localhost URLs are not allowed');
-    // }
+    // SSRF guard: a sanitized URL can be navigated to by a real browser
+    // (exploration job) or fetched server-side. Block hosts that point at
+    // loopback / private / link-local ranges and cloud metadata endpoints.
+    // Disabled only in local `development` so devs can explore localhost apps;
+    // enforced in production AND test (the unit tests assert the block).
+    if (process.env.NODE_ENV !== 'development' && isBlockedSsrfHostname(parsed.hostname)) {
+      throw new ValidationError('This host is not allowed');
+    }
 
     return parsed.toString();
   } catch (error) {
@@ -175,6 +177,50 @@ export const sanitizeUrl = (url: string): string => {
     }
     throw new ValidationError('Invalid URL format');
   }
+};
+
+/**
+ * SSRF blocklist check for a URL hostname. Returns true when the host points
+ * at loopback, private, link-local (incl. the 169.254.169.254 cloud metadata
+ * endpoint) or other non-routable ranges. Conservative string/CIDR matching —
+ * does NOT resolve DNS, so a hostname that resolves to a private IP is not
+ * caught here; that requires a resolve-then-check at fetch time. This blocks
+ * the common direct-IP / localhost cases.
+ */
+export const isBlockedSsrfHostname = (hostnameRaw: string): boolean => {
+  const hostname = hostnameRaw.toLowerCase().replace(/^\[|\]$/g, ''); // strip IPv6 brackets
+
+  // Literal loopback / unspecified names
+  if (
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname === '0.0.0.0' ||
+    hostname === '::' ||
+    hostname === '::1' ||
+    hostname.startsWith('::ffff:') // IPv4-mapped IPv6
+  ) {
+    return true;
+  }
+
+  // IPv4 literal → check private / loopback / link-local / metadata ranges
+  const ipv4 = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const [a, b] = [Number(ipv4[1]), Number(ipv4[2])];
+    if (a === 127) return true;                       // 127.0.0.0/8 loopback
+    if (a === 10) return true;                        // 10.0.0.0/8 private
+    if (a === 192 && b === 168) return true;          // 192.168.0.0/16 private
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 private
+    if (a === 169 && b === 254) return true;          // 169.254.0.0/16 link-local + cloud metadata
+    if (a === 0) return true;                         // 0.0.0.0/8
+    return false;
+  }
+
+  // IPv6 unique-local (fc00::/7) and link-local (fe80::/10)
+  if (hostname.startsWith('fc') || hostname.startsWith('fd') || hostname.startsWith('fe80:')) {
+    return true;
+  }
+
+  return false;
 };
 
 export const sanitizeHtml = (html: string): string => {

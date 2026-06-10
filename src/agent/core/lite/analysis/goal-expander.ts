@@ -332,7 +332,9 @@ Return JSON:
   private static tokenize(text: string): string[] {
     return text
       .toLowerCase()
-      .replace(/[^\w\sа-яёА-ЯЁ]/g, ' ')
+      // Keep any Unicode letter/number (covers en/ru/kk) + whitespace + _;
+      // `\w` is ASCII-only and `[а-яёА-ЯЁ]` drops Kazakh-specific letters.
+      .replace(/[^\p{L}\p{N}\s_]/gu, ' ')
       .split(/\s+/)
       .filter(t => t.length > 2);
   }

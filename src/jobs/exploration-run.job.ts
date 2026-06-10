@@ -12,7 +12,15 @@ import { validateAuthFixture, isAuthFixtureNonEmpty } from '@/agent/core/lite/ex
 import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { ChatService } from '@/services/utils/chat.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { EXPLORATION_DISCOVERY_CREDITS } from '@/config/testing/intelligent-test-limits';
 import { logger } from '@/utils/core/logger';
+
+// Rough USD cost recorded alongside the discovery credit deduction (~2-min
+// browser + LLM survey). Credits are the single source of truth for billing;
+// this is for cost analytics only. The credit amount itself lives in
+// intelligent-test-limits.ts so the /start gate and this charge stay in sync.
+const EXPLORATION_DISCOVERY_COST_USD = 0.01;
 
 export class ExplorationRunJobHandler {
   static async process(job: Job<ExplorationJobData>): Promise<void> {
@@ -160,6 +168,26 @@ export class ExplorationRunJobHandler {
 
       // Mark run as completed
       await ExplorationStorageService.completeRun(explorationId, result);
+
+      // Charge the fixed discovery cost once, on success. Best-effort: a
+      // failed deduction must never fail the exploration the user already
+      // received (mirrors the telemetry-write invariant).
+      try {
+        await CreditCostTrackerService.deductCreditsForTest({
+          userId,
+          testType: 'intelligent',
+          credits: EXPLORATION_DISCOVERY_CREDITS,
+          costUSD: EXPLORATION_DISCOVERY_COST_USD,
+          testId: explorationId,
+          description: `Exploration discovery — ${entryUrl}`,
+        });
+      } catch (creditError) {
+        logger.warn('[EXPLORATION_JOB] Discovery credit deduction failed (non-critical)', {
+          explorationId,
+          userId,
+          error: creditError instanceof Error ? creditError.message : String(creditError),
+        });
+      }
 
       // Save chat messages
       if (chatSessionId) {

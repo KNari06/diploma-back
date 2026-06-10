@@ -93,6 +93,14 @@ describe('validation utilities', () => {
       expect(() => sanitizeUrl('http://0.0.0.0')).toThrow(ValidationError);
     });
 
+    it('should throw for SSRF-prone hosts (private + cloud metadata)', () => {
+      expect(() => sanitizeUrl('http://169.254.169.254/latest/meta-data')).toThrow(ValidationError);
+      expect(() => sanitizeUrl('http://10.0.0.5')).toThrow(ValidationError);
+      expect(() => sanitizeUrl('http://192.168.1.1')).toThrow(ValidationError);
+      expect(() => sanitizeUrl('http://172.16.0.1')).toThrow(ValidationError);
+      expect(() => sanitizeUrl('http://[::1]')).toThrow(ValidationError);
+    });
+
     it('should throw for invalid URL format', () => {
       expect(() => sanitizeUrl('not-a-url')).toThrow(ValidationError);
     });

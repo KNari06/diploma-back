@@ -24,6 +24,7 @@ Any of these → REQUEST_CHANGES before anything else.
 - `{{key}}` interpolation done inline instead of through `resolvePlaceholders`
 - New sink emits/logs/persists interpolated step body without running through `redactSecrets`
 - Telemetry write can fail the test path
+- Per-test-case chat emit routes to `chat:<sessionId>` instead of EXCLUSIVELY `chat:tc:<testCaseId>` (CLAUDE.md §Hard invariant #16 — global/editor chat leak)
 
 **Testing** (`testing.md`)
 - Unit test mocks Supabase directly instead of the `db/` sublayer

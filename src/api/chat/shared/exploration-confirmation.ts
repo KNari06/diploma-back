@@ -9,7 +9,7 @@ import { Request, Response } from 'express';
 import { redisConnection, QueueManager } from '@/config/infrastructure/queues';
 import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/core/logger';
-import { DEFAULT_EXPLORATION_BUDGET } from '@/agent/core/lite/exploration/types';
+import { DEFAULT_EXPLORATION_BUDGET, generateExplorationId } from '@/agent/core/lite/exploration/types';
 import { classifyConfirmation } from './confirmation-classifier';
 
 const PENDING_EXPLORATION_PREFIX = 'pending_exploration:';
@@ -61,7 +61,7 @@ export async function handlePendingExplorationConfirmation(
       return false;
     }
 
-    const explorationId = `expl-${Date.now()}-${userId.slice(0, 8)}`;
+    const explorationId = generateExplorationId(userId);
 
     logger.info('[EXPLORATION_CONFIRM] User confirmed exploration', {
       explorationId,
