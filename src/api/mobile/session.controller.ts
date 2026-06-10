@@ -19,6 +19,7 @@ import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/m
 import { ProjectService } from '@/services/core/project.service';
 import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
+import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
 import { refreshIdle, cancelIdle } from '@/services/mobile/mobile-idle.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { getIO } from '@/websocket/core/server';
@@ -839,8 +840,25 @@ export async function destroySession(req: Request, res: Response): Promise<void>
       await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`);
     }
 
-    // Close editor trace file for this session
-    await EditorTraceService.close(`mobile-${sessionId}`).catch(() => {});
+    // Close editor trace file for this session and upload it, mirroring the
+    // web editor's recording:stop path. uploadEditorTrace skips Supabase in
+    // development (keeps the local file) and is fire-and-forget so a slow
+    // upload never delays the destroy response.
+    await EditorTraceService.close(`mobile-${sessionId}`)
+      .then((meta) => {
+        if (meta) {
+          uploadEditorTrace({
+            filePath: meta.filePath,
+            userId: meta.userId,
+            previewSessionId: `mobile-${sessionId}`,
+            traceType: 'editor',
+          }).catch((err) => logger.error('[MOBILE_SESSION] Editor trace upload failed on destroy', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          }));
+        }
+      })
+      .catch(() => {});
 
     // User explicitly closed the editor → cancel any pending idle timer.
     try { cancelIdle(userId); } catch { /* non-fatal */ }
