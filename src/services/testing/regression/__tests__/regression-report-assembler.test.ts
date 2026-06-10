@@ -13,6 +13,7 @@ jest.mock('@/services/testing/regression/db/regression-report.db', () => ({
   getRunByShareToken: jest.fn(),
   getTestCaseNamesByIds: jest.fn(),
   getTestResultsByTestIds: jest.fn(),
+  getMobileTestResultsByTestIds: jest.fn(),
   getExecutedStepsByTestIds: jest.fn(),
   getNegativeMetaByIds: jest.fn(),
   getTestCasePhaseInfoByIds: jest.fn(),
@@ -41,6 +42,7 @@ jest.mock('@/services/testing/regression/health-check-aggregator.service', () =>
 import {
   getTestCaseNamesByIds,
   getTestResultsByTestIds,
+  getMobileTestResultsByTestIds,
   getExecutedStepsByTestIds,
   getNegativeMetaByIds,
   getTestCasePhaseInfoByIds,
@@ -60,6 +62,7 @@ import type { TestExecution, ExecutionStats } from '@/types/testing.types';
 
 const mockGetTestCaseNames = getTestCaseNamesByIds as jest.MockedFunction<typeof getTestCaseNamesByIds>;
 const mockGetTestResults = getTestResultsByTestIds as jest.MockedFunction<typeof getTestResultsByTestIds>;
+const mockGetMobileTestResults = getMobileTestResultsByTestIds as jest.MockedFunction<typeof getMobileTestResultsByTestIds>;
 const mockGetExecutedSteps = getExecutedStepsByTestIds as jest.MockedFunction<typeof getExecutedStepsByTestIds>;
 const mockGetNegativeMeta = getNegativeMetaByIds as jest.MockedFunction<typeof getNegativeMetaByIds>;
 const mockGetPhaseInfo = getTestCasePhaseInfoByIds as jest.MockedFunction<typeof getTestCasePhaseInfoByIds>;
@@ -121,6 +124,7 @@ describe('RegressionReportAssemblerService.assembleReport', () => {
     // Sensible empty defaults; individual tests override what they assert on.
     mockGetTestCaseNames.mockResolvedValue([]);
     mockGetTestResults.mockResolvedValue([]);
+    mockGetMobileTestResults.mockResolvedValue([]);
     mockGetExecutedSteps.mockResolvedValue([]);
     mockGetNegativeMeta.mockResolvedValue([]);
     mockGetPhaseInfo.mockResolvedValue([]);
@@ -263,6 +267,142 @@ describe('RegressionReportAssemblerService.assembleReport', () => {
     expect(report.summary.platformBreakdown.web.total).toBe(1);
     expect(report.summary.platformBreakdown.mobile.total).toBe(1);
     expect(report.summary.platformBreakdown.api.total).toBe(1);
+  });
+
+  it('surfaces mobile artifacts from mobile_test_results (separate table from web)', async () => {
+    mockGetByRunId.mockResolvedValue([makeExec()]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Bank' }]);
+    // Web table empty; the result lives in mobile_test_results.
+    mockGetMobileTestResults.mockResolvedValue([
+      {
+        test_id: 'test-1',
+        screenshot: 'https://cdn/mobile-final.webp',
+        network_logs: [{ method: 'GET', url: 'https://api', status: 200 }],
+        logs: ['hello'],
+      },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+    const exec = report.executions[0];
+
+    expect(exec.artifacts.screenshots.map((s) => s.url)).toContain('https://cdn/mobile-final.webp');
+    expect(exec.artifacts.networkLogs).toHaveLength(1);
+    expect(exec.artifacts.consoleLogs).toEqual(['hello']);
+  });
+
+  // ── Per-step screenshots (runtimeMeta.stepScreenshotUrl) ──
+  // The feature captures a screenshot after EVERY step (web + mobile) and
+  // threads the URL through runtimeMeta.stepScreenshotUrl. The assembler must
+  // surface it in the Screenshots artifact list — NOT the bug-screenshot list —
+  // and onto the step itself, deduped against the final test_results screenshot.
+
+  it('routes stepScreenshotUrl into screenshots[] (exec + run) with a descriptive label, not bugScreenshots', async () => {
+    mockGetByRunId.mockResolvedValue([makeExec()]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Login' }]);
+    mockGetExecutedSteps.mockResolvedValue([
+      {
+        id: 'test-1',
+        executed_steps: [
+          { type: 'step_completed', ts: '2026-06-05T20:59:14.000Z', data: { success: true, step: 0, stepDescription: 'open', runtimeMeta: { stepScreenshotUrl: 'https://cdn/step-0.webp' } } },
+          { type: 'step_completed', ts: '2026-06-05T20:59:16.000Z', data: { success: true, step: 1, stepDescription: 'click', runtimeMeta: { stepScreenshotUrl: 'https://cdn/step-1.webp' } } },
+        ],
+      },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+
+    const exec = report.executions[0];
+    // onto each step (inline timeline still gets the bare URL)
+    expect(exec.steps.map((s) => (s as any).screenshot)).toEqual([
+      'https://cdn/step-0.webp',
+      'https://cdn/step-1.webp',
+    ]);
+    // into the execution + run-level Screenshots artifact list, as labeled objects
+    expect(exec.artifacts.screenshots.map((s) => s.url)).toEqual(['https://cdn/step-0.webp', 'https://cdn/step-1.webp']);
+    expect(exec.artifacts.screenshots[0]).toMatchObject({
+      url: 'https://cdn/step-0.webp',
+      stepName: 'Step 1: open',
+      status: 'passed',
+    });
+    expect(typeof exec.artifacts.screenshots[0].timestamp).toBe('string'); // HH:MM:SS
+    expect(report.artifactsSummary.screenshots.map((s) => s.url)).toEqual(['https://cdn/step-0.webp', 'https://cdn/step-1.webp']);
+    // NOT the bug-screenshot list (those are failure-only)
+    expect(exec.artifacts.bugScreenshots).toEqual([]);
+  });
+
+  it('keeps the per-step screenshot separate from the failure bug screenshot', async () => {
+    mockGetStats.mockResolvedValue(makeStats({ total: 1, passed: 0, failed: 1 }));
+    mockGetByRunId.mockResolvedValue([makeExec({ status: 'failed' })]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Login' }]);
+    mockGetExecutedSteps.mockResolvedValue([
+      {
+        id: 'test-1',
+        executed_steps: [
+          {
+            type: 'step_completed',
+            data: {
+              success: false,
+              step: 0,
+              stepDescription: 'click',
+              runtimeMeta: {
+                stepScreenshotUrl: 'https://cdn/step-0.webp',
+                bugScreenshotUrl: 'https://cdn/bug-0.png',
+              },
+            },
+          },
+        ],
+      },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+    const exec = report.executions[0];
+
+    // step screenshot → screenshots[]; bug screenshot → bugScreenshots[] (no cross-contamination)
+    expect(exec.artifacts.screenshots.map((s) => s.url)).toEqual(['https://cdn/step-0.webp']);
+    expect(exec.artifacts.screenshots[0]).toMatchObject({ stepName: 'Step 1: click', status: 'failed' });
+    expect(exec.artifacts.bugScreenshots).toEqual(['https://cdn/bug-0.png']);
+    expect((exec.steps[0] as any).screenshot).toBe('https://cdn/step-0.webp');
+    expect(exec.steps[0].error?.screenshot).toBe('https://cdn/bug-0.png');
+  });
+
+  it('dedupes a per-step screenshot already present as the final test_results screenshot', async () => {
+    mockGetByRunId.mockResolvedValue([makeExec()]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Login' }]);
+    mockGetTestResults.mockResolvedValue([{ test_id: 'test-1', screenshot: 'https://cdn/final.webp' }]);
+    mockGetExecutedSteps.mockResolvedValue([
+      {
+        id: 'test-1',
+        executed_steps: [
+          { type: 'step_completed', data: { success: true, step: 0, runtimeMeta: { stepScreenshotUrl: 'https://cdn/final.webp' } } },
+          { type: 'step_completed', data: { success: true, step: 1, runtimeMeta: { stepScreenshotUrl: 'https://cdn/step-1.webp' } } },
+        ],
+      },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+
+    // 'final.webp' came from test_results.screenshot; the matching step URL is not added twice
+    const exec = report.executions[0];
+    expect(exec.artifacts.screenshots.map((s) => s.url)).toEqual(['https://cdn/final.webp', 'https://cdn/step-1.webp']);
+    expect(exec.artifacts.screenshots[0].stepName).toBe('Final screenshot');
+  });
+
+  it('skips a base64 stepScreenshotUrl from the screenshots artifact list', async () => {
+    mockGetByRunId.mockResolvedValue([makeExec()]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Login' }]);
+    mockGetExecutedSteps.mockResolvedValue([
+      {
+        id: 'test-1',
+        executed_steps: [
+          { type: 'step_completed', data: { success: true, step: 0, runtimeMeta: { stepScreenshotUrl: 'data:image/png;base64,AAAA' } } },
+        ],
+      },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+
+    // base64 never lands in the artifact list (would bloat/break the UI)
+    expect(report.executions[0].artifacts.screenshots).toEqual([]);
   });
 });
 

@@ -18,7 +18,14 @@ export function buildExecutorPrompt(
   projectId?: string,
   mode?: 'lite' | 'pro' | 'editor',
   userGoal?: string,
-  projectName?: string
+  projectName?: string,
+  // Per-test-case scope. When set, the chat is bound to ONE existing test
+  // case (the editor opened it). The agent must treat "save/update" as
+  // editing THIS test case (qa_update_test_case_steps), not creating a new
+  // one. Without this the agent defaults to qa_create_test_case and silently
+  // spawns a duplicate test case in the project.
+  testCaseId?: string,
+  testCaseName?: string,
 ): string {
   let prompt = `You are a QA tool executor. Your ONLY job is to call the right tools with correct arguments and return results.
 
@@ -150,6 +157,28 @@ POST-RUN BEHAVIOR (CRITICAL — read carefully):
 - NEVER call the same run tool again right after a successful run unless the user asks.
 - NEVER pretend the run is still in progress — the WebSocket UI already showed the user live progress
   and the completed state, so a vague "watching..." reply contradicts what they see.`;
+  }
+
+  if (testCaseId) {
+    const label = testCaseName ? `"${testCaseName}" (id ${testCaseId})` : `id ${testCaseId}`;
+    prompt += `
+
+TEST-CASE SCOPE (ACTIVE — YOU ARE EDITING ONE SPECIFIC TEST CASE):
+You are bound to the EXISTING test case ${label}. The editor opened it and the
+live preview shows its target page. Everything the user asks is about THIS test
+case unless they explicitly say otherwise.
+
+- "save" / "сохрани" / "update" / "обнови" / "apply" → call qa_update_test_case_steps
+  with test_case_id="${testCaseId}" and the new/edited steps. This OVERWRITES this
+  test case's steps — that is the intended behavior here.
+- Do NOT call qa_create_test_case to "save" in this scope — that creates a SEPARATE
+  duplicate test case. Only call qa_create_test_case if the user EXPLICITLY asks for
+  a NEW / separate / additional test case ("создай новый тест", "make another test").
+- "run" / "запусти" with no target → run THIS test case: qa_run_test with
+  run_type="preview" and target_id="${testCaseId}", or qa_run_draft_steps when the
+  user is iterating on freshly generated steps that aren't saved yet.
+- When the user wants to extend/fix the flow, build on this test case's existing
+  steps (read them via qa_get_test_case if you need them) rather than starting blank.`;
   }
 
   if (plan) {

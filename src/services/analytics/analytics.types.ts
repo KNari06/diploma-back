@@ -79,13 +79,32 @@ export interface SummaryData {
     apiTestsRun?: number;
     apiTestsPassed?: number;
     apiTestsFailed?: number;
+    /**
+     * Trend deltas (signed %), comparing the last 30 days vs the prior 30 days.
+     * INDEPENDENT of the headline numbers above, which stay all-time — these
+     * exist only to drive the dashboard's trend pills. A field is omitted when
+     * the prior window had no data (delta undefined → UI hides the pill rather
+     * than showing a misleading 0%).
+     */
+    trend?: {
+      totalRunsDeltaPct?: number;
+      failedRunsDeltaPct?: number;
+      flakyStepsDeltaPct?: number;
+      /** Relative % change in pass rate vs the prior window (same basis as the
+       *  other deltas), rendered with a "%" suffix in the UI. */
+      passRateDeltaPct?: number;
+    };
   };
   status: {
     state: 'passing' | 'warning' | 'failing';
     message: string;
     lastRunAt: string | null;
     nextSchedule: {
-      cronExpression: string;
+      scheduleType: 'recurring' | 'one_time';
+      // null for a one_time schedule (it has run_at instead).
+      cronExpression: string | null;
+      // set for a one_time schedule; null for recurring.
+      runAt: string | null;
       nextRunAt: string;
     } | null;
   };

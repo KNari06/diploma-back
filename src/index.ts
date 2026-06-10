@@ -23,6 +23,7 @@ initLogBridge();
 startMobileChatMetricsLoop();
 import authRoutes from '@/api/auth/auth.route';
 import chatRoutes from '@/api/chat/chat.route';
+import publicChatRoutes from '@/api/chat/public/public-chat.route';
 import feedbackRoutes from '@/api/chat/feedback.route';
 import fixturesRoutes from '@/api/fixtures/fixtures.route';
 import flowsRoutes from '@/api/flows/flows.route';
@@ -1351,6 +1352,9 @@ app.use(`/api/${env.API_VERSION}/manual-test`, requireAuth, requireApproved, man
 app.use(`/api/${env.API_VERSION}/intelligent-test`, requireAuth, requireApproved, intelligentTestRoutes);
 app.use(`/api/${env.API_VERSION}/test-case`, requireAuth, requireApproved, testCaseRoutes);
 app.use(`/api/${env.API_VERSION}/test-resource`, requireAuth, requireApproved, testResourceRoutes);
+// Public B2C "Ask Me Anything" widget — product Q&A, NO auth. Must be mounted
+// BEFORE the auth-gated /chat mount below, or Express routes /chat/public/* into it.
+app.use(`/api/${env.API_VERSION}/chat/public`, publicChatRoutes);
 app.use(`/api/${env.API_VERSION}/chat`, requireAuth, requireApproved, chatRoutes);
 app.use(`/api/${env.API_VERSION}/chat/feedback`, requireAuth, requireApproved, feedbackRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, requireAuth, requireApproved, apiTestRoutes);

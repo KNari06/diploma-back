@@ -16,10 +16,39 @@ import { parsePostmanCollection } from './adapters/postman.adapter';
 import { parseCurlCommands } from './adapters/curl.adapter';
 import { parseHarFile } from './adapters/har.adapter';
 import { parseInsomniaExport } from './adapters/insomnia.adapter';
+import { parsePythonScript } from './adapters/python.adapter';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FORMAT DETECTION
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Heuristic: does this text look like a Python script that makes HTTP calls?
+ * Exported so the chat handler can route pasted Python without duplicating signals.
+ * Deliberately conservative — requires both a Python HTTP import/lib AND an HTTP
+ * call (or a pytest test), so JSON/YAML specs never match.
+ */
+export function isPythonScript(content: string): boolean {
+  const c = content;
+  const hasHttpLib =
+    /\bimport\s+requests\b/.test(c) ||
+    /\bfrom\s+requests\b/.test(c) ||
+    /\bimport\s+httpx\b/.test(c) ||
+    /\bimport\s+aiohttp\b/.test(c) ||
+    /\bfrom\s+urllib\b/.test(c) ||
+    /\bimport\s+urllib\b/.test(c);
+
+  const hasHttpCall =
+    /\brequests\.(get|post|put|patch|delete|head|options|request)\s*\(/i.test(c) ||
+    /\bhttpx\.(get|post|put|patch|delete|head|options|request|Client|AsyncClient)\s*\(/.test(c) ||
+    /\baiohttp\.ClientSession\s*\(/.test(c) ||
+    /\burllib\.request\.(urlopen|Request)\s*\(/.test(c) ||
+    /\.(get|post|put|patch|delete)\s*\(\s*[fr]?["']https?:\/\//i.test(c);
+
+  const isPytest = /\bdef\s+test_\w*\s*\(/.test(c) && /\bassert\b/.test(c) && hasHttpLib;
+
+  return (hasHttpLib && hasHttpCall) || isPytest;
+}
 
 function detectFormat(content: string, fileName?: string): ApiSpecSourceType {
   const lower = (fileName || '').toLowerCase();
@@ -36,6 +65,7 @@ function detectFormat(content: string, fileName?: string): ApiSpecSourceType {
   // File extension hints
   if (lower.endsWith('.har')) return 'har';
   if (lower.endsWith('.raml')) return 'raml';
+  if (lower.endsWith('.py')) return 'python';
 
   // Try JSON parse for structural detection
   try {
@@ -94,6 +124,13 @@ function detectFormat(content: string, fileName?: string): ApiSpecSourceType {
   // cURL commands
   if (trimmed.toLowerCase().startsWith('curl ') || trimmed.toLowerCase().includes('\ncurl ')) {
     return 'curl';
+  }
+
+  // Python scripts (requests / httpx / aiohttp / urllib / pytest).
+  // Conservative content signals — only reached after all structured formats
+  // (JSON/YAML/cURL) have been ruled out, so a real spec is never misread.
+  if (isPythonScript(content)) {
+    return 'python';
   }
 
   // Fallback: try to parse as OpenAPI
@@ -421,6 +458,9 @@ export class SpecParserService {
 
       case 'insomnia':
         return parseInsomniaExport(content);
+
+      case 'python':
+        return parsePythonScript(content);
 
       case 'raml':
         throw new Error('RAML format is not yet supported. Please convert to OpenAPI using https://www.mulesoft.com/platform/api/api-designer');

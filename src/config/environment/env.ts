@@ -115,6 +115,13 @@ const envSchema = z.object({
   SCALE_CHECK_INTERVAL_MS: z.string().transform(Number).default('15000'),
   SCALE_MAX_MEMORY_PERCENT: z.string().transform(Number).default('80'),
 
+  // When true, the worker process hosts the scheduler bundle (schedule sweeps +
+  // retention jobs) behind a Redis leader lock — exactly one worker replica
+  // runs them. Default OFF: local docker-compose runs a dedicated `scheduler`
+  // container, so the worker stays out of scheduling there. Set true on the
+  // prod worker (which is the only deployed long-lived process).
+  SCHEDULER_IN_WORKER: z.string().transform(v => v === 'true').default('false'),
+
   // Agent
   AGENT_TIMEOUT: z.string().transform(Number).default('300000'),
   AGENT_MAX_RETRIES: z.string().transform(Number).default('3'),
@@ -149,7 +156,7 @@ const envSchema = z.object({
   BACKEND_URL: z.string().optional(),
 
   // Email / SMTP
-  SMTP_PASSWORD: z.string().optional(), // Gmail app password for noreply@qait.dev
+  SMTP_PASSWORD: z.string().optional(), // Gmail app password for yera@qait.dev
 
   // Email Inbox (IMAP for test email reception — catch-all inbox)
   IMAP_HOST: z.string().default('imap.gmail.com'),
@@ -250,6 +257,23 @@ const envSchema = z.object({
   // instant retries by caching the full (message + context) pair for 60s.
   // Set to 'true' to disable.
   INTENT_CACHE_DISABLED: z.string().transform(v => v === 'true').default('false'),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Per-step screenshot capture (web + mobile regression replay).
+  // Captures a lightweight screenshot after EVERY step so passing/flaky
+  // runs have visual evidence even when video/trace are disabled (video
+  // only records on infra-retry attempts). Screenshots are uploaded to
+  // the artifacts bucket as URLs — never stored as base64 in the DB.
+  // ON by default; pair with the artifact-retention job (prunes old
+  // screenshots) so storage doesn't grow unbounded.
+  // ──────────────────────────────────────────────────────────────────
+  SCREENSHOT_EACH_STEP_ENABLED: z.string().transform(v => v === 'true').default('true'),
+  // Encoding format: 'webp' (smaller, via sharp) or 'jpeg' (Playwright-native).
+  SCREENSHOT_FORMAT: z.enum(['webp', 'jpeg']).default('webp'),
+  // Quality 1-100. Applies to both webp and jpeg. Clamped in ScreenshotCaptureFeature.
+  SCREENSHOT_QUALITY: z.string().transform(Number).default('75'),
+  // Screenshots older than this (days) are pruned by the artifact-retention job.
+  SCREENSHOT_RETENTION_DAYS: z.string().transform(Number).default('30'),
 
   // Phase B1: mobile-editor force-route. When `true` (default), chat
   // requests carrying `context.mobileEditorMode=true` with a non-empty

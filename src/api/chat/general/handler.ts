@@ -6,6 +6,7 @@ import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { getSummariesForContext, summarizeOldMessages } from '@/services/ai/summarization/chat-summarization.service';
 import { formatPageContextForChat, getPageContext, type PageContext } from '@/services/chat/editor-context.service';
+import { ChatTestTraceService } from '@/services/chat/chat-test-trace.service';
 import { getProjectFiles, searchKB } from '@/services/kb/kb.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { ChatPersistence } from '@/services/utils/chat-persistence';
@@ -218,6 +219,14 @@ export async function handleGeneralChat(
   // mid-handler refactor mistake from sending some messages to one table
   // and some to the other.
   const store: ChatStore = params.chatStore ?? GLOBAL_STORE;
+
+  // Per-test-case chat trace (test_logs/chat_test/). Captures the full
+  // request → intent → context → tools → response cycle for analysis. Only
+  // active in test-case scope; every write is best-effort and never throws.
+  const chatTrace =
+    store.kind === 'testcase' && chatSessionId
+      ? ChatTestTraceService.getOrCreate(chatSessionId, userId, testCaseId)
+      : null;
 
   // Normalize context: parse JSON string into object if needed (frontend may send stringified JSON)
   let context: any = rawContext;
@@ -683,6 +692,29 @@ export async function handleGeneralChat(
     projectName = projectResult.value.name;
   }
 
+  if (chatTrace) {
+    chatTrace.writeRequest({
+      message,
+      mode,
+      previewSessionId: resolvedPreviewSessionId,
+      mobileSessionId: parsedContext?.mobileSessionId,
+      projectId,
+      projectName,
+    });
+    chatTrace.writePageContext(
+      editorPageContext
+        ? {
+            available: true,
+            url: editorPageContext.url,
+            elementCount: editorPageContext.testSteps?.length,
+            pageTextChars: editorPageContext.pageText?.length,
+            hasConsole: !!editorPageContext.consoleErrors,
+            hasNetwork: !!editorPageContext.networkSummary,
+          }
+        : { available: false, reason: mode === 'editor' ? 'no_active_preview_session' : 'not_editor_mode' },
+    );
+  }
+
   let integrationContext = '';
   if (integrationResult.status === 'fulfilled' && integrationResult.value) {
     integrationContext = integrationResult.value;
@@ -734,6 +766,12 @@ export async function handleGeneralChat(
       logger.info('[GENERAL_CHAT] Tools collected', {
         totalTools: availableTools.length,
       });
+
+      chatTrace?.writeToolsAvailable(
+        availableTools
+          .map((t) => t?.function?.name)
+          .filter((n): n is string => typeof n === 'string'),
+      );
     } catch (toolsError) {
       logger.warn('[GENERAL_CHAT] Failed to load tools, continuing without them', {
         error: toolsError instanceof Error ? toolsError.message : String(toolsError),
@@ -836,6 +874,29 @@ Suggest the user to:
 3. Try sending the message again after the page loads
 
 You can still help with general questions, saved test cases, and test management even without live page context.`;
+  }
+
+  // Per-test-case scope reinforcement. Layered ON TOP of the editor-mode
+  // block above: the chat lives inside ONE existing test case's editor, so the
+  // agent must (a) treat save/update as editing THIS test case, and (b) use the
+  // live page context confidently to build and immediately run the right test.
+  if (testCaseId && mode === 'editor') {
+    systemPrompt += `\n\n--- TEST-CASE SCOPE (you are editing ONE existing test case) ---
+You are inside the editor for the test case currently open in the preview. The
+"CURRENT PAGE CONTEXT" above is the live page this test targets. Act with that context:
+- BUILD CONFIDENTLY: when the user asks to create/extend a flow, read the page
+  context (URL, interactive elements with ref IDs, page text, console/network
+  signals) and generate concrete IntentSteps yourself. Do NOT ask the user for
+  element names or selectors you can already see in the context.
+- CREATE + RUN IN ONE GO: for a clear request ("проверь логин", "test the search"),
+  generate the steps and run them on the preview in the same turn via
+  qa_run_draft_steps(confirm=true) — you do not need a separate confirmation round
+  in editor mode. Only pause to ask when the request is genuinely ambiguous.
+- SAVE = UPDATE THIS TEST CASE: when the user says "save"/"сохрани"/"обнови", call
+  qa_update_test_case_steps for THIS test case. Use qa_create_test_case ONLY when
+  the user explicitly wants a NEW/separate test case.
+- After a run, report the real outcome (passed/failed counts, first error) in past
+  tense — the user already saw the live progress.`;
   }
 
   // Enhance system prompt with old context summary from vector search
@@ -1019,6 +1080,25 @@ You can still help with general questions, saved test cases, and test management
       });
     }
 
+    // Resolve the name of the test case in scope so the executor prompt can
+    // address it by name ("you are editing \"Login Flow\""). Best-effort and
+    // tc-scope-only — never blocks or fails the chat path.
+    let testCaseName: string | undefined;
+    if (testCaseId) {
+      try {
+        const { IntentTestCaseService } = await import(
+          '@/services/testing/ui/preview/intent-test-case.service'
+        );
+        const tc = await IntentTestCaseService.getById(testCaseId, userId);
+        testCaseName = tc?.name;
+      } catch (nameErr) {
+        logger.debug('[GENERAL_CHAT] Could not resolve test case name (non-critical)', {
+          testCaseId,
+          error: nameErr instanceof Error ? nameErr.message : String(nameErr),
+        });
+      }
+    }
+
     try {
       // ═══════════════════════════════════════════════════════════════════════
       // SUB-AGENT PIPELINE (preferred path — cheaper, faster, more focused)
@@ -1041,6 +1121,7 @@ You can still help with general questions, saved test cases, and test management
             // to `chat:tc:<tcid>` — without this, the test-case chat
             // sees zero progress events while sub-agents work.
             testCaseId,
+            testCaseName,
           });
 
           // Extract the user content from the last message (may be multimodal array with images)
@@ -1668,6 +1749,12 @@ You can still help with general questions, saved test cases, and test management
       logger.warn('[GENERAL_CHAT] Failed to get credits info', { error, userId });
     }
   }
+
+  chatTrace?.writeResponse({
+    content: gptResponse.content,
+    intent: 'general_chat',
+    toolsUsed: availableTools.length,
+  });
 
   res.json(response);
 }

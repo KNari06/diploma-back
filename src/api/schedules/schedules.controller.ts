@@ -38,6 +38,28 @@ function validateCronExpression(cronExpression: unknown): string | null {
 }
 
 /**
+ * Validate a one-time runAt instant. Must be an offset-aware ISO-8601 datetime
+ * in the future. `run_at` is stored as an absolute UTC instant, so an
+ * offset-naive string (e.g. "2026-06-10T14:30:00") is REJECTED — JS would parse
+ * it as server-local time, silently anchoring the run to whatever timezone the
+ * server happens to run in. The client must include a `Z` or `±HH:MM` offset.
+ *
+ * Returns null on success, or an error message string on failure.
+ */
+function validateRunAt(runAt: unknown): string | null {
+  if (typeof runAt !== 'string') return 'runAt must be an ISO datetime string';
+  if (!ScheduleService.hasUtcOffset(runAt)) {
+    return `runAt must include a timezone offset (a trailing "Z" or "±HH:MM"), e.g. "2026-06-10T14:30:00Z". Got "${runAt}".`;
+  }
+  const t = Date.parse(runAt);
+  if (Number.isNaN(t)) {
+    return `Invalid runAt: "${runAt}". Expected an ISO-8601 datetime like "2026-06-10T14:30:00Z".`;
+  }
+  if (t <= Date.now()) return 'runAt must be in the future';
+  return null;
+}
+
+/**
  * Validate an IANA timezone string against Intl. UTC is always allowed.
  * Empty / undefined is allowed (service defaults to UTC).
  */
@@ -58,16 +80,35 @@ function validateTimezone(timezone: unknown): string | null {
  */
 export async function createSchedule(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, name, cronExpression, timezone, moduleId, planId, parameters } = req.body;
+    const { projectId, name, cronExpression, runAt, timezone, moduleId, planId, parameters } = req.body;
 
-    if (!projectId || !name || !cronExpression) {
-      res.status(400).json({ success: false, error: 'projectId, name, and cronExpression are required' });
+    if (!projectId || !name) {
+      res.status(400).json({ success: false, error: 'projectId and name are required' });
       return;
     }
-    const cronError = validateCronExpression(cronExpression);
-    if (cronError) {
-      res.status(400).json({ success: false, error: cronError });
+
+    // Timing: exactly one of cronExpression (recurring) or runAt (one-time).
+    const hasCron = cronExpression !== undefined && cronExpression !== null && cronExpression !== '';
+    const hasRunAt = runAt !== undefined && runAt !== null && runAt !== '';
+    if (hasCron === hasRunAt) {
+      res.status(400).json({
+        success: false,
+        error: 'Provide exactly one of cronExpression (recurring) or runAt (one-time)',
+      });
       return;
+    }
+    if (hasCron) {
+      const cronError = validateCronExpression(cronExpression);
+      if (cronError) {
+        res.status(400).json({ success: false, error: cronError });
+        return;
+      }
+    } else {
+      const runAtError = validateRunAt(runAt);
+      if (runAtError) {
+        res.status(400).json({ success: false, error: runAtError });
+        return;
+      }
     }
     const tzError = validateTimezone(timezone);
     if (tzError) {
@@ -81,7 +122,8 @@ export async function createSchedule(req: AuthenticatedRequest, res: Response): 
       projectId,
       userId,
       name,
-      cronExpression,
+      cronExpression: hasCron ? cronExpression : undefined,
+      runAt: hasRunAt ? runAt : undefined,
       timezone,
       moduleId,
       planId,
@@ -145,16 +187,33 @@ export async function listSchedules(req: AuthenticatedRequest, res: Response): P
 export async function updateSchedule(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { name, cronExpression, timezone, parameters, isActive } = req.body;
+    const { name, cronExpression, runAt, timezone, parameters, isActive } = req.body;
     const userId = getUserId(req);
 
     // Validate ONLY the fields the caller is actually changing — partial
     // updates are allowed and we don't want to force the FE to round-trip
     // unchanged fields just to satisfy validation.
+    // Timing fields are mutually exclusive (a schedule is recurring XOR
+    // one-time); reject both with a clean 400 rather than letting the service
+    // throw a generic 500.
+    if (cronExpression !== undefined && runAt !== undefined) {
+      res.status(400).json({
+        success: false,
+        error: 'Provide at most one of cronExpression or runAt, not both',
+      });
+      return;
+    }
     if (cronExpression !== undefined) {
       const cronError = validateCronExpression(cronExpression);
       if (cronError) {
         res.status(400).json({ success: false, error: cronError });
+        return;
+      }
+    }
+    if (runAt !== undefined) {
+      const runAtError = validateRunAt(runAt);
+      if (runAtError) {
+        res.status(400).json({ success: false, error: runAtError });
         return;
       }
     }
@@ -171,6 +230,7 @@ export async function updateSchedule(req: AuthenticatedRequest, res: Response): 
       userId,
       name,
       cronExpression,
+      runAt,
       timezone,
       parameters,
       isActive,

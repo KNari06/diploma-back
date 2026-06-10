@@ -28,6 +28,7 @@
 
 import { redisConnection } from '@/config/infrastructure/queues';
 import { logger } from '@/utils/core/logger';
+import { CANCEL, toBoundaryRegex } from '@/config/testing/intent-keywords';
 
 const PENDING_COMPOUND_PREFIX = 'pending_compound:';
 // Short TTL: a continuation is expected within a normal back-and-forth. Kept
@@ -49,11 +50,11 @@ interface PendingCompound {
 }
 
 /**
- * Explicit abandon phrases (EN + RU). Uses a unicode-aware boundary
- * `(?![\p{L}\p{N}])` instead of `\b` — JS `\b` is ASCII-only, so `\bхватит\b`
- * never matches Cyrillic (same trap fixed in confirmation-classifier.ts).
+ * Explicit abandon phrases (EN + RU + KK) from the central intent-keywords
+ * registry. Uses a unicode-aware boundary `(?![\p{L}\p{N}])` instead of `\b`
+ * — JS `\b` is ASCII-only, so `\bхватит\b` / `\bтоқта\b` never match Cyrillic.
  */
-const CANCEL_RE = /^(stop|cancel|abort|nevermind|never mind|forget it|отмена|отмени|стоп|хватит|забудь)(?![\p{L}\p{N}])/iu;
+const CANCEL_RE = toBoundaryRegex(CANCEL);
 
 function keyFor(chatSessionId: string): string {
   return `${PENDING_COMPOUND_PREFIX}${chatSessionId}`;

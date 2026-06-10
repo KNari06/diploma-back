@@ -42,6 +42,10 @@ export interface IntentParserContext {
   projectInfo?: string;
   chatHistory?: Array<{ role: string; content: string }>; // Chat history for context
 
+  // User's IANA timezone (when known) — anchors relative-date resolution for
+  // one-time schedules ("tomorrow 14:30" → absolute runAt). Defaults to UTC.
+  timezone?: string;
+
   // Editor mode context
   mode?: 'lite' | 'pro' | 'editor';
   previewSessionId?: string;   // Active preview session (web editor mode)
@@ -342,6 +346,25 @@ AVAILABLE INTENTS: ${intents.join(', ')}
    - If no test ID/name provided → needs_clarification (ask which test to run)
    - Output: savedTestCaseId (from message or null)
 
+6a. "run_by_tag" - RUN every test carrying a TAG
+   - A run verb + a recognized TAG TOKEN: "run smoke", "запусти smoke",
+     "run @critical", "гоняй sanity", "run nightly".
+   - A TAG TOKEN is ONE of these specific QA labels ONLY:
+     smoke, sanity, regression, critical, e2e, nightly, p0, p1, p2, or an @-prefixed word.
+   - This is NOT for descriptive phrases like "payment tests" / "платежные тесты" /
+     "login tests" — those describe a SUBJECT, not a tag → run_regression (the
+     downstream resolver turns the descriptor into concrete test IDs).
+   - Rule of thumb: a single known tag word → run_by_tag; a descriptive noun
+     phrase ("X tests", "тесты по X") → run_regression.
+   - Only available when "run_by_tag" is in AVAILABLE INTENTS.
+
+6b. "run_plan" / "run_module" - RUN a named plan / module
+   - "run the Release v2 plan", "запусти модуль Оплата", "run checkout module"
+   - Use when the label clearly names a plan or a module (not a tag).
+
+6c. "create_plan" / "add_to_plan" - build or extend a regression plan
+   - "собери план из платежных тестов", "add these to the smoke plan"
+
 7. "analyze_failure" - Understand WHY a test FAILED
    - "why did it fail?", "analyze failure", "почему упал", "что пошло не так", "разбери ошибку"
    - sourceTestId priority: lastFailedTestId → lastTestId → null (handler does own lookup)
@@ -368,6 +391,10 @@ AVAILABLE INTENTS: ${intents.join(', ')}
 
 3. "save this" / "save flow" / "сохрани" → save_test
    "run saved test" / "запусти регресс" → run_regression
+   run verb + a KNOWN tag token (smoke/sanity/regression/critical/e2e/nightly/p0-p2/@word) → run_by_tag
+   run verb + a descriptive subject phrase ("платежные тесты", "login tests") → run_regression (NOT run_by_tag)
+   run verb + named plan/module ("run Release v2 plan", "запусти модуль Оплата") → run_plan / run_module
+   (only if those intents are in AVAILABLE INTENTS)
 
 4. Failure questions ("why did it fail", "почему упал") → analyze_failure
 
@@ -612,8 +639,13 @@ Ex41: "add the checkout module to my Release plan"
 
   // Request-understanding extension: ANALYZE (decompose / targetSelector /
   // executionModifiers) + IMPROVE (routeHint) added to the SAME JSON output,
-  // so there is no extra LLM round-trip for the common case.
-  prompt += `\n${buildUnderstandingExtension()}`;
+  // so there is no extra LLM round-trip for the common case. Pass current time +
+  // timezone so one-time schedule datetimes ("tomorrow 14:30") resolve to an
+  // absolute runAt.
+  prompt += `\n${buildUnderstandingExtension({
+    nowIso: new Date().toISOString(),
+    timezone: context?.timezone || 'UTC',
+  })}`;
 
   prompt += `\nRETURN ONLY VALID JSON (no markdown):`;
 

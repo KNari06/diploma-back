@@ -1395,7 +1395,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_manage_schedule',
       description:
-        '⚠️ WRITE operation — Create/update/activate/deactivate/delete test schedule. Create needs: project_id, name, cron_expression, and exactly one of plan_id or module_id. Describe changes → get approval → confirm=true.',
+        '⚠️ WRITE operation — Create/update/activate/deactivate/delete test schedule. Create needs: project_id, name, exactly one of cron_expression (recurring) OR run_at (one-time), and exactly one of plan_id or module_id. Describe changes → get approval → confirm=true.',
       parameters: {
         type: 'object',
         properties: {
@@ -1418,11 +1418,15 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
           cron_expression: {
             type: 'string',
-            description: 'Cron expression (e.g. "0 9 * * *" for daily at 9am). Required for create.',
+            description: 'Cron expression for a RECURRING schedule (e.g. "0 9 * * *" for daily at 9am). Provide this OR run_at, not both.',
+          },
+          run_at: {
+            type: 'string',
+            description: 'Absolute ISO-8601 datetime for a ONE-TIME run (e.g. "2026-06-10T14:30:00Z"), fires once then deactivates. Provide this OR cron_expression, not both.',
           },
           timezone: {
             type: 'string',
-            description: 'Timezone (e.g. "Asia/Almaty"). Optional.',
+            description: 'Timezone (e.g. "Asia/Almaty"). Optional. Applies to cron_expression; for run_at send an offset-aware instant instead.',
           },
           plan_id: {
             type: 'string',

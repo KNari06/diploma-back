@@ -13,6 +13,7 @@ import { processNegativeGeneration } from '@/jobs/negative-generation.job';
 import { RegressionDoctorJobHandler } from '@/jobs/regression-doctor.job';
 import { StaleReaperService } from '@/services/testing/results/stale-reaper.service';
 import { logger } from '@/utils/core/logger';
+import { startLeaderElection, stopLeaderElection } from '@/scheduler/leader';
 import { Worker } from 'bullmq';
 import { queueMonitor } from './queue-monitor';
 
@@ -603,6 +604,13 @@ const gracefulShutdown = async (signal: string) => {
     // Stop dynamic scaling monitor first
     queueMonitor.stop();
 
+    // Release the scheduler leader lock + stop the sweep bundle (no-op if we
+    // never held it / SCHEDULER_IN_WORKER is off) so a surviving replica takes
+    // over immediately instead of waiting out the lock TTL.
+    if (env.SCHEDULER_IN_WORKER) {
+      await stopLeaderElection();
+    }
+
     // Use Promise.allSettled to ensure all workers close even if one fails
     const closeResults = await Promise.allSettled([
       testRunWorker.close(),
@@ -720,6 +728,15 @@ logger.info(`📋 Listening to queues: ${Object.values(QUEUE_NAMES).join(', ')}`
     // Don't exit - workers will fail gracefully if Redis is unavailable
   }
 })();
+
+// Host the scheduler bundle in the worker when enabled (prod). A Redis leader
+// lock guarantees exactly one worker replica runs the sweeps even at N>1.
+// Default OFF, so local docker-compose's dedicated scheduler container is
+// unaffected. See src/scheduler/leader.ts.
+if (env.SCHEDULER_IN_WORKER) {
+  logger.info('[WORKER] SCHEDULER_IN_WORKER=true — hosting scheduler bundle (leader-locked)');
+  startLeaderElection();
+}
 
 export {
   aiAnalysisWorker,

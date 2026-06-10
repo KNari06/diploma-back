@@ -11,31 +11,38 @@ import { AI_MODELS, AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { generateTextWithGemini } from '@/services/ai/core/gemini.service';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
+import {
+  AFFIRMATIVE,
+  CANCEL,
+  REJECTION,
+  toBoundaryRegex,
+  type MultiLangList,
+} from '@/config/testing/intent-keywords';
 
 export type ConfirmationIntent = 'confirm' | 'decline' | 'other';
 
+// Decline = explicit rejection ("no") OR a cancel/abort ("stop", "отмена").
+// Merge both families per-language so the boundary regex covers all of them.
+const DECLINE_WORDS: MultiLangList = {
+  en: [...REJECTION.en, ...CANCEL.en],
+  ru: [...REJECTION.ru, ...CANCEL.ru],
+  kk: [...REJECTION.kk, ...CANCEL.kk],
+};
+
+// Built once. Both use the central registry (en/ru/kk) + a unicode-aware
+// boundary `(?![\p{L}\p{N}])` — JS `\b` is ASCII-only and never matches
+// Cyrillic, so `\bда\b` / `\bиә\b` would silently fail.
+const CONFIRM_PATTERN = toBoundaryRegex(AFFIRMATIVE);
+const DECLINE_PATTERN = toBoundaryRegex(DECLINE_WORDS);
+
 /**
  * Regex fallback — only used when the AI classification call fails. Pure.
- *
- * NOTE: uses a unicode-aware boundary `(?![\p{L}\p{N}])` instead of `\b`. JS
- * `\b` is ASCII-only, so `\bда\b` never matches Cyrillic — the lookahead
- * "next char is not a letter/digit" works across scripts. Matches a whole-word
- * affirmative/negative at the START of the reply.
+ * Matches a whole-word affirmative/negative at the START of the reply.
  */
 export function classifyConfirmationByRegex(message: string): ConfirmationIntent {
-  const boundary = '(?![\\p{L}\\p{N}])';
-  const confirmPattern = new RegExp(
-    `^(yes|yeah|yep|y|да|ок|ok|давай|конечно|sure|go|start|proceed|confirm|подтверждаю|запускай|поехали)${boundary}`,
-    'iu',
-  );
-  const declinePattern = new RegExp(
-    `^(no|nope|n|нет|не надо|не|cancel|отмена|stop|отменить)${boundary}`,
-    'iu',
-  );
-
   const trimmed = message.trim();
-  if (confirmPattern.test(trimmed)) return 'confirm';
-  if (declinePattern.test(trimmed)) return 'decline';
+  if (CONFIRM_PATTERN.test(trimmed)) return 'confirm';
+  if (DECLINE_PATTERN.test(trimmed)) return 'decline';
   return 'other';
 }
 
@@ -55,7 +62,7 @@ export async function classifyConfirmation(
     'You classify user messages in a yes/no confirmation dialog. ' +
     `The user was asked whether they want to ${subject}. ` +
     'Classify the response as exactly one of: "confirm", "decline", or "other". ' +
-    'Support any language (English, Russian, etc.).\n\n' +
+    'Support any language (English, Russian, Kazakh, etc.).\n\n' +
     `User message: "${trimmed}"\n\n` +
     'Return ONLY valid JSON: { "intent": "confirm" | "decline" | "other" }';
 

@@ -598,12 +598,27 @@ export async function parseIntent(
       // way to recover from one mid-flow.
       // ═══════════════════════════════════════════════════════════════════
       if (isTestCaseScope) {
-        if (BLOCKED_IN_TEST_CASE_SCOPE.has(parsedIntent.intent)) {
+        const rawIntent = parsedIntent.intent;
+        const blocked = BLOCKED_IN_TEST_CASE_SCOPE.has(parsedIntent.intent);
+        if (blocked) {
           logger.warn('[CHAT] intent blocked in test-case scope, redirecting to general_chat', {
             userId,
             blockedIntent: parsedIntent.intent,
           });
           parsedIntent.intent = 'general_chat';
+        }
+        // Trace the classification decision into test_logs/chat_test/.
+        if (chatSessionId) {
+          try {
+            const { ChatTestTraceService } = require('@/services/chat/chat-test-trace.service');
+            ChatTestTraceService.getOrCreate(chatSessionId, userId, testCaseId).writeIntent({
+              intent: parsedIntent.intent,
+              confidence: parsedIntent.confidence ?? parsedIntent.intent_confidence,
+              rawIntent,
+              blockedBy: blocked ? 'BLOCKED_IN_TEST_CASE_SCOPE' : undefined,
+              routingSource: parsedIntent.metadata?.routingSource,
+            });
+          } catch { /* trace must never break intent parsing */ }
         }
       }
 

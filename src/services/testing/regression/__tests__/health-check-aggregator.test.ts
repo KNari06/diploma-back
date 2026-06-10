@@ -26,6 +26,18 @@ describe('HealthCheckAggregatorService', () => {
       expect(cats).toContain('broken_images');
       expect(cats).toContain('page_responsive');
     });
+
+    it('skips web-only checks for mobile (no JS exceptions / broken images / page-responsive)', () => {
+      const result = HealthCheckAggregatorService.aggregateFromTestResult(
+        // `errors` holds a step/app failure — for web this would become a
+        // "JS exception"; for mobile it must NOT.
+        { logs: [], network_logs: [], errors: [{ message: 'tap: finder found nothing' }] },
+        { isMobile: true },
+      );
+      const cats = result.findings.map((f) => f.category);
+      expect(cats).toEqual(['console_errors', 'network_errors']);
+      expect(cats).not.toContain('js_exceptions');
+    });
   });
 
   // ── checkConsoleLogs (via aggregateFromTestResult) ────────────────────────

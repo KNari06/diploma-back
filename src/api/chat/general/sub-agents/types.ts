@@ -173,6 +173,8 @@ export interface PipelineContext {
    * progress updates during the first request.
    */
   testCaseId?: string;
+  /** Human-readable name of the test case in scope (for the executor prompt). */
+  testCaseName?: string;
 }
 
 /**

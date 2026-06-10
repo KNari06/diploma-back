@@ -119,7 +119,15 @@ export async function executeTools(
   }
 
   // Build executor messages
-  const executorPrompt = buildExecutorPrompt(promptPlan, context.projectId, context.mode, userGoal, context.projectName);
+  const executorPrompt = buildExecutorPrompt(
+    promptPlan,
+    context.projectId,
+    context.mode,
+    userGoal,
+    context.projectName,
+    context.testCaseId,
+    context.testCaseName,
+  );
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: executorPrompt },
     // Include relevant context messages (system prompts with memory/KB/history)
@@ -238,6 +246,24 @@ export async function executeTools(
       // Push messages (tool_result + possible screenshot image)
       messages.push(...callResult.messages);
       toolResults.push(callResult.record);
+
+      // Trace the tool call into test_logs/chat_test/ (test-case scope only).
+      if (context.testCaseId && context.chatSessionId) {
+        try {
+          const { ChatTestTraceService } = require('@/services/chat/chat-test-trace.service');
+          ChatTestTraceService.getOrCreate(
+            context.chatSessionId,
+            context.userId,
+            context.testCaseId,
+          ).writeToolCall({
+            toolName,
+            args: toolArgs as Record<string, unknown>,
+            success: callResult.toolResult.success,
+            resultSummary: callResult.toolResult.message,
+            durationMs: callResult.record.durationMs,
+          });
+        } catch { /* trace must never break tool execution */ }
+      }
 
       // Update blackboard step status (executor-specific concern)
       if (blackboard) {
