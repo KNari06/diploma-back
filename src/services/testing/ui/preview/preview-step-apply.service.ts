@@ -6,7 +6,7 @@
 
 import { logger } from '@/utils/core/logger';
 import { recordSource, resolvePlaceholders } from '@/utils/interpolation/resolve-placeholders';
-import { collectSecretValues } from '@/utils/interpolation/redact-secrets';
+import { collectSecretValues, redactWithValues } from '@/utils/interpolation/redact-secrets';
 import { logIntentResolveApply } from './intent-resolve-audit';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -38,6 +38,7 @@ import { executeCoordinateDrag, parseDragCoordinates } from '@/agent/playwright/
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
 import { recordedFingerprintHasStrongIdentity, hasStrongIdentityContradiction } from './recorded-identity.util';
 import { probeIdentity } from './step-readiness-v2.service';
+import { typedValueLooksApplied, clearFieldBeforeType, verifyTypedValueAndRetry } from './type-action.helpers';
 import { waitForHoverEffect } from '../wait-phases/hover-effect-settle';
 import { smartStepWait } from '../smart-step-wait.service';
 
@@ -2422,9 +2423,12 @@ async function executeAction(
   step: IntentStep,
   candidate: LintCandidate,
   preResolvedLocator?: Locator,
-  options?: { expectsNavigation?: boolean }
+  options?: { expectsNavigation?: boolean; secretValues?: readonly string[] }
 ): Promise<{ success: boolean; error?: string; urlChanged: boolean }> {
   const urlBefore = page.url();
+  // Post-interpolation step bodies (the `type` value) can contain resolved
+  // `secrets.*` plaintext — redact through these before any log line (#10).
+  const secretValues = options?.secretValues ?? [];
 
   try {
     // Build selector (unless we have a pre-resolved locator from compiled plan)
@@ -2554,8 +2558,9 @@ async function executeAction(
 
           // If we want to "replace", clear existing content before typing.
           // We clear quickly, then type gradually for the human-like effect.
-          if (step.options?.replaceContent !== false) {
-            await locator.fill('', { timeout });
+          const isReplace = step.options?.replaceContent !== false;
+          if (isReplace) {
+            await clearFieldBeforeType(locator, timeout, { secretValues });
           }
 
           // Delay between keystrokes:
@@ -2566,6 +2571,14 @@ async function executeAction(
             : randomIntInclusive(50, 150);
 
           await locator.pressSequentially(value, { timeout, delay });
+
+          // Verify the value landed (Finding 2): humanLike types char-by-char
+          // with a 50–150ms delay — slower typing makes mask races WORSE, so
+          // this path needs the masked-drop verify most. Replace-mode only
+          // (append-mode field holds prior content, so it can't match `value`).
+          if (isReplace) {
+            await verifyTypedValueAndRetry(page, locator, value, timeout, { secretValues });
+          }
 
           // Sometimes pause after typing (e.g., user thinking / UI debounce)
           await maybeRandomPause(page, 0.35, 80, 220);
@@ -2584,9 +2597,13 @@ async function executeAction(
           if (value.length <= 50 || userKeyPressDelay != null) {
             // Short text (credentials, emails, OTP) OR user-requested gradual typing:
             // use pressSequentially for full keyboard event chain.
-            await locator.fill('', { timeout }).catch(() => {}); // Clear existing content first
+            await clearFieldBeforeType(locator, timeout, { secretValues }); // Clear existing content (verified — see helper)
             await locator.click({ timeout });
             await locator.pressSequentially(value, { timeout, delay: userKeyPressDelay ?? 20 });
+            // Read back the value and, on a SAFE masked-drop mismatch, repair
+            // once with fill(). Gated so it can't wipe an OTP/maxlength/multi-box
+            // entry; logs are secret-redacted. See verifyTypedValueAndRetry.
+            await verifyTypedValueAndRetry(page, locator, value, timeout, { secretValues });
           } else {
             // Long text (comments, descriptions): fast fill with post-blur fallback
             await locator.fill(value, { timeout });
@@ -2601,10 +2618,13 @@ async function executeAction(
               // Re-focus to check value
               await locator.focus({ timeout: 2000 }).catch(() => {});
               const postBlurValue = await locator.inputValue().catch(() => '');
-              if (value && postBlurValue.trim() !== value.trim()) {
+              // Share the tolerant comparator with the short-text path (Finding
+              // 9) — strict `!==` false-positives on an auto-formatting long
+              // field and spuriously clears + retypes.
+              if (value && !typedValueLooksApplied(value, postBlurValue)) {
                 logger.info('[EXECUTE_ACTION] fill() value lost after blur — retrying with pressSequentially', {
-                  expected: value.slice(0, 50),
-                  actual: postBlurValue.slice(0, 50),
+                  expected: redactWithValues(value, secretValues).slice(0, 50),
+                  actual: redactWithValues(postBlurValue, secretValues).slice(0, 50),
                 });
                 // Clear and retry with pressSequentially (generates full keyboard event chain)
                 await locator.fill('', { timeout }).catch(() => {});
@@ -3568,7 +3588,7 @@ export class PreviewStepApplyService {
 
         let result;
         try {
-          result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 });
+          result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 }, undefined, { secretValues: secretValuesForAudit });
           // Emit complete phase for navigate
           if (stepDraft.type === 'navigate') {
             const navUrl = stepDraft.value || '';
@@ -4229,7 +4249,7 @@ export class PreviewStepApplyService {
         // V5: Capture URL BEFORE action for accurate compiled context
         const urlBeforeAction = page.url();
         
-        const result = await executeAction(page, stepDraft, confirmedCandidate, undefined, { expectsNavigation });
+        const result = await executeAction(page, stepDraft, confirmedCandidate, undefined, { expectsNavigation, secretValues: secretValuesForAudit });
 
         if (result.success) {
           // V16: Post-action settle via smartStepWait('post'). In run-mode
@@ -4533,7 +4553,7 @@ export class PreviewStepApplyService {
               : null;
 
             // Execute action with compiled locator
-            const result = await executeAction(page, stepDraft, compiledCandidate, compiledResult.locator, { expectsNavigation });
+            const result = await executeAction(page, stepDraft, compiledCandidate, compiledResult.locator, { expectsNavigation, secretValues: secretValuesForAudit });
 
             if (result.success) {
               // V13: Postcondition verification — if the compiled plan
@@ -5634,7 +5654,7 @@ export class PreviewStepApplyService {
           });
         } catch { /* non-fatal */ }
         let playwrightThrew = false;
-        const result = await executeAction(page, stepDraft, candidate, undefined, { expectsNavigation });
+        const result = await executeAction(page, stepDraft, candidate, undefined, { expectsNavigation, secretValues: secretValuesForAudit });
         const actionDur = Date.now() - actionStart;
         if (!result.success && result.error) playwrightThrew = true;
         try {

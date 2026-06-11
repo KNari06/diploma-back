@@ -72,6 +72,11 @@ const PREVIEW_VIDEO_CONFIG = {
   // in before they reach for the Refresh button. 2s would catch more cases
   // but at 5× the screenshot CPU cost on idle sessions.
   cdpIdleThresholdMs: 5000,
+  // Cap for the run-loop sync screenshot (injectSyncFrame). page.screenshot()
+  // defaults to a 30s timeout — far too long for a per-step poke that runs
+  // concurrently with apply/readiness. Bail fast and let the next step (or the
+  // idle watchdog) catch up instead of blocking on a contended renderer.
+  syncFrameTimeoutMs: 3000,
 };
 
 // ============================================================================
@@ -1078,8 +1083,13 @@ export class PreviewVideoStreamService {
   /**
    * Inject a manual screenshot frame into the video stream.
    * Used after page reload/navigation when CDP screencast may lag behind.
+   *
+   * `timeoutMs` caps the underlying page.screenshot (defaults to Playwright's
+   * 30s). Callers on a contended path (the run-loop sync poke) pass a short cap
+   * so they fail fast instead of blocking; the watchdog/navigation callers omit
+   * it and keep the default.
    */
-  async injectFrame(): Promise<boolean> {
+  async injectFrame(opts?: { timeoutMs?: number }): Promise<boolean> {
     if (!this.isStreaming || this.isStopped || !this.page || !this.nsp) {
       return false;
     }
@@ -1088,6 +1098,7 @@ export class PreviewVideoStreamService {
       const buf = await this.page.screenshot({
         type: 'jpeg',
         quality: PREVIEW_VIDEO_CONFIG.quality,
+        ...(opts?.timeoutMs != null ? { timeout: opts.timeoutMs } : {}),
       });
 
       // V13: TOCTOU re-check — between the screenshot await and the emit
@@ -1140,6 +1151,32 @@ export class PreviewVideoStreamService {
       });
       return false;
     }
+  }
+
+  /**
+   * Guarded one-shot frame for run-loop step sync.
+   *
+   * Unlike the raw injectFrame() (used by post-navigation re-arm, where a forced
+   * frame is exactly what we want), this respects the SAME backpressure / zombie
+   * / circuit-breaker guards the idle watchdog applies, so a per-step poke can't
+   * pile screenshots onto a paused / zombie / contended stream:
+   *   - not streaming / stopped / CDP-closed → skip (dead session);
+   *   - circuit breaker open (isPaused) → skip (stream already failing);
+   *   - nobody in the room → skip (zombie session, no renderer);
+   *   - a frame already in flight (pendingFrames) → skip (don't pile up).
+   * It deliberately does NOT apply the watchdog's CDP-recency gate: the whole
+   * point of the run-loop poke is to land a frame in lockstep with each step
+   * even while the screencast lags under apply contention — the pendingFrames
+   * guard already bounds load to ≤1 screenshot per step. Screenshot is capped at
+   * syncFrameTimeoutMs so it fails fast on a stuck renderer.
+   */
+  async injectSyncFrame(): Promise<boolean> {
+    if (!this.isStreaming || this.isStopped || this.cdpSessionClosed) return false;
+    if (this.isPaused) return false;
+    if (this.pendingFrames > 0) return false;
+    const roomSize = this.nsp?.adapter.rooms.get(this.room)?.size ?? 0;
+    if (roomSize === 0) return false;
+    return this.injectFrame({ timeoutMs: PREVIEW_VIDEO_CONFIG.syncFrameTimeoutMs });
   }
 
   /**
@@ -1288,6 +1325,19 @@ export class PreviewVideoStreamRegistry {
     const stream = this.streams.get(previewSessionId);
     if (stream) {
       return stream.injectFrame();
+    }
+    return false;
+  }
+
+  /**
+   * Guarded run-loop sync frame (backpressure / zombie / circuit-breaker safe).
+   * Use this from the run loop instead of injectFrame — see
+   * PreviewVideoStreamService.injectSyncFrame.
+   */
+  async injectSyncFrame(previewSessionId: string): Promise<boolean> {
+    const stream = this.streams.get(previewSessionId);
+    if (stream) {
+      return stream.injectSyncFrame();
     }
     return false;
   }

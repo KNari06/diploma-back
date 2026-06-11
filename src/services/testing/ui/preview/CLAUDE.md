@@ -72,6 +72,7 @@ Element resolution and auto-healing serve all three.
 | [auto-wait-for.utils.ts](auto-wait-for.utils.ts) | Inject `wait:*` synthetic steps before slow actions. |
 | [page-interactive.utils.ts](page-interactive.utils.ts) | "Is page interactive yet" heuristic. |
 | [text-normalizer.util.ts](text-normalizer.util.ts) | Unicode/whitespace normalization for label matching. |
+| [type-action.helpers.ts](type-action.helpers.ts) | `type` action clear/verify/retry helpers (extracted from `preview-step-apply`). `typedValueLooksApplied` (mask-tolerant compare), `shouldRetryTypeWithFill` (gates the fill() repair off OTP/maxlength/multi-box), `clearFieldBeforeType` (settle-verified clear), `verifyTypedValueAndRetry` (post-type read-back + gated fill, secret-redacted logs). Shared by the humanLike + short-text typing branches. |
 | [implicit-role.util.ts](implicit-role.util.ts) | Maps `<button>`, `<a href>` etc. to ARIA roles. |
 | [dynamic-id.util.ts](dynamic-id.util.ts) | Detects framework-generated IDs (`el-id-`, `radix-`, `:rN:`, `mui-`, UUID, …) — skipped in fingerprints. |
 | [intent-resolve-audit.ts](intent-resolve-audit.ts) | Audit log for resolver decisions: `logIntentResolveApply`, `logIntentResolveLint`, `buildChosenSnapshot`. Fire-and-forget JSONL to `logs/intent_resolve.log`. |
@@ -210,12 +211,16 @@ preview:run:start
     - injectAutoWaitForSteps() prepends wait:* before slow actions
     - loop steps:
         waitForStepReadiness → applyStep → emit progress
+        emit 'running' → injectSyncFrame() (guarded — sync live picture to the panel — see below)
         on fail: stepBlockerDiagnosis (LLM) → suggested wait → retry once
         on timeout: break, emit complete with partial result
+    - final injectSyncFrame() before complete (lands picture on the run's end state)
     - persist final state (batch compile plans for steps that gained one)
   → emit preview:run:complete
 ```
 Timeout: `min(15min, 60s + 15s × steps)`.
+
+**Preview picture sync during a run.** The periodic `preview:page` snapshot pipeline is gated off while a run is in flight (DOM tick early-returns on `isRunning`, to avoid `page.evaluate()` contention with readiness/apply), and the CDP screencast can lag/freeze under that contention — so the step panel (driven by tiny `preview:run:step` events) races ahead of the picture. To keep them in lockstep the run loop pushes one `getPreviewVideoStreamRegistry().injectSyncFrame()` per step (right after the `running` emit, when the previous step has settled) plus a final frame before `preview:run:completed`. `injectSyncFrame` is a read-only `page.screenshot` (NOT a CDP-session reuse — invariant #3 safe), fire-and-forget, and — unlike the raw `injectFrame` used by post-navigation re-arm — it applies the SAME backpressure/zombie/circuit-breaker guards as the CDP-idle watchdog (skips when paused, when a frame is already in flight, or when the room is empty) and caps the screenshot at `syncFrameTimeoutMs`. It deliberately does NOT apply the watchdog's CDP-recency gate — the per-step poke must land a frame even while the screencast lags.
 
 ### Pick element (one-shot read-only picker)
 ```
@@ -426,7 +431,8 @@ If apply fails after action: auto-heal path
 - `element-resolver.test.ts` — resolver path coverage
 - `intent-step-lint.service.test.ts` — candidate scoring
 - `preview-run.service.test.ts` — run loop, cancel
-- `preview-step-apply.helpers.test.ts` — small helpers
+- `preview-step-apply.helpers.test.ts` — small helpers (glob→regex, normalizeTypeActionValue)
+- `type-action.helpers.test.ts` — type clear/verify/retry helpers (mask-tolerant compare, fill-retry gating, settle-verified clear)
 - `preview-session-recording-state.test.ts` — recording lifecycle
 - `recording-capture.service.test.ts` — probe, field sessions
 - `step-readiness.service.test.ts` — 7-layer wait

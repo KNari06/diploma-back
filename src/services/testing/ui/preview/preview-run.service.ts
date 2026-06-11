@@ -18,6 +18,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { IntentTestCaseService } from './intent-test-case.service';
 import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
+import { getPreviewVideoStreamRegistry } from './preview-video-stream.service';
 import { detectPageLoadError } from './page-load-error.util';
 import type { IntentActionType, IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, waitForApiIdle } from './step-readiness.service';
@@ -1731,6 +1732,20 @@ export class PreviewRunService {
           timestamp: new Date().toISOString(),
         });
 
+        // Keep the live preview picture in lockstep with the steps panel.
+        // During a run the periodic preview:page snapshot pipeline is gated off
+        // (see preview.handler.ts DOM tick) and the CDP screencast can lag or
+        // freeze under apply/readiness contention — so the panel races ahead
+        // while the picture sits on a stale frame (steps appear to "outrun" the
+        // preview). The previous step has fully settled by the time we mark this
+        // one 'running', so push ONE fresh frame reflecting the state this step
+        // is about to act on. Fire-and-forget: injectSyncFrame is a read-only,
+        // backpressure/zombie/circuit-breaker-guarded page.screenshot (NOT a
+        // CDP-session reuse — invariant #3 safe) that swallows its own errors and
+        // skips paused/zombie/contended streams. The trailing final frame is
+        // emitted after the loop so the last step's result is shown too.
+        getPreviewVideoStreamRegistry().injectSyncFrame(previewSessionId).catch(() => {});
+
         // NOTE: We do NOT emit chat:processing:step here. The draft run is fire-and-forget
         // so clientRequestInFlightRef is already false on the frontend, and processing steps
         // would be silently discarded. Frontend subscribes to preview:run:* directly instead.
@@ -3001,6 +3016,12 @@ export class PreviewRunService {
           });
         }
       } catch { /* non-fatal */ }
+
+      // Final sync: the per-step inject above shows each step's result on the
+      // NEXT iteration's 'running' tick — the last step has no next iteration,
+      // so push one frame now to land the picture on the run's end state
+      // (pass screen, failed step, or the page where it stopped).
+      getPreviewVideoStreamRegistry().injectSyncFrame(previewSessionId).catch(() => {});
 
       webSocketService.emitToUser(userId, 'preview:run:completed', {
         previewSessionId,
