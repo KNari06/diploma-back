@@ -1739,11 +1739,12 @@ export class PreviewRunService {
         // while the picture sits on a stale frame (steps appear to "outrun" the
         // preview). The previous step has fully settled by the time we mark this
         // one 'running', so push ONE fresh frame reflecting the state this step
-        // is about to act on. Fire-and-forget: injectFrame is a read-only
-        // page.screenshot (NOT a CDP-session reuse — invariant #3 safe) and
-        // swallows its own errors. The trailing final frame is emitted after the
-        // loop so the last step's result is shown too.
-        getPreviewVideoStreamRegistry().injectFrame(previewSessionId).catch(() => {});
+        // is about to act on. Fire-and-forget: injectSyncFrame is a read-only,
+        // backpressure/zombie/circuit-breaker-guarded page.screenshot (NOT a
+        // CDP-session reuse — invariant #3 safe) that swallows its own errors and
+        // skips paused/zombie/contended streams. The trailing final frame is
+        // emitted after the loop so the last step's result is shown too.
+        getPreviewVideoStreamRegistry().injectSyncFrame(previewSessionId).catch(() => {});
 
         // NOTE: We do NOT emit chat:processing:step here. The draft run is fire-and-forget
         // so clientRequestInFlightRef is already false on the frontend, and processing steps
@@ -3020,7 +3021,7 @@ export class PreviewRunService {
       // NEXT iteration's 'running' tick — the last step has no next iteration,
       // so push one frame now to land the picture on the run's end state
       // (pass screen, failed step, or the page where it stopped).
-      getPreviewVideoStreamRegistry().injectFrame(previewSessionId).catch(() => {});
+      getPreviewVideoStreamRegistry().injectSyncFrame(previewSessionId).catch(() => {});
 
       webSocketService.emitToUser(userId, 'preview:run:completed', {
         previewSessionId,
