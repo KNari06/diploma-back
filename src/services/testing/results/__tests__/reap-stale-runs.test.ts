@@ -45,6 +45,7 @@ const makeRun = (id: string): StaleRunRow => ({
   trigger: 'manual',
   test_id: null,
   test_ids: ['t1'],
+  summary: null,
 });
 
 describe('StaleReaperService.reapStaleRuns', () => {

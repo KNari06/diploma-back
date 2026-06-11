@@ -8,6 +8,7 @@ import { AI_MODELS, AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { cacheMetrics } from '@/utils/core/cache-metrics';
 import { extractKeywordsSync } from '@/utils/text-processing/ai-keyword-extractor';
+import { FIELD_SEMANTIC_KEYWORDS, fieldSemanticStems } from '@/config/testing/field-semantic-keywords';
 import {
     getEffectiveLabel,
     resolveElement,
@@ -179,6 +180,17 @@ function scoreCandidate(node: InteractiveNode, step: IntentStep): { score: numbe
   if (!node.isVisible) {
     score += WEIGHTS.NOT_VISIBLE_PENALTY;
     reasons.push('Not visible');
+  }
+  // Hard-reject invisible elements, symmetric with buildAllowedSets Rule 1
+  // (the AI path's ONLY hard exclude). Without this, a hidden duplicate that
+  // shares a strong identifier with the visible target — the classic case is
+  // a hidden mobile-menu item with the same data-testid as the desktop
+  // button (150 + 120 - 100 = 170 > 0) — survives rule-based ranking and can
+  // be suggested in degraded mode. Strict `=== false` mirrors the resolver's
+  // condition: nodes with isVisible undefined (test fixtures) keep only the
+  // soft penalty above.
+  if (node.isVisible === false) {
+    hardReject = true;
   }
 
   if (node.isDisabled) {
@@ -359,18 +371,15 @@ function scoreCandidate(node: InteractiveNode, step: IntentStep): { score: numbe
     }
   }
 
-  // Smart autocomplete inference from description
+  // Smart autocomplete inference from description (degraded path only).
+  // Stems live in FIELD_SEMANTIC_KEYWORDS — the {en,ru,kk} contract forces
+  // Kazakh coverage (CLAUDE.md Hard invariant #17 spirit). The inline ru/en
+  // map this replaced silently dropped Kazakh, so "құпиясөз" never inferred
+  // password.
   const descLower = step.description.toLowerCase();
   if (!hints.autocomplete) {
-    const autocompleteMappings: Record<string, string[]> = {
-      'email': ['email', 'почт', 'e-mail'],
-      'username': ['username', 'login', 'логин', 'пользовател'],
-      'password': ['password', 'пароль', 'current-password', 'new-password'],
-      'tel': ['phone', 'телефон', 'mobile', 'мобильн'],
-    };
-
-    for (const [autoVal, terms] of Object.entries(autocompleteMappings)) {
-      if (terms.some(t => descLower.includes(t))) {
+    for (const [autoVal, langList] of Object.entries(FIELD_SEMANTIC_KEYWORDS)) {
+      if (fieldSemanticStems(langList).some(t => descLower.includes(t))) {
         if (node.autocomplete === autoVal || node.type === autoVal) {
           score += WEIGHTS.AUTOCOMPLETE_MATCH;
           reasons.push(`Inferred autocomplete=${autoVal}`);

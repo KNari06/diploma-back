@@ -1626,6 +1626,30 @@ export interface PreviewStepLintResultPayload {
    * V3: True if Apply should be disabled (status is needs_clarification without user selection)
    */
   applyDisabled?: boolean;
+  /**
+   * Diagnostic parity across branches. The resolved/not_found branch spreads
+   * the whole LintResult, but the needs_clarification branch builds its
+   * payload by hand — these fields let the FE distinguish "LLM degraded,
+   * retry later" from "genuinely ambiguous, refine the description" and
+   * feed latency telemetry. All optional; absent on older servers.
+   */
+  degradedMode?: boolean;
+  degradedReason?: string;
+  aiFallbackReason?: 'semantic_zero' | 'ambiguous' | 'low_confidence';
+  cacheHit?: boolean;
+  resolverPath?: string;
+  /** V23 coaching hint (already emitted via conditional spread; now typed) */
+  suggestion?: {
+    issue: 'NO_MATCH' | 'AMBIGUOUS' | 'GENERIC_INTENT' | 'VAGUE_INTENT' | 'LOW_CONFIDENCE';
+    hint: string;
+    examples?: string[];
+  };
+  phaseTimings?: {
+    snapshotMs?: number;
+    resolveMs?: number;
+    totalMs?: number;
+    domNodeCount?: number;
+  };
   timestamp: string;
 }
 

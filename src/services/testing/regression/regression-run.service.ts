@@ -32,6 +32,7 @@ import {
   getRunExecutionStatsRows,
 } from './db/regression-run.db';
 import { getProjectForAccess } from './db/regression.db';
+import { priorityRank } from './resolve-test-case-priority.util';
 import { TestExecutionOrchestratorService } from './test-execution-orchestrator.service';
 
 /**
@@ -649,39 +650,33 @@ export class RegressionRunService {
         );
       }
 
-      // 1b. Batch-fetch depends_on for UI test cases
+      // 1b. Batch-fetch depends_on + priority for UI test cases.
+      // Dependencies are passed RAW (not filtered to in-run ids): the
+      // orchestrator detects out-of-run references, surfaces them in the
+      // run summary as `missingDependencies`, and the topological sort
+      // ignores them for ordering — so the user sees the gap instead of
+      // it being silently swallowed here.
       const uiCaseIds = expandedCases.filter((tc) => tc.testType === 'ui').map((tc) => tc.testCaseId);
       const depMap = new Map<string, string[]>();
+      const priorityMap = new Map<string, string | null>();
       if (uiCaseIds.length > 0) {
         const depRows = await RegressionTestQueryService.getDependsOnRows(uiCaseIds);
         for (const row of depRows) {
           depMap.set(row.id, row.depends_on || []);
+          priorityMap.set(row.id, row.priority ?? null);
         }
       }
 
-      // Filter depends_on to only include test cases that are part of this run
-      const runTestCaseIds = new Set(expandedCases.map((tc) => tc.testCaseId));
-
-      const executableCases: ExecutableTestCase[] = expandedCases.map((tc) => {
-        const rawDeps = depMap.get(tc.testCaseId) || [];
-        const validDeps = rawDeps.filter((depId) => runTestCaseIds.has(depId));
-        if (validDeps.length !== rawDeps.length) {
-          logger.warn('[REGRESSION_RUN] Filtered out-of-run dependencies', {
-            testCaseId: tc.testCaseId,
-            originalDeps: rawDeps,
-            filteredDeps: validDeps,
-          });
-        }
-        return {
-          testCaseId: tc.testCaseId,
-          testType: tc.testType,
-          moduleId: tc.moduleId,
-          flowId: tc.flowId,
-          dependsOn: validDeps,
-          ...(tc.isNegative && { isNegative: true }),
-          ...(tc.platform && { platform: tc.platform }),
-        };
-      });
+      const executableCases: ExecutableTestCase[] = expandedCases.map((tc) => ({
+        testCaseId: tc.testCaseId,
+        testType: tc.testType,
+        moduleId: tc.moduleId,
+        flowId: tc.flowId,
+        dependsOn: depMap.get(tc.testCaseId) || [],
+        priority: priorityMap.get(tc.testCaseId) ?? null,
+        ...(tc.isNegative && { isNegative: true }),
+        ...(tc.platform && { platform: tc.platform }),
+      }));
 
       // 1c. Credit check — verify user has enough credits for all test cases
       await this.checkCreditBalance(userId, executableCases, 'regression_plan');
@@ -1037,30 +1032,9 @@ export class RegressionRunService {
       // priority column repo-wide (see analytics-query.service:838) — no
       // signal to sort on, so we don't pretend to.
       //
-      // NULL handling: legacy rows pre-default (before
-      // intent-test-case.service.ts started inserting 'medium' as the
-      // default) collapse into the medium bucket here. Without this,
-      // newly-created 'medium' tests would run BEFORE older NULL tests
-      // — a confusing ordering change for users who haven't backfilled.
-      // Sort treats unknown-priority as middle-of-the-road, which is
-      // also what every other downstream path (Jira fallback, Telegram
-      // omission) effectively does.
-      //
-      // Case-insensitive lookup: defends against schema drift where a
-      // row might have 'Critical' (capital C) bypassing the CHECK
-      // constraint (e.g. via raw SQL or migration mishap). Without
-      // this, such a row would sort to the medium bucket along with
-      // NULL — silently wrong. Lowercasing keys is cheap and safe.
-      const PRIORITY_ORDER: Record<string, number> = {
-        critical: 0,
-        high: 1,
-        medium: 2,
-        low: 3,
-      };
-      const priorityRank = (p: string | null | undefined): number => {
-        const key = typeof p === 'string' ? p.toLowerCase() : '';
-        return PRIORITY_ORDER[key] ?? PRIORITY_ORDER.medium;
-      };
+      // NULL / wrongly-cased handling lives in the shared priorityRank()
+      // (resolve-test-case-priority.util.ts): legacy NULL rows and schema
+      // drift like 'Critical' collapse into the medium bucket.
       const orderedUiCases = [...(uiCases || [])].sort(
         (a, b) => priorityRank(a.priority) - priorityRank(b.priority),
       );
@@ -1072,6 +1046,7 @@ export class RegressionRunService {
           flowId: tc.flow_id || undefined,
           dependsOn: tc.depends_on || [],
           platform: tc.platform || undefined,
+          priority: tc.priority ?? null,
         })),
         ...(apiCases || []).map((tc: any) => ({
           testCaseId: tc.id,
@@ -1170,6 +1145,7 @@ export class RegressionRunService {
           flowId: tc.flow_id || undefined,
           dependsOn: tc.depends_on || [],
           platform: tc.platform || undefined,
+          priority: tc.priority ?? null,
         })),
         ...(apiCases || []).map((tc: any) => ({
           testCaseId: tc.id,

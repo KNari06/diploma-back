@@ -1689,6 +1689,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           clarificationQuestion: result.clarificationQuestion,
           alternativesIncluded: !!includeAlternatives,
           applyDisabled: true, // V5: Apply should be disabled for needs_clarification
+          // Diagnostic parity with the resolved/not_found branch below (which
+          // spreads the whole result). Without these the FE cannot tell
+          // "LLM degraded — show retry hint" apart from "genuinely ambiguous".
+          degradedMode: result.degradedMode,
+          degradedReason: result.degradedReason,
+          aiFallbackReason: result.aiFallbackReason,
+          cacheHit: result.cacheHit,
+          resolverPath: result.resolverPath,
+          phaseTimings: result.phaseTimings,
           // V23: forward AMBIGUOUS coaching so the editor renders an
           // actionable hint alongside the alternatives picker.
           ...(result.suggestion ? { suggestion: result.suggestion } : {}),

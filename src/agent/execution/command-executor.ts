@@ -3742,6 +3742,11 @@ export class CommandExecutor {
             domNodes,
             pageUrl: this.page.url(),
             includeAlternatives: false,
+            // V26 parity with the lint path: real viewport makes
+            // buildAllowedSets' modal-coverage ratio accurate on long
+            // scrollable pages. Null (no emulation) falls back to the
+            // bbox high-water-mark heuristic, same as before.
+            viewport: this.page.viewportSize() ?? undefined,
             screenshot: () => captureSmartScreenshot(pageForScreenshot),
             // Journey context: the user's narrative (test goal + the steps
             // completed before this failing one) so heal can disambiguate
@@ -3887,6 +3892,8 @@ export class CommandExecutor {
                     domNodes: freshNodes,
                     pageUrl: this.page.url(),
                     includeAlternatives: false,
+                    // Same viewport parity as the primary heal call above.
+                    viewport: this.page.viewportSize() ?? undefined,
                     screenshot: () => captureSmartScreenshot(this.page),
                     // Same journey context as the primary heal so a scroll-revealed
                     // step is disambiguated with the test goal + prior steps too.
@@ -5496,6 +5503,9 @@ export class CommandExecutor {
       domNodes: nodes,
       pageUrl: this.page.url(),
       includeAlternatives: false,
+      // Viewport parity with the heal calls: overlay-coverage math needs the
+      // real viewport, especially here where the target IS the overlay layer.
+      viewport: this.page.viewportSize() ?? undefined,
     });
     const ref = res.highlight?.find((h) => h.type === 'success')?.ref ?? res.candidates?.[0]?.ref;
     if (res.status !== 'resolved' || !ref) return false;

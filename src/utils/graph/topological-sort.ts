@@ -65,11 +65,37 @@ export function topologicalSort(testCases: ExecutableTestCase[]): TopologicalSor
     currentLevel = nextLevel;
   }
 
-  // Any node with remaining in-degree > 0 is part of a cycle
+  // Any node with remaining in-degree > 0 is either ON a cycle or
+  // (transitively) depends on one. Separate the two: a node that no
+  // unordered node depends on cannot be on a cycle, so iteratively
+  // peeling such "leaf" nodes leaves exactly the cycle members.
   const hasCycle = sorted.length < testCases.length;
-  const cycleNodes = hasCycle
-    ? testCases.filter((tc) => !sorted.some((s) => s.testCaseId === tc.testCaseId)).map((tc) => tc.testCaseId)
-    : undefined;
+  let cycleNodes: string[] | undefined;
+  let blockedByCycleNodes: string[] | undefined;
 
-  return { sorted, levels, hasCycle, cycleNodes };
+  if (hasCycle) {
+    const sortedIds = new Set(sorted.map((s) => s.testCaseId));
+    const unordered = new Set(
+      testCases.filter((tc) => !sortedIds.has(tc.testCaseId)).map((tc) => tc.testCaseId),
+    );
+    const blocked: string[] = [];
+
+    let peeled = true;
+    while (peeled) {
+      peeled = false;
+      for (const id of unordered) {
+        const hasUnorderedDependent = (dependents.get(id) || []).some((d) => unordered.has(d));
+        if (!hasUnorderedDependent) {
+          unordered.delete(id);
+          blocked.push(id);
+          peeled = true;
+        }
+      }
+    }
+
+    cycleNodes = [...unordered];
+    blockedByCycleNodes = blocked;
+  }
+
+  return { sorted, levels, hasCycle, cycleNodes, blockedByCycleNodes };
 }

@@ -139,8 +139,8 @@ Element resolution and auto-healing serve all three.
 | `preview:recording:step:remove` | Step removed (e.g. typing field session ended with no change) |
 | `preview:recording:state` | `{ recording: boolean, reason? }` |
 | `preview:page` | DOM snapshot update (throttled 500ms, only on change) |
-| `preview:video:stream` | CDP screencast frame |
-| `preview:lint:result` | Resolved candidates + confidence |
+| `preview:video:frame` | CDP screencast frame — meta payload + raw JPEG bytes as the 2nd (binary) socket.io argument |
+| `preview:step:lint:result` | Resolved candidates + confidence (+ `preview:step:clarify` when alternatives requested) |
 | `preview:step:apply:result` | Apply success/fail + evidence |
 | `preview:run:progress` / `:complete` | Run loop status |
 | `preview:auth:required` | Login wall detected |

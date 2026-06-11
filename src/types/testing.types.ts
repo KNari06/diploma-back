@@ -1267,6 +1267,8 @@ export interface ExecutableTestCase {
   isNegative?: boolean;
   /** Test case platform — used to route mobile tests to the mobile runner */
   platform?: string;
+  /** Curator-set priority — used to order dispatch within a topological level */
+  priority?: string | null;
 }
 
 /**
@@ -1279,8 +1281,14 @@ export interface TopologicalSortResult {
   levels: ExecutableTestCase[][];
   /** True if the dependency graph contains a cycle */
   hasCycle: boolean;
-  /** IDs of nodes involved in a cycle (only present when hasCycle=true) */
+  /** IDs of nodes that lie ON a cycle (only present when hasCycle=true) */
   cycleNodes?: string[];
+  /**
+   * IDs of nodes that are NOT on a cycle themselves but can never run
+   * because a (transitive) dependency is. Reported separately so they
+   * can be marked "blocked" instead of the misleading "circular".
+   */
+  blockedByCycleNodes?: string[];
 }
 
 // ============================================================================

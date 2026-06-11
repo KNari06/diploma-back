@@ -13,6 +13,7 @@ import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import type { ExecutableTestCase } from '@/types/testing.types';
 import type { RegressionRunProgressPayload } from '@/websocket/types/types';
 import { getProjectWorkspaceMemberIds } from './regression-report-assembler.service';
+import { priorityRank } from './resolve-test-case-priority.util';
 import { MobileTestDispatcherService } from './mobile-test-dispatcher.service';
 import { WebTestRequestBuilderService } from './web-test-request-builder.service';
 import { RegressionTestQueryService } from './db/regression-test-query.db';
@@ -119,24 +120,28 @@ export class TestExecutionOrchestratorService {
     }
 
     // Topological sort by depends_on
-    const { levels, hasCycle, cycleNodes } = topologicalSort(testCases);
+    const { levels, hasCycle, cycleNodes, blockedByCycleNodes } = topologicalSort(testCases);
 
-    if (hasCycle) {
-      logger.error('[REGRESSION_RUN] Dependency cycle detected in run', { runId, cycleNodes });
-      // Mark cycle nodes as failed
-      for (const nodeId of cycleNodes || []) {
-        const tc = testCases.find((t) => t.testCaseId === nodeId);
-        if (tc) {
-          const execId = execByKey.get(`${tc.testType}:${tc.testCaseId}`);
-          if (execId) {
-            await ExecutionService.updateStatus({
-              id: execId,
-              status: 'failed',
-              errorMessage: 'Circular dependency detected. Cannot execute.',
-            });
-          }
-        }
-      }
+    // Dependencies pointing OUTSIDE this run (test case in depends_on but
+    // not in the plan/selection) are ignored for ordering — the dependent
+    // runs without waiting. That's the only sane default, but it must be
+    // VISIBLE: a server-side log alone leaves QA wondering why B ran
+    // without A. Collected here and persisted into every summary write
+    // below so the run report can render a warning.
+    const inRunIds = new Set(testCases.map((t) => t.testCaseId));
+    const missingDependencies = testCases
+      .map((tc) => ({
+        testCaseId: tc.testCaseId,
+        missingDependencyIds: (tc.dependsOn || []).filter((d) => !inRunIds.has(d)),
+      }))
+      .filter((e) => e.missingDependencyIds.length > 0);
+    const missingDepsSummary =
+      missingDependencies.length > 0 ? { missingDependencies } : {};
+    if (missingDependencies.length > 0) {
+      logger.warn('[REGRESSION_RUN] Test cases reference dependencies outside this run', {
+        runId,
+        missingDependencies,
+      });
     }
 
     // Level-based execution with dependency tracking
@@ -203,6 +208,71 @@ export class TestExecutionOrchestratorService {
     };
 
     emitProgress('started', `Regression run started: ${totalTests} tests in ${totalLevels} levels`);
+
+    if (missingDependencies.length > 0) {
+      emitProgress(
+        'started',
+        `${missingDependencies.length} test(s) reference dependencies outside this run and will run without waiting for them`,
+      );
+    }
+
+    if (hasCycle) {
+      logger.error('[REGRESSION_RUN] Dependency cycle detected in run', {
+        runId,
+        cycleNodes,
+        blockedByCycleNodes,
+      });
+      // True cycle members can never be ordered — fail them outright.
+      for (const nodeId of cycleNodes || []) {
+        const tc = testCases.find((t) => t.testCaseId === nodeId);
+        if (!tc) continue;
+        const execId = execByKey.get(`${tc.testType}:${tc.testCaseId}`);
+        if (execId) {
+          await ExecutionService.updateStatus({
+            id: execId,
+            status: 'failed',
+            errorMessage: 'Circular dependency detected. Cannot execute.',
+          });
+          emitProgress('test_completed', `Failed (circular dependency): ${tc.testCaseId}`, {
+            testExecution: {
+              testCaseId: tc.testCaseId,
+              testExecutionId: execId,
+              testType: tc.testType,
+              event: 'completed',
+              status: 'failed',
+              errorMessage: 'Circular dependency detected. Cannot execute.',
+            },
+          });
+        }
+      }
+      // Nodes that merely depend on the cycle are not broken themselves —
+      // skip them with an honest reason instead of the misleading
+      // "circular dependency" label. Mirrors the failed-prerequisite skip.
+      for (const nodeId of blockedByCycleNodes || []) {
+        const tc = testCases.find((t) => t.testCaseId === nodeId);
+        if (!tc) continue;
+        skippedCount++;
+        const execId = execByKey.get(`${tc.testType}:${tc.testCaseId}`);
+        if (execId) {
+          const blockedReason = 'Skipped: depends on test(s) inside a circular dependency chain';
+          await ExecutionService.updateStatus({
+            id: execId,
+            status: 'skipped',
+            errorMessage: blockedReason,
+          });
+          emitProgress('test_completed', `Skipped (blocked by circular dependency): ${tc.testCaseId}`, {
+            testExecution: {
+              testCaseId: tc.testCaseId,
+              testExecutionId: execId,
+              testType: tc.testType,
+              event: 'completed',
+              status: 'skipped',
+              errorMessage: blockedReason,
+            },
+          });
+        }
+      }
+    }
 
     // Mobile regression concurrency cap.
     //
@@ -307,7 +377,14 @@ export class TestExecutionOrchestratorService {
     let failFastTriggerTestCaseId: string | null = null;
 
     for (let levelIdx = 0; levelIdx < levels.length && !creditExhausted && !failFastTriggered; levelIdx++) {
-      const level = levels[levelIdx];
+      // Dispatch critical tests first within the level. Order between
+      // levels is owned by the topological sort; within a level it used
+      // to be arbitrary (input order), so a critical smoke test could
+      // queue behind twenty low-priority ones. Stable sort keeps the
+      // curator's relative order inside each priority bucket.
+      const level = [...levels[levelIdx]].sort(
+        (a, b) => priorityRank(a.priority) - priorityRank(b.priority),
+      );
       // `platform` captured at dispatch so we can forward it with the
       // per-test completion event below (post-level), which is how the
       // UI discriminates mobile vs web cards.
@@ -955,6 +1032,7 @@ export class TestExecutionOrchestratorService {
           skipped: skippedCount,
           failFastTriggered: true,
           failFastTriggerTestCaseId,
+          ...missingDepsSummary,
           started_at: startedAt,
           completed_at: new Date().toISOString(),
         },
@@ -990,6 +1068,7 @@ export class TestExecutionOrchestratorService {
           api_failed: apiFailed,
           skipped: skippedCount,
           creditExhausted: true,
+          ...missingDepsSummary,
           started_at: startedAt,
           completed_at: new Date().toISOString(),
         },
@@ -1009,6 +1088,7 @@ export class TestExecutionOrchestratorService {
           api_passed: apiPassed,
           api_failed: apiFailed,
           skipped: skippedCount,
+          ...missingDepsSummary,
           started_at: startedAt,
         },
       });
@@ -1039,6 +1119,7 @@ export class TestExecutionOrchestratorService {
         api_passed: apiPassed,
         api_failed: apiFailed,
         skipped: skippedCount,
+        ...missingDepsSummary,
         completed_at: new Date().toISOString(),
       },
       completed_at: new Date().toISOString(),
