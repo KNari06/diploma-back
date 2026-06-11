@@ -106,6 +106,10 @@ export async function listIntegrations(req: AuthenticatedRequest, res: Response)
     res.json({
       success: true,
       data: integrations.map((i) => sanitizeIntegration(i, webhookUrl)),
+      // Top-level webhookUrl mirrors the create/get responses so clients can
+      // show the receiver URL BEFORE any integration exists (the create-plan
+      // dialog needs it while the list is still empty).
+      webhookUrl,
       timestamp: new Date(),
     });
   } catch (error) {
