@@ -101,17 +101,34 @@ export class RegressionPlanService {
 
     const plan = this.mapToRegressionPlan(data);
 
-    // Sync schedule and git integration if automation config provided
+    // Sync schedule and git integration if automation config provided.
+    // syncSchedule now THROWS when an enabled schedule can't be created (was a
+    // silent null → plan saved without a test_schedules row → scheduler never
+    // fired). Roll the plan back so the user gets an error instead of a plan
+    // that looks scheduled in the UI but never runs.
     if (automationConfig) {
-      const scheduleId = await this.syncSchedule(plan, automationConfig.schedule);
-      await this.syncGitIntegration(plan, automationConfig.gitTriggers);
+      try {
+        const scheduleId = await this.syncSchedule(plan, automationConfig.schedule);
+        await this.syncGitIntegration(plan, automationConfig.gitTriggers);
 
-      if (scheduleId) {
+        if (scheduleId) {
+          await supabaseAdmin
+            .from('regression_plans')
+            .update({ schedule_id: scheduleId })
+            .eq('id', plan.id);
+          plan.scheduleId = scheduleId;
+        }
+      } catch (scheduleErr) {
+        logger.error('[REGRESSION_PLAN_SERVICE] Schedule sync failed — rolling back plan', {
+          planId: plan.id,
+          error: scheduleErr instanceof Error ? scheduleErr.message : String(scheduleErr),
+        });
         await supabaseAdmin
           .from('regression_plans')
-          .update({ schedule_id: scheduleId })
-          .eq('id', plan.id);
-        plan.scheduleId = scheduleId;
+          .delete()
+          .eq('id', plan.id)
+          .eq('user_id', userId);
+        throw scheduleErr;
       }
     }
 
@@ -681,6 +698,21 @@ export class RegressionPlanService {
     if (automationConfig !== undefined) updates.automation_config = automationConfig;
     if (notificationsEnabled !== undefined) updates.notifications_enabled = notificationsEnabled;
 
+    // Capture the CURRENT automation_config before we overwrite it, so a later
+    // syncSchedule failure can revert the row instead of leaving drift (see the
+    // rollback in the automationConfig block below). Only needed when we're
+    // actually changing automation_config.
+    let priorAutomationConfig: unknown = undefined;
+    if (automationConfig !== undefined) {
+      const { data: prior } = await supabaseAdmin
+        .from('regression_plans')
+        .select('automation_config')
+        .eq('id', id)
+        .eq('user_id', userId)
+        .maybeSingle();
+      priorAutomationConfig = prior?.automation_config ?? null;
+    }
+
     // Mobile build pinning. The two fields can move together or
     // separately — caller might just toggle the mode, or just swap
     // which build is pinned. Switching mode to 'latest' clears the
@@ -741,17 +773,37 @@ export class RegressionPlanService {
 
     const plan = this.mapToRegressionPlan(data);
 
-    // Re-sync schedule and git integration when automation config changes
+    // Re-sync schedule and git integration when automation config changes.
+    // syncSchedule THROWS on a failed enabled-schedule sync. The plan row above
+    // already persisted the new automation_config (which may say the schedule is
+    // enabled), so on a throw we must REVERT automation_config + schedule_id to
+    // their prior values — otherwise the plan shows an enabled schedule in the UI
+    // with no/stale test_schedules row (the exact silent drift create() rolls
+    // back). We rethrow so the user still gets a real error.
     if (automationConfig !== undefined) {
-      const scheduleId = await this.syncSchedule(plan, automationConfig?.schedule);
-      await this.syncGitIntegration(plan, automationConfig?.gitTriggers);
+      const priorScheduleId = plan.scheduleId;
+      try {
+        const scheduleId = await this.syncSchedule(plan, automationConfig?.schedule);
+        await this.syncGitIntegration(plan, automationConfig?.gitTriggers);
 
-      if (scheduleId !== plan.scheduleId) {
+        if (scheduleId !== plan.scheduleId) {
+          await supabaseAdmin
+            .from('regression_plans')
+            .update({ schedule_id: scheduleId })
+            .eq('id', plan.id);
+          plan.scheduleId = scheduleId || undefined;
+        }
+      } catch (syncErr) {
+        logger.error('[REGRESSION_PLAN_SERVICE] Schedule sync failed on update — reverting automation_config', {
+          planId: plan.id,
+          error: syncErr instanceof Error ? syncErr.message : String(syncErr),
+        });
         await supabaseAdmin
           .from('regression_plans')
-          .update({ schedule_id: scheduleId })
-          .eq('id', plan.id);
-        plan.scheduleId = scheduleId || undefined;
+          .update({ automation_config: priorAutomationConfig ?? null, schedule_id: priorScheduleId ?? null })
+          .eq('id', plan.id)
+          .eq('user_id', userId);
+        throw syncErr;
       }
     }
 
@@ -1308,94 +1360,113 @@ export class RegressionPlanService {
    * Create/update/deactivate linked test_schedules record
    * Returns scheduleId or null
    */
+  /**
+   * Sync the plan's automation schedule into a `test_schedules` row.
+   *
+   * Returns the schedule id (created/updated/existing), or `null` ONLY when the
+   * schedule is legitimately absent/disabled. When the config says enabled but
+   * the row cannot be created/updated, this THROWS — a silent null here is the
+   * exact bug that let a plan be "created successfully" while the scheduler had
+   * nothing to fire (UI showed "Every day at 23:00", but test_schedules was
+   * empty and schedule_id stayed null). The caller surfaces the throw to the
+   * user instead of persisting a half-configured plan.
+   */
   private static async syncSchedule(
     plan: RegressionPlan,
     scheduleConfig?: PlanScheduleConfig
   ): Promise<string | null> {
-    try {
-      const existingScheduleId = plan.scheduleId;
+    const existingScheduleId = plan.scheduleId;
 
-      // No schedule config or disabled → deactivate existing
-      if (!scheduleConfig || !scheduleConfig.enabled) {
-        if (existingScheduleId) {
-          await supabaseAdmin
-            .from('test_schedules')
-            .update({ is_active: false })
-            .eq('id', existingScheduleId);
+    // No schedule config or disabled → deactivate existing. This is the ONLY
+    // legitimate null return; any failure on the enabled path throws below.
+    if (!scheduleConfig || !scheduleConfig.enabled) {
+      if (existingScheduleId) {
+        const { error } = await supabaseAdmin
+          .from('test_schedules')
+          .update({ is_active: false })
+          .eq('id', existingScheduleId);
+        if (error) {
+          // Best-effort deactivation: log but don't fail the plan op — the
+          // schedule simply stays active until the next sync, no data risk.
+          logger.warn('[REGRESSION_PLAN_SERVICE] Failed to deactivate schedule', {
+            error: error.message,
+            planId: plan.id,
+            scheduleId: existingScheduleId,
+          });
+        } else {
           logger.info('[REGRESSION_PLAN_SERVICE] Deactivated schedule', {
             planId: plan.id,
             scheduleId: existingScheduleId,
           });
         }
-        // Return null — schedule is inactive, plan should not reference it as "active"
-        return null;
       }
+      return null;
+    }
 
-      const cronExpression = scheduleConfig.customCron || this.buildCronExpression(scheduleConfig);
-      const timezone = scheduleConfig.timezone || 'UTC';
+    const cronExpression = scheduleConfig.customCron || this.buildCronExpression(scheduleConfig);
+    const timezone = scheduleConfig.timezone || 'UTC';
 
-      // Calculate next_run_at using a simple approach
-      const nextRunAt = this.calculateNextRunFromSchedule(cronExpression, timezone);
+    // Validate the cron BEFORE touching the DB so an unsatisfiable/invalid
+    // expression fails with a clear message instead of a downstream throw.
+    if (!ScheduleService.parseCron(cronExpression)) {
+      throw new Error(
+        `Schedule has an invalid cron expression: "${cronExpression}". Fix the schedule and try again.`
+      );
+    }
+    // calculateNextRun throws on a structurally-valid-but-unsatisfiable cron.
+    const nextRunAt = this.calculateNextRunFromSchedule(cronExpression, timezone);
 
-      if (existingScheduleId) {
-        // Update existing schedule
-        const { error } = await supabaseAdmin
-          .from('test_schedules')
-          .update({
-            cron_expression: cronExpression,
-            timezone,
-            is_active: true,
-            next_run_at: nextRunAt,
-          })
-          .eq('id', existingScheduleId);
-
-        if (error) {
-          logger.error('[REGRESSION_PLAN_SERVICE] Failed to update schedule', { error, planId: plan.id });
-        } else {
-          logger.info('[REGRESSION_PLAN_SERVICE] Updated schedule', {
-            planId: plan.id,
-            scheduleId: existingScheduleId,
-            cronExpression,
-          });
-        }
-        return existingScheduleId;
-      }
-
-      // Create new schedule
-      const { data, error } = await supabaseAdmin
+    if (existingScheduleId) {
+      const { error } = await supabaseAdmin
         .from('test_schedules')
-        .insert({
-          project_id: plan.projectId,
-          user_id: plan.userId,
-          name: `Auto: ${plan.name}`,
-          plan_id: plan.id,
+        .update({
           cron_expression: cronExpression,
           timezone,
           is_active: true,
           next_run_at: nextRunAt,
-          parameters: {},
         })
-        .select('id')
-        .single();
+        .eq('id', existingScheduleId);
 
       if (error) {
-        logger.error('[REGRESSION_PLAN_SERVICE] Failed to create schedule', { error, planId: plan.id });
-        return null;
+        logger.error('[REGRESSION_PLAN_SERVICE] Failed to update schedule', { error, planId: plan.id });
+        throw new Error(`Failed to update the plan's schedule: ${error.message}`);
       }
-
-      logger.info('[REGRESSION_PLAN_SERVICE] Created schedule', {
+      logger.info('[REGRESSION_PLAN_SERVICE] Updated schedule', {
         planId: plan.id,
-        scheduleId: data.id,
+        scheduleId: existingScheduleId,
         cronExpression,
       });
-      return data.id;
-    } catch (error) {
-      logger.error('[REGRESSION_PLAN_SERVICE] syncSchedule error', {
-        error: error instanceof Error ? error.message : String(error),
-        planId: plan.id,
-      });
-      return plan.scheduleId || null;
+      return existingScheduleId;
     }
+
+    // Create new schedule
+    const { data, error } = await supabaseAdmin
+      .from('test_schedules')
+      .insert({
+        project_id: plan.projectId,
+        user_id: plan.userId,
+        name: `Auto: ${plan.name}`,
+        plan_id: plan.id,
+        cron_expression: cronExpression,
+        timezone,
+        is_active: true,
+        next_run_at: nextRunAt,
+        parameters: {},
+      })
+      .select('id')
+      .single();
+
+    if (error || !data) {
+      logger.error('[REGRESSION_PLAN_SERVICE] Failed to create schedule', { error, planId: plan.id });
+      throw new Error(`Failed to create the plan's schedule: ${error?.message || 'no row returned'}`);
+    }
+
+    logger.info('[REGRESSION_PLAN_SERVICE] Created schedule', {
+      planId: plan.id,
+      scheduleId: data.id,
+      cronExpression,
+    });
+    return data.id;
   }
 
   /**

@@ -169,11 +169,14 @@ export function getPageInsightsArray(bb: ExplorationBlackboard): CartographerIns
 }
 
 /**
- * Get categories covered so far.
+ * Get categories actually covered so far.
+ * Skipped flows (budget exhausted, never executed) do NOT count as coverage —
+ * including them would hide real gaps from the Sentinel.
  */
 export function getCategoriesCovered(bb: ExplorationBlackboard): string[] {
   const categories = new Set<string>();
   for (const flow of bb.completedFlows) {
+    if (flow.status === 'skipped') continue;
     categories.add(flow.category);
   }
   return Array.from(categories);
@@ -190,6 +193,11 @@ export function taskToFlowResult(task: FlowExplorationTask): FlowExecutionResult
     status = 'blocked';
   } else if (task.status === 'timeout') {
     status = 'timeout';
+  } else if (task.status === 'skipped') {
+    // Skipped = never executed (budget exhausted). Must NOT collapse into
+    // 'failed' — otherwise Sentinel counts it as explored coverage and as a
+    // real failure, distorting the score, gaps and risk areas.
+    status = 'skipped';
   } else {
     status = 'failed';
   }
@@ -210,7 +218,9 @@ export function taskToFlowResult(task: FlowExplorationTask): FlowExecutionResult
     canUserHelp: task.canUserHelp,
     progressScore: task.progressScore,
     roundsUsed: task.roundsUsed,
-    finalUrl: task.entryPoint.sourcePageUrl,
+    // Real post-flow URL captured by the runner; fall back to the source page
+    // only when the runner couldn't record it (e.g. infra-failed tasks).
+    finalUrl: task.finalUrl ?? task.entryPoint.sourcePageUrl,
     rawTask: task,
   };
 }

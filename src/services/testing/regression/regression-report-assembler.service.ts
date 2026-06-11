@@ -3,6 +3,7 @@ import {
   getRunByShareToken,
   getTestCaseNamesByIds,
   getTestResultsByTestIds,
+  getMobileTestResultsByTestIds,
   getExecutedStepsByTestIds,
   getNegativeMetaByIds,
   getTestCasePhaseInfoByIds,
@@ -16,12 +17,22 @@ import type {
   RunReport,
   RunReportExecution,
   RunReportStep,
+  RunReportScreenshot,
   RunReportSummary,
   RunReportArtifactsSummary,
   EnrichedBug,
   ExecutionHealthChecks,
   NegativeSummary,
 } from '@/types/testing.types';
+
+/** Format a step event timestamp (ISO/epoch) to HH:MM:SS, or undefined if invalid. */
+function formatClock(ts: unknown): string | undefined {
+  if (typeof ts !== 'string' && typeof ts !== 'number') return undefined;
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return undefined;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 
 export class RegressionReportAssemblerService {
   // =========================================================================
@@ -72,8 +83,14 @@ export class RegressionReportAssemblerService {
     const map = new Map<string, any>();
     if (!testIds.length) return map;
 
-    const rows = await getTestResultsByTestIds(testIds);
-    for (const row of rows) {
+    // Web results live in `test_results`, mobile in `mobile_test_results`. A
+    // given testId belongs to exactly one, so fetch both and merge — otherwise
+    // mobile execs surface with no artifacts/bugs.
+    const [webRows, mobileRows] = await Promise.all([
+      getTestResultsByTestIds(testIds),
+      getMobileTestResultsByTestIds(testIds),
+    ]);
+    for (const row of [...webRows, ...mobileRows]) {
       // Prefer the result that has ai_summary
       const existing = map.get(row.test_id);
       if (!existing || (!existing.ai_summary && row.ai_summary)) {
@@ -241,7 +258,7 @@ export class RegressionReportAssemblerService {
       let execArtifacts: {
         videoUrl?: string;
         traceUrl?: string;
-        screenshots: string[];
+        screenshots: RunReportScreenshot[];
         bugScreenshots: string[];
         consoleLogs: string[];
         networkLogs: Array<{ method: string; url: string; status?: number; durationMs?: number }>;
@@ -281,6 +298,10 @@ export class RegressionReportAssemblerService {
         // we can label setup / main / teardown without touching the
         // executor service. Undefined entries fall back to legacy (no phase).
         const phaseList = phaseMapByTestCaseId.get(exec.testCaseId);
+        // Per-step screenshots with display metadata for the Screenshots tab.
+        // Built here (in the step loop) so the label carries the step name,
+        // capture time, and outcome — not just a bare URL.
+        const stepScreenshots: RunReportScreenshot[] = [];
         for (let i = 0; i < completedSteps.length; i++) {
           const step = completedSteps[i];
           const meta = step.data?.runtimeMeta;
@@ -295,12 +316,29 @@ export class RegressionReportAssemblerService {
           // Phase 3: a failing teardown step is a warning, not a failure —
           // teardown runs best-effort and never flips the overall verdict.
           const isTeardownFailure = !success && phase === 'teardown';
+          const description = step.data?.stepDescription || step.data?.step || `Step ${i + 1}`;
+          // V16: Soft failures (e.g. auto-injected waitFor timeout) are warnings, not errors.
+          // Phase 3: teardown failures are also warnings by contract.
+          const stepStatus: RunReportStep['status'] = success
+            ? 'passed'
+            : (isSoftFailure || isTeardownFailure ? 'warning' : 'failed');
+          const stepScreenshotUrl =
+            typeof meta?.stepScreenshotUrl === 'string' && meta.stepScreenshotUrl
+              ? meta.stepScreenshotUrl
+              : undefined;
+          // Collect a labeled gallery entry: "Step N: <desc>" + HH:MM:SS + outcome.
+          if (stepScreenshotUrl && !stepScreenshotUrl.startsWith('data:')) {
+            stepScreenshots.push({
+              url: stepScreenshotUrl,
+              stepName: `Step ${i + 1}: ${description}`,
+              timestamp: formatClock(step.ts),
+              status: stepStatus,
+            });
+          }
           steps.push({
             index: i + 1,
-            description: step.data?.stepDescription || step.data?.step || `Step ${i + 1}`,
-            // V16: Soft failures (e.g. auto-injected waitFor timeout) are warnings, not errors
-            // Phase 3: teardown failures are also warnings by contract.
-            status: success ? 'passed' : (isSoftFailure || isTeardownFailure ? 'warning' : 'failed'),
+            description,
+            status: stepStatus,
             durationMs: meta?.executionMs,
             error: !success ? {
               message: meta?.failureExplanation || meta?.failedReason || 'Step failed',
@@ -309,6 +347,9 @@ export class RegressionReportAssemblerService {
               rootCause: meta?.rootCause,
               networkVerdict: meta?.networkVerdict,
             } : undefined,
+            // Per-step screenshot (every step, pass or fail) — surfaced inline
+            // in the timeline; the labeled copy lands in the Screenshots tab.
+            ...(stepScreenshotUrl ? { screenshot: stepScreenshotUrl } : {}),
             ...(healed ? { healed: true } : {}),
             ...(typeof meta?.healConfidence === 'number' ? { healConfidence: meta.healConfidence } : {}),
             // Forward self-heal before/after provenance. Only meaningful when
@@ -328,13 +369,13 @@ export class RegressionReportAssemblerService {
           execArtifacts.videoUrl = testResult.video_url || undefined;
           execArtifacts.traceUrl = testResult.trace_url || undefined;
           if (testResult.screenshot) {
-            const screenshots = Array.isArray(testResult.screenshot)
+            const finals = Array.isArray(testResult.screenshot)
               ? testResult.screenshot
               : [testResult.screenshot];
-            // Filter out base64 data — only include URLs
-            execArtifacts.screenshots = screenshots.filter(
-              (s: string) => typeof s === 'string' && !s.startsWith('data:'),
-            );
+            // URLs only (drop base64); label as the final/representative shot.
+            execArtifacts.screenshots = finals
+              .filter((s: string) => typeof s === 'string' && !s.startsWith('data:'))
+              .map((url: string): RunReportScreenshot => ({ url, stepName: 'Final screenshot' }));
           }
           if (testResult.logs) {
             execArtifacts.consoleLogs = Array.isArray(testResult.logs) ? testResult.logs : [];
@@ -360,7 +401,8 @@ export class RegressionReportAssemblerService {
           }
 
           // Aggregate health checks from existing test result data
-          execHealthChecks = HealthCheckAggregatorService.aggregateFromTestResult(testResult);
+          const isMobileExec = typeof exec.platform === 'string' && exec.platform.startsWith('mobile');
+          execHealthChecks = HealthCheckAggregatorService.aggregateFromTestResult(testResult, { isMobile: isMobileExec });
 
           // Aggregate into run-level artifacts
           if (execArtifacts.videoUrl && !aggArtifacts.videoUrl) aggArtifacts.videoUrl = execArtifacts.videoUrl;
@@ -377,6 +419,20 @@ export class RegressionReportAssemblerService {
           }
         }
         aggArtifacts.bugScreenshots.push(...execArtifacts.bugScreenshots);
+
+        // Labeled per-step screenshots → Screenshots artifact tab. Works for
+        // web AND mobile (both append step_completed with stepScreenshotUrl).
+        // Deduped by URL against the final/test_results screenshot collected
+        // above; runs outside the testResult gate so it works even when
+        // test_results has no top-level screenshot.
+        const seenScreenshotUrls = new Set(execArtifacts.screenshots.map((s) => s.url));
+        for (const shot of stepScreenshots) {
+          if (!seenScreenshotUrls.has(shot.url)) {
+            seenScreenshotUrls.add(shot.url);
+            execArtifacts.screenshots.push(shot);
+            aggArtifacts.screenshots.push(shot);
+          }
+        }
 
         // Aggregate quality checks at run level
         if (execArtifacts.qualityChecks) {

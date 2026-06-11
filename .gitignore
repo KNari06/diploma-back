@@ -85,7 +85,9 @@ dist
 
 # Gatsby files
 .cache/
-public
+# Anchored to repo root so it doesn't swallow source dirs named "public"
+# (e.g. src/api/chat/public — the B2C public chat endpoint).
+/public
 
 # Storybook build outputs
 .out
@@ -169,7 +171,9 @@ dist
 
 # Gatsby files
 .cache/
-public
+# Anchored to repo root so it doesn't swallow source dirs named "public"
+# (e.g. src/api/chat/public — the B2C public chat endpoint).
+/public
 
 # Storybook build outputs
 .out
@@ -260,3 +264,8 @@ id_ed25519*
 .claude/launch.json
 .claude/worktrees/
 .claude/scheduled_tasks.lock
+
+# Always track the B2C public chat endpoint source (guards against any
+# broad "public" ignore rule above).
+!src/api/chat/public/
+!src/api/chat/public/**

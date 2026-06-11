@@ -493,37 +493,39 @@ Goal: today's agent sees the context it already collects.
 
 **Exit criterion:** in a manual run, KB chunks and similar bugs appear inside LiteEngine prompts. Verified by grepping JSONL traces for the new `priorKnowledge:` block.
 
-### Phase 1 — Wrap QA execution as tools (5–7 days)
+### Phase 1 — Wrap QA execution as tools (REVISED — mostly already shipped)
 
-> **Pattern reference:** §4.4 MCP tool primitive; §4.3 Letta principle "memory access is a tool". Every layer of the system becomes addressable through a tool the Planner can invoke.
+> **Pattern reference:** §4.4 MCP tool primitive; §4.3 Letta principle "memory access is a tool".
+>
+> **⚠️ REVISED after code audit (see §0.5).** This phase was written in May assuming the QA execution layer was NOT yet tool-addressable. **It now is.** [qa.skill.ts](../../src/services/skills/qa/qa.skill.ts) exposes **~49 tools**, and **12 of the 13** originally-proposed tools already exist. The skill infrastructure the plan wanted to build (confirm/preview gate keyed `chatSessionId:toolName` with 5-min TTL, retry, loop-detection, per-tool timeouts, hook system) is **already in production** in [skill-registry.ts](../../src/services/skills/skill-registry.ts) + [tool-executor.ts](../../src/services/skills/tool-executor.ts). So Phase 1 is **no longer "build tools"** — it is **"wire + fill 2 gaps + teach the planner."**
 
-Goal: collapse the 17-intent switch into something the agent can call.
+#### 1A. What already exists (DO NOT rebuild)
 
-| Step | New file | Implements |
+| Originally proposed | Already shipped as | Evidence |
 |---|---|---|
-| 1.1 | `src/services/skills/qa/qa-execution.skill.ts` | `run_web_test(url, goal, mode)` → wraps `createTest` + `QueueManager.addTestRunJob` ([queues.ts:461](../../src/config/infrastructure/queues.ts)). Returns `{ testId, jobId, correlationId }`. |
-| 1.2 | same file | `run_mobile_test(...)` → uses mobile dispatch path. Wraps `QueueManager.addMobileTestRunJob` ([queues.ts:707](../../src/config/infrastructure/queues.ts)). |
-| 1.3 | same file | `run_api_test(endpoint, level)` → wraps API test service. |
-| 1.4 | same file | `run_regression_by_id(test_case_id)` → wraps `RegressionRunService.runSavedTestCase`. |
-| 1.5 | same file | `run_plan(plan_id)`, `run_module(module_id)`, `run_by_tag(tag)` → wraps `RegressionRunService.runPlan/runModule/runByTag`. |
-| 1.6 | same file | `save_test_case(intent_steps)` → wraps `IntentTestCaseService.create`. |
-| 1.7 | same file | `analyze_failure(test_result_id)` → joins `ai_summary` + `intelligent_test_findings` for one consolidated view. |
-| 1.8 | same file | `wait_for_run(run_id, timeout_ms)` → polls `regression_runs.state` until completed/failed/cancelled. Lets a plan continue after a test finishes. |
-| 1.9 | `src/services/skills/qa/qa-context.skill.ts` | `search_past_bugs(query, projectId)` — promote `searchProjectFindings` from `jira-qa-orchestrator` into a public tool. Fixes **B10** by making `patterns-query.service.ts` the single funnel. |
-| 1.10 | same file | `recall_similar_missions(query, limit=5)` — once missions exist, reads from `missions` table. Returns plan + outcome of nearest past missions. Closes **B11** loop. |
-| 1.11 | `src/services/skills/qa/qa-collab.skill.ts` | `notify_owner(owner_ref, payload)`. `owner_ref` accepts `jira:component:payments` or `codeowner:/checkout` or `user:<id>`. Resolves channel + recipient internally. Replaces hardcoded `#qa-alerts`. Fixes **B3, B6**. |
-| 1.12 | same file | `ask_human(question, urgency, options?)` — emits WS + sends to user's preferred channel (Telegram/Slack/in-app). Resolves on reply via channel webhook. |
-| 1.13 | `src/services/skills/qa/qa-browser.skill.ts` | `escalate_to_vision(step_id)` — Critic-callable when DOM-resolver returned 0 candidates AND `pageMetadata.isDOMWeak=true`. Routes to coordinate-based fallback via existing `visionHints`. Implements R9 level L3→L4 transition. Closes the Documentolog-class regression where canvas/heavy-SPA pages have unreachable elements. |
-| 1.14 | same file | `fill_form(map)` — composite: one call fills N fields, auto-detecting text/select/checkbox/radio/file per field (Stagehand `fillForm` pattern). Cuts an 8-step Planner plan to 1 step. Wraps the existing per-field apply logic in `preview-step-apply`. |
-| 1.15 | same file | `read_pdf_at_url(url)` — detects PDF by **Content-Type** (not URL extension — many SaaS serve `/download?id=X`), fetches via authenticated browser request context (cookies preserved), parses with `pdf-parse`. Closes **B19-adjacent** gap: validating post-action PDF artifacts (invoices, contracts, reports) in B2B flows. |
-| 1.16 | `src/services/skills/qa/qa-auth.skill.ts` | `generate_totp(resource_id)` — given a stored TOTP secret in `test_resources` (new `totp` adapter kind), produces the current 6-digit code. Pairs with existing `wait_for_email` (email OTP) to clear 2FA walls. Fixes **B19**. Secret stored encrypted; code never logged (redaction invariant). |
-| 1.17 | same file | `preview_action(intent)` — R11 Stagehand-style: returns the resolved `{description, method, selector, args}` **without executing**. Powers Stage 2 approval cards (§13.2 screen 4) and any "show me what you'll do" UX. Reuses the dry-run lint path already in `intent-step-lint`. |
-| 1.18 | [manifest.ts](../../src/services/skills/manifest.ts) | Register the five new skill files (`qa-execution`, `qa-context`, `qa-collab`, `qa-browser`, `qa-auth`). |
-| 1.19 | [router-prompt.ts](../../src/api/chat/general/sub-agents/prompts/router-prompt.ts), [planner-prompt.ts](../../src/api/chat/general/sub-agents/prompts/planner-prompt.ts) | Teach Router about category `qa_execution` and Planner about how to compose `run_*` with `wait_for_run` and `notify_owner`. **R12 law 4:** Router must **mask** unavailable tool categories (constrain via prefill), NOT delete them from the tool list mid-session — deleting invalidates the KV-cache and confuses the model. |
+| `run_web_test` / `run_mobile_test` / `run_api_test` | **`qa_run_test`** (`run_type`, mobile auto-routed by platform) | [qa-tool-handlers.ts](../../src/services/skills/qa/qa-tool-handlers.ts) `handleRunTest` |
+| `run_regression_by_id` / `run_plan` / `run_module` / `run_by_tag` | **`qa_run_test`** (`run_type='test_case'|'plan'|'module'|'flow'|'tag'|'priority'`) | wraps `RegressionRunService.runSavedTestCase/runPlan/runModule/runFlow/runByTag/runByPriority` |
+| `save_test_case` | **`qa_create_test_case`** | wraps `IntentTestCaseService.create` |
+| `analyze_failure` | **`qa_analyze_failure`** | — |
+| `wait_for_run` | **`qa_get_run_status`** (poll status) | — |
+| `search_past_bugs` | **`qa_list_test_findings`** + `PatternsQueryService` | — |
+| `escalate_to_vision` / `fill_form` / `preview_action` | covered by existing resolver waterfall + `qa_run_draft_steps` + `intent-step-lint` dry-run | (defer; not blocking) |
 
-**No legacy handler is touched in this phase.** All wrappers run alongside the existing code path under a feature flag (off by default).
+Infra already present: confirm-gate (`skill-registry.ts` `CONFIRM_TTL_MS = 5min`, keyed `chatSessionId:toolName`), retry (`retry.ts`, default 2 + backoff), loop-detection (`hooks/loop-detection.hook.ts` `ToolCallTracker`), per-tool timeout (`sub-agents/tool-constants.ts`, `qa_run_test = 8min`), hook system (`tool-executor.ts` `registerToolHook`). Executor already calls `executeTool(ctx)` ([executor-agent.ts](../../src/api/chat/general/sub-agents/agents/executor-agent.ts)).
 
-**Exit criterion:** with the flag on, a user can type *"запусти регрессию на плане Q2-smoke и пни owner в slack если упадёт"* and the agent composes 3 tool calls in one turn. Verified by Reviewer output `goalAlignment > 0.8`.
+#### 1B. The real work (this is what's left)
+
+| Step | Where | Change | Status |
+|---|---|---|---|
+| 1.1 | `qa-collab.skill.ts` (new) or extend qa.skill | **`ask_human(question, urgency, options?)`** — the ONE genuinely missing primitive. Lets a sub-agent pause mid-mission and resume on a human reply (via WS now; channel webhook after Phase 4). Today clarification only happens through the Responder ending the turn — there's no resumable ask. | ❌ missing |
+| 1.2 | `qa-collab.skill.ts` / extend | **`notify_owner(owner_ref, payload)`** — direct result-driven ping. Today only indirect via `qa_manage_automation_action`. `owner_ref` resolves `jira:component:*` / `codeowner:/path` / `user:<id>` → channel + recipient. | 🟡 partial |
+| 1.3 | [router-prompt.ts](../../src/api/chat/general/sub-agents/prompts/router-prompt.ts), [planner-prompt.ts](../../src/api/chat/general/sub-agents/prompts/planner-prompt.ts) | Teach Router category `qa_execution` and Planner to **compose** `qa_run_test` + `qa_get_run_status` + `notify_owner` in one plan. **R12 law 4:** mask unavailable categories via prefill, never delete mid-session (KV-cache). | ❌ todo |
+| 1.4 | config / feature flag | Flag to allow QA-execution intents (`run_regression`, `run_plan`, `platform_test`, …) to reach `SubAgentPipeline` instead of their hardcoded handlers, so the agent can actually compose. **This is the Phase-1↔Phase-2 hinge** — small slice here, full unification deferred to Phase 2 (which the team may now skip in favor of the router-centric path; decide explicitly). | ❌ todo |
+| 1.5 | `correlation_id` | Thread a mission/correlation id through `qa_run_test` → BullMQ job data → results, so a composed plan can correlate "the run I started" with "the result that came back". Overlaps Phase 0.3. | ❌ todo |
+
+**Exit criterion (revised):** with the flag on, *"запусти регрессию на плане Q2-smoke, дождись результата и пни owner в slack если упадёт"* → agent composes `qa_run_test` + `qa_get_run_status` + `notify_owner` in one turn. Verified by Reviewer `goalAlignment > 0.8`. `ask_human` proven by a mid-run clarification that resumes without losing plan state.
+
+**Deferred from original 1.x (not blocking autonomy now):** `recall_similar_missions` (needs Phase 3 missions table), `read_pdf_at_url`, `generate_totp`/2FA (B19), `fill_form` composite, `preview_action` standalone tool. Re-prioritize after the compose loop works end-to-end.
 
 ### Phase 2 — Unify the pipeline (5–7 days, then canary)
 

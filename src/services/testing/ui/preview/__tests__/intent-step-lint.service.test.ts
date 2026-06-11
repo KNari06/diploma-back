@@ -164,17 +164,13 @@ describe('isEvidenceShortcutNodeCompatible', () => {
   // Select action validation
   // ═══════════════════════════════════════════════════════════════════════════
 
+  // Select is NOT native-only: the executor (command-executor / action-executor)
+  // detects native <select> vs custom dropdown and uses click-based selection for
+  // the latter. So lint accepts native <select>, ARIA combobox/listbox, any
+  // aria-expanded trigger, and the soft tags (button/div/span/input/a/li) that
+  // frameworks commonly render dropdowns as. Only genuinely non-dropdown elements
+  // are rejected with `select_action_requires_dropdown_element`.
   describe('Select action', () => {
-    it('should reject select action on <input> element', () => {
-      const step = makeStep('select');
-      const node = makeNode({ tag: 'input' });
-
-      const result = isEvidenceShortcutNodeCompatible(step, node, PAGE_URL);
-
-      expect(result.ok).toBe(false);
-      expect(result.reason).toContain('select_action_requires_native_select');
-    });
-
     it('should accept select action on <select> element', () => {
       const step = makeStep('select');
       const node = makeNode({ tag: 'select' });
@@ -184,24 +180,43 @@ describe('isEvidenceShortcutNodeCompatible', () => {
       expect(result.ok).toBe(true);
     });
 
-    it('should reject select action on custom combobox role element', () => {
+    it('should accept select action on custom combobox role element', () => {
       const step = makeStep('select');
       const node = makeNode({ tag: 'div', role: 'combobox' });
 
       const result = isEvidenceShortcutNodeCompatible(step, node, PAGE_URL);
 
-      expect(result.ok).toBe(false);
-      expect(result.reason).toContain('select_action_requires_native_select');
+      expect(result.ok).toBe(true);
     });
 
-    it('should reject select action on listbox role element', () => {
+    it('should accept select action on listbox role element', () => {
       const step = makeStep('select');
       const node = makeNode({ tag: 'ul', role: 'listbox' });
 
       const result = isEvidenceShortcutNodeCompatible(step, node, PAGE_URL);
 
+      expect(result.ok).toBe(true);
+    });
+
+    it('should accept select action on <input> element (searchable-combobox trigger)', () => {
+      const step = makeStep('select');
+      const node = makeNode({ tag: 'input' });
+
+      const result = isEvidenceShortcutNodeCompatible(step, node, PAGE_URL);
+
+      expect(result.ok).toBe(true);
+    });
+
+    it('should reject select action on non-dropdown element', () => {
+      const step = makeStep('select');
+      // <p> is not a native select, has no combobox/listbox role, no aria-expanded,
+      // and is not one of the soft dropdown-trigger tags — so it falls through to reject.
+      const node = makeNode({ tag: 'p', isInteractive: true });
+
+      const result = isEvidenceShortcutNodeCompatible(step, node, PAGE_URL);
+
       expect(result.ok).toBe(false);
-      expect(result.reason).toContain('select_action_requires_native_select');
+      expect(result.reason).toContain('select_action_requires_dropdown_element');
     });
   });
 

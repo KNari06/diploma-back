@@ -92,10 +92,24 @@ export interface EnrichResult {
  * result and are lifted into IntentResult.metadata + targetSelector/
  * executionModifiers downstream.
  */
-export function buildUnderstandingExtension(): string {
+export function buildUnderstandingExtension(nowContext?: {
+  nowIso: string;
+  timezone: string;
+}): string {
+  // When available, give the model an absolute "now" + the user's timezone so
+  // it can resolve relative one-time datetimes ("tomorrow 14:30", "in 2 hours")
+  // into an offset-aware ISO instant for analysis.manage.runAt. Without this the
+  // model has no anchor and must omit runAt.
+  const nowBlock = nowContext
+    ? `
+CURRENT TIME: ${nowContext.nowIso} (user timezone: ${nowContext.timezone}).
+Use this as the anchor when resolving relative dates/times to an absolute instant.
+`
+    : '';
+
   return `
 --- REQUEST UNDERSTANDING (ADDITIONAL FIELDS) ---
-
+${nowBlock}
 Beyond classifying the intent, ANALYZE the message and add these fields to the SAME JSON object.
 Think about what the user actually wants — do NOT pattern-match on words.
 
@@ -150,8 +164,16 @@ Think about what the user actually wants — do NOT pattern-match on words.
      • action: the operation — schedule: create|update|activate|deactivate|delete;
        module: create|update; plan: create|update|add_item|remove_item.
      • name: entity name when stated ("a plan called Auth Smoke" → "Auth Smoke").
-     • cronExpression: for schedules, a cron string when derivable ("every day at
-       9am" → "0 9 * * *"); else omit and let the handler ask.
+     • cronExpression: for a RECURRING schedule, a cron string when derivable
+       ("every day at 9am" → "0 9 * * *"); else omit and let the handler ask.
+     • runAt: for a ONE-TIME schedule (fires once at an absolute moment, e.g.
+       "run the smoke plan tomorrow at 14:30", "schedule it for June 10 2pm",
+       "in 2 hours"), an offset-aware ISO-8601 instant resolved against CURRENT
+       TIME above (e.g. "2026-06-10T14:30:00+05:00"). Provide cronExpression OR
+       runAt, NEVER both: recurring wording ("every", "daily", "each Monday") →
+       cronExpression; one-off wording ("tomorrow", "on <date>", "once", "at
+       <specific datetime>") → runAt. Omit runAt if you cannot resolve a concrete
+       instant (no CURRENT TIME given, or the time is ambiguous) — let the handler ask.
      • timezone: IANA tz when stated ("Almaty time" → "Asia/Almaty").
      • planName / moduleName: the plan/module the op targets, by name.
      • platformKey: module platform — web_ui | api | mobile.
@@ -220,7 +242,7 @@ export function buildEnrichPrompt(params: {
   candidates: EnrichInputCandidate[];
   session: EnrichSessionContext;
   missingModifiers?: Array<keyof ExecutionModifiers>;
-  userLanguage?: 'en' | 'ru' | 'neutral';
+  userLanguage?: 'en' | 'ru' | 'kk' | 'neutral';
 }): string {
   const { message, descriptor, candidates, session, missingModifiers } = params;
 

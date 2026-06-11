@@ -411,10 +411,12 @@ export class AnalyticsQueryService {
           filters.endDate
         ),
 
-        // Next schedule — use maybeSingle() to avoid error when no rows
+        // Next schedule — use maybeSingle() to avoid error when no rows.
+        // Pull schedule_type + run_at so a one_time schedule (cron_expression
+        // null) can still be described by the consumer instead of rendering blank.
         supabaseAdmin
           .from('test_schedules')
-          .select('cron_expression, next_run_at, last_run_at')
+          .select('schedule_type, cron_expression, run_at, next_run_at, last_run_at')
           .in('project_id', projectIds)
           .eq('is_active', true)
           .order('next_run_at', { ascending: true })
@@ -523,6 +525,15 @@ export class AnalyticsQueryService {
       byPlatform.api.passed = apiTestsPassed;
       byPlatform.api.failed = apiTestsFailed;
 
+      // Trend deltas: last 30d vs the prior 30d. Computed independently of the
+      // all-time headline numbers above (which never change meaning). Best-effort
+      // — a failure here must not break the summary, so it's wrapped and falls
+      // back to `undefined` (UI hides the pills).
+      const trend = await this.computeTrend(filters, platform).catch((err) => {
+        logger.warn('[ANALYTICS] trend computation failed (non-fatal)', { err });
+        return undefined;
+      });
+
       const result: SummaryData = {
         summary: {
           testStepsRun,
@@ -534,6 +545,7 @@ export class AnalyticsQueryService {
           apiTestsRun: apiTestsRun > 0 ? apiTestsRun : undefined,
           apiTestsPassed: apiTestsRun > 0 ? apiTestsPassed : undefined,
           apiTestsFailed: apiTestsRun > 0 ? apiTestsFailed : undefined,
+          trend,
         },
         status: {
           state,
@@ -541,7 +553,9 @@ export class AnalyticsQueryService {
           lastRunAt,
           nextSchedule: schedule
             ? {
-                cronExpression: schedule.cron_expression,
+                scheduleType: (schedule.schedule_type as 'recurring' | 'one_time') || 'recurring',
+                cronExpression: schedule.cron_expression ?? null,
+                runAt: schedule.run_at ?? null,
                 nextRunAt: schedule.next_run_at,
               }
             : null,
@@ -565,6 +579,119 @@ export class AnalyticsQueryService {
       logger.error('[ANALYTICS] Failed to get summary', { error, filters });
       throw error;
     }
+  }
+
+  /**
+   * Compute the 4 trend KPIs (totalRuns / failedRuns / flakySteps / passRate)
+   * for a single explicit [start, end] window. Deliberately lightweight: only
+   * the two queries those KPIs need (regression runs + UI/API executions),
+   * reusing the same context/platform/flaky helpers as getSummary so the math
+   * can't drift from the headline numbers.
+   *
+   * Returns null when the window has no runs — the caller treats that as
+   * "no comparable data" and omits the delta (avoids a fake 0%).
+   */
+  private static async computeWindowKpis(
+    base: AnalyticsFilters,
+    platform: AnalyticsPlatformFilter,
+    startDate: Date,
+    endDate: Date,
+  ): Promise<{ totalRuns: number; failedRuns: number; flakySteps: number; passRate: number } | null> {
+    const { projectIds, runIds } = await this.getWorkspaceRunContext(
+      base.workspaceId, base.projectId, startDate, endDate,
+    );
+    if (projectIds.length === 0) return null;
+
+    const runUiQuery = this.wantsUiData(platform) && runIds.length > 0;
+
+    // Only the two queries the trend KPIs need. NOTE: API-test executions are
+    // intentionally NOT fetched here — the headline `passRate`/`failedRuns` in
+    // getSummary are derived from UI `test_executions` only, so the trend must
+    // use the same basis or the pill would drift from the number it annotates.
+    const [executionsResult, runsResult] = await Promise.all([
+      runUiQuery
+        ? (() => {
+            const q = supabaseAdmin
+              .from('test_executions')
+              .select('status, run_id, test_case_id, platform')
+              .in('run_id', runIds);
+            return this.applyPlatformFilter(q, platform);
+          })()
+        : Promise.resolve({ data: [], error: null }),
+      supabaseAdmin
+        .from('regression_runs')
+        .select('id, status')
+        .in('project_id', projectIds)
+        .gte('started_at', startDate.toISOString())
+        .lte('started_at', endDate.toISOString()),
+    ]);
+
+    const executions: any[] = (executionsResult.data as any[]) || [];
+    const runs = runsResult.data || [];
+
+    // Mirror getSummary exactly (lines ~446-460):
+    //   totalRuns   = regression_runs in window
+    //   failedRuns  = distinct run_ids with ≥1 failed execution
+    //   flakySteps  = calculateFlakySteps(executions)
+    //   passRate    = passedSteps / (passedSteps + failedSteps), UI steps only
+    const totalRuns = runs.length;
+    const failedRuns = new Set(
+      executions.filter((e) => e.status === 'failed').map((e) => e.run_id),
+    ).size;
+    const flakySteps = this.calculateFlakySteps(executions);
+
+    const passedSteps = executions.filter((e) => e.status === 'passed').length;
+    const failedSteps = executions.filter((e) => e.status === 'failed').length;
+    const completed = passedSteps + failedSteps;
+    const passRate = completed > 0
+      ? Math.round((passedSteps / completed) * 100 * 10) / 10
+      : 0;
+
+    if (totalRuns === 0 && completed === 0) return null;
+    return { totalRuns, failedRuns, flakySteps, passRate };
+  }
+
+  /**
+   * Last 30 days vs the prior 30 days → signed % deltas for the trend pills.
+   * Returns undefined when the prior window has no comparable data, so the UI
+   * hides the pill instead of rendering a misleading 0%.
+   */
+  private static async computeTrend(
+    base: AnalyticsFilters,
+    platform: AnalyticsPlatformFilter,
+  ): Promise<SummaryData['summary']['trend']> {
+    const DAY = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const curStart = new Date(now - 30 * DAY);
+    const curEnd = new Date(now);
+    const prevStart = new Date(now - 60 * DAY);
+    // Exclusive end (curStart − 1ms): the window query uses inclusive `.lte`,
+    // so sharing the exact `curStart` instant would double-count a run landing
+    // on that boundary in both windows.
+    const prevEnd = new Date(curStart.getTime() - 1);
+
+    const [cur, prev] = await Promise.all([
+      this.computeWindowKpis(base, platform, curStart, curEnd),
+      this.computeWindowKpis(base, platform, prevStart, prevEnd),
+    ]);
+
+    // No baseline → no honest comparison.
+    if (!cur || !prev) return undefined;
+
+    // Signed % change, rounded to one decimal. When the previous value is 0 we
+    // can't express a percentage (division by zero), so that field is omitted.
+    const pct = (current: number, previous: number): number | undefined => {
+      if (previous === 0) return undefined;
+      return Math.round(((current - previous) / previous) * 100 * 10) / 10;
+    };
+
+    return {
+      totalRunsDeltaPct: pct(cur.totalRuns, prev.totalRuns),
+      failedRunsDeltaPct: pct(cur.failedRuns, prev.failedRuns),
+      flakyStepsDeltaPct: pct(cur.flakySteps, prev.flakySteps),
+      // Relative % change, like the other deltas (UI shows a "%" suffix for all).
+      passRateDeltaPct: pct(cur.passRate, prev.passRate),
+    };
   }
 
   /**

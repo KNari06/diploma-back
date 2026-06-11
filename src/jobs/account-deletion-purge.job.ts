@@ -13,13 +13,15 @@
  * Where this runs
  * ──────────────────────────────────────────────────────────────────────
  *
- * Bootstrapped exclusively from `src/scheduler/index.ts` — the dedicated
- * single-instance "scheduler" Cloud Run service. Do NOT start it from
- * `src/index.ts` (the auto-scaled API service): Cloud Run will run N
- * replicas of the API in production, and N concurrent `setInterval`
- * sweeps would (a) issue duplicate `ACCOUNT_DELETION_COMPLETED` audit
- * entries per user, (b) waste storage round-trips, and (c) thrash the
- * `auth.users` admin-delete on already-purged rows.
+ * Bootstrapped from the scheduler bundle ONLY: `src/scheduler/index.ts` (the
+ * dedicated local "scheduler" container) or, in prod, the worker behind the
+ * Redis leader lock in `src/scheduler/leader.ts` (`SCHEDULER_IN_WORKER=true`).
+ * This job has NO cross-instance dedupe of its own, so the leader lock is what
+ * guarantees a single live sweep when the worker scales to N replicas. Do NOT
+ * start it from `src/index.ts` (the auto-scaled API) or anywhere outside that
+ * lock: N concurrent `setInterval` sweeps would (a) issue duplicate
+ * `ACCOUNT_DELETION_COMPLETED` audit entries per user, (b) waste storage
+ * round-trips, and (c) thrash the `auth.users` admin-delete on already-purged rows.
  *
  * ──────────────────────────────────────────────────────────────────────
  * Why setInterval and not a BullMQ repeatable

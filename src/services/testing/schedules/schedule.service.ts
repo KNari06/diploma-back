@@ -28,6 +28,7 @@ export class ScheduleService {
       userId,
       name,
       cronExpression,
+      runAt,
       timezone,
       moduleId,
       planId,
@@ -40,20 +41,31 @@ export class ScheduleService {
       throw new Error('Exactly one of moduleId or planId must be set');
     }
 
-    // Defence-in-depth: refuse to persist an unparseable cron. The
-    // controllers also validate, but other internal callers (e.g.
-    // RegressionPlanService.syncSchedule) may bypass them and we don't
-    // want a bad row that fires every hour forever via the fallback in
-    // calculateNextRun.
-    if (!this.parseCron(cronExpression)) {
-      throw new Error(`Invalid cron expression: "${cronExpression}"`);
+    // Timing: exactly one of cronExpression (recurring) or runAt (one_time).
+    // Mirrors the exactly-one-target guard above.
+    const isOneTime = !!runAt;
+    if (!!cronExpression === isOneTime) {
+      throw new Error('Provide exactly one of cronExpression or runAt');
+    }
+
+    // Defence-in-depth: refuse to persist a bad timing value. The controllers
+    // also validate, but other internal callers (e.g. RegressionPlanService.
+    // syncSchedule) may bypass them and we don't want a row that misfires.
+    let nextRunAt: string;
+    if (isOneTime) {
+      nextRunAt = this.parseFutureRunAt(runAt as string);
+    } else {
+      if (!this.parseCron(cronExpression as string)) {
+        throw new Error(`Invalid cron expression: "${cronExpression}"`);
+      }
+      nextRunAt = this.calculateNextRun(cronExpression as string, timezone || 'UTC');
     }
 
     // Verify the target exists AND the user may access it. Without this a
     // schedule could be created against a foreign/non-existent module or plan;
     // it would then fail at run time and self-deactivate with a misleading
     // message — and it's an authorization gap (scheduling someone else's target).
-    // Runs AFTER cron validation so a bad cron returns its precise error first.
+    // Runs AFTER timing validation so a bad cron/runAt returns its precise error first.
     const ownsTarget = await this.userOwnsTarget(userId, { moduleId, planId });
     if (!ownsTarget) {
       throw new Error(
@@ -65,11 +77,10 @@ export class ScheduleService {
       projectId,
       userId,
       name,
-      cronExpression,
+      scheduleType: isOneTime ? 'one_time' : 'recurring',
+      cronExpression: isOneTime ? undefined : cronExpression,
+      runAt: isOneTime ? nextRunAt : undefined,
     });
-
-    // Calculate next run time
-    const nextRunAt = this.calculateNextRun(cronExpression, timezone || 'UTC');
 
     const { data, error } = await supabaseAdmin
       .from('test_schedules')
@@ -77,7 +88,9 @@ export class ScheduleService {
         project_id: projectId,
         user_id: userId,
         name,
-        cron_expression: cronExpression,
+        schedule_type: isOneTime ? 'one_time' : 'recurring',
+        cron_expression: isOneTime ? null : cronExpression,
+        run_at: isOneTime ? nextRunAt : null,
         timezone: timezone || 'UTC',
         module_id: moduleId || null,
         plan_id: planId || null,
@@ -152,29 +165,59 @@ export class ScheduleService {
    * @returns Updated schedule
    */
   static async update(params: UpdateTestScheduleParams): Promise<TestSchedule> {
-    const { id, userId, name, cronExpression, timezone, parameters, isActive } = params;
+    const { id, userId, name, cronExpression, runAt, timezone, parameters, isActive } = params;
 
-    // Defence-in-depth — controllers also validate cron, but other internal
-    // callers may bypass them. Refuse to persist an unparseable cron.
+    // Timing fields are mutually exclusive, same as create(). Sending both
+    // would leave the row violating check_schedule_mode no matter how we
+    // reconcile — reject it up front with a clear message instead of letting
+    // the DB raise an opaque constraint error.
+    if (cronExpression !== undefined && runAt !== undefined) {
+      throw new Error('Provide at most one of cronExpression or runAt, not both');
+    }
+
+    // Defence-in-depth — controllers also validate, but other internal
+    // callers may bypass them. Refuse to persist an unparseable cron / bad runAt.
     if (cronExpression !== undefined && !this.parseCron(cronExpression)) {
       throw new Error(`Invalid cron expression: "${cronExpression}"`);
+    }
+    let runAtIso: string | undefined;
+    if (runAt !== undefined) {
+      runAtIso = this.parseFutureRunAt(runAt);
     }
 
     const updates: Record<string, any> = {};
     if (name !== undefined) updates.name = name;
-    if (cronExpression !== undefined) updates.cron_expression = cronExpression;
     if (timezone !== undefined) updates.timezone = timezone;
     if (parameters !== undefined) updates.parameters = parameters;
     if (isActive !== undefined) updates.is_active = isActive;
 
-    // Recalculate next run if cron or timezone changed
-    if (cronExpression !== undefined || timezone !== undefined) {
-      // Get current values if not provided
+    // Switching to / staying one_time: write ALL four mode columns consistently
+    // (schedule_type, run_at, cron_expression=null, next_run_at) so the row
+    // satisfies check_schedule_mode even when the previous mode was recurring.
+    if (runAtIso !== undefined) {
+      updates.schedule_type = 'one_time';
+      updates.run_at = runAtIso;
+      updates.cron_expression = null;
+      updates.next_run_at = runAtIso;
+      // Re-arm: supplying a fresh future runAt is an explicit intent to schedule
+      // another run, so reactivate a row that a prior fire deactivated — unless
+      // the caller is simultaneously setting isActive explicitly (respect that).
+      if (isActive === undefined) updates.is_active = true;
+    } else if (cronExpression !== undefined) {
+      // Switching to / staying recurring: mirror image. Recompute next_run_at
+      // from the new cron (+ new or existing timezone).
+      const current = timezone === undefined ? await this.getById(id, userId) : null;
+      const tz = timezone ?? current?.timezone ?? 'UTC';
+      updates.schedule_type = 'recurring';
+      updates.cron_expression = cronExpression;
+      updates.run_at = null;
+      updates.next_run_at = this.calculateNextRun(cronExpression, tz);
+    } else if (timezone !== undefined) {
+      // Timezone-only change. Recompute next_run_at ONLY for a recurring row;
+      // a one_time row's next_run_at is an absolute instant unaffected by tz.
       const current = await this.getById(id, userId);
-      if (current) {
-        const cron = cronExpression || current.cronExpression;
-        const tz = timezone || current.timezone;
-        updates.next_run_at = this.calculateNextRun(cron, tz);
+      if (current && current.scheduleType === 'recurring' && current.cronExpression) {
+        updates.next_run_at = this.calculateNextRun(current.cronExpression, timezone);
       }
     }
 
@@ -233,6 +276,18 @@ export class ScheduleService {
    * @returns Updated schedule
    */
   static async activate(id: string, userId: string): Promise<TestSchedule> {
+    // A one_time schedule that already fired was deactivated by claimDueSchedule
+    // with next_run_at = null (run_at is left intact as a record of when it ran).
+    // Flipping is_active back to true would NOT make it run again — getDueSchedules
+    // requires next_run_at <= now, and NULL never matches — so the user would
+    // silently see an "active" schedule that never fires. Reject with guidance to
+    // re-arm it via a fresh runAt instead.
+    const current = await this.getById(id, userId);
+    if (current && current.scheduleType === 'one_time' && !current.nextRunAt) {
+      throw new Error(
+        'This one-time schedule has already run and cannot be re-activated. Update it with a new runAt to schedule another run.'
+      );
+    }
     return this.update({ id, userId, isActive: true });
   }
 
@@ -273,6 +328,7 @@ export class ScheduleService {
         scheduleId: row.id,
         projectId: row.project_id,
         userId: row.user_id,
+        scheduleType: (row.schedule_type as 'recurring' | 'one_time') || 'recurring',
         parameters: row.parameters || {},
       };
       if (row.module_id) {
@@ -298,13 +354,33 @@ export class ScheduleService {
 
     const { data: schedule, error: fetchError } = await supabaseAdmin
       .from('test_schedules')
-      .select('cron_expression, timezone')
+      .select('schedule_type, cron_expression, timezone')
       .eq('id', id)
       .single();
 
     if (fetchError || !schedule) {
       logger.error('[SCHEDULE_SERVICE] Failed to fetch schedule for update', { error: fetchError, id });
       return false;
+    }
+
+    // One-time schedule: fires exactly once, then deactivate so it never
+    // re-appears in getDueSchedules(). The is_active=true + next_run_at<=now
+    // WHERE clause is the same atomic single-claim guard as the cron path —
+    // a second instance that lost the race matches 0 rows and returns false.
+    if (schedule.schedule_type === 'one_time') {
+      const { data: claimed, error: claimError } = await supabaseAdmin
+        .from('test_schedules')
+        .update({ last_run_at: nowIso, is_active: false, next_run_at: null })
+        .eq('id', id)
+        .eq('is_active', true)
+        .lte('next_run_at', nowIso)
+        .select('id');
+
+      if (claimError) {
+        logger.error('[SCHEDULE_SERVICE] Failed to claim one-time schedule', { error: claimError, id });
+        return false;
+      }
+      return Array.isArray(claimed) ? claimed.length > 0 : !!claimed;
     }
 
     const nextRunAt = this.calculateNextRunOrNull(
@@ -386,6 +462,68 @@ export class ScheduleService {
     return next;
   }
 
+  /**
+   * True if an ISO-8601 datetime string carries an explicit UTC offset — a
+   * trailing `Z` or a `±HH:MM` / `±HHMM` suffix on the time part. Offset-naive
+   * strings (e.g. "2026-06-10T14:30:00") are rejected because JS parses them as
+   * server-local time, which would silently anchor a one_time run to the
+   * server's timezone. Public so the controller validates with the SAME rule.
+   */
+  static hasUtcOffset(value: string): boolean {
+    // Match the offset only AFTER the time component, so a date-only "2026-06-10"
+    // (no time) doesn't falsely pass and a date's "-" separators aren't read as
+    // an offset sign.
+    return /T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/.test(value.trim());
+  }
+
+  /**
+   * Validate a one_time runAt: offset-aware, parseable, strictly in the future.
+   * Returns the normalized absolute UTC ISO string. Throws on any failure.
+   * Single source of truth for create() + update() (controller mirrors hasUtcOffset).
+   */
+  static parseFutureRunAt(runAt: string): string {
+    if (!this.hasUtcOffset(runAt)) {
+      throw new Error(
+        `runAt must include a timezone offset (a trailing "Z" or "±HH:MM"): "${runAt}"`
+      );
+    }
+    const t = Date.parse(runAt);
+    if (Number.isNaN(t)) {
+      throw new Error(`Invalid runAt: "${runAt}" (expected an ISO-8601 datetime)`);
+    }
+    if (t <= Date.now()) {
+      throw new Error('runAt must be in the future');
+    }
+    return new Date(t).toISOString();
+  }
+
+  /**
+   * Format an absolute ISO instant into a human-readable wall-clock string in
+   * the given timezone, e.g. "Jun 10, 2026, 2:30 PM (Asia/Almaty)". Falls back
+   * to the raw value if it can't be parsed/formatted, so callers never throw.
+   * Used for chat confirmation/success messages so users see a readable date
+   * instead of a raw ISO string.
+   */
+  static formatRunAtForHuman(runAt: string, timezone?: string): string {
+    const t = Date.parse(runAt);
+    if (Number.isNaN(t)) return runAt;
+    const tz = this.resolveTimezone(timezone || 'UTC');
+    try {
+      const formatted = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz,
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+      }).format(new Date(t));
+      return `${formatted} (${tz})`;
+    } catch {
+      return runAt;
+    }
+  }
+
   // Like calculateNextRun but returns null instead of throwing when the cron is
   // unsatisfiable. The scheduler uses this to deactivate impossible schedules
   // without try/catch; create/update go through the throwing wrapper above.
@@ -418,8 +556,17 @@ export class ScheduleService {
     // Scan up to 1500 days (>4 years) so legitimate leap-day crons ("0 9 29 2 *")
     // resolve to the next real Feb 29 (up to ~1461 days out) instead of being
     // misclassified as unsatisfiable.
+    //
+    // Enumerate candidate LOCAL days, not raw 24h UTC steps. Stepping by exactly
+    // 24h UTC drifts against local calendar days across DST: a 23h spring-forward
+    // local day gets skipped entirely (annual missed run for a late-hour cron),
+    // and a 25h fall-back day double-counts. Anchor at the local date of `now`
+    // and advance by calendar days (via UTC-noon arithmetic, which never lands
+    // in a DST gap), then read the local parts of that noon instant.
+    const nowParts = this.datePartsInTimezone(now, tz);
+    const baseNoonUtc = Date.UTC(nowParts.year, nowParts.month - 1, nowParts.day, 12, 0, 0);
     for (let dayOffset = 0; dayOffset <= 1500; dayOffset++) {
-      const candidate = new Date(now.getTime() + dayOffset * 24 * 60 * 60 * 1000);
+      const candidate = new Date(baseNoonUtc + dayOffset * 24 * 60 * 60 * 1000);
       const candidateParts = this.datePartsInTimezone(candidate, tz);
 
       if (!months.has(candidateParts.month)) continue;
@@ -626,30 +773,43 @@ export class ScheduleService {
   ): Date {
     const guess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0, 0));
     const guessParts = this.datePartsInTimezone(guess, tz);
-    const guessMinutes = guessParts.hour * 60 + guessParts.minute;
-    const targetMinutes = hour * 60 + minute;
-    const diffMinutes = guessMinutes - targetMinutes;
+    // The diff MUST include the calendar-day component, not just hour:minute.
+    // For a late local hour in a positive-offset tz the guess's wall clock rolls
+    // into the NEXT local day (a 21:30 Asia/Almaty guess shows 02:30 tomorrow);
+    // an hour:minute-only diff then reads UTC+5 as UTC-19 and the result lands
+    // exactly 24h late. Symmetric for early hours in a negative-offset tz
+    // (guess shows the PREVIOUS local day → result lands 24h early, which also
+    // mislabels dow-restricted crons). Comparing full date parts as naive-UTC
+    // timestamps yields the true offset for any tz, including beyond ±12.
+    const guessAsNaiveUtc = Date.UTC(
+      guessParts.year,
+      guessParts.month - 1,
+      guessParts.day,
+      guessParts.hour,
+      guessParts.minute
+    );
+    const diffMinutes = (guessAsNaiveUtc - guess.getTime()) / 60000;
     const result = new Date(guess.getTime() - diffMinutes * 60 * 1000);
 
     // DST spring-forward gap guard.
-    //   On the DST-forward day in a behind-UTC tz (e.g. NY 2026-03-08
-    //   2:30 AM doesn't exist — the clock jumps 2:00 → 3:00), the
-    //   single-step Newton correction above lands one DAY too early
-    //   instead of one HOUR too late. Detect by checking that the
-    //   resulting UTC instant still maps back to the SAME calendar
-    //   day in the target tz. If it doesn't, the requested wall-clock
-    //   time is non-existent — return EPOCH so the caller's
-    //   `targetUtc > now` comparison fails and the dayOffset loop
-    //   advances to the next day (where the cron rule may fire at
-    //   the same hour:minute, valid by then).
+    //   On the DST-forward day (e.g. NY 2026-03-08 2:30 AM doesn't exist — the
+    //   clock jumps 2:00 → 3:00), the requested wall-clock time is non-existent;
+    //   the single-step Newton correction can't land on it. Detect that by
+    //   verifying the result maps back to the requested HOUR:MINUTE in the
+    //   target tz. If it doesn't, the local time is non-existent — return EPOCH
+    //   so `targetUtc > now` fails and the dayOffset loop advances (POSIX cron
+    //   SKIPS non-existent local times rather than firing twice).
     //
-    //   We intentionally don't try to "round forward" to 3:00 AM:
-    //   POSIX cron behaviour is to SKIP non-existent local times, and
-    //   that's what users expect (a daily 2:30 AM cron fires every day
-    //   except the one DST day per year — better than two runs on the
-    //   fall-back day).
+    //   IMPORTANT: verify HOUR:MINUTE, NOT the calendar day. A correct result
+    //   legitimately rolls to the next calendar day for late hours in a positive
+    //   UTC offset (e.g. 23:00 Asia/Almaty = 18:00 UTC, which is the *next* day
+    //   in UTC terms after the Newton step). The old `verify.day !== day` check
+    //   false-positived on EVERY such time, returning EPOCH → the whole cron was
+    //   misclassified "unsatisfiable" → schedules at hour ≥ (24 - offset) in any
+    //   ahead-of-UTC tz (incl. Asia/Almaty UTC+5, so any time ≥ 19:00) silently
+    //   never got created. That was the root cause of "I set 23:00 and nothing runs".
     const verify = this.datePartsInTimezone(result, tz);
-    if (verify.day !== day || verify.month !== month) {
+    if (verify.hour !== hour || verify.minute !== minute) {
       return new Date(0);
     }
     return result;
@@ -704,7 +864,9 @@ export class ScheduleService {
       name: row.name,
       moduleId: row.module_id || undefined,
       planId: row.plan_id || undefined,
-      cronExpression: row.cron_expression,
+      scheduleType: (row.schedule_type as 'recurring' | 'one_time') || 'recurring',
+      cronExpression: row.cron_expression || undefined,
+      runAt: row.run_at || undefined,
       timezone: row.timezone,
       isActive: row.is_active,
       parameters: row.parameters || {},

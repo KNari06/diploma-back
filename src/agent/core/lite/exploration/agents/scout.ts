@@ -19,19 +19,19 @@
 
 import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
-import { AI_MODELS } from '@/config/ai/ai-models.config';
 
 import { RateLimiter } from '../rate-limiter';
 import type { ExplorationTraceService } from '../exploration-trace.service';
 import type { ScoutInput, ScoutOutput, ScoutDiscovery } from './agent-types';
+import { EXPLORATION_AGENT_LLM } from './agent-llm-config';
 import {
   SCOUT_SYSTEM_PROMPT,
   buildScoutPrompt,
   parseScoutResponse,
 } from './scout-prompts';
 
-/** Timeout for Scout AI call */
-const SCOUT_TIMEOUT_MS = 20_000;
+/** Centralized LLM tuning for this agent (model / temp / tokens / timeout). */
+const LLM = EXPLORATION_AGENT_LLM.scout;
 
 export class Scout {
   constructor(
@@ -72,7 +72,7 @@ export class Scout {
 
       this.trace?.writeBranchDetectionPrompt({
         entryPointId: completedFlow.name,
-        model: AI_MODELS.fast,
+        model: LLM.model,
         systemPrompt: SCOUT_SYSTEM_PROMPT,
         userPrompt: prompt,
       });
@@ -86,14 +86,14 @@ export class Scout {
             { role: 'user', content: prompt },
           ],
           {
-            model: AI_MODELS.fast,
-            temperature: 0.1,
-            max_tokens: 1500,
+            model: LLM.model,
+            temperature: LLM.temperature,
+            max_tokens: LLM.maxTokens,
             response_format: { type: 'json_object' },
           },
         ),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Scout AI timeout')), SCOUT_TIMEOUT_MS),
+          setTimeout(() => reject(new Error('Scout AI timeout')), LLM.timeoutMs),
         ),
       ]);
 
@@ -103,7 +103,7 @@ export class Scout {
 
       this.trace?.writeBranchDetectionResponse({
         entryPointId: completedFlow.name,
-        model: AI_MODELS.fast,
+        model: LLM.model,
         rawResponse: response.content,
         parsedBranches: result.newEntryPoints.map((ep) => ({
           name: ep.name,

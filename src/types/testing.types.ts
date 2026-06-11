@@ -307,6 +307,8 @@ export interface UpdateTestFlowParams {
 /**
  * Test schedule - cron-based scheduling for test runs
  */
+export type ScheduleType = 'recurring' | 'one_time';
+
 export interface TestSchedule {
   id: string;
   projectId: string;
@@ -314,7 +316,10 @@ export interface TestSchedule {
   name: string;
   moduleId?: string;
   planId?: string;
-  cronExpression: string;
+  // recurring: set; one_time: undefined (use runAt instead).
+  scheduleType: ScheduleType;
+  cronExpression?: string;
+  runAt?: string;
   timezone: string;
   isActive: boolean;
   parameters: Record<string, any>;
@@ -324,13 +329,15 @@ export interface TestSchedule {
 }
 
 /**
- * Params for creating a test schedule
+ * Params for creating a test schedule.
+ * Provide exactly one of cronExpression (recurring) or runAt (one_time).
  */
 export interface CreateTestScheduleParams {
   projectId: string;
   userId: string;
   name: string;
-  cronExpression: string;
+  cronExpression?: string;
+  runAt?: string;
   timezone?: string;
   moduleId?: string;
   planId?: string;
@@ -345,6 +352,7 @@ export interface UpdateTestScheduleParams {
   userId: string;
   name?: string;
   cronExpression?: string;
+  runAt?: string;
   timezone?: string;
   parameters?: Record<string, any>;
   isActive?: boolean;
@@ -926,6 +934,14 @@ export interface RunReportStep {
   description: string;
   status: 'passed' | 'failed' | 'warning' | 'skipped';
   durationMs?: number;
+  /**
+   * Per-step screenshot URL captured for EVERY step (pass or fail) when
+   * per-step capture is enabled. Sourced from runtimeMeta.stepScreenshotUrl.
+   * The run-report timeline renders this inline; it is also aggregated into
+   * the execution's `screenshots` artifact list. Distinct from
+   * `error.screenshot` (the failure-only bug screenshot).
+   */
+  screenshot?: string;
   error?: {
     message: string;
     failedReason?: string;
@@ -980,7 +996,7 @@ export interface RunReportStep {
 export interface RunReportExecArtifacts {
   videoUrl?: string;
   traceUrl?: string;
-  screenshots: string[];
+  screenshots: RunReportScreenshot[];
   bugScreenshots: string[];
   consoleLogs: string[];
   networkLogs: Array<{
@@ -1100,10 +1116,24 @@ export interface RunReportSummary {
 /**
  * Aggregated artifacts across all executions (actual data, not counts)
  */
+/**
+ * A per-step screenshot with display metadata for the run-report gallery.
+ * `url` is the only required field; the rest drive the descriptive label
+ * (step name + capture time + outcome) the Screenshots tab renders.
+ */
+export interface RunReportScreenshot {
+  url: string;
+  /** Human label, e.g. "Step 3: Click" (or "Final screenshot"). */
+  stepName?: string;
+  /** Capture time, formatted HH:MM:SS. */
+  timestamp?: string;
+  status?: 'passed' | 'failed' | 'warning' | 'skipped';
+}
+
 export interface RunReportArtifactsSummary {
   videoUrl?: string;
   traceUrl?: string;
-  screenshots: string[];
+  screenshots: RunReportScreenshot[];
   bugScreenshots: string[];
   consoleLogs: string[];
   networkLogs: Array<{
@@ -1237,6 +1267,8 @@ export interface ExecutableTestCase {
   isNegative?: boolean;
   /** Test case platform — used to route mobile tests to the mobile runner */
   platform?: string;
+  /** Curator-set priority — used to order dispatch within a topological level */
+  priority?: string | null;
 }
 
 /**
@@ -1249,8 +1281,14 @@ export interface TopologicalSortResult {
   levels: ExecutableTestCase[][];
   /** True if the dependency graph contains a cycle */
   hasCycle: boolean;
-  /** IDs of nodes involved in a cycle (only present when hasCycle=true) */
+  /** IDs of nodes that lie ON a cycle (only present when hasCycle=true) */
   cycleNodes?: string[];
+  /**
+   * IDs of nodes that are NOT on a cycle themselves but can never run
+   * because a (transitive) dependency is. Reported separately so they
+   * can be marked "blocked" instead of the misleading "circular".
+   */
+  blockedByCycleNodes?: string[];
 }
 
 // ============================================================================
@@ -1334,6 +1372,10 @@ export interface DueSchedule {
   scheduleId: string;
   projectId: string;
   userId: string;
+  // recurring schedules retry on the next occurrence; a one_time schedule has
+  // already been deactivated by claimDueSchedule and will NOT retry — the
+  // scheduler branches its failure notification on this.
+  scheduleType: ScheduleType;
   // 'suite' is surfaced so the scheduler can reject it explicitly — there is
   // no runSuite() execution path, so a suite schedule must NOT be silently
   // misrouted to runPlan() (which would self-deactivate it as "target deleted").

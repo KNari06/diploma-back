@@ -88,14 +88,36 @@ export class FlowQueue {
    * Build queue from Strategist output — AI-driven ordering replaces static formula.
    * Entry points not in the strategy plan are appended after planned ones.
    * Skipped flows are excluded.
+   *
+   * `opts.excludeIds` — entry-point ids already executed (e.g. Phase 2 flows
+   * when rebuilding the queue in Phase 2.5). They are dropped so the extra
+   * round never re-runs a completed flow.
+   * `opts.seedDedup` — names/goals already seen, used to pre-seed the dedup
+   * memory of the fresh queue so near-duplicates of earlier flows are rejected
+   * on enqueue (a brand-new FlowQueue otherwise starts with empty dedup state).
    */
   static fromStrategyOutput(
     entryPoints: EntryPoint[],
     strategy: StrategistOutput,
+    opts?: { excludeIds?: Iterable<string>; seedDedup?: { names?: Iterable<string>; goals?: Iterable<string> } },
   ): FlowQueue {
     const q = new FlowQueue();
     const skipIds = new Set(strategy.skipFlows.map((s) => s.id));
+    const excludeIds = new Set(opts?.excludeIds ?? []);
     const planMap = new Map(strategy.plan.map((p) => [p.entryPointId, p]));
+
+    // Pre-seed dedup memory so the rebuilt queue keeps rejecting duplicates of
+    // already-seen flows (a fresh FlowQueue starts with empty allNames/allGoals).
+    if (opts?.seedDedup) {
+      for (const name of opts.seedDedup.names ?? []) {
+        q.allNames.add(name.toLowerCase().trim());
+      }
+      for (const goal of opts.seedDedup.goals ?? []) {
+        // Goal dedup keys by id; seed with a synthetic key so the goal text is
+        // compared on enqueue without colliding with real entry-point ids.
+        q.allGoals.set(`seed:${q.allGoals.size}`, goal);
+      }
+    }
 
     // Separate into planned (ordered by Strategist) and unplanned
     const planned: EntryPoint[] = [];
@@ -103,6 +125,7 @@ export class FlowQueue {
 
     for (const ep of entryPoints) {
       if (skipIds.has(ep.id)) continue; // Strategist said skip
+      if (excludeIds.has(ep.id)) continue; // already executed in a prior round
       if (planMap.has(ep.id)) {
         planned.push(ep);
       } else {

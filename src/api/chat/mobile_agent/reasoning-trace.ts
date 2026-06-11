@@ -22,6 +22,7 @@
  */
 
 import { env } from '@/config/environment/env';
+import { redactCredentials } from '@/utils/security/redact-credentials';
 
 export const WS_PREVIEW_CHARS = 300;
 export const TRACE_PER_ENTRY = 1000;
@@ -68,28 +69,18 @@ export interface ReasoningEntry {
  * Intentionally NOT shared with mobile-step-sanitizer.ts — that one
  * masks a typed `value` field, this one scans free-form prose.
  */
-const KEYWORD = '(password|passwd|passcode|pin|otp|token|secret|api[_-]?key|auth[a-z_]*|credential[s]?)';
-// Separator: `=`, `:`, or whitespace + "is" + whitespace. All optionally
-// surrounded by whitespace.
-const SEP = '\\s*(?:[:=]|\\bis\\b)\\s*';
-// Value: optionally quoted; must be either ≥6 alphanumeric, OR contain a
-// digit/special char (signals it's not a plain English word).
-const VALUE = `["']?((?:[A-Za-z0-9]{6,80})|(?:[^\\s"',.;!?]*[\\d!@#$%^&*+\\-_/\\\\][^\\s"',.;!?]{2,80}))["']?`;
-
-const SENSITIVE_ASSIGNMENT_RE = new RegExp(
-  `\\b${KEYWORD}\\b${SEP}${VALUE}`,
-  'gi',
-);
-
 /**
  * Mask credential-like assignments in free-form reasoning text. Returns
  * the sanitised string; leaves non-matching prose untouched.
+ *
+ * The credential-pattern catalogue now lives in the shared
+ * `redact-credentials` util so the AI-action logger and any other free-text
+ * sink mask identically. This wrapper keeps the mobile call sites stable and
+ * preserves the empty-string-on-nullish contract they rely on.
  */
 export function sanitizeReasoning(input: string): string {
   if (!input || typeof input !== 'string') return '';
-  return input.replace(SENSITIVE_ASSIGNMENT_RE, (_match, label) => {
-    return `${label}: [REDACTED]`;
-  });
+  return redactCredentials(input);
 }
 
 /**

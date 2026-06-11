@@ -27,6 +27,8 @@ export interface AITrackingContext {
   workspaceId: string;
   /** Test ID (if within a test execution) */
   testId?: string;
+  /** Regression run ID (if within a regression run). Correlates LLM calls to a run. */
+  runId?: string;
   /** User who initiated the operation */
   userId?: string;
   /** High-level operation category */

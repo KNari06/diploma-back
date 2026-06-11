@@ -79,8 +79,12 @@ function getCompiledPatterns(kind: CredentialKind): CompiledPatterns {
       // Supports Latin and Cyrillic characters
       try {
         const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        // Boundary class covers Latin + Cyrillic incl. Kazakh-specific letters
+        // (ә ғ қ ң ө ұ ү һ і) — `[а-яёА-ЯЁ]` alone would treat a Kazakh letter
+        // as a boundary and mis-match credential fields labelled in Kazakh.
+        const NON_WORD = '[^a-zа-яёәғқңөұүһіA-ZА-ЯЁӘҒҚҢӨҰҮҺІ0-9]';
         const regex = new RegExp(
-          `(?:^|[^a-zа-яёA-ZА-ЯЁ0-9])${escaped}(?:$|[^a-zа-яёA-ZА-ЯЁ0-9])`,
+          `(?:^|${NON_WORD})${escaped}(?:$|${NON_WORD})`,
           'i'
         );
         boundaryRegexes.push(regex);
@@ -109,7 +113,7 @@ function tokenize(text: string): string[] {
   // Replace separators with spaces, handle camelCase
   const normalized = text
     .replace(/([a-z])([A-Z])/g, '$1 $2') // camelCase -> camel Case
-    .replace(/([а-яё])([А-ЯЁ])/g, '$1 $2') // Cyrillic camelCase
+    .replace(/([а-яёәғқңөұүһі])([А-ЯЁӘҒҚҢӨҰҮҺІ])/g, '$1 $2') // Cyrillic camelCase (ru + kk)
     .replace(/[_.:/\s-]+/g, ' ') // separators -> space (hyphen at end to avoid escaping)
     .toLowerCase()
     .trim();

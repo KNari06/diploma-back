@@ -408,6 +408,18 @@ export class PricingPlansService {
           planId,
         });
 
+        // Map each credit volume to its Stripe checkout code via the `plans`
+        // table (plans.credits_per_period ↔ option.credits). Lets the
+        // frontend pass the right plan_code to /billing/checkout without
+        // hardcoding the credits→code mapping.
+        const { data: planCodes } = await supabaseAdmin
+          .from('plans')
+          .select('code, credits_per_period')
+          .eq('plan_id', planId);
+        const codeByCredits = new Map<number, string>(
+          (planCodes || []).map(p => [p.credits_per_period, p.code])
+        );
+
         return (data || []).map(opt => ({
           credits: opt.credits,
           price: Number(opt.price),
@@ -416,6 +428,7 @@ export class PricingPlansService {
           billing_period: 'monthly',
           description: opt.description,
           savings: opt.savings || 0,
+          plan_code: codeByCredits.get(opt.credits) ?? null,
         }));
       }
 

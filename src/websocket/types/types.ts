@@ -417,7 +417,14 @@ export interface ServerToClientEvents {
       | 'ready';
     progress: number;     // 0-100
     url?: string;
-    elapsedMs: number;
+    // elapsedMs is optional: the web preview path stamps it, the mobile warmup
+    // path historically didn't. Keeping it optional avoids forcing a fake value.
+    elapsedMs?: number;
+    // When set, this stage FAILED — `stage` names the phase that failed (e.g.
+    // 'boot_emulator' when the emulator crashed during startup) and `error` is
+    // the user-facing message. The frontend stops the spinner and shows this
+    // instead of optimistically completing the checklist. Absent on success.
+    error?: string;
   }) => void;
 
   // Login required — emitted when the preview lands on a login / auth
@@ -582,6 +589,8 @@ export interface ServerToClientEvents {
   'api:flow:dag-ready': (data: ApiFlowDagReadyPayload) => void;
   'api:flow:step-start': (data: ApiFlowStepStartPayload) => void;
   'api:flow:step-complete': (data: ApiFlowStepCompletePayload) => void;
+  'api:flow:step-skipped': (data: ApiFlowStepSkippedPayload) => void;
+  'api:flow:step-retrying': (data: ApiFlowStepRetryingPayload) => void;
   'api:flow:variable-extracted': (data: ApiFlowVariableExtractedPayload) => void;
   'api:flow:completed': (data: ApiFlowCompletedPayload) => void;
   'api:flow:failed': (data: ApiFlowFailedPayload) => void;
@@ -787,6 +796,13 @@ export interface TestStepCompletedPayload {
 
     /** Screenshot URL captured at the moment a bug was detected */
     bugScreenshotUrl?: string;
+
+    /**
+     * Screenshot URL captured after EVERY step (pass or fail) when per-step
+     * capture is enabled. Distinct from `bugScreenshotUrl` (failure-only) —
+     * the report assembler surfaces this in the Screenshots artifact tab.
+     */
+    stepScreenshotUrl?: string;
 
     /**
      * Non-blocking, advisory warnings raised by the runner for this step.
@@ -1610,6 +1626,30 @@ export interface PreviewStepLintResultPayload {
    * V3: True if Apply should be disabled (status is needs_clarification without user selection)
    */
   applyDisabled?: boolean;
+  /**
+   * Diagnostic parity across branches. The resolved/not_found branch spreads
+   * the whole LintResult, but the needs_clarification branch builds its
+   * payload by hand — these fields let the FE distinguish "LLM degraded,
+   * retry later" from "genuinely ambiguous, refine the description" and
+   * feed latency telemetry. All optional; absent on older servers.
+   */
+  degradedMode?: boolean;
+  degradedReason?: string;
+  aiFallbackReason?: 'semantic_zero' | 'ambiguous' | 'low_confidence';
+  cacheHit?: boolean;
+  resolverPath?: string;
+  /** V23 coaching hint (already emitted via conditional spread; now typed) */
+  suggestion?: {
+    issue: 'NO_MATCH' | 'AMBIGUOUS' | 'GENERIC_INTENT' | 'VAGUE_INTENT' | 'LOW_CONFIDENCE';
+    hint: string;
+    examples?: string[];
+  };
+  phaseTimings?: {
+    snapshotMs?: number;
+    resolveMs?: number;
+    totalMs?: number;
+    domNodeCount?: number;
+  };
   timestamp: string;
 }
 
@@ -2708,6 +2748,9 @@ export interface ApiFlowStepStartPayload {
   path: string;
   resolvedUrl: string;
   variablesInjected: string[]; // variable names used
+  // Case Matrix (Group 5): set when this is one case of a node's matrix.
+  caseId?: string;
+  caseName?: string;
   timestamp: string;
 }
 
@@ -2722,6 +2765,35 @@ export interface ApiFlowStepCompletePayload {
   durationMs: number;
   variablesExtracted: Array<{ name: string; value: string }>;
   error?: string;
+  // Case Matrix (Group 5): set when this is one case of a node's matrix.
+  caseId?: string;
+  caseName?: string;
+  timestamp: string;
+}
+
+export interface ApiFlowStepSkippedPayload {
+  flowSpecId: string;
+  flowRunId: string;
+  sessionId: string;
+  stepIndex: number;
+  nodeId: string;
+  // 'unsupported' | dependency failure | user cancelled — drives node visual state
+  reason: 'unsupported' | 'dependency_failed' | 'cancelled';
+  // when reason === 'cancelled' the frontend renders the node as 'cancelled', else 'skipped'
+  status: 'skipped' | 'cancelled';
+  message?: string;
+  timestamp: string;
+}
+
+export interface ApiFlowStepRetryingPayload {
+  flowSpecId: string;
+  flowRunId: string;
+  sessionId: string;
+  stepIndex: number;
+  nodeId: string;
+  attempt: number; // current retry attempt (1-based)
+  maxRetries: number;
+  reason: 'rate_limited' | 'auth_refresh';
   timestamp: string;
 }
 
@@ -2729,6 +2801,8 @@ export interface ApiFlowVariableExtractedPayload {
   flowSpecId: string;
   flowRunId: string;
   sessionId: string;
+  nodeId: string; // source node that produced the variable (for edge/node highlight)
+  stepIndex: number;
   variableName: string;
   extractedFrom: string; // e.g. "POST /auth/login → $.data.token"
   value: string; // masked for sensitive values (tokens show first 8 chars + ***)

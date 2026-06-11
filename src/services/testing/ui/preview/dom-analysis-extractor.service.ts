@@ -236,6 +236,11 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
     node.isInsideActiveModal = true;
   }
 
+  // Carry floating-corner-widget flag (geometry-derived, both collectors)
+  if (element.floatingWidget) {
+    node.floatingWidget = true;
+  }
+
   // Phase 4: Propagate custom component interactivity signals
   if (element.frameworkClickable) {
     node.frameworkClickable = element.frameworkClickable;
@@ -466,11 +471,16 @@ export function extractInteractiveNodes(snapshot: LiteSnapshot): InteractiveNode
     const node = elementToInteractiveNode(element);
     nodes.push(node);
 
-    // Limit total nodes
+    // Limit total nodes. WARN, not debug: past this cap the tail of the page
+    // (document order) is silently absent from the resolver's candidate set —
+    // a user's target beyond the cap surfaces as an unexplained not_found.
+    // This line is the only production-visible signal that the cut happened.
     if (nodes.length >= MAX_INTERACTIVE_NODES) {
-      logger.debug('[DOM_ANALYSIS_EXTRACTOR] Reached max interactive nodes limit', {
+      logger.warn('[DOM_ANALYSIS_EXTRACTOR] Interactive node cap reached — tail elements dropped from candidate set', {
         limit: MAX_INTERACTIVE_NODES,
         totalElements: snapshot.elements.length,
+        droppedAtLeast: snapshot.elements.length - MAX_INTERACTIVE_NODES,
+        url: snapshot.url,
       });
       break;
     }

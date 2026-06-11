@@ -26,9 +26,13 @@ import type { LiteSnapshot, ObstacleFact, ObstacleType } from '../lite-types';
 import {
   IRON_CLAD_MODAL_SELECTORS,
   CLOSE_BUTTON_SELECTOR,
+  CLOSE_AFFORDANCE_FN_SOURCE,
   LAYER3_FALLBACK_PATTERNS,
   OBSTACLE_RECOVERY_MAP,
+  DESTRUCTIVE_TEXT_REGEX,
+  DESTRUCTIVE_WORDS,
 } from '@/agent/utils/selectors/modal-detection';
+import { isFloatingCornerWidget } from '@/services/testing/ui/preview/floating-widget.util';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -90,14 +94,19 @@ async function waitForDomSettle(page: Page): Promise<void> {
 }
 
 /**
- * Destructive action patterns — NEVER click buttons whose text matches these.
- * Prevents accidental data deletion, logout, or account changes during exploration.
+ * Destructive-action guard. Single source of truth in modal-detection.ts:
+ * Unicode-aware (`(?![\p{L}\p{N}])` boundary, NOT ASCII `\b`) + multi-language
+ * terms, so "Удалить"/"删除"/"Löschen" trigger the penalty on non-English sites.
  */
-const DESTRUCTIVE_PATTERNS = /\b(delete|remove|cancel\s+subscription|unsubscribe|deactivate|disable|log\s*out|sign\s*out|clear\s+all|erase|reset|terminate|revoke|destroy)\b/i;
+const DESTRUCTIVE_PATTERNS = DESTRUCTIVE_TEXT_REGEX;
 
 /**
  * Extended heuristic patterns for obstacle classification.
  * Used when SnapshotCollector's hintType and LAYER3_FALLBACK_PATTERNS don't match.
+ *
+ * NOTE: chat_widget is intentionally NOT here — vendor-name lists (intercom /
+ * crisp / drift …) miss most launchers. It is classified by GEOMETRY instead
+ * (small fixed corner widget) via `isFloatingCornerWidget`, in `classifySingle`.
  */
 const HEURISTIC_PATTERNS: Record<string, { classRegex: RegExp; coverageMax?: number; requiresCloseButton?: boolean }> = {
   drawer: {
@@ -114,28 +123,37 @@ const HEURISTIC_PATTERNS: Record<string, { classRegex: RegExp; coverageMax?: num
   onboarding: {
     classRegex: /onboarding|tour|walkthrough|joyride|introjs|shepherd|welcome[-_]?guide/i,
   },
-  chat_widget: {
-    classRegex: /intercom|drift|crisp|zendesk|tawk|livechat|hubspot[-_]?chat/i,
-    coverageMax: 0.10,
-  },
 };
 
 /**
  * Promo modal text patterns — detect newsletter/subscription popups.
+ * Used only as a weak classification hint (never as a basis to click). Kept
+ * English-leaning on purpose: a miss just means the modal is classified as a
+ * generic `modal` and still dismissed via Escape / explicit close affordance —
+ * so non-English promo modals are NOT silently skipped, they take the safe path.
  */
-const PROMO_MODAL_PATTERNS = /\b(subscribe|newsletter|sign\s+up\s+for|get\s+\d+%\s+off|exclusive\s+offer|join\s+our|special\s+deal|discount\s+code|early\s+access)\b/i;
+const PROMO_MODAL_PATTERNS = /(subscribe|newsletter|sign\s+up\s+for|get\s+\d+%\s+off|exclusive\s+offer|join\s+our|special\s+deal|discount\s+code|early\s+access)(?![\p{L}\p{N}])/iu;
 
 /**
- * Extended close button text patterns for dismiss_button recovery.
- * Reuses CLOSE_BUTTON_SELECTOR for DOM queries, these are for text matching.
+ * Weak close-word tiebreaker for the dismiss-button scorer (NOT a click trigger).
+ *
+ * Universality: a button is only ever clicked when it has an EXPLICIT close
+ * affordance (structural attribute/class/role, an authored aria-label/title in a
+ * supported language, or a lone × glyph — see CLOSE_AFFORDANCE_FN_SOURCE). These
+ * visible-text words merely break ties between several such candidates, so an
+ * incomplete list can't cause a wrong click on a non-English site.
+ *
+ * Deliberately EXCLUDES consent verbs (accept / agree / allow): clicking those
+ * grants consent on the user's behalf — a side effect tests didn't ask for.
  */
-const DISMISS_BUTTON_TEXT_PATTERNS = [
-  'close', 'dismiss', 'закрыть', 'отклонить',
-  'accept', 'accept all', 'agree', 'allow', 'allow all',
-  'got it', 'i understand', 'ok', 'okay', 'понятно',
-  'consent', 'continue', 'no thanks', 'not now', 'maybe later',
-  'skip', 'deny', 'reject', 'decline', 'reject all',
-  '×', 'x', '✕', '✖',
+const CLOSE_TIEBREAK_WORDS = [
+  'close', 'dismiss', 'закрыть', 'отклонить', 'понятно',
+  'got it', 'i understand', 'ok', 'okay',
+  'no thanks', 'not now', 'maybe later',
+  'skip', 'decline', 'reject', 'reject all', 'deny',
+  // kk
+  'жабу', 'жабыңыз', 'түсінікті', 'бас тарту', 'өткізіп жіберу', 'кейінірек', 'келіспеймін',
+  '×', '✕', '✖', '✗',
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -205,8 +223,8 @@ export class OverlayDismisser {
         const obstacles = lastSnapshot.obstacleFacts ?? [];
         if (obstacles.length === 0) break;
 
-        // Classify each obstacle
-        const classified = this.classifyObstacles(obstacles);
+        // Classify each obstacle (viewport enables geometry-based chat_widget detection)
+        const classified = this.classifyObstacles(obstacles, lastSnapshot.viewport);
 
         // Filter to dismissible obstacles (only count real overlays, not unknown/permanent)
         const dismissible = this.filterDismissible(classified, mode);
@@ -313,14 +331,18 @@ export class OverlayDismisser {
    */
   private static classifyObstacles(
     facts: ObstacleFact[],
+    viewport?: { width: number; height: number },
   ): Array<{ fact: ObstacleFact; type: ObstacleType }> {
     return facts.map((fact) => ({
       fact,
-      type: this.classifySingle(fact),
+      type: this.classifySingle(fact, viewport),
     }));
   }
 
-  private static classifySingle(fact: ObstacleFact): ObstacleType {
+  private static classifySingle(
+    fact: ObstacleFact,
+    viewport?: { width: number; height: number },
+  ): ObstacleType {
     // Priority 1: SnapshotCollector's deterministic hint (ARIA, geometry)
     if (fact.hintType && fact.hintType !== 'unknown') {
       return fact.hintType;
@@ -332,6 +354,21 @@ export class OverlayDismisser {
       if (pattern.test(searchText)) {
         return type as ObstacleType;
       }
+    }
+
+    // Priority 2.5: chat_widget by GEOMETRY, not vendor name. A small fixed
+    // element pinned to a viewport corner is a launcher/bubble regardless of
+    // brand — language- and vendor-agnostic (shared rule, Invariant #19).
+    if (
+      viewport &&
+      isFloatingCornerWidget(
+        fact.rect,
+        fact.position,
+        fact.role === 'dialog' || fact.role === 'alertdialog' || fact.ariaModal === true,
+        viewport,
+      )
+    ) {
+      return 'chat_widget';
     }
 
     // Priority 3: Extended heuristic patterns
@@ -490,11 +527,21 @@ export class OverlayDismisser {
    */
   private static async tryCloseButton(page: Page, overlayRef: string): Promise<boolean> {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const clicked = await page.evaluate(
-        (args: { ref: string; selectorStr: string; textPatterns: string[] }) => {
+        (args: {
+          ref: string;
+          selectorStr: string;
+          tiebreakWords: string[];
+          destructiveWords: string[];
+          affordanceFnSource: string;
+        }) => {
           const doc = (globalThis as any).document;
           const win = (globalThis as any).window;
+
+          // Materialize the shared close-affordance probe from its single source.
+          const hasExplicitCloseAffordance = new Function(
+            `${args.affordanceFnSource} return hasExplicitCloseAffordance;`,
+          )() as (el: any) => boolean;
 
           // Helper: check if element is visible
           const isVisible = (el: any): boolean => {
@@ -504,6 +551,16 @@ export class OverlayDismisser {
               style.visibility !== 'hidden' &&
               parseFloat(style.opacity) >= 0.3
             );
+          };
+
+          // Language-agnostic destructive check (Unicode word list passed in).
+          // ASCII \b would never match Cyrillic/CJK, so test by substring against
+          // an explicit multi-language word list instead.
+          const isDestructive = (allText: string): boolean => {
+            for (const w of args.destructiveWords) {
+              if (allText.indexOf(w) !== -1) return true;
+            }
+            return false;
           };
 
           // Collect candidates: first from overlay element, then global
@@ -521,7 +578,7 @@ export class OverlayDismisser {
           // 2. Global high z-index buttons (for overlays without data-agent-ref)
           if (candidates.length === 0) {
             const allButtons = doc.querySelectorAll(
-              'button, a, [role="button"], [aria-label*="close" i], [aria-label*="dismiss" i], [aria-label*="accept" i]',
+              'button, a, [role="button"], [aria-label*="close" i], [aria-label*="dismiss" i]',
             );
             for (const btn of allButtons) {
               if (!isVisible(btn)) continue;
@@ -535,36 +592,37 @@ export class OverlayDismisser {
 
           if (candidates.length === 0) return false;
 
-          // Score candidates
+          // Score candidates. HARD GATE: only ever click an element with an
+          // EXPLICIT close affordance (structural attr/class/role, authored
+          // aria-label/title close word in any language, or a lone × glyph).
+          // A generic text button is NEVER clicked to "close" — this is the
+          // universal, language-safe default that replaces relying on a word list.
           let bestCandidate: any = null;
           let bestScore = -1;
 
           for (const candidate of candidates) {
-            let score = 0;
             const text = (candidate.textContent?.trim() || '').toLowerCase();
             const ariaLabel = (candidate.getAttribute('aria-label') || '').toLowerCase();
             const title = (candidate.getAttribute('title') || '').toLowerCase();
             const allText = `${text} ${ariaLabel} ${title}`;
 
-            // Check against text patterns
-            for (const pattern of args.textPatterns) {
-              if (allText.includes(pattern.toLowerCase())) {
-                score += 3;
+            // Destructive content is an absolute veto, never a tiebreak.
+            if (isDestructive(allText)) continue;
+
+            // HARD GATE: must be an unambiguous close control.
+            if (!hasExplicitCloseAffordance(candidate)) continue;
+
+            let score = 1; // base score for passing the affordance gate
+
+            // Weak tiebreakers among already-safe close controls.
+            for (const word of args.tiebreakWords) {
+              if (allText.indexOf(word.toLowerCase()) !== -1) {
+                score += 2;
                 break;
               }
             }
-
-            // Prefer aria-label with "close"
-            if (ariaLabel.includes('close') || ariaLabel.includes('закрыть')) score += 2;
-
-            // Prefer short text (icon buttons like X)
-            if (text.length <= 3 && text.length > 0) score += 2;
-
-            // Prefer "accept all" (cookie consent specific)
-            if (allText.includes('accept all') || allText.includes('allow all')) score += 4;
-
-            // Avoid destructive buttons
-            if (/\b(delete|remove|cancel|logout|sign.out)\b/i.test(allText)) score -= 10;
+            // Prefer short text (icon buttons like ×)
+            if (text.length <= 3 && text.length > 0) score += 1;
 
             if (score > bestScore) {
               bestScore = score;
@@ -572,7 +630,7 @@ export class OverlayDismisser {
             }
           }
 
-          if (bestCandidate && bestScore > 0) {
+          if (bestCandidate) {
             bestCandidate.click();
             return true;
           }
@@ -582,7 +640,9 @@ export class OverlayDismisser {
         {
           ref: overlayRef,
           selectorStr: CLOSE_BUTTON_SELECTOR,
-          textPatterns: DISMISS_BUTTON_TEXT_PATTERNS,
+          tiebreakWords: CLOSE_TIEBREAK_WORDS,
+          destructiveWords: [...DESTRUCTIVE_WORDS],
+          affordanceFnSource: CLOSE_AFFORDANCE_FN_SOURCE,
         },
       );
 

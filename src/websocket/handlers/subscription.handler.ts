@@ -773,10 +773,8 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
       const rooms = getRoomSet(socket.id);
 
       // Idempotent — second subscribe for the same test case is a no-op.
-      // We still try to JOIN the per-session room below in case the
-      // session was created since the last subscribe (covers the rare
-      // case of a long-lived socket whose user just sent the first
-      // message in another tab).
+      // `chat:tc:<testCaseId>` is the ONLY room a test-case chat joins;
+      // all test-case chat emits route here exclusively.
       const alreadyInTcRoom = rooms.has(tcRoom);
       if (!alreadyInTcRoom) {
         socket.join(tcRoom);
@@ -784,14 +782,16 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         incrementSubscriptions(socket.id);
       }
 
-      // Look up the existing session (if any) and additionally join the
-      // per-session room. This covers two cases at once:
-      //   1. User reopens an existing test-case chat — they should
-      //      receive history-driven emits that target `chat:<sid>`.
-      //   2. User opens a fresh test case — no session yet, we only
-      //      hold the `chat:tc:<tcid>` membership; the dual-broadcast
-      //      in emitChatMessage will reach this socket via that room
-      //      until the session is created on first POST /chat.
+      // Look up the existing session (if any) only to resolve its id for
+      // the ack — we do NOT join the per-session room `chat:<sid>`.
+      //
+      // Leak fix: this socket may ALSO hold a global-chat subscription
+      // (`chat:<globalSid>`) on the same connection. All test-case chat
+      // emits now route EXCLUSIVELY to `chat:tc:<testCaseId>` (see
+      // emitChatMessage), so joining `chat:<tcSid>` here is unnecessary
+      // and previously caused editor messages to surface in the global
+      // chat. The `chat:tc:` membership joined above is the only room a
+      // test-case chat needs.
       let resolvedSessionId: string | undefined;
       try {
         const { TestCaseChatService } = await import(
@@ -800,18 +800,12 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         const session = await TestCaseChatService.findSession(userId, testCaseId.trim());
         if (session) {
           resolvedSessionId = session.id;
-          const sessionRoom = createRoomName('chat', session.id);
-          if (!rooms.has(sessionRoom)) {
-            socket.join(sessionRoom);
-            rooms.add(sessionRoom);
-            incrementSubscriptions(socket.id);
-          }
         }
       } catch (lookupErr) {
         // Non-fatal: subscription to chat:tc:<tcid> already succeeded
-        // above. The per-session room will be picked up on the next
-        // subscribe (e.g. on reconnect after the session is created).
-        logger.warn('[WebSocket] Optional session-room join failed', {
+        // above. The ack just won't carry a sessionId; the frontend can
+        // fetch it via REST when needed (cancel / feedback).
+        logger.warn('[WebSocket] Optional session lookup failed', {
           socketId: socket.id,
           userId,
           testCaseId,
@@ -838,10 +832,10 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
     }
   });
 
-  // Unsubscribe — leave both the test-case room and (if joined) the
-  // per-session room. Idempotent: leaving a room we're not in is a
-  // no-op and the subscription counter only decrements when we
-  // actually had it.
+  // Unsubscribe — leave the test-case room. Idempotent: leaving a room
+  // we're not in is a no-op and the subscription counter only decrements
+  // when we actually held it. We no longer join a per-session room (see
+  // subscribe:chat:testcase), so there is nothing else to leave.
   socket.on('unsubscribe:chat:testcase', async ({ testCaseId }) => {
     try {
       if (!testCaseId || typeof testCaseId !== 'string' || testCaseId.trim().length === 0) {
@@ -855,27 +849,6 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         socket.leave(tcRoom);
         rooms.delete(tcRoom);
         decrementSubscriptions(socket.id);
-      }
-
-      // Also leave the per-session room. Lookup is best-effort — if
-      // it fails the socket still gets cleaned up on disconnect.
-      if (userId) {
-        try {
-          const { TestCaseChatService } = await import(
-            '@/services/utils/test-case-chat.service'
-          );
-          const session = await TestCaseChatService.findSession(userId, trimmed);
-          if (session) {
-            const sessionRoom = createRoomName('chat', session.id);
-            if (rooms.has(sessionRoom)) {
-              socket.leave(sessionRoom);
-              rooms.delete(sessionRoom);
-              decrementSubscriptions(socket.id);
-            }
-          }
-        } catch {
-          // best-effort
-        }
       }
     } catch (error) {
       logger.error('[WebSocket] Error in unsubscribe:chat:testcase', {
@@ -915,6 +888,17 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
       userId,
       questionId,
     });
+
+    // Reject malformed payloads: a missing/empty answer must NOT be written to
+    // Redis, otherwise the worker's poller resumes a flow with junk input.
+    if (typeof questionId !== 'string' || !questionId.trim()
+      || typeof answer !== 'string' || !answer.trim()) {
+      logger.warn('[SubscriptionHandler] Ignoring invalid exploration clarification response', {
+        questionId,
+        hasAnswer: typeof answer === 'string' && answer.trim().length > 0,
+      });
+      return;
+    }
 
     try {
       const { ClarificationService } = require('@/agent/utils/context/clarification.service');

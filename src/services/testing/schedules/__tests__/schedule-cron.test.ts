@@ -77,10 +77,88 @@ describe('ScheduleService.calculateNextRun', () => {
     expect(next.getUTCHours()).toBe(4);
   });
 
+  // Regression (Bug #3): a LATE-hour cron in a positive-offset tz used to be
+  // misclassified "unsatisfiable" because the DST-gap guard compared the
+  // calendar DAY instead of HOUR:MINUTE — the Newton correction legitimately
+  // rolls 23:00 Asia/Almaty to the NEXT UTC day (18:00Z), which the guard read
+  // as a non-existent local time and returned EPOCH for every candidate.
+  // Effect: any schedule at hour >= (24 - offset) silently never fired
+  // ("I set 23:00 and nothing runs"). Guard now verifies HOUR:MINUTE.
+  it('resolves a late-hour cron in a +offset tz (23:00 Asia/Almaty → 18:00 UTC), not unsatisfiable', () => {
+    const iso = ScheduleService.calculateNextRun('0 23 * * *', 'Asia/Almaty');
+    const d = new Date(iso);
+    expect(d.getUTCHours()).toBe(18); // 23:00 +05:00 == 18:00Z
+    expect(d.getUTCMinutes()).toBe(0);
+    // and it actually reads back as 23:00 in Almaty
+    const hh = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Almaty', hour: '2-digit', hour12: false }).format(d);
+    expect(hh).toBe('23');
+  });
+
+  it('resolves the boundary hour 19:00 Asia/Almaty (= 14:00 UTC)', () => {
+    const d = new Date(ScheduleService.calculateNextRun('0 19 * * *', 'Asia/Almaty'));
+    expect(d.getUTCHours()).toBe(14);
+  });
+
   it('falls back to UTC on an unknown timezone', () => {
     const utc = new Date(ScheduleService.calculateNextRun('0 9 * * *', 'UTC')).getUTCHours();
     const bogus = new Date(ScheduleService.calculateNextRun('0 9 * * *', 'Mars/Olympus')).getUTCHours();
     expect(bogus).toBe(utc);
+  });
+});
+
+describe('ScheduleService — day-wrap in the timezone Newton correction (Bug #4)', () => {
+  // The Newton diff in buildDateInTimezone used ONLY hour*60+minute. When the
+  // UTC guess's wall clock rolls into an adjacent local day, the minute-only
+  // diff is off by exactly 1440 — e.g. a 21:30 Asia/Almaty guess shows 02:30
+  // the NEXT local day, so UTC+5 was read as UTC-19 and the returned instant
+  // landed 24h late. First computation after create/update therefore skipped
+  // a whole day whenever today's late-hour occurrence was still ahead.
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('late-hour cron in a +offset tz still ahead today resolves to TODAY (21:30 Asia/Almaty)', () => {
+    // 05:00Z = 10:00 in Almaty (UTC+5) — today's 21:30 local (16:30Z) is ahead.
+    jest.setSystemTime(new Date('2026-06-15T05:00:00Z'));
+    const next = ScheduleService.calculateNextRun('30 21 * * *', 'Asia/Almaty');
+    expect(new Date(next).toISOString()).toBe('2026-06-15T16:30:00.000Z');
+  });
+
+  it('early-hour dow-restricted cron in a -offset tz fires on the right local day (Mon 02:00 America/New_York)', () => {
+    // Symmetric case: the guess shows the PREVIOUS local day, landing 24h
+    // early. For a daily cron the scan loop masked that, but a dow-restricted
+    // cron returned an instant that is the wrong weekday locally and skipped
+    // this week's occurrence entirely.
+    // 2026-06-15 is a Monday. 01:00Z = Sun 21:00 in NY (EDT, UTC-4) —
+    // Monday 02:00 local (06:00Z) is still ahead.
+    jest.setSystemTime(new Date('2026-06-15T01:00:00Z'));
+    const next = ScheduleService.calculateNextRun('0 2 * * 1', 'America/New_York');
+    expect(new Date(next).toISOString()).toBe('2026-06-15T06:00:00.000Z');
+  });
+
+  it('DST spring-forward gap guard intact: non-existent local time is skipped, not fired', () => {
+    // NY 2026-03-08 02:30 does not exist (clock jumps 2:00 → 3:00). POSIX cron
+    // skips it; the next 03-08 02:30 that exists is 2027 (EST, UTC-5 → 07:30Z).
+    jest.setSystemTime(new Date('2026-03-01T00:00:00Z'));
+    const next = ScheduleService.calculateNextRunOrNull('30 2 8 3 *', 'America/New_York');
+    expect(next).not.toBeNull();
+    expect(new Date(next!).toISOString()).toBe('2027-03-08T07:30:00.000Z');
+  });
+
+  // The day scan must enumerate LOCAL calendar days, not raw 24h UTC steps.
+  // On 2026-03-08 NY springs forward (local day is only 23h). Stepping by exactly
+  // 24h UTC drifts and could skip that local day entirely, dropping a late-hour
+  // daily run that DOES exist (23:30 is after the gap, so it occurs normally).
+  it('late-hour daily cron does NOT skip the 23h spring-forward local day (23:30 NY, 2026-03-08)', () => {
+    // Anchor just after the Mar 7 23:30 fire so the next is Mar 8 23:30 — which
+    // must NOT be skipped despite Mar 8 being a 23h local day.
+    jest.setSystemTime(new Date('2026-03-08T05:00:00Z')); // Mar 8 00:00 EST, before 23:30 local
+    const next = ScheduleService.calculateNextRun('30 23 * * *', 'America/New_York');
+    // Mar 8 23:30 EDT (UTC-4 after the jump) = 2026-03-09T03:30Z.
+    expect(new Date(next).toISOString()).toBe('2026-03-09T03:30:00.000Z');
   });
 });
 

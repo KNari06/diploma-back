@@ -84,11 +84,11 @@ Triggers when a `recordedFingerprint` (or `compiled.targetFingerprint`) is prese
 
 Skipped when no recorded fingerprint, 0 allowed candidates, or ambiguous (let LLM use context).
 
-### Stage 3 — Evidence shortcut (sync)
+### Stage 3 — Evidence shortcut (sync, **implemented one layer up**)
 
-When step has `lastSuccessRef` from prior successful apply (manually-added steps without recording info). If the previously-resolved ref is still findable in the live allowed set, return it.
+When step has `lastSuccessRef` from prior successful apply (manually-added steps without recording info). If the previously-resolved ref is still findable, visible, and action-type compatible, return it without calling this resolver at all.
 
-`resolverPath = 'evidence_shortcut'`.
+**Note:** the implementation does NOT live in `element-resolver.service.ts` (no `lastSuccessRef` reference in this file). It lives in `evidence-shortcut.utils.ts` (`evaluateEvidenceShortcut`, pure) and is invoked by the callers — `intent-step-lint.service.ts` (before `resolveElement`) and `preview-step-apply.service.ts`. Listed here because it is logically a waterfall stage; `resolverPath = 'evidence_shortcut'` is stamped by the lint layer.
 
 ### Stage 4 — LLM selection (async, Gemini Flash Lite)
 

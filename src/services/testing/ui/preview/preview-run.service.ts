@@ -18,6 +18,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { IntentTestCaseService } from './intent-test-case.service';
 import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
+import { getPreviewVideoStreamRegistry } from './preview-video-stream.service';
 import { detectPageLoadError } from './page-load-error.util';
 import type { IntentActionType, IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, waitForApiIdle } from './step-readiness.service';
@@ -1340,14 +1341,29 @@ export class PreviewRunService {
         if (['assert', 'ai_check'].includes(actionType)) return 'assertion';
         return 'default';
       };
+      // Category-aware lower floor. Navigation-class actions (click/open/toggle/
+      // select) can mount late overlays — a floating corner widget (chat bubble)
+      // typically slides in over ~300-500ms AFTER the click. The lookahead
+      // snapshot that feeds element resolution runs as soon as the page looks
+      // settled, so an over-eager adaptive floor (150ms) snapshots the widget
+      // mid-animation and its buttons pollute the candidate set (the Run-vs-Apply
+      // divergence: single Apply runs the full post-action settle). A 450ms floor
+      // for navigation gives the entry animation time to finish. Input/assertion
+      // stay at 150ms — they don't spawn corner widgets and shouldn't slow down.
+      const getSettleFloorMs = (category: string): number =>
+        category === 'navigation' ? 450 : 150;
       const getAdaptiveSettleMs = (prevActionType?: IntentActionType | string): number => {
         const category = prevActionType ? getActionCategory(prevActionType) : 'default';
+        const floor = getSettleFloorMs(category);
         const samples = adaptiveSettleByCategory.get(category);
-        if (!samples || samples.length < 2) return STEP_READINESS_CONFIG.defaults.settleMs; // Not enough data
-        // p75 × 1.5 safety margin, clamped to [150, 3000]
+        if (!samples || samples.length < 2) {
+          // Not enough data — use the configured default, but never below the floor.
+          return Math.max(floor, STEP_READINESS_CONFIG.defaults.settleMs);
+        }
+        // p75 × 1.5 safety margin, clamped to [floor, 3000]
         const sorted = [...samples].sort((a, b) => a - b);
         const p75 = sorted[Math.floor(sorted.length * 0.75)];
-        return Math.max(150, Math.min(3000, Math.round(p75 * 1.5)));
+        return Math.max(floor, Math.min(3000, Math.round(p75 * 1.5)));
       };
       const recordSettleTime = (prevActionType: IntentActionType | string, waitedMs: number): void => {
         const category = getActionCategory(prevActionType);
@@ -1715,6 +1731,20 @@ export class PreviewRunService {
           description: step.description,
           timestamp: new Date().toISOString(),
         });
+
+        // Keep the live preview picture in lockstep with the steps panel.
+        // During a run the periodic preview:page snapshot pipeline is gated off
+        // (see preview.handler.ts DOM tick) and the CDP screencast can lag or
+        // freeze under apply/readiness contention — so the panel races ahead
+        // while the picture sits on a stale frame (steps appear to "outrun" the
+        // preview). The previous step has fully settled by the time we mark this
+        // one 'running', so push ONE fresh frame reflecting the state this step
+        // is about to act on. Fire-and-forget: injectSyncFrame is a read-only,
+        // backpressure/zombie/circuit-breaker-guarded page.screenshot (NOT a
+        // CDP-session reuse — invariant #3 safe) that swallows its own errors and
+        // skips paused/zombie/contended streams. The trailing final frame is
+        // emitted after the loop so the last step's result is shown too.
+        getPreviewVideoStreamRegistry().injectSyncFrame(previewSessionId).catch(() => {});
 
         // NOTE: We do NOT emit chat:processing:step here. The draft run is fire-and-forget
         // so clientRequestInFlightRef is already false on the frontend, and processing steps
@@ -2986,6 +3016,12 @@ export class PreviewRunService {
           });
         }
       } catch { /* non-fatal */ }
+
+      // Final sync: the per-step inject above shows each step's result on the
+      // NEXT iteration's 'running' tick — the last step has no next iteration,
+      // so push one frame now to land the picture on the run's end state
+      // (pass screen, failed step, or the page where it stopped).
+      getPreviewVideoStreamRegistry().injectSyncFrame(previewSessionId).catch(() => {});
 
       webSocketService.emitToUser(userId, 'preview:run:completed', {
         previewSessionId,

@@ -119,12 +119,11 @@ Key services integrated: `PreviewSessionService`, `RecordingCaptureService`, `Pr
 - **Server steps:**
   1. Validate user, required fields
   2. Look up pending clarification from cache via key `${sessionId}:${stepId}`
-  3. Find matching candidate by ref
-  4. Store selection in `confirmedSelections` map for use by next apply
-  5. Call `lintStepWithAI()` again with selectedRef constraint (refines step.description)
-  6. Emit updated `preview:step:lint:result`
-- **Response event:** `preview:step:lint:result` (updated with refined description)
-- **Side-effects:** Stores confirmed selection (consumed by preview:step:apply next); LLM re-matches the selected ref
+  3. Find matching candidate by ref (error lint:result if absent)
+  4. Delete the pending clarification; store selection in `confirmedSelections` map for use by next apply
+  5. Emit `preview:step:lint:result` with `status: 'resolved'`, `confidence: 1.0`, the selected candidate and a success highlight — **no re-lint / no LLM call** (user confirmation is treated as ground truth)
+- **Response event:** `preview:step:lint:result` (resolved, confidence 1.0)
+- **Side-effects:** Stores confirmed selection (consumed by preview:step:apply next). No LLM call.
 - **Gotchas:** If pending clarification not found or expired, emit error lint:result; selection only valid for ONE apply (deleted after apply succeeds)
 
 #### `preview:step:apply`

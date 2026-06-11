@@ -115,6 +115,13 @@ const envSchema = z.object({
   SCALE_CHECK_INTERVAL_MS: z.string().transform(Number).default('15000'),
   SCALE_MAX_MEMORY_PERCENT: z.string().transform(Number).default('80'),
 
+  // When true, the worker process hosts the scheduler bundle (schedule sweeps +
+  // retention jobs) behind a Redis leader lock — exactly one worker replica
+  // runs them. Default OFF: local docker-compose runs a dedicated `scheduler`
+  // container, so the worker stays out of scheduling there. Set true on the
+  // prod worker (which is the only deployed long-lived process).
+  SCHEDULER_IN_WORKER: z.string().transform(v => v === 'true').default('false'),
+
   // Agent
   AGENT_TIMEOUT: z.string().transform(Number).default('300000'),
   AGENT_MAX_RETRIES: z.string().transform(Number).default('3'),
@@ -149,7 +156,7 @@ const envSchema = z.object({
   BACKEND_URL: z.string().optional(),
 
   // Email / SMTP
-  SMTP_PASSWORD: z.string().optional(), // Gmail app password for noreply@qait.dev
+  SMTP_PASSWORD: z.string().optional(), // Gmail app password for yera@qait.dev
 
   // Email Inbox (IMAP for test email reception — catch-all inbox)
   IMAP_HOST: z.string().default('imap.gmail.com'),
@@ -185,6 +192,19 @@ const envSchema = z.object({
   // Staged rollout: enable reads first, then writes, then credits cutover
   FEATURE_ORG_MEMBERS_ENABLED: z.string().transform(v => v === 'true').default('true'),
   FEATURE_ORG_CREDITS_ENABLED: z.string().transform(v => v === 'true').default('true'),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Self-serve PLG signup. Default false keeps the B2B flow intact
+  // (manual admin approval + business-email gate). When true:
+  //   - new users are provisioned approved on first auth (status set to
+  //     'approved', overriding the users.status column default), with a
+  //     default workspace + project so they skip the onboarding wizard
+  //   - the business-email gate accepts personal domains (Gmail etc.);
+  //     the disposable-domain block stays on as anti-abuse
+  // The requireApproved middleware is left in place — flipping this off
+  // restores gated behaviour with no code change.
+  // ──────────────────────────────────────────────────────────────────
+  AUTO_APPROVE_SIGNUP: z.string().transform(v => v === 'true').default('false'),
 
   // ──────────────────────────────────────────────────────────────────
   // Per-test-case chat (Phase 1-8 backend, frontend integration TBD).
@@ -237,6 +257,28 @@ const envSchema = z.object({
   // instant retries by caching the full (message + context) pair for 60s.
   // Set to 'true' to disable.
   INTENT_CACHE_DISABLED: z.string().transform(v => v === 'true').default('false'),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Per-step screenshot capture (web + mobile regression replay).
+  // Captures a lightweight screenshot after EVERY step so passing/flaky
+  // runs have visual evidence even when video/trace are disabled (video
+  // only records on infra-retry attempts). Screenshots are uploaded to
+  // the artifacts bucket as URLs — never stored as base64 in the DB.
+  // ON by default; pair with the artifact-retention job (prunes old
+  // screenshots) so storage doesn't grow unbounded.
+  // ──────────────────────────────────────────────────────────────────
+  SCREENSHOT_EACH_STEP_ENABLED: z.string().transform(v => v === 'true').default('true'),
+  // Encoding format: 'webp' (smaller, via sharp) or 'jpeg' (Playwright-native).
+  SCREENSHOT_FORMAT: z.enum(['webp', 'jpeg']).default('webp'),
+  // Quality 1-100. Applies to both webp and jpeg. Clamped in ScreenshotCaptureFeature.
+  SCREENSHOT_QUALITY: z.string().transform(Number).default('75'),
+  // Screenshots older than this (days) are pruned by the artifact-retention job.
+  SCREENSHOT_RETENTION_DAYS: z.string().transform(Number).default('30'),
+  // Local editor / forensic logs in test_logs/editor/ older than this (days) are
+  // pruned by the artifact-retention job's local sweep. These are debug artifacts
+  // (editor traces + per-apply forensic jsonl/ds/html triplets) that otherwise
+  // grow without bound — ~16 files per editor session, no upstream cleanup.
+  EDITOR_LOG_RETENTION_DAYS: z.string().transform(Number).default('3'),
 
   // Phase B1: mobile-editor force-route. When `true` (default), chat
   // requests carrying `context.mobileEditorMode=true` with a non-empty
@@ -291,6 +333,14 @@ const envSchema = z.object({
   // matters more than the post-hoc "why did the agent do X" debug surface.
   // WebSocket streaming is unaffected by this flag.
   MOBILE_AGENT_PERSIST_REASONING: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
+
+  // Full LLM prompt+completion persistence to ai_call_logs (for hallucination
+  // debugging). OPT-IN and OFF by default — unlike the reasoning flag above —
+  // because it stores the richest, most sensitive data (even after redaction)
+  // and adds DB volume. Enable in dev/staging or per-incident to debug AI
+  // failures. Text is always passed through redactForPersist first; rows carry
+  // a 30-day TTL. Set to 'true' to enable.
+  LLM_IO_PERSIST_ENABLED: z.string().transform(v => v.trim().toLowerCase() === 'true').default('false'),
 
   // ──────────────────────────────────────────────────────────────────
   // Phase 4 (May 2026): mobile regression concurrency cap.

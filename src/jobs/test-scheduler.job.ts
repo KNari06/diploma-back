@@ -102,6 +102,23 @@ export class TestSchedulerJobHandler {
   }
 
   /**
+   * Wait for any in-flight tick to finish (bounded). Call on graceful shutdown
+   * BEFORE process.exit so a deploy landing inside the claim→dispatch window
+   * doesn't abandon a just-claimed (and, for one_time, already-deactivated)
+   * schedule mid-flight — which would lose that run with no record. A hard
+   * kill (SIGKILL/OOM) can still interrupt; this only covers graceful stops.
+   */
+  static async waitForIdle(timeoutMs = 10000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.isRunning && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (this.isRunning) {
+      logger.warn('[TEST_SCHEDULER] waitForIdle timed out with a tick still running');
+    }
+  }
+
+  /**
    * Process all due schedules
    */
   static async processSchedules(): Promise<void> {
@@ -333,12 +350,17 @@ export class TestSchedulerJobHandler {
       }
 
       // ── Branch 3: All other failures ─────────────────────────────────
-      // Network blip, DB error, runner crash. Schedule's next_run_at
-      // was already advanced by claimDueSchedule(), so the user misses
-      // exactly one occurrence. Tell them so they aren't surprised.
+      // Network blip, DB error, runner crash. For a RECURRING schedule,
+      // next_run_at was already advanced by claimDueSchedule(), so the user
+      // misses exactly one occurrence and the next one retries. For a ONE_TIME
+      // schedule, claimDueSchedule() already deactivated it (is_active=false,
+      // next_run_at=null) — there is NO next occurrence, so the run is lost and
+      // the message must NOT promise a retry.
+      const isOneTime = schedule.scheduleType === 'one_time';
       logger.error('[TEST_SCHEDULER] Scheduled run failed', {
         userId,
         scheduleId: schedule.scheduleId,
+        scheduleType: schedule.scheduleType,
         targetType,
         targetId,
         error: errorMessage,
@@ -349,8 +371,10 @@ export class TestSchedulerJobHandler {
           userId,
           type: 'personal',
           category: 'system',
-          title: 'Scheduled run failed',
-          message: `Your scheduled ${targetType} couldn't start: ${errorMessage.slice(0, 200)}. The next scheduled run will try again.`,
+          title: isOneTime ? 'One-time scheduled run failed' : 'Scheduled run failed',
+          message: isOneTime
+            ? `Your one-time scheduled ${targetType} couldn't start: ${errorMessage.slice(0, 200)}. It will NOT retry — please reschedule it.`
+            : `Your scheduled ${targetType} couldn't start: ${errorMessage.slice(0, 200)}. The next scheduled run will try again.`,
           metadata: {
             scheduleId: schedule.scheduleId,
             targetType,

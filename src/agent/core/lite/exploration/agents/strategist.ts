@@ -21,9 +21,9 @@
 
 import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
-import { AI_MODELS } from '@/config/ai/ai-models.config';
 
 import type { ExplorationBlackboard, StrategistInput, StrategistOutput } from './agent-types';
+import { EXPLORATION_AGENT_LLM } from './agent-llm-config';
 import {
   buildTreeSummary,
   buildFlowSummaries,
@@ -37,8 +37,8 @@ import {
   parseStrategistResponse,
 } from './strategist-prompts';
 
-/** Timeout for Strategist AI call (45s — strategist processes all entry points + page insights) */
-const STRATEGIST_TIMEOUT_MS = 45_000;
+/** Centralized LLM tuning for this agent (model / temp / tokens / timeout). */
+const LLM = EXPLORATION_AGENT_LLM.strategist;
 
 export class ExplorationStrategist {
   constructor(private readonly bb: ExplorationBlackboard) {}
@@ -53,16 +53,13 @@ export class ExplorationStrategist {
   }
 
   /**
-   * Re-evaluate strategy after a batch of flows completes.
-   * Sees: all of above + completed flows + Scout discoveries.
-   */
-  async reEvaluate(): Promise<StrategistOutput | null> {
-    return this.callStrategist();
-  }
-
-  /**
    * Handle a user directive from WebSocket.
    * Sees: all context + the user directive.
+   *
+   * INTEGRATION POINT (not yet wired): a WebSocket handler can call this to let
+   * the user steer a running exploration ("focus on checkout", "skip X"). It is
+   * intentionally kept even though no caller exists yet — it is the entry point
+   * for that feature, not dead-by-mistake code.
    */
   async handleDirective(directive: string): Promise<StrategistOutput> {
     const result = await this.callStrategist(directive);
@@ -71,6 +68,11 @@ export class ExplorationStrategist {
 
   /**
    * Plan focused exploration based on Sentinel's gap analysis.
+   *
+   * This IS the between-rounds re-evaluation: callStrategist() rebuilds its
+   * input from the live blackboard, so it sees completed flows, Scout's
+   * recentDiscoveries, and the coverage assessment — the adaptive re-strategy
+   * the engine runs before each extra Phase 2.5 round.
    */
   async planFocused(focusAreas?: string[]): Promise<StrategistOutput> {
     const directive = focusAreas
@@ -85,7 +87,7 @@ export class ExplorationStrategist {
     const prompt = buildStrategistPrompt(input);
 
     this.bb.trace?.writeStrategistPrompt({
-      model: AI_MODELS.smart,
+      model: LLM.model,
       systemPrompt: STRATEGIST_SYSTEM_PROMPT,
       userPrompt: prompt,
       userDirective,
@@ -103,14 +105,14 @@ export class ExplorationStrategist {
             { role: 'user', content: prompt },
           ],
           {
-            model: AI_MODELS.smart,
-            temperature: 0.2,
-            max_tokens: 3500,
+            model: LLM.model,
+            temperature: LLM.temperature,
+            max_tokens: LLM.maxTokens,
             response_format: { type: 'json_object' },
           },
         ),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Strategist AI timeout')), STRATEGIST_TIMEOUT_MS),
+          setTimeout(() => reject(new Error('Strategist AI timeout')), LLM.timeoutMs),
         ),
       ]);
 
@@ -120,7 +122,7 @@ export class ExplorationStrategist {
       const latencyMs = Date.now() - aiStartTime;
 
       this.bb.trace?.writeStrategistResponse({
-        model: AI_MODELS.smart,
+        model: LLM.model,
         rawResponse: response.content,
         parsed: result ? {
           plannedFlows: result.plan.length,
@@ -158,12 +160,15 @@ export class ExplorationStrategist {
   }
 
   private buildInput(userDirective?: string): StrategistInput {
+    // Exclude skipped (budget-exhausted, never-run) flows from the "completed"
+    // view — otherwise the Strategist re-plans as if they were already done.
+    const executedFlows = this.bb.completedFlows.filter((f) => f.status !== 'skipped');
     return {
       tree: buildTreeSummary(this.bb.tree),
       allEntryPoints: this.bb.tree?.getAllEntryPoints() ?? [],
       pageInsights: getPageInsightsArray(this.bb),
-      completedFlows: buildFlowSummaries(this.bb.completedFlows),
-      blockedFlows: buildBlockedFlowSummaries(this.bb.completedFlows),
+      completedFlows: buildFlowSummaries(executedFlows),
+      blockedFlows: buildBlockedFlowSummaries(executedFlows),
       recentDiscoveries: this.bb.discoveredBranches,
       coverageAssessment: this.bb.coverageAssessment,
       budget: buildBudgetSummary(this.bb.budget),
