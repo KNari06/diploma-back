@@ -138,4 +138,33 @@ describe('MobileExplorationRelay', () => {
     jest.advanceTimersByTime(1001);
     expect(lastSocket.disconnect).toHaveBeenCalledTimes(1);
   });
+
+  it('waitUntilDone resolves with the completion outcome', async () => {
+    const relay = makeRelay();
+    relay.start();
+    lastSocket.fire('exploration:completed', {
+      explorationId: 'expl-1', status: 'completed', testCasesCount: 3, summary: { coverageScore: 70 },
+    });
+    await expect(relay.waitUntilDone()).resolves.toEqual(expect.objectContaining({
+      status: 'completed', reason: 'completed', testCasesCount: 3, summary: { coverageScore: 70 },
+    }));
+  });
+
+  it('waitUntilDone resolves failed when the cap fires without completion', async () => {
+    const relay = makeRelay({ maxLifetimeMs: 1000 });
+    relay.start();
+    jest.advanceTimersByTime(1001);
+    const outcome = await relay.waitUntilDone();
+    expect(outcome.status).toBe('failed');
+    expect(outcome.reason).toBe('timeout');
+  });
+
+  it('waitUntilDone resolves failed on a bare stop() (cancel)', async () => {
+    const relay = makeRelay();
+    relay.start();
+    relay.stop();
+    const outcome = await relay.waitUntilDone();
+    expect(outcome.status).toBe('failed');
+    expect(outcome.reason).toBe('stopped');
+  });
 });

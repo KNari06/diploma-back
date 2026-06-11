@@ -7,6 +7,7 @@ import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from 
 import { AllureImportJobHandler } from '@/jobs/allure-import.job';
 import { AutoLearnJobHandler } from '@/jobs/auto-learn.job';
 import { ExplorationRunJobHandler } from '@/jobs/exploration-run.job';
+import { MobileExplorationRunJobHandler } from '@/jobs/mobile-exploration-run.job';
 import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manual-test-run.job';
 import { MobileTestRunJobHandler } from '@/jobs/mobile-test-run.job';
 import { processNegativeGeneration } from '@/jobs/negative-generation.job';
@@ -302,6 +303,48 @@ const explorationWorker = new Worker(
   }
 );
 
+// Mobile exploration worker — backend-brokered runner crawl (Stage 3).
+// Holds a relay for the run's lifetime, so concurrency is capped low and
+// the lock spans the whole crawl (mirrors the web exploration worker).
+const mobileExplorationWorker = new Worker(
+  QUEUE_NAMES.MOBILE_EXPLORATION,
+  async (job) => {
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+    const startTime = Date.now();
+    logger.info(`[MOBILE_EXPLORATION_WORKER] Processing job: ${job.id}`, {
+      explorationId: job.data?.explorationId,
+      appId: job.data?.appId,
+      platform: job.data?.platform,
+    });
+    try {
+      if (!MobileExplorationRunJobHandler || typeof MobileExplorationRunJobHandler.process !== 'function') {
+        throw new Error('MobileExplorationRunJobHandler.process is not a function');
+      }
+      await MobileExplorationRunJobHandler.process(job);
+      logger.info(`[MOBILE_EXPLORATION_WORKER] Job completed: ${job.id}`, {
+        explorationId: job.data?.explorationId,
+        duration: `${Date.now() - startTime}ms`,
+      });
+    } catch (error) {
+      logger.error(`[MOBILE_EXPLORATION_WORKER] Job failed: ${job.id}`, {
+        explorationId: job.data?.explorationId,
+        duration: `${Date.now() - startTime}ms`,
+        error: error instanceof Error ? { message: error.message, name: error.name, stack: error.stack } : String(error),
+      });
+      throw error;
+    }
+  },
+  {
+    ...workerOptions,
+    concurrency: 2,
+    lockDuration: 20 * 60 * 1000, // 20 min — crawl can run long
+    stalledInterval: 5 * 60 * 1000,
+    maxStalledCount: 1,
+  },
+);
+
 // Mobile test run worker
 const mobileTestRunWorker = new Worker(
   QUEUE_NAMES.MOBILE_TEST_RUN,
@@ -576,6 +619,7 @@ setupWorkerEvents(notificationWorker, 'Notification');
 setupWorkerEvents(webhookWorker, 'Webhook');
 setupWorkerEvents(gitWebhookWorker, 'GitWebhook');
 setupWorkerEvents(explorationWorker, 'Exploration');
+setupWorkerEvents(mobileExplorationWorker, 'MobileExploration');
 setupWorkerEvents(mobileTestRunWorker, 'MobileTestRun');
 setupWorkerEvents(negativeGenerationWorker, 'NegativeGeneration');
 setupWorkerEvents(allureImportWorker, 'AllureImport');
@@ -621,6 +665,7 @@ const gracefulShutdown = async (signal: string) => {
       webhookWorker.close(),
       gitWebhookWorker.close(),
       explorationWorker.close(),
+      mobileExplorationWorker.close(),
       mobileTestRunWorker.close(),
       negativeGenerationWorker.close(),
       allureImportWorker.close(),

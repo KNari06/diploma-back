@@ -108,6 +108,48 @@ export class ExplorationStorageService {
   }
 
   /**
+   * Mark a MOBILE exploration run as completed.
+   *
+   * Mobile runs come from the runner (not the in-process ExplorationEngine),
+   * so we don't have a web `ExplorationResult` — only the relay's terminal
+   * outcome (status + summary + counts). This persists those directly,
+   * mirroring `completeRun`'s columns. `failRun` covers the failed path.
+   */
+  static async completeMobileRun(
+    explorationId: string,
+    data: {
+      summary: Record<string, unknown>;
+      durationMs?: number | null;
+      testCasesCount?: number;
+    },
+  ): Promise<void> {
+    try {
+      const { error } = await supabaseAdmin
+        .from('exploration_runs')
+        .update({
+          status: 'completed',
+          summary: data.summary,
+          duration_ms: data.durationMs ?? null,
+          test_cases_count: data.testCasesCount ?? 0,
+          completed_at: new Date().toISOString(),
+        })
+        .eq('exploration_id', explorationId);
+
+      if (error) {
+        logger.error('[EXPLORATION_STORAGE] Failed to complete mobile run', {
+          error: error.message,
+          explorationId,
+        });
+      }
+    } catch (error) {
+      logger.error('[EXPLORATION_STORAGE] Error completing mobile run', {
+        error: error instanceof Error ? error.message : String(error),
+        explorationId,
+      });
+    }
+  }
+
+  /**
    * Mark exploration run as failed.
    */
   static async failRun(explorationId: string, errorMessage: string): Promise<void> {

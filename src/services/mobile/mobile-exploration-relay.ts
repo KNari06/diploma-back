@@ -28,8 +28,14 @@ import type {
 export interface MobileExplorationRelayParams {
   /** Runner Socket.IO base URL, e.g. ws://runner:4100 (http(s):// also ok). */
   runnerSocketUrl: string;
-  /** The runner's run id — also the explorationId on the wire. */
+  /** The runner's run id — what we subscribe to on the runner socket. */
   runId: string;
+  /**
+   * Our backend exploration id, used to RE-LABEL forwarded events. The
+   * runner mints its own runId; the frontend keys off explorationId. When
+   * omitted we fall back to runId (they're the same on the web path).
+   */
+  explorationId?: string;
   /** Routing: which chat session + user the backend emits to. */
   chatSessionId?: string;
   userId?: string;
@@ -41,12 +47,37 @@ export interface MobileExplorationRelayParams {
 
 const DEFAULT_MAX_LIFETIME_MS = 20 * 60 * 1000;
 
+/** Terminal outcome resolved by waitUntilDone(). */
+export interface MobileExplorationRelayOutcome {
+  status: 'completed' | 'failed';
+  errorMessage?: string;
+  testCasesCount: number;
+  summary: Record<string, unknown>;
+  /** Why the relay ended: a forwarded completion, a stop(), or the cap. */
+  reason: 'completed' | 'stopped' | 'timeout';
+}
+
 export class MobileExplorationRelay {
   private socket: Socket | null = null;
   private lifetimeTimer: NodeJS.Timeout | null = null;
   private stopped = false;
 
-  constructor(private readonly params: MobileExplorationRelayParams) {}
+  // Resolved once the run terminates (completion / stop / cap). Lets the
+  // owning job hold the relay for the run's duration, then persist + emit.
+  private donePromise: Promise<MobileExplorationRelayOutcome>;
+  private resolveDone!: (o: MobileExplorationRelayOutcome) => void;
+  private lastCompleted: Partial<ExplorationCompletedPayload> | null = null;
+
+  constructor(private readonly params: MobileExplorationRelayParams) {
+    this.donePromise = new Promise((resolve) => {
+      this.resolveDone = resolve;
+    });
+  }
+
+  /** Await the run's terminal outcome (job holds the relay until this resolves). */
+  waitUntilDone(): Promise<MobileExplorationRelayOutcome> {
+    return this.donePromise;
+  }
 
   /** Connect to the runner, subscribe to the run, begin forwarding. */
   start(): void {
@@ -75,6 +106,7 @@ export class MobileExplorationRelay {
     });
 
     socket.on('exploration:completed', (envelope: Partial<ExplorationCompletedPayload>) => {
+      this.lastCompleted = envelope;
       this.forwardCompleted(envelope);
       // Terminal — tear down once the completion is forwarded.
       this.stop('completed');
@@ -118,11 +150,25 @@ export class MobileExplorationRelay {
       this.socket = null;
     }
     logger.info('[mobile-exploration-relay] stopped', { runId: this.params.runId, reason });
+
+    // Resolve the owning job's await exactly once. A forwarded completion
+    // carries the real status/summary; a stop()/timeout without one is a
+    // failed outcome (the run never reported done).
+    const c = this.lastCompleted;
+    const outcomeReason: MobileExplorationRelayOutcome['reason'] =
+      reason === 'completed' ? 'completed' : reason === 'timeout' ? 'timeout' : 'stopped';
+    this.resolveDone({
+      status: c ? (c.status === 'failed' ? 'failed' : 'completed') : 'failed',
+      errorMessage: c?.errorMessage ?? (c ? undefined : `relay ended without completion (${reason})`),
+      testCasesCount: c?.testCasesCount ?? 0,
+      summary: c?.summary ?? {},
+      reason: outcomeReason,
+    });
   }
 
   private forwardProgress(envelope: Partial<ExplorationProgressPayload>): void {
     const payload: ExplorationProgressPayload = {
-      explorationId: envelope.explorationId ?? this.params.runId,
+      explorationId: this.params.explorationId ?? envelope.explorationId ?? this.params.runId,
       phase: envelope.phase ?? 'flow',
       event: envelope.event ?? 'progress',
       progressPercent: envelope.progressPercent ?? 0,
@@ -138,7 +184,7 @@ export class MobileExplorationRelay {
 
   private forwardCompleted(envelope: Partial<ExplorationCompletedPayload>): void {
     const payload: ExplorationCompletedPayload = {
-      explorationId: envelope.explorationId ?? this.params.runId,
+      explorationId: this.params.explorationId ?? envelope.explorationId ?? this.params.runId,
       testCasesCount: envelope.testCasesCount ?? 0,
       summary: envelope.summary ?? {},
       status: envelope.status === 'failed' ? 'failed' : 'completed',
