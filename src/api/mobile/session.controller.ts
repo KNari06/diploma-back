@@ -2182,3 +2182,33 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
     });
   }
 }
+
+/**
+ * GET /api/v1/mobile/exploration/readiness
+ *
+ * Backend-brokered readiness probe for mobile exploration. Replaces the
+ * browser's direct runner call: the runner API key stays server-side
+ * (injected by MobileRunnerClient), so the frontend launcher can show
+ * the "Runner / LLM keys / emulator slot" panel without ever holding
+ * the key. Returns the runner's readiness shape as-is.
+ */
+export async function explorationReadiness(req: Request, res: Response): Promise<void> {
+  if (!req.user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+  try {
+    const client = getMobileRunnerClient();
+    const readiness = await client.getExplorationReadiness({ userId: req.user.id });
+    res.json({ success: true, readiness });
+  } catch (error) {
+    logger.warn('[MOBILE_SESSION] Exploration readiness probe failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(502).json({
+      success: false,
+      error: 'Runner readiness check failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
