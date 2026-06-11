@@ -66,6 +66,56 @@ describe('topologicalSort', () => {
     expect(result.sorted.some((t) => t.testCaseId === 'C')).toBe(true);
   });
 
+  it('separates cycle members from nodes merely blocked by the cycle', () => {
+    // A ↔ B cycle; C depends on B; D depends on C (transitive chain off the cycle)
+    const result = topologicalSort([
+      tc('A', ['B']),
+      tc('B', ['A']),
+      tc('C', ['B']),
+      tc('D', ['C']),
+    ]);
+    expect(result.hasCycle).toBe(true);
+    expect(result.cycleNodes!.sort()).toEqual(['A', 'B']);
+    expect(result.blockedByCycleNodes!.sort()).toEqual(['C', 'D']);
+  });
+
+  it('reports a self-dependency as a cycle, not as blocked', () => {
+    const result = topologicalSort([tc('A', ['A']), tc('B')]);
+    expect(result.hasCycle).toBe(true);
+    expect(result.cycleNodes).toEqual(['A']);
+    expect(result.blockedByCycleNodes).toEqual([]);
+  });
+
+  it('handles two independent cycles each with their own blocked dependents', () => {
+    const result = topologicalSort([
+      tc('A', ['B']),
+      tc('B', ['A']),
+      tc('C', ['D']),
+      tc('D', ['C']),
+      tc('E', ['A']),
+      tc('F', ['D']),
+      tc('G'),
+    ]);
+    expect(result.hasCycle).toBe(true);
+    expect(result.cycleNodes!.sort()).toEqual(['A', 'B', 'C', 'D']);
+    expect(result.blockedByCycleNodes!.sort()).toEqual(['E', 'F']);
+    // the healthy node still executes
+    expect(result.sorted.map((t) => t.testCaseId)).toEqual(['G']);
+  });
+
+  it('keeps a node with one healthy and one cyclic dependency in blocked, not in cycle', () => {
+    // E depends on both the cycle (A) and a healthy node (G)
+    const result = topologicalSort([
+      tc('A', ['B']),
+      tc('B', ['A']),
+      tc('G'),
+      tc('E', ['A', 'G']),
+    ]);
+    expect(result.cycleNodes!.sort()).toEqual(['A', 'B']);
+    expect(result.blockedByCycleNodes).toEqual(['E']);
+    expect(result.sorted.map((t) => t.testCaseId)).toEqual(['G']);
+  });
+
   it('handles a diamond dependency graph (A → B, A → C, B → D, C → D)', () => {
     const result = topologicalSort([
       tc('A'),

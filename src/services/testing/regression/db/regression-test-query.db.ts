@@ -74,7 +74,7 @@ export class RegressionTestQueryService {
     // UI test cases from intent_test_cases (unified table)
     const { data: uiCases, error: uiError } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, flow_id, depends_on, platform')
+      .select('id, flow_id, depends_on, platform, priority')
       .in('flow_id', flowIds);
 
     if (uiError) {
@@ -91,6 +91,7 @@ export class RegressionTestQueryService {
         flowId,
         dependsOn: tc.depends_on || [],
         platform: tc.platform || undefined,
+        priority: tc.priority ?? null,
       });
     }
 
@@ -253,19 +254,19 @@ export class RegressionTestQueryService {
   }
 
   /**
-   * depends_on arrays for the given UI test case ids. Empty input → empty array.
+   * depends_on + priority for the given UI test case ids. Empty input → empty array.
    */
   static async getDependsOnRows(
     uiCaseIds: string[],
-  ): Promise<Array<{ id: string; depends_on: string[] | null }>> {
+  ): Promise<Array<{ id: string; depends_on: string[] | null; priority: string | null }>> {
     if (uiCaseIds.length === 0) return [];
 
     const { data } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, depends_on')
+      .select('id, depends_on, priority')
       .in('id', uiCaseIds);
 
-    return (data as Array<{ id: string; depends_on: string[] | null }>) || [];
+    return (data as Array<{ id: string; depends_on: string[] | null; priority: string | null }>) || [];
   }
 
   /**
@@ -329,7 +330,7 @@ export class RegressionTestQueryService {
   static async getUiTestCasesByPriority(projectId: string, priority: Priority): Promise<any[]> {
     const { data } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, flow_id, depends_on, platform')
+      .select('id, flow_id, depends_on, platform, priority')
       .eq('project_id', projectId)
       .eq('priority', priority);
 

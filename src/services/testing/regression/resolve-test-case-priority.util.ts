@@ -90,6 +90,24 @@ const VALID_PRIORITIES: ReadonlySet<string> = new Set([
   'low',
 ]);
 
+/**
+ * Numeric rank for dispatch ordering: critical=0 … low=3. NULL / unknown /
+ * wrongly-cased values collapse to the medium bucket — same semantics the
+ * runByTag sorter has always used (legacy NULL rows must not jump ahead of
+ * or behind explicit 'medium').
+ */
+const PRIORITY_ORDER: Record<string, number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+};
+
+export function priorityRank(priority: string | null | undefined): number {
+  const key = typeof priority === 'string' ? priority.toLowerCase() : '';
+  return PRIORITY_ORDER[key] ?? PRIORITY_ORDER.medium;
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Cache + singleflight (see "PERFORMANCE" in module JSDoc)
 // ────────────────────────────────────────────────────────────────────

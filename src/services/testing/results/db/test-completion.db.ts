@@ -16,12 +16,13 @@ export interface StaleRunRow {
   trigger: string | null;
   test_id: string | null;
   test_ids: string[] | null;
+  summary: Record<string, unknown> | null;
 }
 
 // ── stale-run-reaper ────────────────────────────────────────────────────────
 
 const RUN_FIELDS =
-  'id, status, started_at, project_id, user_id, plan_id, trigger, test_id, test_ids';
+  'id, status, started_at, project_id, user_id, plan_id, trigger, test_id, test_ids, summary';
 
 /**
  * Fetch regression runs whose OWN row is still 'running'/'pending' and
