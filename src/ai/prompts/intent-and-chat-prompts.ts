@@ -51,6 +51,14 @@ export interface IntentParserContext {
   previewSessionId?: string;   // Active preview session (web editor mode)
   mobileSessionId?: string;    // Active runner session (mobile editor mode)
 
+  // Surface the message originated from. When 'exploration', the chat is
+  // embedded in the Exploration UI: an ambiguous URL-bearing request
+  // should default to a site exploration rather than a single test or a
+  // plain answer. This is a SOFT bias applied AFTER classification — it
+  // never overrides an explicit non-exploration intent (api_test,
+  // save_test, editor_action, mobile_*, run_*, …).
+  surfaceContext?: 'exploration' | 'editor' | 'chat' | 'mobile';
+
   // Regression context (for save/run test intents)
   lastTestId?: string;          // ID of last executed test
   lastTestGoal?: string;        // Goal/description of last test

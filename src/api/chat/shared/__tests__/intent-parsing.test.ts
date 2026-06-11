@@ -2,10 +2,77 @@
  * Unit tests for intent-parsing.ts pure functions
  */
 
-import { buildIntentMessage } from '../intent-parsing';
+import { buildIntentMessage, applyExplorationSurfaceBias } from '../intent-parsing';
 import { IntentResult } from '@/types';
 
 describe('intent-parsing', () => {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // applyExplorationSurfaceBias — soft exploration nudge for the Explore UI
+  // ═══════════════════════════════════════════════════════════════════════════
+  describe('applyExplorationSurfaceBias', () => {
+    const biased = (intent: any, surface: unknown, msg: string) => {
+      const p = { ...intent };
+      applyExplorationSurfaceBias(p, surface, msg);
+      return p;
+    };
+
+    it('upgrades general_chat with a URL to platform_test/exploration', () => {
+      const p = biased({ intent: 'general_chat' }, 'exploration', 'check https://shop.com please');
+      expect(p.intent).toBe('platform_test');
+      expect(p.executionStrategy).toBe('exploration');
+    });
+
+    it('upgrades a bare-domain general_chat', () => {
+      const p = biased({ intent: 'general_chat' }, 'exploration', 'explore practicetestautomation.com');
+      expect(p.intent).toBe('platform_test');
+      expect(p.executionStrategy).toBe('exploration');
+    });
+
+    it('upgrades a standard platform_test to exploration', () => {
+      const p = biased(
+        { intent: 'platform_test', executionStrategy: 'standard' },
+        'exploration',
+        'test https://shop.com',
+      );
+      expect(p.intent).toBe('platform_test');
+      expect(p.executionStrategy).toBe('exploration');
+    });
+
+    it('is a no-op when surfaceContext is not exploration', () => {
+      const p = biased({ intent: 'general_chat' }, 'chat', 'check https://shop.com');
+      expect(p.intent).toBe('general_chat');
+      expect(p.executionStrategy).toBeUndefined();
+    });
+
+    it('is a no-op without a URL (plain question stays general_chat)', () => {
+      const p = biased({ intent: 'general_chat' }, 'exploration', 'what can you do?');
+      expect(p.intent).toBe('general_chat');
+    });
+
+    it('never overrides explicit non-exploration intents', () => {
+      for (const intent of ['api_test', 'save_test', 'run_regression', 'editor_action', 'mobile_test', 'needs_clarification']) {
+        const p = biased({ intent }, 'exploration', 'do it on https://shop.com');
+        expect(p.intent).toBe(intent);
+      }
+    });
+
+    it('does not bias on a reverse-DNS package id (that is mobile, not a site)', () => {
+      const p = biased({ intent: 'general_chat' }, 'exploration', 'explore com.acme.app');
+      expect(p.intent).toBe('general_chat');
+    });
+
+    it('leaves an already-exploration platform_test untouched', () => {
+      const p = biased(
+        { intent: 'platform_test', executionStrategy: 'exploration', target: 'checkout' },
+        'exploration',
+        'explore https://shop.com checkout',
+      );
+      expect(p.intent).toBe('platform_test');
+      expect(p.executionStrategy).toBe('exploration');
+      expect(p.target).toBe('checkout');
+    });
+  });
+
   // ═══════════════════════════════════════════════════════════════════════════
   // buildIntentMessage
   // ═══════════════════════════════════════════════════════════════════════════
