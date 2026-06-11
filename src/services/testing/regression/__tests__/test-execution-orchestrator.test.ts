@@ -244,4 +244,183 @@ describe('TestExecutionOrchestratorService.executeTestCasesAsync', () => {
     expect(mockDispatchMobile).toHaveBeenCalledTimes(1);
     expect(mockBuildWebReq).not.toHaveBeenCalled();
   });
+
+  it('surfaces out-of-run dependencies in the run summary instead of swallowing them', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [{ id: 'e1', test_case_id: 'api-1', test_type: 'api' }],
+      error: null,
+    });
+    mockExecuteApi.mockResolvedValue({ success: true, id: 'apiexec-1', status_code: 200 });
+
+    // api-1 depends on a test case that is NOT part of this run
+    await run([apiTC({ dependsOn: ['outside-the-run'] })]);
+
+    // the external dep must not block dispatch
+    expect(mockExecuteApi).toHaveBeenCalledTimes(1);
+    const [, patch] = mockUpdateRun.mock.calls.at(-1)!;
+    expect((patch.summary as any).missingDependencies).toEqual([
+      { testCaseId: 'api-1', missingDependencyIds: ['outside-the-run'] },
+    ]);
+  });
+
+  it('fails cycle members but skips tests merely blocked by the cycle', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [
+        { id: 'e1', test_case_id: 'api-1', test_type: 'api' },
+        { id: 'e2', test_case_id: 'api-2', test_type: 'api' },
+        { id: 'e3', test_case_id: 'api-3', test_type: 'api' },
+      ],
+      error: null,
+    });
+
+    // api-1 ↔ api-2 cycle; api-3 depends on api-2 but is not in the cycle
+    await run([
+      apiTC({ testCaseId: 'api-1', dependsOn: ['api-2'] }),
+      apiTC({ testCaseId: 'api-2', dependsOn: ['api-1'] }),
+      apiTC({ testCaseId: 'api-3', dependsOn: ['api-2'] }),
+    ]);
+
+    expect(mockExecuteApi).not.toHaveBeenCalled();
+    const statusByExec = new Map<string, any>(
+      mockUpdateStatus.mock.calls.map((c: any[]) => [c[0].id, c[0]]),
+    );
+    expect(statusByExec.get('e1')!.status).toBe('failed');
+    expect(statusByExec.get('e2')!.status).toBe('failed');
+    expect(statusByExec.get('e3')!.status).toBe('skipped');
+    expect(statusByExec.get('e3')!.errorMessage).toContain('circular dependency chain');
+  });
+
+  it('dispatches critical tests before low-priority ones within the same level', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [
+        { id: 'e1', test_case_id: 'api-low', test_type: 'api' },
+        { id: 'e2', test_case_id: 'api-crit', test_type: 'api' },
+      ],
+      error: null,
+    });
+    mockExecuteApi.mockResolvedValue({ success: true, id: 'apiexec', status_code: 200 });
+
+    // input order is low-first; dispatch order must be critical-first
+    await run([
+      apiTC({ testCaseId: 'api-low', priority: 'low' }),
+      apiTC({ testCaseId: 'api-crit', priority: 'critical' }),
+    ]);
+
+    const dispatched = mockExecuteApi.mock.calls.map((c: any[]) => c[1].test_config_id);
+    expect(dispatched).toEqual(['api-crit', 'api-low']);
+  });
+
+  it('priority never overrides dependency order: a critical dependent still waits for its low-priority parent', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [
+        { id: 'e1', test_case_id: 'api-parent', test_type: 'api' },
+        { id: 'e2', test_case_id: 'api-child', test_type: 'api' },
+      ],
+      error: null,
+    });
+    mockExecuteApi.mockResolvedValue({ success: true, id: 'apiexec', status_code: 200 });
+
+    await run([
+      apiTC({ testCaseId: 'api-child', priority: 'critical', dependsOn: ['api-parent'] }),
+      apiTC({ testCaseId: 'api-parent', priority: 'low' }),
+    ]);
+
+    const dispatched = mockExecuteApi.mock.calls.map((c: any[]) => c[1].test_config_id);
+    expect(dispatched).toEqual(['api-parent', 'api-child']);
+  });
+
+  it('cascades skips down a dependency chain when the root test fails', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [
+        { id: 'e1', test_case_id: 'api-1', test_type: 'api' },
+        { id: 'e2', test_case_id: 'api-2', test_type: 'api' },
+        { id: 'e3', test_case_id: 'api-3', test_type: 'api' },
+      ],
+      error: null,
+    });
+    mockExecuteApi.mockResolvedValue({ success: false, error_message: 'root failed' });
+
+    // chain: api-1 ← api-2 ← api-3
+    await run([
+      apiTC({ testCaseId: 'api-1' }),
+      apiTC({ testCaseId: 'api-2', dependsOn: ['api-1'] }),
+      apiTC({ testCaseId: 'api-3', dependsOn: ['api-2'] }),
+    ]);
+
+    // only the root was actually executed
+    expect(mockExecuteApi).toHaveBeenCalledTimes(1);
+    const skips = mockUpdateStatus.mock.calls
+      .map((c: any[]) => c[0])
+      .filter((p: any) => p.status === 'skipped');
+    expect(skips.map((p: any) => p.id).sort()).toEqual(['e2', 'e3']);
+    skips.forEach((p: any) => expect(p.errorMessage).toContain('prerequisite'));
+
+    const finalize = mockUpdateRun.mock.calls.at(-1)![1];
+    expect(finalize.status).toBe('failed');
+    expect((finalize.summary as any).skipped).toBe(2);
+  });
+
+  it('omits missingDependencies from the summary when all dependencies are in-run', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [
+        { id: 'e1', test_case_id: 'api-1', test_type: 'api' },
+        { id: 'e2', test_case_id: 'api-2', test_type: 'api' },
+      ],
+      error: null,
+    });
+    mockExecuteApi.mockResolvedValue({ success: true, id: 'apiexec', status_code: 200 });
+
+    await run([apiTC({ testCaseId: 'api-1' }), apiTC({ testCaseId: 'api-2', dependsOn: ['api-1'] })]);
+
+    const finalize = mockUpdateRun.mock.calls.at(-1)![1];
+    expect((finalize.summary as any).missingDependencies).toBeUndefined();
+  });
+
+  it('reports only the out-of-run portion of a mixed dependency list and still honors the in-run part', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [
+        { id: 'e1', test_case_id: 'api-1', test_type: 'api' },
+        { id: 'e2', test_case_id: 'api-2', test_type: 'api' },
+      ],
+      error: null,
+    });
+    mockExecuteApi.mockResolvedValue({ success: true, id: 'apiexec', status_code: 200 });
+
+    // api-2 depends on api-1 (in run) AND ghost-1 (absent)
+    await run([
+      apiTC({ testCaseId: 'api-1' }),
+      apiTC({ testCaseId: 'api-2', dependsOn: ['api-1', 'ghost-1'] }),
+    ]);
+
+    // in-run dependency still ordered: parent dispatched before child
+    const dispatched = mockExecuteApi.mock.calls.map((c: any[]) => c[1].test_config_id);
+    expect(dispatched).toEqual(['api-1', 'api-2']);
+
+    const finalize = mockUpdateRun.mock.calls.at(-1)![1];
+    expect((finalize.summary as any).missingDependencies).toEqual([
+      { testCaseId: 'api-2', missingDependencyIds: ['ghost-1'] },
+    ]);
+  });
+
+  it('carries missingDependencies into the fail-fast finalize summary', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [
+        { id: 'e1', test_case_id: 'api-1', test_type: 'api' },
+        { id: 'e2', test_case_id: 'api-2', test_type: 'api' },
+      ],
+      error: null,
+    });
+    mockExecuteApi.mockResolvedValue({ success: false, error_message: 'boom' });
+
+    await run(
+      [apiTC({ testCaseId: 'api-1', dependsOn: ['ghost-1'] }), apiTC({ testCaseId: 'api-2' })],
+      { failFast: true },
+    );
+
+    const finalize = mockUpdateRun.mock.calls.at(-1)![1];
+    expect((finalize.summary as any).failFastTriggered).toBe(true);
+    expect((finalize.summary as any).missingDependencies).toEqual([
+      { testCaseId: 'api-1', missingDependencyIds: ['ghost-1'] },
+    ]);
+  });
 });

@@ -49,6 +49,19 @@ const PREVIEW_VIDEO_CONFIG = {
   // Monitoring
   statsIntervalMs: 10000,
 
+  // Adaptive throttle ladder (client-health driven). The server NEVER restarts
+  // the screencast or changes JPEG quality (per the chosen strategy) — it only
+  // widens the inter-frame interval per session when the CLIENT reports it
+  // can't keep up. Cheap, fully reversible, loses no guaranteed frames.
+  // Index 0 is the default (45fps); the client report walks the ladder up
+  // (slower) on sustained low FPS and back down (faster) when it recovers.
+  adaptiveIntervalLadderMs: [22, 33, 66] as const, // ≈45 / 30 / 15 fps
+  // A client FPS at or below this fraction of the current target is "struggling".
+  adaptiveDegradeRatio: 0.6,
+  // A client FPS at or above this fraction of the NEXT-FASTER target means it
+  // has headroom — step back down. Hysteresis gap (0.6 vs 0.9) prevents flapping.
+  adaptiveRecoverRatio: 0.9,
+
   // CDP-idle watchdog (see PreviewVideoStreamService field comment).
   // Tick interval — keep small so detection is responsive.
   cdpIdleCheckIntervalMs: 1000,
@@ -187,6 +200,11 @@ export class PreviewVideoStreamService {
   private cdpIdleWatchdog: NodeJS.Timeout | null = null;
   private lastCdpFrameAt = 0;
 
+  // Adaptive throttle state (client-health driven). Index into
+  // adaptiveIntervalLadderMs; 0 = full 45fps. Only moved by applyHealthHint().
+  private adaptiveLadderIdx = 0;
+  private currentMinFrameIntervalMs = PREVIEW_VIDEO_CONFIG.minFrameIntervalMs;
+
   constructor(previewSessionId: string, userId: string, room: string, initialSeq?: number) {
     this.previewSessionId = previewSessionId;
     this.userId = userId;
@@ -199,6 +217,60 @@ export class PreviewVideoStreamService {
   /** Get current seq value (for passing to replacement stream on page switch) */
   getSeq(): number {
     return this.seq;
+  }
+
+  /**
+   * Adaptive throttle — react to a client-reported render FPS. The client
+   * (which knows its real paint rate) periodically reports how many frames it
+   * actually rendered; if it's well below the rate we're sending, the client
+   * is the bottleneck (slow CPU, background tab, weak GPU) and pushing more
+   * frames only grows latency. We widen the inter-frame interval one ladder
+   * step; when the client recovers, we step back down.
+   *
+   * Strategy is INTENTIONALLY fps-only: we never restart the screencast or
+   * change JPEG quality here. Changing only `currentMinFrameIntervalMs` cannot
+   * lose a guaranteed frame, races nothing, and is instantly reversible.
+   *
+   * Idempotent and self-clamping — safe to call on every client report.
+   * Returns the (possibly unchanged) target interval for logging/telemetry.
+   */
+  applyHealthHint(clientFps: number): number {
+    const ladder = PREVIEW_VIDEO_CONFIG.adaptiveIntervalLadderMs;
+    const prevIdx = this.adaptiveLadderIdx;
+    const currentTargetFps = 1000 / ladder[prevIdx];
+
+    // Ignore obviously bogus reports (negative / absurd) — fail safe (no-op).
+    if (!Number.isFinite(clientFps) || clientFps < 0) {
+      return this.currentMinFrameIntervalMs;
+    }
+
+    // Struggling: client renders ≤ 60% of what we're sending → step slower.
+    if (
+      clientFps < currentTargetFps * PREVIEW_VIDEO_CONFIG.adaptiveDegradeRatio
+      && this.adaptiveLadderIdx < ladder.length - 1
+    ) {
+      this.adaptiveLadderIdx++;
+    } else if (this.adaptiveLadderIdx > 0) {
+      // Recovery: only step faster if the client comfortably clears the
+      // NEXT-faster target (hysteresis vs the degrade threshold → no flapping).
+      const fasterTargetFps = 1000 / ladder[this.adaptiveLadderIdx - 1];
+      if (clientFps >= fasterTargetFps * PREVIEW_VIDEO_CONFIG.adaptiveRecoverRatio) {
+        this.adaptiveLadderIdx--;
+      }
+    }
+
+    this.currentMinFrameIntervalMs = ladder[this.adaptiveLadderIdx];
+
+    if (this.adaptiveLadderIdx !== prevIdx) {
+      logger.info('[PREVIEW_VIDEO] Adaptive throttle adjusted', {
+        previewSessionId: this.previewSessionId,
+        clientFps: Math.round(clientFps),
+        fromTargetFps: Math.round(currentTargetFps),
+        toTargetFps: Math.round(1000 / this.currentMinFrameIntervalMs),
+        ladderIdx: this.adaptiveLadderIdx,
+      });
+    }
+    return this.currentMinFrameIntervalMs;
   }
 
   /**
@@ -483,8 +555,9 @@ export class PreviewVideoStreamService {
       }
     }
 
-    // Throttle to ~10 FPS
-    if (now - this.lastFrameTime < PREVIEW_VIDEO_CONFIG.minFrameIntervalMs) {
+    // Throttle to the current adaptive cap (default 22ms ≈ 45 FPS; widened by
+    // applyHealthHint when the client reports it can't keep up).
+    if (now - this.lastFrameTime < this.currentMinFrameIntervalMs) {
       return; // Skip frame (not counted as drop, just throttled)
     }
 
@@ -652,7 +725,18 @@ export class PreviewVideoStreamService {
       byteLength: frame.byteLength,
     };
 
-    this.nsp.to(this.room).emit('preview:video:frame', payload, frame);
+    // volatile: drop the frame for any client whose transport buffer hasn't
+    // drained yet instead of queueing it. Since V21 made this emit synchronous,
+    // the pendingFrames backpressure check above can never accumulate (inc and
+    // dec happen in the same tick) — the real queue moved into Socket.IO's
+    // per-client write buffer, where a slow consumer would otherwise build up
+    // unbounded latency ("rubber-band" video) and server memory. Frames are
+    // full JPEGs with no inter-frame dependency, so dropping any of them is
+    // safe; the next frame (≤22ms on an active page, ≤5s via the idle
+    // watchdog) repaints completely. Guaranteed deliveries (first-frame
+    // guarantee, idle watchdog) go through injectFrame()'s own NON-volatile
+    // emit and are unaffected.
+    this.nsp.to(this.room).volatile.emit('preview:video:frame', payload, frame);
   }
 
   /**

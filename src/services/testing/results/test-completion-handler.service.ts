@@ -551,12 +551,12 @@ export class TestCompletionHandlerService {
       const [directResult, batchResult, execResult] = await Promise.all([
         supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at, summary')
           .eq('test_id', testId)
           .in('status', ['running', 'pending']),
         supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at, summary')
           .filter('test_ids', 'cs', `["${testId}"]`)
           .in('status', ['running', 'pending']),
         // Fallback: find via test_executions table (most reliable for plan runs)
@@ -577,7 +577,7 @@ export class TestCompletionHandlerService {
       if (execRunId && !runMap.has(execRunId)) {
         const { data: execRun } = await supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at, summary')
           .eq('id', execRunId)
           .in('status', ['running', 'pending'])
           .maybeSingle();
@@ -962,6 +962,12 @@ export class TestCompletionHandlerService {
           skipped: statuses.filter((s: string) => s === 'skipped').length,
           cancelled: statuses.filter((s: string) => s === 'cancelled').length,
           creditExhausted,
+          // The orchestrator records out-of-run depends_on references in the
+          // run summary at dispatch time; this recompute replaces the summary
+          // wholesale, so carry the warning over or the report loses it.
+          ...(run?.summary?.missingDependencies
+            ? { missingDependencies: run.summary.missingDependencies }
+            : {}),
           completed_at: new Date().toISOString(),
         };
 
