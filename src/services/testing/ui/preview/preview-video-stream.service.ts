@@ -1357,6 +1357,19 @@ export class PreviewVideoStreamRegistry {
   }
 
   /**
+   * Forward a client-reported render-FPS health hint to the session's stream
+   * so it can adapt its send rate. No-op if no active stream (client report
+   * raced a stop). Mirrors injectFrame/armFirstFrameGuarantee — the handler
+   * never touches the streams Map directly.
+   */
+  reportClientHealth(previewSessionId: string, clientFps: number): void {
+    const stream = this.streams.get(previewSessionId);
+    if (stream) {
+      stream.applyHealthHint(clientFps);
+    }
+  }
+
+  /**
    * Check if stream exists
    */
   hasStream(previewSessionId: string): boolean {
