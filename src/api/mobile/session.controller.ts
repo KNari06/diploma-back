@@ -2241,12 +2241,14 @@ export async function startMobileExploration(req: Request, res: Response): Promi
     runnerSessionId,
     goal,
     budget,
+    chatSessionId,
   } = req.body as {
     platform?: string;
     appId?: string;
     runnerSessionId?: string;
     goal?: string;
     budget?: Record<string, number>;
+    chatSessionId?: string;
   };
 
   const VALID: Record<string, 'android' | 'ios' | 'flutter'> = {
@@ -2284,6 +2286,7 @@ export async function startMobileExploration(req: Request, res: Response): Promi
       platform,
       projectId,
       userId,
+      chatSessionId: chatSessionId || undefined,
       budget,
       goal: goal?.trim() || undefined,
     });
