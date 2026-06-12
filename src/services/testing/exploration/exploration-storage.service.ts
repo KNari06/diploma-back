@@ -108,6 +108,94 @@ export class ExplorationStorageService {
   }
 
   /**
+   * Persist discovered MOBILE test cases straight from the runner snapshot.
+   *
+   * Mobile runs don't produce web `DiscoveredTestCase` objects — the runner
+   * returns nested cases under `flows[].mobile.cases[]`, each already
+   * carrying replay-ready `intentSteps` (the exact shape intent_test_cases
+   * .steps_json wants). So we insert directly here rather than round-trip
+   * through the web `toIntentTestCase` adapter (which would lose the mobile
+   * step shape). Returns inserted ids; never throws (best-effort, mirrors
+   * saveTestCases).
+   *
+   * `snapshotFlows` is `UiExplorationSnapshot.flows` from the runner — typed
+   * loosely on purpose so the backend doesn't import the runner's contract.
+   */
+  static async saveMobileTestCasesFromSnapshot(
+    snapshotFlows: Array<{
+      name?: string;
+      category?: string;
+      priority?: string;
+      mobile?: {
+        cases?: Array<{
+          name?: string;
+          description?: string;
+          status?: string;
+          intentSteps?: unknown[];
+        }>;
+      };
+    }>,
+    projectId: string,
+    userId: string,
+    platform: 'android' | 'ios' | 'flutter',
+  ): Promise<string[]> {
+    const browserTag = platform === 'ios' ? 'mobile_ios' : platform === 'flutter' ? 'mobile_flutter' : 'mobile_android';
+    const records: Array<Record<string, unknown>> = [];
+
+    for (const flow of snapshotFlows || []) {
+      const cases = flow.mobile?.cases || [];
+      for (const c of cases) {
+        const steps = Array.isArray(c.intentSteps) ? c.intentSteps : [];
+        // Skip empty cases — nothing replayable to save.
+        if (steps.length === 0) continue;
+        const priority = ['high', 'medium', 'low'].includes(flow.priority || '')
+          ? (flow.priority as string)
+          : 'medium';
+        records.push({
+          project_id: projectId,
+          user_id: userId,
+          name: c.name || flow.name || 'Mobile flow',
+          description: c.description || null,
+          start_url: null, // mobile has no URL
+          steps_json: steps,
+          tags: [browserTag, ...(flow.category ? [flow.category] : [])],
+          priority,
+          expected_result: null,
+          preconditions: null,
+          status: 'draft',
+          kind: 'standalone',
+          source: 'exploration',
+        });
+      }
+    }
+
+    if (records.length === 0) return [];
+
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('intent_test_cases')
+        .insert(records)
+        .select('id');
+
+      if (error) {
+        logger.error('[EXPLORATION_STORAGE] Failed to save mobile test cases', {
+          error: error.message,
+          count: records.length,
+        });
+        return [];
+      }
+      const ids = (data || []).map((r: { id: string }) => r.id);
+      logger.info('[EXPLORATION_STORAGE] Mobile test cases saved', { count: ids.length, projectId });
+      return ids;
+    } catch (error) {
+      logger.error('[EXPLORATION_STORAGE] Error saving mobile test cases', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+  }
+
+  /**
    * Mark a MOBILE exploration run as completed.
    *
    * Mobile runs come from the runner (not the in-process ExplorationEngine),

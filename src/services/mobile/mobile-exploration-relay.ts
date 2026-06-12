@@ -112,11 +112,39 @@ export class MobileExplorationRelay {
       this.stop('completed');
     });
 
+    // The runner replays buffered events on subscribe as RAW `explorer:event`,
+    // NOT as the web-contract envelopes above. For a run that finished
+    // between startExploration() and our subscribe (fast runs), the only
+    // signal we get is a replayed `explorer:event` with kind 'finished'.
+    // Recognise it and synthesise a completion so the job never hangs.
+    socket.on('explorer:event', (event: { kind?: string; terminalStatus?: string; error?: string } | undefined) => {
+      if (event?.kind === 'finished' && !this.lastCompleted) {
+        const terminal = event.terminalStatus;
+        const status: ExplorationCompletedPayload['status'] = terminal === 'failed' ? 'failed' : 'completed';
+        const synth: Partial<ExplorationCompletedPayload> = {
+          explorationId: this.params.explorationId ?? this.params.runId,
+          status,
+          errorMessage: event.error,
+        };
+        this.lastCompleted = synth;
+        this.forwardCompleted(synth);
+        this.stop('completed');
+      }
+    });
+
     socket.on('connect_error', (err: Error) => {
       logger.warn('[mobile-exploration-relay] connect_error', {
         runId,
         err: err?.message,
       });
+    });
+
+    // After 5 reconnect attempts socket.io-client gives up silently. Without
+    // this the job's waitUntilDone() would hang until the lifetime cap (20
+    // min). Fail fast instead so the run is marked failed promptly.
+    socket.on('reconnect_failed', () => {
+      logger.error('[mobile-exploration-relay] reconnect attempts exhausted', { runId });
+      this.stop('connect_failed');
     });
 
     socket.on('error', (err: unknown) => {

@@ -9,8 +9,9 @@
  */
 
 const startExploration = jest.fn();
+const getExplorationResult = jest.fn();
 jest.mock('@/services/mobile/mobile-runner-client', () => ({
-  getMobileRunnerClient: () => ({ startExploration }),
+  getMobileRunnerClient: () => ({ startExploration, getExplorationResult }),
 }));
 
 const relayStart = jest.fn();
@@ -27,8 +28,9 @@ jest.mock('@/services/mobile/mobile-exploration-relay', () => ({
 const createRun = jest.fn();
 const completeMobileRun = jest.fn();
 const failRun = jest.fn();
+const saveMobileTestCasesFromSnapshot = jest.fn();
 jest.mock('@/services/testing/exploration/exploration-storage.service', () => ({
-  ExplorationStorageService: { createRun, completeMobileRun, failRun },
+  ExplorationStorageService: { createRun, completeMobileRun, failRun, saveMobileTestCasesFromSnapshot },
 }));
 
 const emitExplorationCompleted = jest.fn();
@@ -64,6 +66,8 @@ beforeEach(() => {
   jest.clearAllMocks();
   createRun.mockResolvedValue({ id: 'row-1' });
   startExploration.mockResolvedValue({ runId: 'runner-run-9', status: 'running' });
+  getExplorationResult.mockResolvedValue({ flows: [], summary: { coverageScore: 70 } });
+  saveMobileTestCasesFromSnapshot.mockResolvedValue([]);
 });
 
 describe('MobileExplorationRunJobHandler', () => {
@@ -88,14 +92,36 @@ describe('MobileExplorationRunJobHandler', () => {
     expect(relayStart).toHaveBeenCalled();
   });
 
-  it('persists completion + saves a chat summary on a completed outcome', async () => {
-    waitUntilDone.mockResolvedValue({ status: 'completed', testCasesCount: 5, summary: { coverageScore: 80 }, reason: 'completed' });
+  it('fetches the result, saves discovered cases, and persists the REAL count', async () => {
+    // Relay completion carries no count; the snapshot does.
+    waitUntilDone.mockResolvedValue({ status: 'completed', testCasesCount: 0, summary: {}, reason: 'completed' });
+    getExplorationResult.mockResolvedValue({
+      flows: [{ name: 'login', mobile: { cases: [{ name: 'happy', intentSteps: [{ a: 1 }] }] } }],
+      summary: { coverageScore: 88 },
+    });
+    saveMobileTestCasesFromSnapshot.mockResolvedValue(['tc-1', 'tc-2', 'tc-3']);
+
     await MobileExplorationRunJobHandler.process(makeJob());
 
-    expect(completeMobileRun).toHaveBeenCalledWith('expl-1', expect.objectContaining({ testCasesCount: 5, summary: { coverageScore: 80 } }));
+    expect(getExplorationResult).toHaveBeenCalledWith('runner-run-9', { userId: 'u-1' });
+    expect(saveMobileTestCasesFromSnapshot).toHaveBeenCalledWith(
+      [{ name: 'login', mobile: { cases: [{ name: 'happy', intentSteps: [{ a: 1 }] }] } }],
+      'p-1', 'u-1', 'android',
+    );
+    // Count comes from saved ids, not the relay outcome.
+    expect(completeMobileRun).toHaveBeenCalledWith('expl-1', expect.objectContaining({ testCasesCount: 3 }));
     expect(saveChatMessages).toHaveBeenCalled();
     expect(failRun).not.toHaveBeenCalled();
     expect(relayStop).toHaveBeenCalled();
+  });
+
+  it('still completes the run (count 0) if fetching the result throws', async () => {
+    waitUntilDone.mockResolvedValue({ status: 'completed', testCasesCount: 0, summary: {}, reason: 'completed' });
+    getExplorationResult.mockRejectedValue(new Error('409 not finished'));
+    await MobileExplorationRunJobHandler.process(makeJob());
+    // A successful crawl must not be flipped to failed by a result-fetch miss.
+    expect(completeMobileRun).toHaveBeenCalledWith('expl-1', expect.objectContaining({ testCasesCount: 0 }));
+    expect(failRun).not.toHaveBeenCalled();
   });
 
   it('fails the run + emits failed on a non-completed outcome', async () => {

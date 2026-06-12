@@ -341,6 +341,9 @@ const mobileExplorationWorker = new Worker(
     concurrency: 2,
     lockDuration: 20 * 60 * 1000, // 20 min — crawl can run long
     stalledInterval: 5 * 60 * 1000,
+    // No checkpoint/resume here (unlike web exploration): a stalled crawl
+    // is marked failed, not retried — a re-run would start a fresh runner
+    // session rather than resume.
     maxStalledCount: 1,
   },
 );

@@ -11,6 +11,7 @@
  * TTL: 15 minutes (session reclaimed if no test starts)
  */
 
+import { randomUUID } from 'crypto';
 import { env } from '@/config/environment/env';
 import { redisConnection, QueueManager } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
@@ -2238,14 +2239,12 @@ export async function startMobileExploration(req: Request, res: Response): Promi
     platform: rawPlatform,
     appId,
     runnerSessionId,
-    runnerSocketUrl: bodyRunnerSocketUrl,
     goal,
     budget,
   } = req.body as {
     platform?: string;
     appId?: string;
     runnerSessionId?: string;
-    runnerSocketUrl?: string;
     goal?: string;
     budget?: Record<string, number>;
   };
@@ -2263,11 +2262,18 @@ export async function startMobileExploration(req: Request, res: Response): Promi
     return;
   }
 
-  // We trust the runner socket URL from server config over a client-sent
-  // one (the client value is only a hint and must never widen SSRF scope).
-  const runnerSocketUrl = currentRunnerSocketUrl() || bodyRunnerSocketUrl || '';
+  // Server-config ONLY — never accept a client-supplied runner URL (it
+  // would let a caller redirect the server-held key to an arbitrary host).
+  const runnerSocketUrl = currentRunnerSocketUrl();
+  if (!runnerSocketUrl) {
+    res.status(503).json({ success: false, error: 'Mobile runner is not configured' });
+    return;
+  }
 
-  const explorationId = `mexpl-${Date.now()}-${userId.slice(0, 8)}`;
+  // randomUUID, not Date.now() — two concurrent requests in the same ms
+  // would otherwise mint the same id, and since it's the BullMQ jobId the
+  // second enqueue would silently dedupe to the first (run never starts).
+  const explorationId = `mexpl-${randomUUID()}`;
 
   try {
     await QueueManager.addMobileExplorationJob({

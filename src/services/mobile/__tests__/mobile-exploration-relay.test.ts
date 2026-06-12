@@ -167,4 +167,38 @@ describe('MobileExplorationRelay', () => {
     expect(outcome.status).toBe('failed');
     expect(outcome.reason).toBe('stopped');
   });
+
+  it('synthesises completion from a replayed explorer:event kind=finished', async () => {
+    // Fast-run race: the run finished before we subscribed, so the only
+    // signal is a replayed raw explorer:event — not an envelope.
+    const relay = makeRelay();
+    relay.start();
+    lastSocket.fire('explorer:event', { kind: 'finished', terminalStatus: 'finished' });
+    expect(emitCompleted).toHaveBeenCalledWith(expect.objectContaining({ explorationId: 'expl-1', status: 'completed' }));
+    await expect(relay.waitUntilDone()).resolves.toEqual(expect.objectContaining({ reason: 'completed' }));
+  });
+
+  it('maps a failed terminalStatus on the replayed finished event', async () => {
+    const relay = makeRelay();
+    relay.start();
+    lastSocket.fire('explorer:event', { kind: 'finished', terminalStatus: 'failed', error: 'crash' });
+    expect(emitCompleted).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', errorMessage: 'crash' }));
+  });
+
+  it('does not double-complete if a real completed envelope already arrived', async () => {
+    const relay = makeRelay();
+    relay.start();
+    lastSocket.fire('exploration:completed', { explorationId: 'expl-1', status: 'completed', testCasesCount: 2 });
+    lastSocket.fire('explorer:event', { kind: 'finished', terminalStatus: 'finished' }); // late replay
+    expect(emitCompleted).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails fast on reconnect_failed instead of hanging until the cap', async () => {
+    const relay = makeRelay();
+    relay.start();
+    lastSocket.fire('reconnect_failed');
+    expect(lastSocket.disconnect).toHaveBeenCalledTimes(1);
+    const outcome = await relay.waitUntilDone();
+    expect(outcome.status).toBe('failed');
+  });
 });

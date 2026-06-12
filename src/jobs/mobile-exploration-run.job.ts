@@ -94,10 +94,36 @@ export class MobileExplorationRunJobHandler {
 
       // 4a. Persist + summarise.
       if (outcome.status === 'completed') {
+        // The runner's completion envelope carries no test-case count and
+        // no cases — fetch the final result snapshot and persist the
+        // discovered cases ourselves (mirrors the web job's saveTestCases).
+        let savedCount = 0;
+        let summary: Record<string, unknown> = outcome.summary;
+        try {
+          const snapshot = await client.getExplorationResult(runnerRunId, { userId });
+          const flows = Array.isArray((snapshot as { flows?: unknown[] }).flows)
+            ? (snapshot as { flows: Parameters<typeof ExplorationStorageService.saveMobileTestCasesFromSnapshot>[0] }).flows
+            : [];
+          const savedIds = await ExplorationStorageService.saveMobileTestCasesFromSnapshot(
+            flows, projectId, userId, platform,
+          );
+          savedCount = savedIds.length;
+          // Prefer the snapshot's richer summary over the envelope's.
+          summary = (snapshot as { summary?: Record<string, unknown> }).summary ?? snapshot ?? outcome.summary;
+        } catch (err) {
+          // Non-fatal: the run DID complete; we just couldn't fetch/persist
+          // cases. Record the run as completed with 0 saved rather than
+          // flipping a successful crawl to failed.
+          logger.warn('[MOBILE_EXPLORATION_JOB] result fetch / case save failed', {
+            explorationId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+
         await ExplorationStorageService.completeMobileRun(explorationId, {
-          summary: outcome.summary,
+          summary,
           durationMs: Date.now() - startedAt,
-          testCasesCount: outcome.testCasesCount,
+          testCasesCount: savedCount,
         });
 
         if (chatSessionId) {
@@ -106,14 +132,14 @@ export class MobileExplorationRunJobHandler {
             content:
               `**Mobile exploration complete**\n\n` +
               `Explored **${appId}** (${platform}).\n\n` +
-              `- Test cases generated: ${outcome.testCasesCount}\n` +
+              `- Test cases generated: ${savedCount}\n` +
               `Exploration ID: \`${explorationId}\``,
-            metadata: { explorationId, mode: 'exploration', platform, appId, testCasesCount: outcome.testCasesCount },
+            metadata: { explorationId, mode: 'exploration', platform, appId, testCasesCount: savedCount },
           }]).catch(() => {});
         }
 
         logger.info('[MOBILE_EXPLORATION_JOB] completed', {
-          explorationId, appId, platform, testCases: outcome.testCasesCount,
+          explorationId, appId, platform, testCases: savedCount,
         });
       } else {
         // 4b. Failed / never reported done.
