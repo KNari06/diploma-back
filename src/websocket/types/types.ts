@@ -465,6 +465,25 @@ export interface ServerToClientEvents {
   }) => void;
 
   /**
+   * Stage 3 — proactive background-observer hint. Emitted by `observer.service`
+   * ONLY when emission is enabled (flag `OBSERVER_LLM_EMIT`, separate from the
+   * shadow-logging flag) AND the LLM returned a non-`none` verdict above the
+   * confidence floor. Advisory: the editor shows an unobtrusive, dismissable
+   * chip — it never blocks the user or auto-acts. `kind` tailors the copy.
+   *   'login_required' — the flow hit a login gate
+   *   'step_missing'   — an obvious step looks missing before the next one
+   *   'blocked'        — captcha / verification / error blocks progress
+   *   'wrong_page'     — the latest step looks recorded on a different page
+   */
+  'preview:observer:hint': (data: {
+    previewSessionId: string;
+    kind: 'login_required' | 'step_missing' | 'blocked' | 'wrong_page';
+    message: string;
+    confidence: number;
+    timestamp: string;
+  }) => void;
+
+  /**
    * Etap 1D.2 — Step exhausted the full resolver waterfall (compiled plan
    * failed AND lint/LLM/vision failed). Frontend uses this to surface a
    * "needs review" badge on the step plus a debug panel showing the

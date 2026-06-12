@@ -257,6 +257,14 @@ function emitRecordingStep(
     timestamp: payload.timestamp || new Date().toISOString(),
   } as any);
 
+  // Background observer (Stage 2) — a step was just recorded; let the proactive
+  // watcher look at the page + step history. Fire-and-forget, flag-gated,
+  // debounced (so a burst of recorded steps collapses to one LLM call),
+  // fail-open. Dynamic import keeps it out of the module's hot init path.
+  void import('@/services/testing/ui/preview/observer.service')
+    .then(({ observe }) => observe(previewSessionId, 'step_added', userId))
+    .catch(() => { /* observer is advisory */ });
+
   // Max-steps auto-stop. Fires exactly once when the count reaches the cap so
   // the user is forced to "Apply All" before recording more. Non-blocking —
   // schedule on microtask so we don't race the just-emitted step on the wire.
@@ -2034,6 +2042,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         ...(pageLoadErr.isLoadError ? { pageLoadError: { url: pageLoadErr.url, message: pageLoadErr.message } } : {}),
         timestamp: new Date().toISOString(),
       });
+
+      // Background observer (Stage 2) — proactive editor hint. Fire-and-forget,
+      // flag-gated, debounced, fail-open. Skipped during a run (the run loop is
+      // not an authoring moment). NEVER awaited — must not delay apply:result.
+      try {
+        const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+        if (!PreviewRunService.isRunning(previewSessionId)) {
+          const { observe } = await import('@/services/testing/ui/preview/observer.service');
+          observe(previewSessionId, 'apply_done', ensuredUserId);
+        }
+      } catch { /* observer is advisory — never break apply */ }
 
       // V8: Auto-persist to DB if intentTestCaseId provided and apply succeeded.
       // Skip if a run is active (the run will batch-persist at the end).
