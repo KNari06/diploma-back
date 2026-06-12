@@ -605,7 +605,7 @@ export class RegressionPlanService {
         .in('id', runIds),
       supabaseAdmin
         .from('test_executions')
-        .select('run_id, test_case_id, status')
+        .select('run_id, test_case_id, status, result')
         .in('run_id', runIds),
     ]);
 
@@ -620,9 +620,13 @@ export class RegressionPlanService {
       runStatusMap.set(run.id, run.status);
     }
 
-    // Group executions by run_id
+    // Group executions by run_id. Environment failures (the test never ran —
+    // device attach / session setup) are dropped here so passRate / failed /
+    // flaky all stay consistent with detectFlakyWithPlatformBreakdown, which
+    // applies the same exclusion. Infrastructure noise is not a test outcome.
     const execsByRun = new Map<string, Array<{ test_case_id: string; status: string }>>();
-    for (const exec of execsResult.data) {
+    for (const exec of execsResult.data as any[]) {
+      if (exec.status === 'failed' && exec.result?.failureCategory === 'environment') continue;
       if (!execsByRun.has(exec.run_id)) execsByRun.set(exec.run_id, []);
       execsByRun.get(exec.run_id)!.push(exec);
     }
@@ -1948,9 +1952,12 @@ export class RegressionPlanService {
 
     // Select platform + test_type so we can bucket without a second query.
     // `test_type` tells us API vs UI; `platform` tells us web vs mobile_*.
+    // `result` carries the env-failure marker (failureCategory) the mobile job
+    // stamps when a test never ran (device attach / session setup) — those are
+    // excluded below so infrastructure noise doesn't inflate flaky / fail rates.
     const { data: executions } = await supabaseAdmin
       .from('test_executions')
-      .select('test_case_id, status, platform, test_type')
+      .select('test_case_id, status, platform, test_type, result')
       .in('run_id', runIds)
       .in('status', ['passed', 'failed']);
 
@@ -1968,6 +1975,14 @@ export class RegressionPlanService {
     const casePlatform = new Map<string, string | null>();
 
     for (const exec of executions as any[]) {
+      // Environment failure = the test never actually ran (emulator stuck,
+      // agent didn't attach). Infrastructure noise, not a test outcome —
+      // exclude from BOTH the per-platform tally and flaky grouping so it
+      // doesn't inflate a case's fail rate (the misleading "70% fail rate").
+      if (exec.status === 'failed' && exec.result?.failureCategory === 'environment') {
+        continue;
+      }
+
       // Platform bucket
       const bucket = this.healthBucketFor(exec);
       byPlatform[bucket].runs++;
