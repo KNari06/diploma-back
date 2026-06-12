@@ -648,6 +648,41 @@ export interface MobileTestJobData {
   retryCount?: number;
 }
 
+// ── Exploration (autonomous app crawl) ─────────────────────────────
+// Shapes for the runner's /api/explorer/* API, brokered by the backend
+// so the runner API key never reaches the browser. Kept intentionally
+// loose for the snapshot — it's the runner's UI-contract object and the
+// backend only reads a handful of fields (status, stats, flows). The
+// relay/job slices narrow what they consume.
+
+/** Runner response to POST /api/explorer/sessions/:id/start (202). */
+export interface MobileExplorationStartResponse {
+  runId: string;
+  status: string; // ExplorationStatus on the runner: 'running' | 'awaiting_user' | …
+}
+
+/** Runner readiness probe — GET /api/explorer/readiness. */
+export interface MobileExplorationReadiness {
+  runner: { ok: boolean; version?: string };
+  llm: { openaiKeySet: boolean; geminiKeySet: boolean; explorerModel?: string };
+  defaults?: { budget?: Record<string, number> };
+}
+
+/**
+ * UI-contract snapshot returned by GET /runs/:id and /runs/:id/result.
+ * Loosely typed on purpose — the runner owns this shape. `status` and
+ * `stats` are the fields the backend job/relay rely on.
+ */
+export interface MobileExplorationSnapshot {
+  runId?: string;
+  status?: string;
+  entryUrl?: string;
+  stats?: Record<string, unknown>;
+  flows?: unknown[];
+  pages?: unknown[];
+  [key: string]: unknown;
+}
+
 // ── Error ─────────────────────────────────────────────────────────
 
 export class MobileRunnerError extends Error {

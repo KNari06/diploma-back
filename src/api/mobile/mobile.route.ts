@@ -26,7 +26,7 @@ import {
 } from './mobile.controller';
 import { generateCiKey, revokeCiKey, getCiKeyStatus } from './ci-key.controller';
 import { triggerCiRun, getCiRunStatus } from './ci.controller';
-import { warmupSession, destroySession, tapSession, swipeSession, goHomeSession, goBackSession, typeSession, keySession, lintSession, applySession, commandSession, runTestCaseOnSession } from './session.controller';
+import { warmupSession, destroySession, tapSession, swipeSession, goHomeSession, goBackSession, typeSession, keySession, lintSession, applySession, commandSession, runTestCaseOnSession, explorationReadiness, startMobileExploration } from './session.controller';
 
 // ── Routes ───────────────────────────────────────────────────────
 //
@@ -139,6 +139,31 @@ router.get(
   '/projects/:projectId/builds',
   requireAuth,
   asyncHandler(listMobileAppBuilds),
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MOBILE EXPLORATION (backend-brokered — runner key stays server-side)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/v1/mobile/exploration/readiness
+ * Probe runner LLM keys + capacity without exposing the runner API key.
+ */
+router.get(
+  '/exploration/readiness',
+  requireAuth,
+  asyncHandler(explorationReadiness),
+);
+
+/**
+ * POST /api/v1/mobile/projects/:projectId/exploration/start
+ * Kick off a backend-brokered mobile exploration on a warmed session.
+ * Body: { platform, appId, runnerSessionId, goal?, budget? }
+ */
+router.post(
+  '/projects/:projectId/exploration/start',
+  requireAuth,
+  asyncHandler(startMobileExploration),
 );
 
 // ═══════════════════════════════════════════════════════════════════════════
