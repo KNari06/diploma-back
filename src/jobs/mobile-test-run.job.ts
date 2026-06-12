@@ -27,6 +27,7 @@ import type { MobileTestJobData, MobileRunStepsResponse, MobileIntentStep } from
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { sanitizeMobileAppPackageSteps } from '@/services/testing/regression/intent-step-dispatch.service';
+import { describeDeviceError, type DeviceFailureCategory } from '@/services/testing/regression/device-error-catalog';
 import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
@@ -1108,7 +1109,18 @@ export class MobileTestRunJobHandler {
       const retryableError = error instanceof MobileRunnerError
         ? error.statusCode === undefined || error.statusCode === 0 || error.statusCode >= 500 || error.statusCode === 429
         : true;
-      if (retryableError && shouldRetry(error, retryCount, MAX_MOBILE_RETRIES)) {
+      // The retry works by re-throwing so BullMQ re-runs the job — which only
+      // happens when the queue is configured with >1 attempt. The
+      // mobile-test-run queue is attempts=1 (queues.ts: "No auto-retry — mobile
+      // runner handles step-level failures"), so a re-throw here would just
+      // kill the job WITHOUT running the failure-persistence branch below
+      // (createFailedJobTestResult + finalizeAnalyticsLinkage). The run would
+      // then be finalized by the abandoned-test reaper with NO failureReason /
+      // env marker — a bare "no steps" card that also counts toward flaky.
+      // Only re-throw when BullMQ has a spare attempt; otherwise fall through to
+      // terminal failure handling (same path non-retryable errors already take).
+      const bullmqWillRetry = (job.opts?.attempts ?? 1) > 1;
+      if (retryableError && bullmqWillRetry && shouldRetry(error, retryCount, MAX_MOBILE_RETRIES)) {
         const delay = calculateRetryDelay(retryCount);
         logger.info('[MOBILE-TEST] Retrying job', {
           testId,
@@ -1120,11 +1132,9 @@ export class MobileTestRunJobHandler {
         try {
           await job.updateData({ ...job.data, retryCount: retryCount + 1 });
         } catch { /* non-fatal — counter increment failed but BullMQ retry still runs */ }
-        // Re-throw triggers BullMQ retry (the queue is configured with
-        // exponential backoff and finite attempts elsewhere in
-        // QueueManager). Doing the rethrow BEFORE the failure-state DB
-        // writes is important — those writes are for the FINAL failure
-        // path, not transient retries.
+        // Re-throw triggers BullMQ retry. Doing the rethrow BEFORE the
+        // failure-state DB writes is important — those writes are for the FINAL
+        // failure path, not transient retries.
         throw new Error(`Mobile test retry ${retryCount + 1}/${MAX_MOBILE_RETRIES}: ${errorMessage}`);
       }
 
@@ -1147,12 +1157,18 @@ export class MobileTestRunJobHandler {
         workspaceId,
       );
 
-      // Same finalizer as the success path, different outcome.
+      // Same finalizer as the success path, different outcome. For environment
+      // failures (device attach / session setup — the test never ran) we also
+      // stamp a marker on the execution row so flaky / fail-rate math can
+      // exclude it as infrastructure noise, not a test outcome.
       await MobileTestRunJobHandler.finalizeAnalyticsLinkage({
         analyticsExecutionId,
         intelligentSessionId,
         passed: false,
         errorMessage,
+        failureTestId: testId,
+        failureCode: errorCode,
+        failureCategory: describeDeviceError(errorCode).category,
       });
 
       // Persist snapshot even on job-level failure (session couldn't
@@ -1496,6 +1512,12 @@ export class MobileTestRunJobHandler {
     totalSteps?: number;
     firstError?: string;
     errorMessage?: string;
+    // Job-level failure provenance. When `failureCategory === 'environment'`
+    // the execution's `result` is stamped with the marker that flaky / fail-
+    // rate detection reads to exclude infrastructure failures.
+    failureTestId?: string;
+    failureCode?: string;
+    failureCategory?: DeviceFailureCategory;
   }): Promise<void> {
     const {
       analyticsExecutionId,
@@ -1505,7 +1527,19 @@ export class MobileTestRunJobHandler {
       totalSteps,
       firstError,
       errorMessage,
+      failureTestId,
+      failureCode,
+      failureCategory,
     } = params;
+    // Re-stamp the execution `result` with the env marker. Keep the same
+    // `{ type, testId }` shape the orchestrator seeds at dispatch so the
+    // `result->>testId` matchers (test-completion / executed-resources) and the
+    // report assembler's `result.testId` lookup keep working — trigger/startedAt
+    // are intentionally not carried (no reader depends on them post-failure).
+    const envMarker =
+      failureCategory === 'environment' && failureTestId
+        ? { type: 'ui', testId: failureTestId, failureLayer: 'job', errorCode: failureCode, failureCategory }
+        : undefined;
 
     // All three targets are independent — parallelize. allSettled so one
     // failure doesn't skip the others; per-branch try/catch logs locally.
@@ -1519,6 +1553,7 @@ export class MobileTestRunJobHandler {
             status: passed ? 'passed' : 'failed',
             ...(durationMs !== undefined ? { durationMs } : {}),
             ...((firstError || errorMessage) ? { errorMessage: firstError || errorMessage } : {}),
+            ...(envMarker ? { result: envMarker } : {}),
           });
         } catch (err) {
           logger.warn('[MOBILE-TEST] Failed to finalize test_executions', {
