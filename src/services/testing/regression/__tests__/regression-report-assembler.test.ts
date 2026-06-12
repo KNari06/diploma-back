@@ -290,6 +290,31 @@ describe('RegressionReportAssemblerService.assembleReport', () => {
     expect(exec.artifacts.consoleLogs).toEqual(['hello']);
   });
 
+  it('leads the gallery with the "Step 0" initial screenshot from mobile metadata', async () => {
+    mockGetByRunId.mockResolvedValue([makeExec()]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Bank' }]);
+    mockGetMobileTestResults.mockResolvedValue([
+      {
+        test_id: 'test-1',
+        screenshot: 'https://cdn/mobile-final.webp',
+        metadata: { platform: 'mobile', initialScreenshot: 'https://cdn/step-0-initial.webp' },
+      },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+    const exec = report.executions[0];
+
+    // Initial screenshot is first, labeled "Step 0", ahead of the final shot.
+    expect(exec.artifacts.screenshots[0]).toMatchObject({
+      url: 'https://cdn/step-0-initial.webp',
+      stepName: 'Step 0: Initial screen',
+    });
+    expect(exec.artifacts.screenshots.map((s) => s.url)).toEqual([
+      'https://cdn/step-0-initial.webp',
+      'https://cdn/mobile-final.webp',
+    ]);
+  });
+
   // ── Per-step screenshots (runtimeMeta.stepScreenshotUrl) ──
   // The feature captures a screenshot after EVERY step (web + mobile) and
   // threads the URL through runtimeMeta.stepScreenshotUrl. The assembler must

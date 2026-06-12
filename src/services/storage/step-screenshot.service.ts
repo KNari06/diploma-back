@@ -36,6 +36,20 @@ export function buildStepScreenshotPath(
 }
 
 /**
+ * Decode a runner-supplied base64 screenshot into a raw buffer + its source
+ * format. Accepts both a bare base64 string and a `data:image/...;base64,` URI.
+ * JPEG is detected from the data-URI MIME or the raw `/9j/` magic prefix;
+ * anything else is treated as PNG. Single source of truth for the per-step
+ * ({@link uploadMobileStepScreenshots}) and step-0 (mobile job) capture paths —
+ * do not inline the prefix/decode logic at call sites.
+ */
+export function decodeBase64Screenshot(shot: string): { buffer: Buffer; sourceExt: 'jpg' | 'png' } {
+  const isJpeg = shot.startsWith('data:image/jpeg') || shot.startsWith('/9j/');
+  const base64 = shot.replace(/^data:image\/[a-z]+;base64,/, '');
+  return { buffer: Buffer.from(base64, 'base64'), sourceExt: isJpeg ? 'jpg' : 'png' };
+}
+
+/**
  * Re-encode a raw screenshot buffer to the configured per-step format
  * (webp via sharp, or jpeg). Falls back to the raw buffer (tagged with
  * `sourceExt`) if sharp is unavailable or encoding throws — so a broken
@@ -207,10 +221,8 @@ export async function uploadMobileStepScreenshots(
         // Already uploaded (URL) — leave as-is.
         if (shot.startsWith('http://') || shot.startsWith('https://')) return;
         try {
-          const isJpeg = shot.startsWith('data:image/jpeg') || shot.startsWith('/9j/');
-          const base64 = shot.replace(/^data:image\/[a-z]+;base64,/, '');
-          const raw = Buffer.from(base64, 'base64');
-          step.screenshot = await uploader(raw, isJpeg ? 'jpg' : 'png', {
+          const { buffer: raw, sourceExt } = decodeBase64Screenshot(shot);
+          step.screenshot = await uploader(raw, sourceExt, {
             testId,
             userId: userId || 'anonymous',
             stepIndex: index + 1,
