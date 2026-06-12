@@ -39,6 +39,30 @@ export interface ExplorationJobData {
   rateLimiting?: RateLimitingConfig;
 }
 
+/**
+ * Mobile exploration job (Stage 3). The session is already warmed by the
+ * chat handler (mirrors how web passes entryUrl); the job starts the run
+ * on the runner, holds a relay for its lifetime, and persists the result.
+ * The runner API key is NEVER in this payload — it's read server-side.
+ */
+export interface MobileExplorationJobData {
+  explorationId: string;
+  /** Warmed runner session to start the exploration on. */
+  runnerSessionId: string;
+  /** Runner Socket.IO base URL the relay connects to (ws(s)://host:port). */
+  runnerSocketUrl: string;
+  /** App under test (package name / bundle id) — stored as the run's "entry". */
+  appId: string;
+  platform: 'android' | 'ios' | 'flutter';
+  projectId: string;
+  userId: string;
+  chatSessionId?: string;
+  workspaceId?: string;
+  /** Plain-English focus, forwarded to the runner as the exploration goal. */
+  goal?: string;
+  budget?: Record<string, number>;
+}
+
 // Helper to check if Redis is available
 let redisAvailable = false;
 
@@ -187,6 +211,7 @@ export const QUEUE_NAMES = {
   WEBHOOK: 'webhook',
   GIT_WEBHOOK: 'git-webhook',
   EXPLORATION: 'exploration',
+  MOBILE_EXPLORATION: 'mobile-exploration',
   MOBILE_TEST_RUN: 'mobile-test-run',
   NEGATIVE_GENERATION: 'negative-generation',
   ALLURE_IMPORT: 'allure-import',
@@ -339,6 +364,19 @@ export const explorationQueue = new Queue<ExplorationJobData>(QUEUE_NAMES.EXPLOR
       type: 'fixed',
       delay: 5000,
     },
+  },
+});
+
+// Mobile exploration queue — backend-brokered runner crawl (Stage 3).
+// Same retry/lock posture as web exploration (long-running, resumable
+// only at the runner level so we don't auto-retry a half-done crawl).
+export const mobileExplorationQueue = new Queue<MobileExplorationJobData>(QUEUE_NAMES.MOBILE_EXPLORATION, {
+  connection,
+  prefix: env.QUEUE_PREFIX,
+  defaultJobOptions: {
+    removeOnComplete: 50,
+    removeOnFail: 25,
+    attempts: 1, // No auto-retry — a re-run would start a fresh runner crawl
   },
 });
 
@@ -716,6 +754,34 @@ export class QueueManager {
       return job;
     } catch (error) {
       logger.error('❌ Failed to add exploration job', {
+        error: error instanceof Error ? error.message : String(error),
+        explorationId: jobData.explorationId,
+      });
+      throw handleQueueError(error);
+    }
+  }
+
+  static async addMobileExplorationJob(jobData: MobileExplorationJobData) {
+    try {
+      if (!redisAvailable) {
+        logger.error('❌ [QUEUE] Redis unavailable for mobile exploration', {
+          explorationId: jobData.explorationId,
+        });
+        throw new Error('Redis is not available. Cannot add mobile exploration job to queue.');
+      }
+
+      const job = await mobileExplorationQueue.add('mobile-exploration', jobData, {
+        priority: 5,
+        jobId: jobData.explorationId,
+      });
+
+      logQueueEvent('added', job.id!, {
+        queue: QUEUE_NAMES.MOBILE_EXPLORATION,
+        explorationId: jobData.explorationId,
+      });
+      return job;
+    } catch (error) {
+      logger.error('❌ Failed to add mobile exploration job', {
         error: error instanceof Error ? error.message : String(error),
         explorationId: jobData.explorationId,
       });

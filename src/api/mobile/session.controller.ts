@@ -11,8 +11,9 @@
  * TTL: 15 minutes (session reclaimed if no test starts)
  */
 
+import { randomUUID } from 'crypto';
 import { env } from '@/config/environment/env';
-import { redisConnection } from '@/config/infrastructure/queues';
+import { redisConnection, QueueManager } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
@@ -2178,6 +2179,131 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
     res.status(500).json({
       success: false,
       error: 'Failed to run test case',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * GET /api/v1/mobile/exploration/readiness
+ *
+ * Backend-brokered readiness probe for mobile exploration. Replaces the
+ * browser's direct runner call: the runner API key stays server-side
+ * (injected by MobileRunnerClient), so the frontend launcher can show
+ * the "Runner / LLM keys / emulator slot" panel without ever holding
+ * the key. Returns the runner's readiness shape as-is.
+ */
+export async function explorationReadiness(req: Request, res: Response): Promise<void> {
+  if (!req.user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+  try {
+    const client = getMobileRunnerClient();
+    const readiness = await client.getExplorationReadiness({ userId: req.user.id });
+    res.json({ success: true, readiness });
+  } catch (error) {
+    logger.warn('[MOBILE_SESSION] Exploration readiness probe failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(502).json({
+      success: false,
+      error: 'Runner readiness check failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * POST /api/v1/mobile/projects/:projectId/exploration/start
+ *
+ * Backend-brokered mobile exploration kickoff (Stage 3, Slice 4). The
+ * frontend has already warmed a session (warmupSession) and holds its
+ * sessionId; it sends that here instead of calling the runner directly,
+ * so the runner API key stays server-side. We mint an explorationId,
+ * enqueue the brokered job (which starts the runner run + relays its
+ * events), and return immediately — progress arrives over the backend
+ * Socket.IO as web-style exploration:* events keyed by explorationId.
+ *
+ * Body: { platform, appId, runnerSessionId, runnerSocketUrl?, goal?, budget? }
+ */
+export async function startMobileExploration(req: Request, res: Response): Promise<void> {
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { projectId } = req.params;
+  const {
+    platform: rawPlatform,
+    appId,
+    runnerSessionId,
+    goal,
+    budget,
+    chatSessionId,
+  } = req.body as {
+    platform?: string;
+    appId?: string;
+    runnerSessionId?: string;
+    goal?: string;
+    budget?: Record<string, number>;
+    chatSessionId?: string;
+  };
+
+  const VALID: Record<string, 'android' | 'ios' | 'flutter'> = {
+    android: 'android', ios: 'ios', flutter: 'flutter',
+  };
+  const platform = VALID[rawPlatform ?? ''] ?? 'android';
+
+  if (!projectId || !appId || !runnerSessionId) {
+    res.status(400).json({
+      success: false,
+      error: 'projectId, appId and runnerSessionId are required',
+    });
+    return;
+  }
+
+  // Server-config ONLY — never accept a client-supplied runner URL (it
+  // would let a caller redirect the server-held key to an arbitrary host).
+  const runnerSocketUrl = currentRunnerSocketUrl();
+  if (!runnerSocketUrl) {
+    res.status(503).json({ success: false, error: 'Mobile runner is not configured' });
+    return;
+  }
+
+  // randomUUID, not Date.now() — two concurrent requests in the same ms
+  // would otherwise mint the same id, and since it's the BullMQ jobId the
+  // second enqueue would silently dedupe to the first (run never starts).
+  const explorationId = `mexpl-${randomUUID()}`;
+
+  try {
+    await QueueManager.addMobileExplorationJob({
+      explorationId,
+      runnerSessionId,
+      runnerSocketUrl,
+      appId,
+      platform,
+      projectId,
+      userId,
+      chatSessionId: chatSessionId || undefined,
+      budget,
+      goal: goal?.trim() || undefined,
+    });
+
+    logger.info('[MOBILE_SESSION] Mobile exploration queued', {
+      explorationId, projectId, platform, appId, userId,
+    });
+
+    res.json({ success: true, explorationId, mode: 'exploration', platform });
+  } catch (error) {
+    logger.error('[MOBILE_SESSION] Failed to queue mobile exploration', {
+      explorationId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to start mobile exploration',
       message: error instanceof Error ? error.message : String(error),
     });
   }

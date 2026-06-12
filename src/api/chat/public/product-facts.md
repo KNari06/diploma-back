@@ -52,9 +52,10 @@ early access. Its interface is available in English, Russian, and Kazakh.
 - Web — all major modern browsers: Chrome, Firefox, Safari, Edge. Primary focus
   during early access.
 - API — endpoint and API-flow testing.
-- Mobile — iOS and Android, on both real physical devices and emulators/
-  simulators. Mobile is newer and expanding; for a specific mobile capability or
-  device, suggest confirming current status via a demo.
+- Mobile — yes, QAIT tests mobile apps. It supports iOS and Android, on both
+  real physical devices and emulators/simulators. (Mobile is newer than web, so
+  for a specific device model or an advanced capability you can confirm exact
+  current support via a demo — but mobile testing itself is fully supported.)
 
 ## Pricing
 Plans (monthly; annual billing is ~15% cheaper). Pricing is shown live on the
@@ -120,10 +121,11 @@ cases for them automatically. You can also describe specific tests in plain
 English if you prefer.
 
 **Q: What browsers and devices are supported?**
-A: All major modern browsers (Chrome, Firefox, Safari, Edge) for web. For mobile,
-QAIT runs on iOS and Android — on both real physical devices and emulators/
-simulators. Mobile coverage is newer and expanding; confirm a specific device via
-a demo.
+A: All major modern browsers (Chrome, Firefox, Safari, Edge) for web. Yes — QAIT
+also tests mobile apps: iOS and Android, on both real physical devices and
+emulators/simulators. Mobile is newer than web, so for a specific device model
+you can confirm exact current support via a demo, but mobile testing itself is
+supported.
 
 **Q: How are test failures handled?**
 A: QAIT focuses on WHY a test failed — analyzing UI state, user intent, and

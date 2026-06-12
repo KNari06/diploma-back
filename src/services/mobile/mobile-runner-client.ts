@@ -23,6 +23,9 @@ import type {
   MobileStepHistoryResponse,
   MobileLogsResponse,
   MobileLogLevel,
+  MobileExplorationStartResponse,
+  MobileExplorationReadiness,
+  MobileExplorationSnapshot,
 } from './mobile-runner.types';
 import { MobileRunnerError } from './mobile-runner.types';
 import { mintRunnerUserToken } from './user-token';
@@ -188,6 +191,101 @@ export class MobileRunnerClient {
       timeoutMs: 5000,
       userId: opts?.userId,
     });
+  }
+
+  // ── Exploration (autonomous app crawl) ──────────────────────────
+  //
+  // Brokers the runner's /api/explorer/* API so the runner API key stays
+  // server-side and never reaches the browser (B2C). Mirrors the web
+  // exploration flow: backend starts a run, relays the runner's per-run
+  // socket events, and fetches the final result on completion.
+  //
+  // The runner authenticates these calls via the X-API-Key header that
+  // `request()` injects from the server-held MOBILE_RUNNER_API_KEY.
+
+  /**
+   * Start an exploration on an already-warmed session.
+   * Runner returns 202 with the run id; 409 if the session is already
+   * exploring, 404 if the session is gone.
+   */
+  async startExploration(
+    sessionId: string,
+    body: { appId: string; goal?: string; budget?: Record<string, number> },
+    opts?: { userId?: string },
+  ): Promise<MobileExplorationStartResponse> {
+    return this.request<MobileExplorationStartResponse>(
+      'POST',
+      `/api/explorer/sessions/${sessionId}/start`,
+      { body, timeoutMs: 30_000, userId: opts?.userId },
+    );
+  }
+
+  /** UI-contract snapshot of a live or cold run (404 if unknown). */
+  async getExplorationStatus(
+    runId: string,
+    opts?: { userId?: string },
+  ): Promise<MobileExplorationSnapshot> {
+    return this.request<MobileExplorationSnapshot>(
+      'GET',
+      `/api/explorer/runs/${runId}`,
+      { timeoutMs: 10_000, userId: opts?.userId },
+    );
+  }
+
+  /** Final result snapshot — 409 until the run is finished. */
+  async getExplorationResult(
+    runId: string,
+    opts?: { userId?: string },
+  ): Promise<MobileExplorationSnapshot> {
+    return this.request<MobileExplorationSnapshot>(
+      'GET',
+      `/api/explorer/runs/${runId}/result`,
+      { timeoutMs: 15_000, userId: opts?.userId },
+    );
+  }
+
+  /** Answer an awaiting_user prompt (captcha / 2FA / credential). */
+  async submitExplorationAnswer(
+    runId: string,
+    answer: { questionId: string; value?: string; credentialValue?: string; skipped?: boolean },
+    opts?: { userId?: string },
+  ): Promise<unknown> {
+    return this.request(
+      'POST',
+      `/api/explorer/runs/${runId}/answer`,
+      { body: answer, timeoutMs: 10_000, userId: opts?.userId },
+    );
+  }
+
+  /** Abort a run. Idempotent on the runner side. */
+  async cancelExploration(runId: string, opts?: { userId?: string }): Promise<unknown> {
+    return this.request(
+      'POST',
+      `/api/explorer/runs/${runId}/cancel`,
+      { timeoutMs: 10_000, userId: opts?.userId },
+    );
+  }
+
+  /** Runner-side default budget (UI hint shown before a run starts). */
+  async getExplorationDefaults(opts?: { userId?: string }): Promise<Record<string, unknown>> {
+    return this.request<Record<string, unknown>>(
+      'GET',
+      '/api/explorer/defaults',
+      { timeoutMs: 5_000, userId: opts?.userId },
+    );
+  }
+
+  /**
+   * Readiness probe: LLM keys configured on the runner + emulator pool
+   * capacity. Used by the launcher before a run; replaces the browser's
+   * direct runner call.
+   */
+  async getExplorationReadiness(opts?: { userId?: string }): Promise<MobileExplorationReadiness> {
+    return this.request<MobileExplorationReadiness>(
+      'GET',
+      '/api/explorer/readiness',
+      { timeoutMs: 5_000, userId: opts?.userId },
+    );
   }
 
   // ── Fast-auth (app-data snapshot) ────────────────────────────────
