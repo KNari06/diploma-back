@@ -5053,6 +5053,42 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
+  // Client video-render health → adaptive throttle. The client reports the FPS
+  // it actually painted; the server widens/narrows its send interval (fps-only,
+  // never restarts screencast / changes quality). Pure telemetry-driven hint:
+  // silent drop on any failure, no response event, never blocks the stream.
+  socket.on('preview:video:health', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      // Reports are low-frequency (every few seconds); reuse the mouse bucket
+      // as a cheap flood guard. A dropped report just means we adapt one tick
+      // later — never a correctness issue.
+      if (!checkRateLimit(socket.id, 'mouse')) {
+        return;
+      }
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) {
+        return;
+      }
+
+      const renderedFps = (data as { renderedFps?: unknown }).renderedFps;
+      if (typeof renderedFps !== 'number' || !Number.isFinite(renderedFps)) {
+        return; // ignore malformed report — applyHealthHint is also defensive
+      }
+
+      const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+      getPreviewVideoStreamRegistry().reportClientHealth(previewSessionId, renderedFps);
+    } catch (error) {
+      logger.debug('[WebSocket] Error in preview:video:health', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // ═══════════════════════════════════════════════════════════════════════════
   // V8: Preview Run Handlers ("Run from start" feature)
   // ═══════════════════════════════════════════════════════════════════════════

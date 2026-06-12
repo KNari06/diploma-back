@@ -109,6 +109,8 @@ export interface ClientToServerEvents {
   'preview:mouse:up': (data: PreviewMouseButtonRequest) => void;
   'preview:mouse:wheel': (data: PreviewMouseWheelRequest) => void;
   'preview:mouse:probe': (data: PreviewMouseProbeRequest) => void;
+  // Client-reported video render health → server adapts its send rate (fps only).
+  'preview:video:health': (data: PreviewVideoHealthReport) => void;
   'preview:keyboard:type': (data: PreviewKeyboardTypeRequest) => void;
   'preview:keyboard:press': (data: PreviewKeyboardPressRequest) => void;
 
@@ -2185,6 +2187,20 @@ export interface PreviewMouseProbeRequest {
   previewSessionId: string;
   x: number;
   y: number;
+}
+
+/**
+ * Client video-render health report. Sent periodically (every few seconds) by
+ * the preview video hook with the FPS it actually painted over the last window.
+ * The server compares it to the rate it's sending and adapts its throttle
+ * (fps-only — never restarts the screencast or changes quality).
+ */
+export interface PreviewVideoHealthReport {
+  previewSessionId: string;
+  /** Frames the client actually rendered per second over the report window. */
+  renderedFps: number;
+  /** Optional: count of seq gaps the client observed (dropped frames). Telemetry only. */
+  droppedFrames?: number;
 }
 
 /**
