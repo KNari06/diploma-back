@@ -378,6 +378,11 @@ export interface MobileRunStepsResponse {
   status: 'passed' | 'failed' | 'partial';
   /** Test-level metadata echoed from the request */
   metadata?: MobileTestMetadata;
+  /**
+   * Screenshot of the starting screen, captured BEFORE any step ran ("step 0").
+   * Base64 from the runner; uploaded to a URL by the job before persisting.
+   */
+  initialScreenshot?: string;
   /** Aggregated errors from all failed steps */
   errors?: Array<{ type: string; message: string; stepId?: string; timestamp: number }>;
   /** Device log errors (logcat/syslog) collected during the run */

@@ -33,7 +33,7 @@ import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
 import { env } from '@/config/environment/env';
 import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
-import { uploadMobileStepScreenshots } from '@/services/storage/step-screenshot.service';
+import { uploadMobileStepScreenshots, processAndUploadStepScreenshot, decodeBase64Screenshot } from '@/services/storage/step-screenshot.service';
 // Phase 2 (May 2026) telemetry helpers. Kept in a side-effect-free
 // module so unit tests can exercise them without booting supabase/BullMQ.
 import { sumStepDurations } from './helpers/telemetry';
@@ -774,6 +774,30 @@ export class MobileTestRunJobHandler {
       // place so both the Redis append below and createTestResult see URLs.
       if (ScreenshotCaptureFeature.isEnabled()) {
         await uploadMobileStepScreenshots(runResult.steps, testId, userId);
+        // "Step 0" initial screenshot — the starting screen before any step
+        // ran. Uploaded base64→URL (stepIndex 0) so the report can show it
+        // alongside the per-step shots. Best-effort: never fail the test path.
+        if (typeof runResult.initialScreenshot === 'string' && runResult.initialScreenshot) {
+          const shot = runResult.initialScreenshot;
+          if (shot.startsWith('http://') || shot.startsWith('https://')) {
+            // Already a URL (defensive) — keep as-is.
+          } else {
+            try {
+              const { buffer, sourceExt } = decodeBase64Screenshot(shot);
+              runResult.initialScreenshot = await processAndUploadStepScreenshot(
+                buffer,
+                sourceExt,
+                { testId, userId: userId || 'anonymous', stepIndex: 0, isFailure: false, ts: Date.now() },
+              );
+            } catch (err) {
+              logger.debug('[MOBILE-TEST] initial (step 0) screenshot upload failed (non-fatal)', {
+                testId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+              runResult.initialScreenshot = undefined;
+            }
+          }
+        }
       }
 
       // Human-readable step labels: the runner returns per-step results keyed
@@ -1344,6 +1368,13 @@ export class MobileTestRunJobHandler {
         workspace_id: workspaceId,
         metadata: {
           platform: 'mobile',
+          // "Step 0" — the starting screen captured before any step ran. URL
+          // (uploaded above). The report assembler surfaces it as a labeled
+          // gallery entry, mirroring the final screenshot.
+          ...(typeof runResult.initialScreenshot === 'string'
+            && runResult.initialScreenshot.startsWith('http')
+            ? { initialScreenshot: runResult.initialScreenshot }
+            : {}),
           steps: runResult.steps.map((s) => ({
             stepId: s.stepId,
             success: s.success,

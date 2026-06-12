@@ -377,6 +377,13 @@ export class RegressionReportAssemblerService {
               .filter((s: string) => typeof s === 'string' && !s.startsWith('data:'))
               .map((url: string): RunReportScreenshot => ({ url, stepName: 'Final screenshot' }));
           }
+          // "Step 0": the starting screen captured before any step ran (mobile).
+          // Stored as a URL on mobile_test_results.metadata.initialScreenshot.
+          // Lead the gallery with it so the report reads start → steps → final.
+          const initialShot = testResult.metadata?.initialScreenshot;
+          if (typeof initialShot === 'string' && initialShot && !initialShot.startsWith('data:')) {
+            execArtifacts.screenshots.unshift({ url: initialShot, stepName: 'Step 0: Initial screen' });
+          }
           if (testResult.logs) {
             execArtifacts.consoleLogs = Array.isArray(testResult.logs) ? testResult.logs : [];
           }

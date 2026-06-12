@@ -101,7 +101,7 @@ export async function getMobileTestResultsByTestIds(testIds: string[]): Promise<
 
   const { data, error } = await supabaseAdmin
     .from('mobile_test_results')
-    .select('test_id, video_url, trace_url, screenshot, logs, network_logs, errors, ai_summary, quality_checks')
+    .select('test_id, video_url, trace_url, screenshot, logs, network_logs, errors, ai_summary, quality_checks, metadata')
     .in('test_id', testIds)
     .order('created_at', { ascending: false });
 
