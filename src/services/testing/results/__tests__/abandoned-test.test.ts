@@ -39,7 +39,7 @@ describe('StaleReaperService.handleAbandonedTest', () => {
 
     await StaleReaperService.handleAbandonedTest('t1', 'Job failed: worker died');
 
-    expect(mockFinalize).toHaveBeenCalledWith('t1', 'failed', 'Job failed: worker died');
+    expect(mockFinalize).toHaveBeenCalledWith('t1', 'failed');
     expect(completionSpy).toHaveBeenCalledWith('t1');
   });
 

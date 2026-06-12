@@ -189,17 +189,19 @@ export async function forceFailStuckTests(
  * race-safe: it only flips a still-live row, so it's a no-op when the job
  * already finalized gracefully or when a concurrent worker replica won the
  * race. `flipped` tells the caller whether THIS call did the transition.
+ *
+ * Writes only status/completed_at: `tests` has no `error_message` column
+ * (writing one raised PGRST204 and killed the whole abandoned-test backstop,
+ * leaving runs stuck 'running'). The abandon reason lives in the caller's log.
  */
 export async function finalizeAbandonedTest(
   testId: string,
   status: 'failed' | 'timeout',
-  reason: string,
 ): Promise<{ flipped: boolean; error: unknown }> {
   const { data, error } = await supabaseAdmin
     .from('tests')
     .update({
       status,
-      error_message: reason,
       completed_at: new Date().toISOString(),
     })
     .eq('id', testId)

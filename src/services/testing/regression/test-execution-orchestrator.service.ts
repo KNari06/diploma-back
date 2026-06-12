@@ -957,6 +957,27 @@ export class TestExecutionOrchestratorService {
             ),
           ),
         );
+
+        // A timed-out execution means the worker never signalled it, so no
+        // completion event will ever recompute the run — without this trigger
+        // the run stays 'running' until the 30-minute stale reaper. Recompute
+        // now that the rows are stamped; if later levels are still pending the
+        // recompute is a safe early-return, and its optimistic lock makes a
+        // redundant call a no-op. Dynamic import mirrors mobile-test-run.job.ts
+        // (avoids a static import cycle with the completion handler).
+        if (timedOutExecIds.length > 0) {
+          try {
+            const { TestCompletionHandlerService } = await import(
+              '../results/test-completion-handler.service'
+            );
+            await TestCompletionHandlerService.recomputeRunStatusById(runId);
+          } catch (err) {
+            logger.warn('[REGRESSION_RUN] Post-timeout run recompute failed', {
+              runId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
       }
 
       emitProgress('level_completed', `Level ${levelIdx + 1}/${totalLevels} completed`, {
