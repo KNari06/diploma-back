@@ -3,7 +3,6 @@ import { supabaseAdmin } from '@/db/supabase';
 import { EmailService } from '@/services/core/email.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { WorkspaceCreditsService } from '@/services/core/workspace-credits.service';
-import { SUBSCRIPTION_PLANS, WORKSPACE_PLANS } from '@/services/core/token-calculator.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import Stripe from 'stripe';
@@ -779,7 +778,14 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
 
   // Branded purchase confirmation — fire-and-forget so a mail failure never
   // breaks webhook processing (Stripe still sends its own receipt).
-  if (user.email) {
+  // Only on the FIRST charge of a subscription (`subscription_create`) or a
+  // one-off (`manual`/`subscription_update`) — NOT on monthly renewals
+  // (`subscription_cycle`), which would spam "Payment confirmed" every cycle.
+  // Stripe still sends its own receipt for every charge.
+  const billingReason = (invoice as Stripe.Invoice).billing_reason;
+  const isFirstOrOneOff =
+    !billingReason || billingReason === 'subscription_create' || billingReason === 'manual' || billingReason === 'subscription_update';
+  if (user.email && isFirstOrOneOff) {
     EmailService.sendPlanPurchasedEmail({
       recipientEmail: user.email,
       recipientName: user.name || undefined,

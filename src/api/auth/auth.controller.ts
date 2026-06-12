@@ -20,6 +20,7 @@ import {
 import { notifyAdminsOfNewUser } from '@/services/auth/new-user-notification.service';
 import { EmailService } from '@/services/core/email.service';
 import { SelfServeProvisioningService } from '@/services/core/self-serve-provisioning.service';
+import { INDIVIDUAL_PLANS } from '@/services/core/token-calculator.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -46,16 +47,22 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
 
     // Welcome email — fire-and-forget so a mail failure never breaks signup.
     // Distinct from the Supabase verification email and the approval email.
+    // We don't read the live balance here: the trial grant is applied later
+    // (on first verify/login via SelfServeProvisioning), so at signup it's
+    // always absent. Instead we state the configured free-plan grant, which is
+    // what the user will receive — single-sourced from INDIVIDUAL_PLANS.free.
     if (result.user?.email) {
+      const recipientEmail = result.user.email;
       EmailService.sendWelcomeEmail({
-        recipientEmail: result.user.email,
+        recipientEmail,
         recipientName: result.user.name || undefined,
         frontendUrl: env.FRONTEND_URL,
+        freeCredits: INDIVIDUAL_PLANS.free.credits,
       })
         .then((emailResult) => {
           if (!emailResult.success) {
             logger.error('[AUTH] Welcome email not sent', {
-              email: result.user.email,
+              email: recipientEmail,
               error: emailResult.error,
             });
           }
@@ -63,7 +70,7 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
         .catch((err) =>
           logger.error('[AUTH] Failed to send welcome email', {
             error: err instanceof Error ? err.message : String(err),
-            email: result.user.email,
+            email: recipientEmail,
           })
         );
     }
@@ -1015,20 +1022,41 @@ export const sendInfoEmailHandler = async (req: Request, res: Response): Promise
       return;
     }
 
+    // Validate the optional CTA up-front: both fields must be strings and the
+    // URL must be http(s)/mailto. The template also sanitizes (safeUrl), but
+    // reject obviously-bad input here so the admin gets a clear 400.
+    if (cta !== undefined) {
+      const okShape = cta && typeof cta.label === 'string' && typeof cta.url === 'string';
+      if (!okShape || !/^(https?:|mailto:)/i.test(cta.url.trim())) {
+        res.status(400).json({ success: false, error: 'cta must be { label, url } with an http(s)/mailto url' });
+        return;
+      }
+    }
+
+    // Cap total recipients per call so a fat-fingered broadcast can't hang the
+    // request (sends are sequential) or silently truncate a huge .in() lookup.
+    const MAX_RECIPIENTS = 500;
+    const idList = Array.isArray(userIds) ? userIds.slice(0, MAX_RECIPIENTS) : [];
+    const emailList = Array.isArray(emails) ? emails.slice(0, MAX_RECIPIENTS) : [];
+    if ((userIds?.length || 0) + (emails?.length || 0) > MAX_RECIPIENTS) {
+      res.status(400).json({ success: false, error: `Too many recipients (max ${MAX_RECIPIENTS} per call)` });
+      return;
+    }
+
     // Resolve recipients: {email, name}. userIds are looked up; raw emails
     // pass through with no name. De-dupe by email.
     const recipients = new Map<string, { email: string; name?: string }>();
 
-    if (Array.isArray(userIds) && userIds.length > 0) {
+    if (idList.length > 0) {
       const { data: users } = await supabaseAdmin
         .from('users')
         .select('email, name')
-        .in('id', userIds);
+        .in('id', idList);
       for (const u of users || []) {
         if (u.email) recipients.set(u.email, { email: u.email, name: u.name || undefined });
       }
     }
-    for (const e of emails || []) {
+    for (const e of emailList) {
       if (typeof e === 'string' && e.includes('@') && !recipients.has(e)) {
         recipients.set(e, { email: e });
       }

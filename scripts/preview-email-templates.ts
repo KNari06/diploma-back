@@ -56,6 +56,7 @@ emailTemplates.push(
       recipientEmail: 'alex@example.com',
       recipientName: 'Alex',
       frontendUrl: 'http://localhost:3000',
+      freeCredits: 50,
     }),
   },
   {
