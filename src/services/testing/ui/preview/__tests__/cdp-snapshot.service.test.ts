@@ -81,7 +81,12 @@ function makeMockPage(opts: {
   // Single shared evaluate fn — main-frame.evaluate and page.evaluate
   // pull from the same queue so tests written before per-frame routing
   // (single-doc tests with linear evaluateResults) keep working.
-  const sharedEvaluate = jest.fn(async () => {
+  const sharedEvaluate = jest.fn(async (...args: unknown[]) => {
+    // Phase 1.5 framework-clickable tag/untag passes are identified by their
+    // marker argument ('data-qait-fwclick'). They are NOT part of the Phase
+    // 3.5/4/5b evaluate sequence the evaluateResults queue drives, so they must
+    // not consume a queue slot (tag returns a count; untag returns void).
+    if (args[1] === 'data-qait-fwclick') return 0;
     if (evaluateQueue.length === 0) return [];
     return evaluateQueue.shift();
   });
@@ -508,11 +513,12 @@ describe('CdpSnapshotService.collect', () => {
 
       const snapshot = await CdpSnapshotService.collect(page as never);
       expect(snapshot.elements).toEqual([]);
-      // Phase 3.5 + Phase 4 short-circuit on empty interactive set,
-      // but Phase 5b (overlay state — transientState/obstacleFacts)
-      // ALWAYS runs because those signals don't depend on the
-      // interactive subset. Exactly ONE evaluate call expected.
-      expect(page.evaluate).toHaveBeenCalledTimes(1);
+      // Phase 3.5 + Phase 4 short-circuit on empty interactive set. TWO
+      // evaluate calls remain: (1) the Phase 1.5 framework-clickable tag pass
+      // (always runs pre-capture; tags 0 here so the finally untag is skipped),
+      // and (2) Phase 5b overlay state (transientState/obstacleFacts — always
+      // runs, independent of the interactive subset).
+      expect(page.evaluate).toHaveBeenCalledTimes(2);
       // transientState is always populated, even on empty pages.
       expect(snapshot.transientState).toEqual({ isTransient: false });
     });
@@ -696,7 +702,10 @@ describe('CdpSnapshotService.collect', () => {
       const original = page.evaluate;
       page.evaluate = jest.fn(async (...args: unknown[]) => {
         callCount++;
-        if (callCount === 4) throw new Error('page closed');
+        // Call 5 = Phase 5b overlay. The Phase 1.5 framework-clickable tag pass
+        // is now call 1, shifting Phase 3.5/4/5b each by one (3.5=2, enrich=3,
+        // domWalk=4, overlay=5).
+        if (callCount === 5) throw new Error('page closed');
         return original(...(args as [never, never]));
       });
 
@@ -733,7 +742,9 @@ describe('CdpSnapshotService.collect', () => {
       const original = page.evaluate;
       const wrap = jest.fn(async (...args: unknown[]) => {
         callCount++;
-        if (callCount === 4) {
+        // Call 5 = Phase 5b overlay (the Phase 1.5 framework-clickable tag pass
+        // is now call 1, shifting Phase 3.5/4/5b each by one).
+        if (callCount === 5) {
           // Hang forever — would block the whole pipeline without the
           // outer Promise.race in enrichWithOverlayState.
           await new Promise(() => {});
