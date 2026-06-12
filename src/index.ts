@@ -1586,6 +1586,15 @@ const startServer = async () => {
       server = app.listen(env.PORT, async () => {
         logger.info(`QAIT Backend started | port=${env.PORT} env=${env.NODE_ENV}`);
 
+        // Verify SMTP at boot so a dead/missing credential is loud here instead
+        // of silently dropping every user-facing email. Non-fatal — fire and log.
+        try {
+          const { EmailService } = await import('@/services/core/email.service');
+          void EmailService.verifyConfig();
+        } catch (mailerError) {
+          logger.error('[SERVER] Failed to verify SMTP config', { error: formatError(mailerError) });
+        }
+
         // V21: Start system health monitor (polls Supabase, broadcasts maintenance
         // banner to all connected clients on outage). Independent from zombie cleanup
         // and safe to start before any test infrastructure is initialised.

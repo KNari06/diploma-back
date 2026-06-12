@@ -1,8 +1,8 @@
 import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
+import { EmailService } from '@/services/core/email.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { WorkspaceCreditsService } from '@/services/core/workspace-credits.service';
-import { SUBSCRIPTION_PLANS, WORKSPACE_PLANS } from '@/services/core/token-calculator.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import Stripe from 'stripe';
@@ -524,7 +524,7 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
 
   const { data: user } = await supabaseAdmin
     .from('users')
-    .select('id, last_credits_invoice_id, stripe_price_id')
+    .select('id, email, name, last_credits_invoice_id, stripe_price_id')
     .eq('stripe_customer_id', customerId)
     .maybeSingle();
 
@@ -775,6 +775,43 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
   }
 
   await supabaseAdmin.from('users').update(userUpdateData).eq('id', user.id);
+
+  // Branded purchase confirmation — fire-and-forget so a mail failure never
+  // breaks webhook processing (Stripe still sends its own receipt).
+  // Only on the FIRST charge of a subscription (`subscription_create`) or a
+  // one-off (`manual`/`subscription_update`) — NOT on monthly renewals
+  // (`subscription_cycle`), which would spam "Payment confirmed" every cycle.
+  // Stripe still sends its own receipt for every charge.
+  const billingReason = (invoice as Stripe.Invoice).billing_reason;
+  const isFirstOrOneOff =
+    !billingReason || billingReason === 'subscription_create' || billingReason === 'manual' || billingReason === 'subscription_update';
+  if (user.email && isFirstOrOneOff) {
+    EmailService.sendPlanPurchasedEmail({
+      recipientEmail: user.email,
+      recipientName: user.name || undefined,
+      planName: subscriptionPlanLabel,
+      amountCents: transactionData.amount,
+      currency: transactionData.currency,
+      creditsIncluded: creditsPerPeriod || undefined,
+      frontendUrl: env.FRONTEND_URL || 'http://localhost:3000',
+    })
+      .then((result) => {
+        if (!result.success) {
+          logger.error('[STRIPE_WEBHOOK] Purchase email not sent', {
+            userId: user.id,
+            invoiceId: invoice.id,
+            error: result.error,
+          });
+        }
+      })
+      .catch((err) =>
+        logger.error('[STRIPE_WEBHOOK] Failed to send purchase email', {
+          userId: user.id,
+          invoiceId: invoice.id,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      );
+  }
 }
 
 async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {

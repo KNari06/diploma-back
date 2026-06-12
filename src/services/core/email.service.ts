@@ -74,6 +74,39 @@ export interface NewUserSignupEmailData {
   pendingUsersUrl: string;
 }
 
+export interface WelcomeEmailData {
+  recipientEmail: string;
+  recipientName?: string;
+  frontendUrl: string;
+  /** Configured free-plan credit grant the user will receive (e.g. 50). */
+  freeCredits?: number;
+}
+
+export interface PlanPurchasedEmailData {
+  recipientEmail: string;
+  recipientName?: string;
+  planName: string;
+  /** Amount paid in the smallest currency unit (cents), as Stripe reports it. */
+  amountCents: number;
+  currency: string;
+  /** Credits granted for this billing period, when known. */
+  creditsIncluded?: number;
+  frontendUrl: string;
+}
+
+export interface GeneralInfoEmailData {
+  recipientEmail: string;
+  recipientName?: string;
+  /** Headline shown in the hero + used as the email subject when no subject given. */
+  heading: string;
+  /** Body copy. Plain text; rendered as paragraphs (newlines split paragraphs). */
+  body: string;
+  /** Optional subject override; falls back to `heading`. */
+  subject?: string;
+  /** Optional call-to-action button. */
+  cta?: { label: string; url: string };
+}
+
 // ─── Brand constants ────────────────────────────────────────────────────
 const BRAND = {
   tiffany: '#0ab8b2',
@@ -128,6 +161,18 @@ function esc(str: string): string {
     .replace(/'/g, '&#39;');
 }
 
+/**
+ * Sanitize a URL for use in an href: only http(s)/mailto schemes pass, and the
+ * result is HTML-escaped for attribute context. Anything else (javascript:,
+ * data:, attribute breakout) collapses to '#'. Use for ANY caller-supplied URL
+ * landing in a link (admin cta.url, test URLs).
+ */
+function safeUrl(url: string): string {
+  const trimmed = (url || '').trim();
+  if (!/^(https?:|mailto:)/i.test(trimmed)) return '#';
+  return esc(trimmed);
+}
+
 // ─── Shared HTML Template Builder ───────────────────────────────────────
 
 /**
@@ -135,13 +180,13 @@ function esc(str: string): string {
  * Uses table-based layout for full Outlook / Gmail / Apple Mail compatibility.
  */
 function buildEmailTemplate(opts: {
-  /** Icon emoji for the status hero */
+  /** Inline SVG icon markup for the hero (see ICONS). Falls back to none. */
   heroIcon: string;
-  /** Headline in the status hero */
+  /** Headline in the hero */
   heroTitle: string;
   /** Short subtitle under the hero headline */
   heroSubtitle?: string;
-  /** Accent color for the hero icon bg */
+  /** Accent color for the icon stroke (defaults to neutral gray). */
   heroAccent?: string;
   /** HTML body content */
   bodyHtml: string;
@@ -150,15 +195,22 @@ function buildEmailTemplate(opts: {
   /** Optional secondary link */
   secondaryLink?: { label: string; url: string };
 }): string {
-  const accentBg = BADGE_BG[opts.heroAccent || ''] || BRAND.tiffanyLight;
+  // Light minimal style (Linear/Stripe). No tiffany fill, no dark hero —
+  // tiffany lives only in the logo; the CTA is dark; the icon is a thin
+  // bordered square holding a vector SVG (neutral, not filled).
+  const iconColor = opts.heroAccent || BRAND.gray600;
 
   const ctaBlock = opts.cta
-    ? `<table cellpadding="0" cellspacing="0" border="0" style="margin:32px auto 8px;"><tr>
-        <td align="center" style="border-radius:8px;background:${BRAND.tiffany};">
-          <a href="${opts.cta.url}" style="display:inline-block;padding:14px 40px;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;letter-spacing:.3px;font-family:'Segoe UI',Roboto,Arial,sans-serif;">${opts.cta.label} &#8594;</a>
+    ? `<table cellpadding="0" cellspacing="0" border="0" style="margin:28px 0 4px;"><tr>
+        <td align="center" style="border-radius:8px;background:${BRAND.dark};">
+          <a href="${safeUrl(opts.cta.url)}" style="display:inline-block;padding:13px 28px;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;font-family:'Segoe UI',Roboto,Arial,sans-serif;">${esc(opts.cta.label)} &#8594;</a>
         </td>
       </tr></table>
-      ${opts.secondaryLink ? `<table cellpadding="0" cellspacing="0" border="0" style="margin:4px auto 0;"><tr><td align="center"><a href="${opts.secondaryLink.url}" style="color:${BRAND.gray500};font-size:13px;text-decoration:underline;font-family:'Segoe UI',Roboto,Arial,sans-serif;">${opts.secondaryLink.label}</a></td></tr></table>` : ''}`
+      ${opts.secondaryLink ? `<table cellpadding="0" cellspacing="0" border="0" style="margin:4px 0 0;"><tr><td><a href="${safeUrl(opts.secondaryLink.url)}" style="color:${BRAND.gray500};font-size:13px;text-decoration:underline;font-family:'Segoe UI',Roboto,Arial,sans-serif;">${esc(opts.secondaryLink.label)}</a></td></tr></table>` : ''}`
+    : '';
+
+  const iconBlock = opts.heroIcon
+    ? `<div style="width:46px;height:46px;border:1px solid ${BRAND.gray200};border-radius:10px;text-align:center;line-height:44px;margin:0 0 24px;color:${iconColor};">${opts.heroIcon}</div>`
     : '';
 
   return `<!DOCTYPE html>
@@ -169,36 +221,32 @@ function buildEmailTemplate(opts: {
 
   <!-- Outer wrapper table for Outlook -->
   <table cellpadding="0" cellspacing="0" border="0" width="100%" style="background:${BRAND.gray100};"><tr><td align="center" style="padding:24px 16px;">
-  <table cellpadding="0" cellspacing="0" border="0" width="600" style="max-width:600px;width:100%;">
+  <table cellpadding="0" cellspacing="0" border="0" width="600" style="max-width:600px;width:100%;background:#ffffff;border:1px solid ${BRAND.gray200};border-radius:12px;">
 
     <!-- Header bar -->
-    <tr><td style="background:${BRAND.dark};padding:18px 28px;">
+    <tr><td style="padding:28px 40px 0;">
       <table cellpadding="0" cellspacing="0" border="0" width="100%"><tr>
-        <td><span style="color:#ffffff;font-size:20px;font-weight:700;letter-spacing:.5px;">QAIT</span><span style="color:${BRAND.tiffany};font-size:20px;font-weight:700;">.dev</span></td>
+        <td><span style="color:${BRAND.dark};font-size:19px;font-weight:700;">QAIT</span><span style="color:${BRAND.tiffany};font-size:19px;font-weight:700;">.dev</span></td>
         <td style="text-align:right;"><span style="color:${BRAND.gray400};font-size:12px;">AI-Powered Testing</span></td>
       </tr></table>
     </td></tr>
 
-    <!-- Hero section -->
-    <tr><td style="background:${BRAND.dark};padding:32px 28px 28px;text-align:center;">
-      <table cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;"><tr>
-        <td align="center">
-          <div style="width:56px;height:56px;line-height:56px;border-radius:28px;background:${accentBg};font-size:28px;text-align:center;margin:0 auto 16px;"><!--[if mso]>&nbsp;<![endif]-->${opts.heroIcon}<!--[if mso]>&nbsp;<![endif]--></div>
-          <h1 style="color:#ffffff;margin:0;font-size:22px;font-weight:600;line-height:1.3;font-family:'Segoe UI',Roboto,Arial,sans-serif;">${opts.heroTitle}</h1>
-          ${opts.heroSubtitle ? `<p style="color:${BRAND.gray400};margin:8px 0 0;font-size:14px;">${opts.heroSubtitle}</p>` : ''}
-        </td>
-      </tr></table>
+    <!-- Hero (left-aligned, on white) -->
+    <tr><td style="padding:36px 40px 0;">
+      ${iconBlock}
+      <h1 style="color:${BRAND.gray900};margin:0;font-size:24px;font-weight:600;line-height:1.25;letter-spacing:-0.3px;font-family:'Segoe UI',Roboto,Arial,sans-serif;">${opts.heroTitle}</h1>
+      ${opts.heroSubtitle ? `<p style="color:${BRAND.gray500};margin:8px 0 0;font-size:14px;">${opts.heroSubtitle}</p>` : ''}
     </td></tr>
 
-    <!-- Body card -->
-    <tr><td style="background:#ffffff;padding:32px 28px;border-left:1px solid ${BRAND.gray200};border-right:1px solid ${BRAND.gray200};">
+    <!-- Body -->
+    <tr><td style="padding:28px 40px 36px;">
       ${opts.bodyHtml}
       ${ctaBlock}
     </td></tr>
 
     <!-- Footer -->
-    <tr><td style="background:${BRAND.gray50};border:1px solid ${BRAND.gray200};border-top:none;padding:20px 28px;text-align:center;">
-      <p style="margin:0 0 4px;font-size:12px;color:${BRAND.gray400};">&copy; 2026 QAIT.dev &mdash; AI-Powered Testing Platform</p>
+    <tr><td style="border-top:1px solid ${BRAND.gray100};padding:20px 40px;text-align:center;">
+      <p style="margin:0 0 3px;font-size:12px;color:${BRAND.gray400};">&copy; 2026 QAIT.dev &mdash; AI-Powered Testing Platform</p>
       <p style="margin:0;font-size:11px;color:${BRAND.gray400};">You received this because you have notifications enabled.</p>
     </td></tr>
 
@@ -206,6 +254,21 @@ function buildEmailTemplate(opts: {
   </td></tr></table>
 </body></html>`;
 }
+
+/**
+ * Inline SVG hero icons (email-safe: stroke-based, currentColor, 24px).
+ * currentColor picks up the hero icon color set in buildEmailTemplate.
+ * Clients that strip SVG simply show an empty bordered square — acceptable.
+ */
+const ICONS = {
+  wave: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;"><path d="M7 11V6.5a1.5 1.5 0 0 1 3 0V10"/><path d="M10 10V5.5a1.5 1.5 0 0 1 3 0V10"/><path d="M13 10V6.5a1.5 1.5 0 0 1 3 0V11"/><path d="M16 11V8.5a1.5 1.5 0 0 1 3 0v4a7 7 0 0 1-7 7h-1.4a6 6 0 0 1-4.3-1.8L3 14.5a1.6 1.6 0 0 1 2.3-2.2L7 14"/></svg>',
+  check: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;"><circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg>',
+  megaphone: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;"><path d="M4 9v6h3l8 4V5L7 9H4z"/><path d="M18 9a3 3 0 0 1 0 6"/></svg>',
+  alert: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;"><path d="M12 3 2 20h20L12 3z"/><path d="M12 10v4"/><circle cx="12" cy="17" r="0.6" fill="currentColor"/></svg>',
+  x: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;"><circle cx="12" cy="12" r="9"/><path d="m9 9 6 6M15 9l-6 6"/></svg>',
+  doc: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></svg>',
+  user: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;"><circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/></svg>',
+};
 
 /** Render a labeled detail row */
 function detailRow(label: string, value: string): string {
@@ -240,6 +303,19 @@ function codePill(text: string): string {
   return `<code style="background:${BRAND.gray100};padding:3px 8px;border-radius:4px;font-size:12px;font-family:'SF Mono',Monaco,Consolas,monospace;color:${BRAND.gray600};">${esc(text)}</code>`;
 }
 
+/** Format a Stripe amount (cents) + currency code into a localized money string. */
+function formatMoney(amountCents: number, currency: string): string {
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: (currency || 'usd').toUpperCase(),
+    }).format((amountCents || 0) / 100);
+  } catch {
+    // Unknown currency code → fall back to a plain decimal + raw code.
+    return `${((amountCents || 0) / 100).toFixed(2)} ${(currency || '').toUpperCase()}`.trim();
+  }
+}
+
 /**
  * Email Service for sending custom emails
  * Uses the same SMTP settings as Supabase (Gmail)
@@ -256,9 +332,32 @@ export class EmailService {
       secure: false, // use TLS
       auth: {
         user: 'yera@qait.dev',
-        pass: process.env.SMTP_PASSWORD || '', // Need to add this to .env
+        pass: process.env.SMTP_PASSWORD || '',
       },
     });
+  }
+
+  /**
+   * Verify the SMTP credential at boot so a missing/dead password is loud at
+   * startup instead of silently dropping every email. Non-fatal: logs and
+   * returns — the server still starts (a broken mailer must not block boot).
+   * Called once from startServer().
+   */
+  static async verifyConfig(): Promise<boolean> {
+    if (!process.env.SMTP_PASSWORD) {
+      logger.error('[EMAIL_SERVICE] SMTP_PASSWORD not configured — all emails will fail');
+      return false;
+    }
+    try {
+      await this.createTransporter().verify();
+      logger.info('[EMAIL_SERVICE] SMTP credential verified — mailer ready');
+      return true;
+    } catch (error) {
+      logger.error('[EMAIL_SERVICE] SMTP credential rejected — emails will fail until fixed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
   }
 
   /**
@@ -741,6 +840,179 @@ ${name}, спасибо за интерес к QAIT.dev. К сожалению, 
     }
   }
 
+  /**
+   * Send a welcome email right after a user registers. Distinct from the
+   * approval email: this fires at signup regardless of approval state, to
+   * acknowledge the registration and point the user at next steps.
+   */
+  /** Build the welcome email HTML (shared by sender + preview). */
+  static buildWelcomeHtml(data: WelcomeEmailData): string {
+    const name = esc(data.recipientName || 'there');
+    const creditsLine =
+      typeof data.freeCredits === 'number' && data.freeCredits > 0
+        ? `<p style="margin:0 0 20px;font-size:15px;color:${BRAND.gray600};line-height:1.7;">
+             You&rsquo;ll get <strong style="color:${BRAND.gray900};">${data.freeCredits.toLocaleString('en-US')} free credits</strong> to get started &mdash; no card needed.
+           </p>`
+        : '';
+    const bodyHtml = `
+        <p style="margin:0 0 16px;font-size:16px;color:${BRAND.gray700};">Hi ${name},</p>
+        <p style="margin:0 0 16px;font-size:15px;color:${BRAND.gray600};line-height:1.7;">
+          Thanks for signing up for QAIT.dev &mdash; an AI-powered testing platform that finds bugs in your web app on its own.
+        </p>
+        ${creditsLine}
+        <p style="margin:0 0 12px;font-size:15px;font-weight:600;color:${BRAND.gray900};">Run your first test in under a minute:</p>
+        <ol style="margin:0 0 8px;padding-left:22px;font-size:15px;line-height:1.8;color:${BRAND.gray600};">
+          <li>Paste your app&rsquo;s URL &mdash; our AI explores it and discovers test cases automatically</li>
+          <li>Review the discovered tests and run them in one click</li>
+          <li>Get detailed reports with screenshots and the exact step that failed</li>
+        </ol>`;
+    return buildEmailTemplate({
+      heroIcon: '',
+      heroTitle: 'Welcome to QAIT.dev',
+      bodyHtml,
+      cta: { label: 'Start your first test', url: data.frontendUrl },
+    });
+  }
+
+  static async sendWelcomeEmail(data: WelcomeEmailData): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (!process.env.SMTP_PASSWORD) {
+        logger.error('[EMAIL_SERVICE] SMTP_PASSWORD not configured in .env');
+        return { success: false, error: 'SMTP not configured' };
+      }
+
+      const html = this.buildWelcomeHtml(data);
+
+      await this.createTransporter().sendMail({
+        from: '"QAIT.dev" <yera@qait.dev>',
+        to: data.recipientEmail,
+        subject: 'Welcome to QAIT.dev',
+        text: `Hi ${data.recipientName || 'there'},\n\nThanks for signing up for QAIT.dev. Get started: ${data.frontendUrl}`,
+        html,
+      });
+
+      logger.info('[EMAIL_SERVICE] Welcome email sent successfully', { recipientEmail: data.recipientEmail });
+      return { success: true };
+    } catch (error) {
+      logger.error('[EMAIL_SERVICE] Failed to send welcome email', {
+        error: error instanceof Error ? error.message : String(error),
+        recipientEmail: data.recipientEmail,
+      });
+      return { success: false, error: 'Failed to send welcome email' };
+    }
+  }
+
+  /**
+   * Send a purchase confirmation email when a subscription payment succeeds.
+   * Stripe sends its own receipt; this is the branded QAIT confirmation that
+   * names the plan and credits granted.
+   */
+  /** Build the plan-purchased email HTML (shared by sender + preview). */
+  static buildPlanPurchasedHtml(data: PlanPurchasedEmailData): string {
+    const name = esc(data.recipientName || 'there');
+    const amount = formatMoney(data.amountCents, data.currency);
+    const rows = [
+      detailRow('Plan', badge(esc(data.planName), BRAND.tiffany)),
+      detailRow('Amount', amount),
+      ...(data.creditsIncluded ? [detailRow('Credits', `${data.creditsIncluded.toLocaleString('en-US')}`)] : []),
+    ];
+    const bodyHtml = `
+        <p style="margin:0 0 16px;font-size:16px;color:${BRAND.gray700};">Hi ${name},</p>
+        <p style="margin:0 0 20px;font-size:15px;color:${BRAND.gray600};line-height:1.6;">
+          Your payment was successful and your plan is now active. Thank you for upgrading QAIT.dev!
+        </p>
+        ${detailsTable(rows)}`;
+    return buildEmailTemplate({
+      heroIcon: '',
+      heroTitle: 'Payment confirmed',
+      heroSubtitle: `${esc(data.planName)} plan is active`,
+      bodyHtml,
+      cta: { label: 'Go to Dashboard', url: data.frontendUrl },
+    });
+  }
+
+  static async sendPlanPurchasedEmail(data: PlanPurchasedEmailData): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (!process.env.SMTP_PASSWORD) {
+        logger.error('[EMAIL_SERVICE] SMTP_PASSWORD not configured in .env');
+        return { success: false, error: 'SMTP not configured' };
+      }
+
+      const amount = formatMoney(data.amountCents, data.currency);
+      const html = this.buildPlanPurchasedHtml(data);
+
+      await this.createTransporter().sendMail({
+        from: '"QAIT.dev" <yera@qait.dev>',
+        to: data.recipientEmail,
+        subject: `Payment confirmed — ${data.planName} plan`,
+        text: `Hi ${data.recipientName || 'there'},\n\nYour payment of ${amount} for the ${data.planName} plan was successful. Your plan is now active.`,
+        html,
+      });
+
+      logger.info('[EMAIL_SERVICE] Plan purchased email sent successfully', { recipientEmail: data.recipientEmail });
+      return { success: true };
+    } catch (error) {
+      logger.error('[EMAIL_SERVICE] Failed to send plan purchased email', {
+        error: error instanceof Error ? error.message : String(error),
+        recipientEmail: data.recipientEmail,
+      });
+      return { success: false, error: 'Failed to send plan purchased email' };
+    }
+  }
+
+  /**
+   * Send a general/announcement info email to a single user. The heading +
+   * body are caller-supplied (e.g. from an admin broadcast); both are escaped
+   * before rendering.
+   */
+  /** Build the general-info email HTML (shared by sender + preview). */
+  static buildGeneralInfoHtml(data: GeneralInfoEmailData): string {
+    const name = esc(data.recipientName || 'there');
+    const paragraphs = data.body
+      .split(/\n{2,}/)
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .map((p) => `<p style="margin:0 0 16px;font-size:15px;color:${BRAND.gray600};line-height:1.6;">${esc(p).replace(/\n/g, '<br>')}</p>`)
+      .join('');
+    const bodyHtml = `
+        <p style="margin:0 0 16px;font-size:16px;color:${BRAND.gray700};">Hi ${name},</p>
+        ${paragraphs}`;
+    return buildEmailTemplate({
+      heroIcon: '',
+      heroTitle: esc(data.heading),
+      bodyHtml,
+      cta: data.cta,
+    });
+  }
+
+  static async sendGeneralInfoEmail(data: GeneralInfoEmailData): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (!process.env.SMTP_PASSWORD) {
+        logger.error('[EMAIL_SERVICE] SMTP_PASSWORD not configured in .env');
+        return { success: false, error: 'SMTP not configured' };
+      }
+
+      const html = this.buildGeneralInfoHtml(data);
+
+      await this.createTransporter().sendMail({
+        from: '"QAIT.dev" <yera@qait.dev>',
+        to: data.recipientEmail,
+        subject: data.subject || data.heading,
+        text: `Hi ${data.recipientName || 'there'},\n\n${data.body}`,
+        html,
+      });
+
+      logger.info('[EMAIL_SERVICE] General info email sent successfully', { recipientEmail: data.recipientEmail });
+      return { success: true };
+    } catch (error) {
+      logger.error('[EMAIL_SERVICE] Failed to send general info email', {
+        error: error instanceof Error ? error.message : String(error),
+        recipientEmail: data.recipientEmail,
+      });
+      return { success: false, error: 'Failed to send general info email' };
+    }
+  }
+
   // ─── Rich Email Builders ────────────────────────────────────────────
 
   /**
@@ -778,7 +1050,7 @@ ${name}, спасибо за интерес к QAIT.dev. К сожалению, 
       </table>`;
 
     const html = buildEmailTemplate({
-      heroIcon: '&#x2716;',
+      heroIcon: ICONS.x,
       heroTitle: 'Test Execution Failed',
       heroSubtitle: safeUrl,
       heroAccent: BRAND.red,
@@ -860,7 +1132,7 @@ ${name}, спасибо за интерес к QAIT.dev. К сожалению, 
       <table cellpadding="0" cellspacing="0" border="0" style="width:100%;border:1px solid ${BRAND.gray200};background:#ffffff;">${bugsHtml}</table>`;
 
     const html = buildEmailTemplate({
-      heroIcon: '&#x26A0;',
+      heroIcon: ICONS.alert,
       heroTitle: `${data.bugs.length} Critical Issue${data.bugs.length > 1 ? 's' : ''} Detected`,
       heroSubtitle: 'AI analysis found issues requiring attention',
       heroAccent: BRAND.orange,
@@ -897,12 +1169,12 @@ ${name}, спасибо за интерес к QAIT.dev. К сожалению, 
     };
     const catColor = categoryColors[data.category] || BRAND.gray500;
     const categoryIcons: Record<string, string> = {
-      bug: '&#x1F41B;',
-      feature: '&#x2728;',
-      question: '&#x2753;',
-      other: '&#x1F4AC;',
+      bug: ICONS.alert,
+      feature: ICONS.check,
+      question: ICONS.doc,
+      other: ICONS.doc,
     };
-    const catIcon = categoryIcons[data.category] || '&#x1F4AC;';
+    const catIcon = categoryIcons[data.category] || ICONS.doc;
 
     const rows = [
       detailRow('Category', badge(data.category, catColor)),
@@ -979,10 +1251,10 @@ ${name}, спасибо за интерес к QAIT.dev. К сожалению, 
       </table>`;
 
     const html = buildEmailTemplate({
-      heroIcon: '&#x1F464;',
+      heroIcon: ICONS.user,
       heroTitle: 'New user awaiting approval',
       heroSubtitle: `${esc(displayName)} just signed up via ${esc(data.provider)}`,
-      heroAccent: BRAND.tiffany,
+      heroAccent: BRAND.gray600,
       bodyHtml: `${detailsTable(rows)}${ctaBlock}`,
     });
 
