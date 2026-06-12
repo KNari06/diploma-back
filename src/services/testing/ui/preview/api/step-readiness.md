@@ -18,6 +18,7 @@ URL-change races are detected by polling + `framenavigated` event combined (chea
 ### Functions
 - `waitForStepReadiness(params): Promise<LookaheadResult>` — main entry.
 - `shouldSkipLookaheadAfter(prevAction): boolean` — quick gate used by run loop.
+- `waitForDomDensitySettle(page, budgetMs): Promise<DomDensityResult>` — wait for the interactive-node count to plateau (fresh-page hydration guard, phase 2.6).
 - 16 supporting check functions (navigation race, loader probe, animation settle, overlay probe, element-state, third-party API filter, …).
 
 ### Types
@@ -25,6 +26,7 @@ URL-change races are detected by polling + `framenavigated` event combined (chea
 - `LookaheadOptions` — `{ prevAction, currentUrl, expectsNavigation, action, target?, tracer?, hardCapMs? }`.
 - `LookaheadTracer` — `(phase: string, payload: object) => void` for observability.
 - `ReadinessCheckResult` — per-layer `{ ok, durationMs, info? }`.
+- `DomDensityResult` — `{ settled, finalCount, maxCount, grew, waitedMs, budgetExhausted, probeFailed }`.
 
 ---
 
@@ -95,6 +97,14 @@ Run in order; each layer can skip itself based on action type or signals.
 - Returns `true` for previous actions that don't materially change the DOM state, so the next action can run immediately.
 - **Returns `true` for:** `'wait'`, `'scroll'`, `'hover'`, `'press'` (key without focus change), pure `assert`/`ai_check`. **Returns `false` for:** `'click'`, `'navigate'`, `'open'`, `'close'`, `'type'` (debounce-driven re-renders), `'select'`, `'check'`/`'uncheck'`/`'toggle'`, `'upload'`, `'drag_and_drop'`.
 
+### `waitForDomDensitySettle(page, budgetMs): Promise<DomDensityResult>`
+
+- **Phase 2.6 (fresh-page hydration guard).** Runs inside `waitForStepReadiness` after the page-level layers (loaders/animation/overlay) report clear, gated to fresh-page cases: `navigationDetected || locators.length === 0`. Stable mid-page clicks pay nothing.
+- **Why:** the page-level layers confirm loaders/overlays cleared, but on a navigation-heavy SPA the interactive DOM can still be mid-hydration (sparse now, dense after mount — e.g. 22 interactive nodes → 134). The resolver snapshots right after readiness returns, so a sparse DOM here means the target is absent → scroll-hunt ("found with difficulty after a long time + vertical scrolls"). Documentolog run, June 2026.
+- **How:** polls `countInteractiveElementsLight` (reused from `page-interactive.utils.ts`) every `domDensity.pollMs`; each growth resets a quiet timer; returns `settled` once the count holds at/above `domDensity.floor` for `domDensity.quietMs` with no growth. No per-page baseline needed — the plateau IS the signal.
+- **Fail-open + bounded:** genuinely sparse page → settles after one quiet window (never hangs); empty page (< floor) → `budgetExhausted` at the cap; probe throws (navigation in-flight) → `probeFailed`, immediate return. Capped by `min(domDensity.maxWaitMs, remaining readiness budget)`. Disable via `PREVIEW_DOM_DENSITY=off`.
+- **Trade-off:** an SSR shell stable for `> quietMs` BEFORE hydration kicks in is returned at the shell count — strictly no worse than before (which waited 0ms for density), and budget-bounded.
+
 ---
 
 ## Action-type calibration (Layer 6)
@@ -153,6 +163,7 @@ Parallel checks (`isVisible`, `isEnabled`, `isAttached`, topmost-at-center). 500
 | Layer 5 (overlay) | ~1000ms | `elementFromPoint` probe. |
 | Layer 6 (element state) | ~500ms / locator | Parallel checks. |
 | DOM stability | 150ms / 500ms (post-nav) | MutationObserver quiet window. |
+| DOM density (phase 2.6) | poll 120ms / quiet 320ms / cap 2500ms | Interactive-node plateau. Floor 3 nodes. Gated to fresh-page. `PREVIEW_DOM_DENSITY=off`. |
 | Per-locator hard-cap | 500ms | Per-layer slice budget. |
 
 Defaults overridable via `playwright-tuning.ts`.
@@ -170,6 +181,7 @@ loaders_start / loaders_done(remaining, durationMs)
 api_idle_start / api_idle_done(pending, filtered)
 animation_start / animation_done(elements, infinite)
 overlay_start / overlay_done(blocked)
+dom_density(settled, finalCount, maxCount, grew, budgetExhausted, probeFailed, trigger)
 element_state_start / element_state_done(state)
 hardcap_reached(branch, durationMs)
 ```

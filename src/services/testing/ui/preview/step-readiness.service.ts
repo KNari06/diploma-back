@@ -23,6 +23,7 @@ import { logger } from '@/utils/core/logger';
 import type { Locator, Page } from 'playwright';
 import type { IntentActionType, IntentStep } from './preview.types';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
+import { countInteractiveElementsLight } from './page-interactive.utils';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -222,6 +223,7 @@ const DOM_STABLE_THRESHOLD_MS = STEP_READINESS_CONFIG.domStableThresholdMs;
 const BLIND_SETTLE_MS = STEP_READINESS_CONFIG.blindSettleMs;
 const SPA_NAV_DETECT_MS = STEP_READINESS_CONFIG.spaNavDetectMs;
 const DEFAULTS = STEP_READINESS_CONFIG.defaults;
+const DOM_DENSITY = STEP_READINESS_CONFIG.domDensity;
 
 /**
  * Maximum time (ms) to wait for Cloudflare/reCAPTCHA/generic interstitial
@@ -471,6 +473,102 @@ export async function blindSettle(page: Page, domStableThresholdMs: number): Pro
     domStableThresholdMs,
   });
   await pageSettle(page, BLIND_SETTLE_MS, domStableThresholdMs);
+}
+
+/**
+ * Result of a DOM-density settle wait.
+ */
+export interface DomDensityResult {
+  /** Interactive-node count plateaued at/above the floor within budget. */
+  settled: boolean;
+  /** Interactive-node count at the last poll. */
+  finalCount: number;
+  /** Highest interactive-node count seen during the wait. */
+  maxCount: number;
+  /** Count grew at least once during the wait (hydration observed). */
+  grew: boolean;
+  /** Wall time spent (ms). */
+  waitedMs: number;
+  /** Hit the budget cap without settling (fail-open). */
+  budgetExhausted: boolean;
+  /** A node-count probe threw — wait bailed early, fully fail-open. */
+  probeFailed: boolean;
+}
+
+/**
+ * Wait until the page's interactive-node count stops GROWING for a quiet window
+ * (and is at/above a floor), or the budget expires.
+ *
+ * Why: the page-level readiness checks above (loaders cleared, animation done,
+ * overlay clear) can all pass while a navigation-heavy SPA is still hydrating —
+ * the interactive DOM is briefly sparse (e.g. 22 nodes now, 134 after the app
+ * mounts). The element resolver snapshots right after readiness returns, so a
+ * sparse DOM here means the target isn't present yet → the resolver falls into
+ * scroll-hunt ("found with difficulty after a long time + vertical scrolls").
+ * Watching the count *plateau* catches the hydration tail without needing a
+ * per-page baseline: each growth resets the quiet timer, so we only return once
+ * mounting stops.
+ *
+ * Bounded + fail-open by construction:
+ * - genuinely sparse page (real low count, never grows) → returns after one
+ *   quiet window, never hangs;
+ * - empty page (count < floor forever) → returns at budget (budgetExhausted);
+ * - probe throws (navigation in-flight) → returns immediately (probeFailed).
+ *
+ * Known trade-off: an SSR shell that sits stable for > quietMs BEFORE hydration
+ * kicks in is returned at the shell count — strictly no worse than today (which
+ * waits 0ms for density), and bounded by the budget.
+ */
+export async function waitForDomDensitySettle(
+  page: Page,
+  budgetMs: number,
+): Promise<DomDensityResult> {
+  const start = Date.now();
+
+  let prev: number;
+  try {
+    prev = await countInteractiveElementsLight(page);
+  } catch {
+    return {
+      settled: false, finalCount: -1, maxCount: -1, grew: false,
+      waitedMs: Date.now() - start, budgetExhausted: false, probeFailed: true,
+    };
+  }
+
+  let maxCount = prev;
+  let grew = false;
+  let lastGrowthAt = Date.now();
+
+  while (Date.now() - start < budgetMs) {
+    await new Promise(r => setTimeout(r, DOM_DENSITY.pollMs));
+
+    let cur: number;
+    try {
+      cur = await countInteractiveElementsLight(page);
+    } catch {
+      // Page mid-navigation — bail fail-open rather than burn the budget.
+      return {
+        settled: false, finalCount: prev, maxCount, grew,
+        waitedMs: Date.now() - start, budgetExhausted: false, probeFailed: true,
+      };
+    }
+
+    if (cur > maxCount) maxCount = cur;
+    if (cur > prev) { grew = true; lastGrowthAt = Date.now(); }
+    prev = cur;
+
+    if (cur >= DOM_DENSITY.floor && Date.now() - lastGrowthAt >= DOM_DENSITY.quietMs) {
+      return {
+        settled: true, finalCount: cur, maxCount, grew,
+        waitedMs: Date.now() - start, budgetExhausted: false, probeFailed: false,
+      };
+    }
+  }
+
+  return {
+    settled: false, finalCount: prev, maxCount, grew,
+    waitedMs: Date.now() - start, budgetExhausted: true, probeFailed: false,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1766,6 +1864,50 @@ export async function waitForStepReadiness(
         ...readinessChecks,
         elapsed: Date.now() - startTime,
       });
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 2.6: DOM-density settle (fresh-page guard)
+  // The page-level checks above confirm loaders/overlays/animation cleared, but
+  // on a navigation-heavy SPA the interactive DOM can still be mid-hydration
+  // (sparse now, dense after mount). Resolving on that sparse snapshot misses
+  // the target → scroll-hunt. Wait for the interactive-node count to plateau.
+  // Gated to fresh-page cases (a navigation just happened OR no fast locator was
+  // available) so stable mid-page clicks pay nothing. Fail-open, budget-capped.
+  // ─────────────────────────────────────────────────────────────────────────
+  if (DOM_DENSITY.enabled && (navigationDetected || locators.length === 0)) {
+    const remainingForDensity = maxWaitMs - (Date.now() - startTime);
+    if (remainingForDensity > DOM_DENSITY.minBudgetMs) {
+      const densityStart = Date.now();
+      const density = await waitForDomDensitySettle(
+        page,
+        Math.min(DOM_DENSITY.maxWaitMs, remainingForDensity),
+      );
+      const trigger = locators.length === 0 ? 'blind' : 'navigation';
+      trace.phase({
+        phase: 'dom_density',
+        durationMs: Date.now() - densityStart,
+        details: {
+          settled: density.settled,
+          finalCount: density.finalCount,
+          maxCount: density.maxCount,
+          grew: density.grew,
+          budgetExhausted: density.budgetExhausted,
+          probeFailed: density.probeFailed,
+          trigger,
+        },
+      });
+      // Only log when something interesting happened — hydration observed (grew)
+      // or we capped out without a plateau (budgetExhausted). A clean immediate
+      // settle on an already-dense page is silent.
+      if (density.grew || density.budgetExhausted) {
+        logger.info('[STEP_READINESS] DOM-density settle', {
+          stepId: nextStep.id,
+          ...density,
+          trigger,
+        });
+      }
     }
   }
 
