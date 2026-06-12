@@ -2,6 +2,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import {
   forceFailStuckExecutions,
   forceFailStuckTests,
+  getRunsByIds,
 } from '@/services/testing/results/db/test-completion.db';
 import { executionCompletionEmitter } from '@/services/testing/executions/execution-completion-emitter';
 import { TestResultsFormatterService } from '@/services/testing/results/test-results-formatter.service';
@@ -855,6 +856,21 @@ export class TestCompletionHandlerService {
    * Public because `StaleReaperService` drives it for orphaned runs. It remains
    * the single funnel for run finalization + telemetry aggregation (invariant 11).
    */
+  /**
+   * Recompute a run by id — for callers that only hold the run id (e.g. the
+   * orchestrator after stamping timed-out executions, where no worker-side
+   * completion event will ever fire). Hydrates the full row and delegates to
+   * `recomputeRunStatus`; its optimistic lock makes a redundant call a no-op.
+   */
+  static async recomputeRunStatusById(runId: string): Promise<void> {
+    const runs = await getRunsByIds([runId]);
+    if (runs.length === 0) {
+      logger.warn('[TEST_COMPLETION] recomputeRunStatusById: run not found', { runId });
+      return;
+    }
+    await this.recomputeRunStatus(runs[0]);
+  }
+
   static async recomputeRunStatus(
     run: any,
     options: { suppressSideEffects?: boolean } = {},
