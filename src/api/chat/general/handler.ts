@@ -181,6 +181,53 @@ async function resolveEditorPageContext(
   }
 }
 
+/** Plain-language labels for the frontend's blocker keys (no internal jargon). */
+const EXPLORE_BLOCKER_LABELS: Record<string, string> = {
+  backend: "can't reach QAIT (connection)",
+  project: 'no project selected',
+  app: 'no app build uploaded',
+  runner: 'mobile testing service is offline',
+  llm: 'testing service AI is not configured',
+  capacity: 'no test device available right now',
+};
+
+/**
+ * Render the frontend's facts-only Explore snapshot into a system message so
+ * the agent can SEE the current screen. Returns null when there's nothing
+ * useful (no state, or a plain web surface with no run). Never includes
+ * secrets — the frontend only sends surface/platform/appId/ready/blockers.
+ */
+export function formatExploreStateForChat(state: unknown): string | null {
+  if (!state || typeof state !== 'object') return null;
+  const s = state as {
+    surface?: string; platform?: string; appId?: string;
+    ready?: boolean; blockers?: string[];
+  };
+  if (s.surface !== 'mobile') {
+    // Web surface carries no extra live state worth a message (yet).
+    return null;
+  }
+  const lines: string[] = [
+    '--- CURRENT EXPLORE SCREEN (the user is looking at this right now) ---',
+    'Surface: Mobile app exploration.',
+  ];
+  if (s.platform) lines.push(`Platform: ${s.platform}.`);
+  if (s.appId) lines.push(`App: ${s.appId}.`);
+  if (s.ready) {
+    lines.push('Status: READY — the user can start the run from the chat input (empty goal = whole app).');
+  } else {
+    const blockers = Array.isArray(s.blockers) ? s.blockers : [];
+    const labels = blockers.map((b) => EXPLORE_BLOCKER_LABELS[b] || b);
+    lines.push(
+      blockers.length
+        ? `Status: NOT READY — blocked by: ${labels.join('; ')}.`
+        : 'Status: NOT READY (preparing).',
+    );
+    lines.push('If asked why it won\'t start, explain the blocker(s) above in plain language and the fix (try again later / contact support / upload an .apk-.ipa / use a Flutter debug build).');
+  }
+  return lines.join('\n');
+}
+
 /**
  * ═══════════════════════════════════════════════════════════════════════════
  * HANDLER: GENERAL CHAT
@@ -938,6 +985,16 @@ You are inside the editor for the test case currently open in the preview. The
       role: 'system',
       content: formatPageContextForChat(editorPageContext),
     });
+  }
+
+  // Live Explore-screen state (Slice B): the frontend sends a facts-only
+  // snapshot so the agent can SEE the current surface + mobile readiness and
+  // answer "why won't it start / what do I do" about THIS screen. Pushed as a
+  // system message so it reaches BOTH the monolithic and sub-agent paths
+  // (the appended systemPrompt blocks above do NOT flow into the pipeline).
+  const exploreStateMessage = formatExploreStateForChat(parsedContext?.exploreState);
+  if (exploreStateMessage) {
+    messages.push({ role: 'system', content: exploreStateMessage });
   }
 
   // Inject cached draft steps for cross-turn persistence (editor mode only)
