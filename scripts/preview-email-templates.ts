@@ -47,6 +47,41 @@ const emailTemplates = [
   { name: 'Support Report', html: supportReport.html },
 ];
 
+// Lifecycle emails — the senders build their HTML via these shared build*Html
+// methods, so previewing them here renders exactly what users receive.
+emailTemplates.push(
+  {
+    name: 'Welcome',
+    html: EmailService.buildWelcomeHtml({
+      recipientEmail: 'alex@example.com',
+      recipientName: 'Alex',
+      frontendUrl: 'http://localhost:3000',
+    }),
+  },
+  {
+    name: 'Plan Purchased',
+    html: EmailService.buildPlanPurchasedHtml({
+      recipientEmail: 'alex@example.com',
+      recipientName: 'Alex',
+      planName: 'Pro',
+      amountCents: 4900,
+      currency: 'usd',
+      creditsIncluded: 5000,
+      frontendUrl: 'http://localhost:3000',
+    }),
+  },
+  {
+    name: 'General Info',
+    html: EmailService.buildGeneralInfoHtml({
+      recipientEmail: 'alex@example.com',
+      recipientName: 'Alex',
+      heading: 'Scheduled maintenance on June 20',
+      body: 'We’ll be performing scheduled maintenance on June 20, 02:00–04:00 UTC.\n\nDuring this window test runs may be delayed. No action is needed on your side.',
+      cta: { label: 'View status page', url: 'http://localhost:3000/status' },
+    }),
+  }
+);
+
 // ─── Telegram message simulation ────────────────────────────────────────
 // We import the builder to generate real messages, then render them
 // inside a Telegram-like UI.
@@ -315,6 +350,9 @@ const indexPage = `<!DOCTYPE html>
     <button class="tab active" onclick="load('/email/0', this)">Test Failed <span class="badge badge-email">Email</span></button>
     <button class="tab" onclick="load('/email/1', this)">Critical Issues <span class="badge badge-email">Email</span></button>
     <button class="tab" onclick="load('/email/2', this)">Support Report <span class="badge badge-email">Email</span></button>
+    <button class="tab" onclick="load('/email/3', this)">Welcome <span class="badge badge-email">Email</span></button>
+    <button class="tab" onclick="load('/email/4', this)">Plan Purchased <span class="badge badge-email">Email</span></button>
+    <button class="tab" onclick="load('/email/5', this)">General Info <span class="badge badge-email">Email</span></button>
     <div class="sep"></div>
     <button class="tab" onclick="load('/telegram', this)">Telegram <span class="badge badge-tg">TG</span></button>
   </div>

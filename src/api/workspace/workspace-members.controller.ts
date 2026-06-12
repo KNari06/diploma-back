@@ -715,14 +715,14 @@ export const getInviteInfo = async (req: Request, res: Response): Promise<void> 
     }
 
     const [{ data: workspace }, { data: inviter }] = await Promise.all([
-      supabaseAdmin.from('workspaces').select('project_name').eq('id', invite.workspace_id).single(),
+      supabaseAdmin.from('workspaces').select('name').eq('id', invite.workspace_id).single(),
       supabaseAdmin.from('users').select('name, email').eq('id', invite.invited_by_user_id).single(),
     ]);
 
     res.json({
       success: true,
       data: {
-        workspace_name: workspace?.project_name || null,
+        workspace_name: workspace?.name || null,
         inviter_name: inviter?.name || inviter?.email || null,
         role: invite.role,
         email: invite.email,

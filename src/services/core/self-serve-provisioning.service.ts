@@ -1,5 +1,6 @@
 import { logger } from '@/utils/core/logger';
 import { env } from '@/config/environment/env';
+import { EmailService } from '@/services/core/email.service';
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { ProjectService } from '@/services/core/project.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
@@ -75,12 +76,37 @@ export class SelfServeProvisioningService {
    * row, or it was already approved (0 rows updated, but not rejected).
    */
   private static async approveUser(userId: string): Promise<boolean> {
-    const updated = await approvePendingUser(userId);
-    if (updated > 0) {
+    const approvedRow = await approvePendingUser(userId);
+    if (approvedRow) {
       logger.info('[SELF_SERVE] User auto-approved', { userId });
+      // Send the "You're in!" email exactly once, on the pending→approved
+      // transition. Fire-and-forget: a mail failure must never break auth or
+      // provisioning. The admin PATCH path is the OTHER place this email is
+      // sent — auto-approved users would otherwise never receive it.
+      if (approvedRow.email) {
+        void EmailService.sendApprovalEmail({
+          recipientEmail: approvedRow.email,
+          recipientName: approvedRow.name || undefined,
+          frontendUrl: env.FRONTEND_URL,
+        }).then((result) => {
+          if (!result.success) {
+            logger.error('[SELF_SERVE] Approval email not sent', {
+              userId,
+              email: approvedRow.email,
+              error: result.error,
+            });
+          }
+        }).catch((err) =>
+          logger.error('[SELF_SERVE] Approval email threw', {
+            userId,
+            email: approvedRow.email,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        );
+      }
       return true;
     }
-    // 0 rows updated → either already approved or rejected. Re-read to tell
+    // No row updated → either already approved or rejected. Re-read to tell
     // them apart so we never report a rejected user as approved.
     const status = await fetchUserStatus(userId);
     return status === 'approved';

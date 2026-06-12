@@ -74,6 +74,37 @@ export interface NewUserSignupEmailData {
   pendingUsersUrl: string;
 }
 
+export interface WelcomeEmailData {
+  recipientEmail: string;
+  recipientName?: string;
+  frontendUrl: string;
+}
+
+export interface PlanPurchasedEmailData {
+  recipientEmail: string;
+  recipientName?: string;
+  planName: string;
+  /** Amount paid in the smallest currency unit (cents), as Stripe reports it. */
+  amountCents: number;
+  currency: string;
+  /** Credits granted for this billing period, when known. */
+  creditsIncluded?: number;
+  frontendUrl: string;
+}
+
+export interface GeneralInfoEmailData {
+  recipientEmail: string;
+  recipientName?: string;
+  /** Headline shown in the hero + used as the email subject when no subject given. */
+  heading: string;
+  /** Body copy. Plain text; rendered as paragraphs (newlines split paragraphs). */
+  body: string;
+  /** Optional subject override; falls back to `heading`. */
+  subject?: string;
+  /** Optional call-to-action button. */
+  cta?: { label: string; url: string };
+}
+
 // ─── Brand constants ────────────────────────────────────────────────────
 const BRAND = {
   tiffany: '#0ab8b2',
@@ -240,6 +271,19 @@ function codePill(text: string): string {
   return `<code style="background:${BRAND.gray100};padding:3px 8px;border-radius:4px;font-size:12px;font-family:'SF Mono',Monaco,Consolas,monospace;color:${BRAND.gray600};">${esc(text)}</code>`;
 }
 
+/** Format a Stripe amount (cents) + currency code into a localized money string. */
+function formatMoney(amountCents: number, currency: string): string {
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: (currency || 'usd').toUpperCase(),
+    }).format((amountCents || 0) / 100);
+  } catch {
+    // Unknown currency code → fall back to a plain decimal + raw code.
+    return `${((amountCents || 0) / 100).toFixed(2)} ${(currency || '').toUpperCase()}`.trim();
+  }
+}
+
 /**
  * Email Service for sending custom emails
  * Uses the same SMTP settings as Supabase (Gmail)
@@ -256,9 +300,32 @@ export class EmailService {
       secure: false, // use TLS
       auth: {
         user: 'yera@qait.dev',
-        pass: process.env.SMTP_PASSWORD || '', // Need to add this to .env
+        pass: process.env.SMTP_PASSWORD || '',
       },
     });
+  }
+
+  /**
+   * Verify the SMTP credential at boot so a missing/dead password is loud at
+   * startup instead of silently dropping every email. Non-fatal: logs and
+   * returns — the server still starts (a broken mailer must not block boot).
+   * Called once from startServer().
+   */
+  static async verifyConfig(): Promise<boolean> {
+    if (!process.env.SMTP_PASSWORD) {
+      logger.error('[EMAIL_SERVICE] SMTP_PASSWORD not configured — all emails will fail');
+      return false;
+    }
+    try {
+      await this.createTransporter().verify();
+      logger.info('[EMAIL_SERVICE] SMTP credential verified — mailer ready');
+      return true;
+    } catch (error) {
+      logger.error('[EMAIL_SERVICE] SMTP credential rejected — emails will fail until fixed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
   }
 
   /**
@@ -738,6 +805,175 @@ ${name}, спасибо за интерес к QAIT.dev. К сожалению, 
         recipientEmail: data.recipientEmail,
       });
       return { success: false, error: 'Failed to send email' };
+    }
+  }
+
+  /**
+   * Send a welcome email right after a user registers. Distinct from the
+   * approval email: this fires at signup regardless of approval state, to
+   * acknowledge the registration and point the user at next steps.
+   */
+  /** Build the welcome email HTML (shared by sender + preview). */
+  static buildWelcomeHtml(data: WelcomeEmailData): string {
+    const name = esc(data.recipientName || 'there');
+    const bodyHtml = `
+        <p style="margin:0 0 16px;font-size:16px;color:${BRAND.gray700};">Hi ${name},</p>
+        <p style="margin:0 0 16px;font-size:15px;color:${BRAND.gray600};line-height:1.6;">
+          Thanks for signing up for QAIT.dev &mdash; an AI-powered testing platform that helps you ship faster with confidence.
+        </p>
+        <p style="margin:0 0 12px;font-size:14px;font-weight:600;color:${BRAND.gray900};">Here&rsquo;s what you can do next:</p>
+        <ol style="margin:0 0 8px;padding-left:22px;font-size:14px;line-height:1.8;color:${BRAND.gray600};">
+          <li>Connect your app and run your first AI test</li>
+          <li>Chat with our AI assistant to generate a test plan</li>
+          <li>Track results and get detailed bug reports</li>
+        </ol>`;
+    return buildEmailTemplate({
+      heroIcon: '&#x1F44B;',
+      heroTitle: 'Welcome to QAIT.dev',
+      heroAccent: BRAND.tiffany,
+      bodyHtml,
+      cta: { label: 'Open QAIT.dev', url: data.frontendUrl },
+    });
+  }
+
+  static async sendWelcomeEmail(data: WelcomeEmailData): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (!process.env.SMTP_PASSWORD) {
+        logger.error('[EMAIL_SERVICE] SMTP_PASSWORD not configured in .env');
+        return { success: false, error: 'SMTP not configured' };
+      }
+
+      const html = this.buildWelcomeHtml(data);
+
+      await this.createTransporter().sendMail({
+        from: '"QAIT.dev" <yera@qait.dev>',
+        to: data.recipientEmail,
+        subject: 'Welcome to QAIT.dev',
+        text: `Hi ${data.recipientName || 'there'},\n\nThanks for signing up for QAIT.dev. Get started: ${data.frontendUrl}`,
+        html,
+      });
+
+      logger.info('[EMAIL_SERVICE] Welcome email sent successfully', { recipientEmail: data.recipientEmail });
+      return { success: true };
+    } catch (error) {
+      logger.error('[EMAIL_SERVICE] Failed to send welcome email', {
+        error: error instanceof Error ? error.message : String(error),
+        recipientEmail: data.recipientEmail,
+      });
+      return { success: false, error: 'Failed to send welcome email' };
+    }
+  }
+
+  /**
+   * Send a purchase confirmation email when a subscription payment succeeds.
+   * Stripe sends its own receipt; this is the branded QAIT confirmation that
+   * names the plan and credits granted.
+   */
+  /** Build the plan-purchased email HTML (shared by sender + preview). */
+  static buildPlanPurchasedHtml(data: PlanPurchasedEmailData): string {
+    const name = esc(data.recipientName || 'there');
+    const amount = formatMoney(data.amountCents, data.currency);
+    const rows = [
+      detailRow('Plan', badge(esc(data.planName), BRAND.tiffany)),
+      detailRow('Amount', amount),
+      ...(data.creditsIncluded ? [detailRow('Credits', `${data.creditsIncluded.toLocaleString('en-US')}`)] : []),
+    ];
+    const bodyHtml = `
+        <p style="margin:0 0 16px;font-size:16px;color:${BRAND.gray700};">Hi ${name},</p>
+        <p style="margin:0 0 20px;font-size:15px;color:${BRAND.gray600};line-height:1.6;">
+          Your payment was successful and your plan is now active. Thank you for upgrading QAIT.dev!
+        </p>
+        ${detailsTable(rows)}`;
+    return buildEmailTemplate({
+      heroIcon: '&#x1F389;',
+      heroTitle: 'Payment Confirmed',
+      heroSubtitle: `${esc(data.planName)} plan is active`,
+      heroAccent: BRAND.green,
+      bodyHtml,
+      cta: { label: 'Go to Dashboard', url: data.frontendUrl },
+    });
+  }
+
+  static async sendPlanPurchasedEmail(data: PlanPurchasedEmailData): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (!process.env.SMTP_PASSWORD) {
+        logger.error('[EMAIL_SERVICE] SMTP_PASSWORD not configured in .env');
+        return { success: false, error: 'SMTP not configured' };
+      }
+
+      const amount = formatMoney(data.amountCents, data.currency);
+      const html = this.buildPlanPurchasedHtml(data);
+
+      await this.createTransporter().sendMail({
+        from: '"QAIT.dev" <yera@qait.dev>',
+        to: data.recipientEmail,
+        subject: `Payment confirmed — ${data.planName} plan`,
+        text: `Hi ${data.recipientName || 'there'},\n\nYour payment of ${amount} for the ${data.planName} plan was successful. Your plan is now active.`,
+        html,
+      });
+
+      logger.info('[EMAIL_SERVICE] Plan purchased email sent successfully', { recipientEmail: data.recipientEmail });
+      return { success: true };
+    } catch (error) {
+      logger.error('[EMAIL_SERVICE] Failed to send plan purchased email', {
+        error: error instanceof Error ? error.message : String(error),
+        recipientEmail: data.recipientEmail,
+      });
+      return { success: false, error: 'Failed to send plan purchased email' };
+    }
+  }
+
+  /**
+   * Send a general/announcement info email to a single user. The heading +
+   * body are caller-supplied (e.g. from an admin broadcast); both are escaped
+   * before rendering.
+   */
+  /** Build the general-info email HTML (shared by sender + preview). */
+  static buildGeneralInfoHtml(data: GeneralInfoEmailData): string {
+    const name = esc(data.recipientName || 'there');
+    const paragraphs = data.body
+      .split(/\n{2,}/)
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .map((p) => `<p style="margin:0 0 16px;font-size:15px;color:${BRAND.gray600};line-height:1.6;">${esc(p).replace(/\n/g, '<br>')}</p>`)
+      .join('');
+    const bodyHtml = `
+        <p style="margin:0 0 16px;font-size:16px;color:${BRAND.gray700};">Hi ${name},</p>
+        ${paragraphs}`;
+    return buildEmailTemplate({
+      heroIcon: '&#x1F4E2;',
+      heroTitle: esc(data.heading),
+      heroAccent: BRAND.blue,
+      bodyHtml,
+      cta: data.cta,
+    });
+  }
+
+  static async sendGeneralInfoEmail(data: GeneralInfoEmailData): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (!process.env.SMTP_PASSWORD) {
+        logger.error('[EMAIL_SERVICE] SMTP_PASSWORD not configured in .env');
+        return { success: false, error: 'SMTP not configured' };
+      }
+
+      const html = this.buildGeneralInfoHtml(data);
+
+      await this.createTransporter().sendMail({
+        from: '"QAIT.dev" <yera@qait.dev>',
+        to: data.recipientEmail,
+        subject: data.subject || data.heading,
+        text: `Hi ${data.recipientName || 'there'},\n\n${data.body}`,
+        html,
+      });
+
+      logger.info('[EMAIL_SERVICE] General info email sent successfully', { recipientEmail: data.recipientEmail });
+      return { success: true };
+    } catch (error) {
+      logger.error('[EMAIL_SERVICE] Failed to send general info email', {
+        error: error instanceof Error ? error.message : String(error),
+        recipientEmail: data.recipientEmail,
+      });
+      return { success: false, error: 'Failed to send general info email' };
     }
   }
 

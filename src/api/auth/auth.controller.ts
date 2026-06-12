@@ -44,6 +44,30 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
 
     const result = await signUpWithEmail(email, password, name);
 
+    // Welcome email — fire-and-forget so a mail failure never breaks signup.
+    // Distinct from the Supabase verification email and the approval email.
+    if (result.user?.email) {
+      EmailService.sendWelcomeEmail({
+        recipientEmail: result.user.email,
+        recipientName: result.user.name || undefined,
+        frontendUrl: env.FRONTEND_URL,
+      })
+        .then((emailResult) => {
+          if (!emailResult.success) {
+            logger.error('[AUTH] Welcome email not sent', {
+              email: result.user.email,
+              error: emailResult.error,
+            });
+          }
+        })
+        .catch((err) =>
+          logger.error('[AUTH] Failed to send welcome email', {
+            error: err instanceof Error ? err.message : String(err),
+            email: result.user.email,
+          })
+        );
+    }
+
     res.status(201).json({
       success: true,
       message: 'User registered successfully. Please check your email for verification.',
@@ -736,25 +760,48 @@ export const updateUserStatus = async (req: Request, res: Response): Promise<voi
           recipientEmail: updatedUser.email,
           recipientName: updatedUser.name || undefined,
           frontendUrl: env.FRONTEND_URL,
-        }).catch((err) =>
-          logger.error('[AUTH] Failed to send approval email on status change', {
-            error: err instanceof Error ? err.message : String(err),
-            userId,
-            email: updatedUser.email,
+        })
+          .then((result) => {
+            // A resolved {success:false} (e.g. SMTP misconfigured/rejected) is
+            // NOT a thrown error — surface it explicitly, otherwise a dead
+            // credential fails completely silently while the admin sees "approved".
+            if (!result.success) {
+              logger.error('[AUTH] Approval email not sent on status change', {
+                userId,
+                email: updatedUser.email,
+                error: result.error,
+              });
+            }
           })
-        );
+          .catch((err) =>
+            logger.error('[AUTH] Failed to send approval email on status change', {
+              error: err instanceof Error ? err.message : String(err),
+              userId,
+              email: updatedUser.email,
+            })
+          );
       } else if (status === 'rejected') {
         EmailService.sendRejectionEmail({
           recipientEmail: updatedUser.email,
           recipientName: updatedUser.name || undefined,
           frontendUrl: env.FRONTEND_URL,
-        }).catch((err) =>
-          logger.error('[AUTH] Failed to send rejection email on status change', {
-            error: err instanceof Error ? err.message : String(err),
-            userId,
-            email: updatedUser.email,
+        })
+          .then((result) => {
+            if (!result.success) {
+              logger.error('[AUTH] Rejection email not sent on status change', {
+                userId,
+                email: updatedUser.email,
+                error: result.error,
+              });
+            }
           })
-        );
+          .catch((err) =>
+            logger.error('[AUTH] Failed to send rejection email on status change', {
+              error: err instanceof Error ? err.message : String(err),
+              userId,
+              email: updatedUser.email,
+            })
+          );
       }
     }
 
@@ -816,12 +863,21 @@ export const sendApprovalEmailHandler = async (req: Request, res: Response): Pro
       recipientEmail: email,
       recipientName: name || undefined,
       frontendUrl: env.FRONTEND_URL,
-    }).catch((err) =>
-      logger.error('[AUTH] Failed to send approval email', {
-        error: err instanceof Error ? err.message : String(err),
-        email,
+    })
+      .then((result) => {
+        if (!result.success) {
+          logger.error('[AUTH] Approval email not sent', {
+            email,
+            error: result.error,
+          });
+        }
       })
-    );
+      .catch((err) =>
+        logger.error('[AUTH] Failed to send approval email', {
+          error: err instanceof Error ? err.message : String(err),
+          email,
+        })
+      );
 
     res.json({ success: true, message: 'Approval email queued' });
   } catch (error: any) {
@@ -929,5 +985,86 @@ export const verifyEmail = async (req: Request, res: Response): Promise<void> =>
   } catch (error: any) {
     logger.error('[AUTH] Email verification error', { error: error.message });
     res.status(500).json({ success: false, error: 'Verification failed' });
+  }
+};
+
+/**
+ * Send a general-info / announcement email to one or more users (admin only).
+ * POST /auth/admin/send-info-email
+ * Body: { userIds?: string[], emails?: string[], heading, body, subject?, cta? }
+ * Recipients resolve from userIds (looked up) and/or raw emails. Sends are
+ * sequential and best-effort; the response reports per-recipient success.
+ */
+export const sendInfoEmailHandler = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { userIds, emails, heading, body, subject, cta } = req.body as {
+      userIds?: string[];
+      emails?: string[];
+      heading?: string;
+      body?: string;
+      subject?: string;
+      cta?: { label: string; url: string };
+    };
+
+    if (!heading || typeof heading !== 'string' || !body || typeof body !== 'string') {
+      res.status(400).json({ success: false, error: 'heading and body are required' });
+      return;
+    }
+    if ((!Array.isArray(userIds) || userIds.length === 0) && (!Array.isArray(emails) || emails.length === 0)) {
+      res.status(400).json({ success: false, error: 'Provide userIds and/or emails' });
+      return;
+    }
+
+    // Resolve recipients: {email, name}. userIds are looked up; raw emails
+    // pass through with no name. De-dupe by email.
+    const recipients = new Map<string, { email: string; name?: string }>();
+
+    if (Array.isArray(userIds) && userIds.length > 0) {
+      const { data: users } = await supabaseAdmin
+        .from('users')
+        .select('email, name')
+        .in('id', userIds);
+      for (const u of users || []) {
+        if (u.email) recipients.set(u.email, { email: u.email, name: u.name || undefined });
+      }
+    }
+    for (const e of emails || []) {
+      if (typeof e === 'string' && e.includes('@') && !recipients.has(e)) {
+        recipients.set(e, { email: e });
+      }
+    }
+
+    if (recipients.size === 0) {
+      res.status(400).json({ success: false, error: 'No valid recipients resolved' });
+      return;
+    }
+
+    let sent = 0;
+    const failed: string[] = [];
+    for (const r of recipients.values()) {
+      const result = await EmailService.sendGeneralInfoEmail({
+        recipientEmail: r.email,
+        recipientName: r.name,
+        heading,
+        body,
+        subject,
+        cta,
+      });
+      if (result.success) sent += 1;
+      else failed.push(r.email);
+    }
+
+    if (failed.length > 0) {
+      logger.error('[AUTH] Info email partially failed', { sent, failed: failed.length });
+    }
+
+    res.json({
+      success: true,
+      data: { total: recipients.size, sent, failed },
+      message: `Info email sent to ${sent}/${recipients.size} recipients`,
+    });
+  } catch (error: any) {
+    logger.error('[AUTH] Send info email error', { error: error.message });
+    res.status(500).json({ success: false, error: 'Failed to send info email' });
   }
 };
