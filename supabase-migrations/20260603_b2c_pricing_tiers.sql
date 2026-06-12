@@ -1,4 +1,4 @@
--- B2C self-serve pricing tiers: $29 / $49 / $99, price scales by credit volume.
+-- B2C self-serve pricing tiers: $19 / $49 / $99, price scales by credit volume.
 -- One Pro plan, three volume tiers (Claude Pro/Max style); the frontend renders
 -- them as a single Pro card with a volume dropdown (Free / Pro / Enterprise = 3
 -- cards total). All features available on every tier — price differs only by
@@ -9,11 +9,11 @@
 -- reach Stripe checkout. They become purchasable only after activation.
 --
 -- ACTIVATION (separate, deliberate step — NOT part of this migration):
---   1. In the Stripe Dashboard create 3 recurring (monthly) Prices ($29/$49/$99)
+--   1. In the Stripe Dashboard create 3 recurring (monthly) Prices ($19/$49/$99)
 --      and copy each price_id.
 --   2. Run, substituting the real ids:
---        UPDATE public.plans SET stripe_price_id='price_REAL_29', is_active=true,
---          updated_at=now() WHERE code='pro_29';
+--        UPDATE public.plans SET stripe_price_id='price_REAL_19', is_active=true,
+--          updated_at=now() WHERE code='pro_19';
 --        -- repeat for pro_49 / pro_99
 --   Once active, Stripe checkout (by `code`) and the invoice webhook (by
 --   stripe_price_id) work with zero controller changes — pro_* codes fall
@@ -27,9 +27,9 @@
 -- ~$0.001 COGS/credit (LLM ~$0.0003 + browser-run infra; see
 -- project-credit-unit-economics memory). Volume bonus (cheaper $/credit on
 -- higher tiers). Monthly reset, no rollover.
---   pro_29 → 5,000 cr  ($0.0058/cr, ~83% margin)
---   pro_49 → 9,000 cr  ($0.0054/cr, ~82% margin)
---   pro_99 → 19,000 cr ($0.0052/cr, ~81% margin)
+--   pro_19 →    990 cr ($0.0192/cr, ~95% margin)
+--   pro_49 →  7,000 cr ($0.0070/cr, ~86% margin)
+--   pro_99 → 18,000 cr ($0.0055/cr, ~82% margin)
 --
 -- All rows reference the existing 'pro' pricing_plans row.
 
@@ -45,9 +45,9 @@ BEGIN
 
   INSERT INTO public.plans (code, stripe_price_id, credits_per_period, is_active, plan_id)
   VALUES
-    ('pro_29', 'REPLACE_WITH_STRIPE_PRICE_ID_29',  5000, false, pro_plan_id),
-    ('pro_49', 'REPLACE_WITH_STRIPE_PRICE_ID_49',  9000, false, pro_plan_id),
-    ('pro_99', 'REPLACE_WITH_STRIPE_PRICE_ID_99', 19000, false, pro_plan_id)
+    ('pro_19', 'REPLACE_WITH_STRIPE_PRICE_ID_19',   990, false, pro_plan_id),
+    ('pro_49', 'REPLACE_WITH_STRIPE_PRICE_ID_49',  7000, false, pro_plan_id),
+    ('pro_99', 'REPLACE_WITH_STRIPE_PRICE_ID_99', 18000, false, pro_plan_id)
   ON CONFLICT (code) DO UPDATE SET
     -- Only refresh credit volume + plan link on re-apply. Leave stripe_price_id
     -- and is_active alone so an already-activated tier is never clobbered.
