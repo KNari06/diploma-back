@@ -58,6 +58,16 @@ export const TEST_CREDITS = {
 } as const;
 
 /**
+ * Mobile step cost multiplier. A mobile run (emulator/redroid on an ARM T2A
+ * instance, or a real device) costs ~3–4× a web step by COGS — the emulator is
+ * held for the whole run and mobile concurrency defaults to 1 (serial), so the
+ * per-step infra cost is far higher than a Playwright web step. Conservative 4×
+ * keeps ≥80% margin even in the worst case. Applied per mobile step in
+ * mobile-test-run.job.ts; web/lite steps stay at TEST_CREDITS.INTELLIGENT.
+ */
+export const MOBILE_STEP_CREDIT_MULTIPLIER = 4;
+
+/**
  * Individual subscription plans (user_credits)
  */
 export const INDIVIDUAL_PLANS = {

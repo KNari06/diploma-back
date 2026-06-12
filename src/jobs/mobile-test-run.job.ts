@@ -33,6 +33,8 @@ import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
 import { env } from '@/config/environment/env';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { MOBILE_STEP_CREDIT_MULTIPLIER } from '@/services/core/token-calculator.service';
 import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
 import { uploadMobileStepScreenshots, processAndUploadStepScreenshot, decodeBase64Screenshot } from '@/services/storage/step-screenshot.service';
 // Phase 2 (May 2026) telemetry helpers. Kept in a side-effect-free
@@ -693,6 +695,40 @@ export class MobileTestRunJobHandler {
         telemetryTestStepsMs: tlm.testStepsMs,
         telemetrySessionClaimMs: tlm.sessionClaimMs,
       });
+
+      // ── Billing: charge mobile steps at the mobile multiplier ─────────
+      // A mobile run never went through the per-step web billing path
+      // (test-executor); it runs as a batch RPC to the runner. Charge here,
+      // once, for the user-authored test steps (the scenario_setup prefix —
+      // logins etc. — is excluded). Mobile steps cost MOBILE_STEP_CREDIT_
+      // MULTIPLIER× a web step (emulator COGS). Best-effort: a failed
+      // deduction must never fail the run the user already received.
+      if (userId) {
+        const billableSteps = Math.max(
+          0,
+          (runResult.steps?.length ?? 0) - (tlm.scenarioStepCount ?? 0),
+        );
+        const mobileCredits = billableSteps * MOBILE_STEP_CREDIT_MULTIPLIER;
+        if (mobileCredits > 0) {
+          try {
+            await CreditCostTrackerService.deductCreditsForTest({
+              userId,
+              testType: 'intelligent',
+              credits: mobileCredits,
+              costUSD: 0,
+              testId,
+              description: `Mobile run — ${billableSteps} steps × ${MOBILE_STEP_CREDIT_MULTIPLIER}`,
+            });
+          } catch (creditError) {
+            logger.warn('[MOBILE-TEST] Credit deduction failed (non-critical)', {
+              testId,
+              userId,
+              billableSteps,
+              error: creditError instanceof Error ? creditError.message : String(creditError),
+            });
+          }
+        }
+      }
 
       // ── Diagnostic: aborted/timed-out steps ──────────────────────────
       // The runner pushes per-step results with `error: 'Client aborted'`

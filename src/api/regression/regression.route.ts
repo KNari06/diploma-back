@@ -1,4 +1,4 @@
-import { requireAuth } from '@/middleware/auth.middleware';
+import { requireAuth, requireCredits } from '@/middleware/auth.middleware';
 import { sharedReportRateLimiter } from '@/middleware/rate-limiter.middleware';
 import { Router } from 'express';
 import {
@@ -143,7 +143,7 @@ router.post('/save', requireAuth, saveTestCase);
  *         description: Resource not found
  */
 // Run/replay: execute a saved test case (creates new execution run records).
-router.post('/run', requireAuth, runRegression);
+router.post('/run', requireAuth, requireCredits(1), runRegression);
 
 /**
  * @swagger
@@ -216,7 +216,7 @@ router.get('/runs', requireAuth, listRuns);
  *         description: Plan run started
  */
 // Run a regression plan (a custom selection of tests).
-router.post('/run-plan', requireAuth, runPlan);
+router.post('/run-plan', requireAuth, requireCredits(1), runPlan);
 
 /**
  * @swagger
@@ -245,7 +245,7 @@ router.post('/run-plan', requireAuth, runPlan);
  *         description: Module run started
  */
 // Run all tests under a module (hierarchy shortcut).
-router.post('/run-module', requireAuth, runModule);
+router.post('/run-module', requireAuth, requireCredits(1), runModule);
 
 /**
  * @swagger
@@ -274,7 +274,7 @@ router.post('/run-module', requireAuth, runModule);
  *         description: Flow run started
  */
 // Run all tests under a flow (hierarchy shortcut).
-router.post('/run-flow', requireAuth, runFlow);
+router.post('/run-flow', requireAuth, requireCredits(1), runFlow);
 
 /**
  * @swagger
@@ -304,7 +304,7 @@ router.post('/run-flow', requireAuth, runFlow);
  *         description: Tag run started
  */
 // Run tests filtered by tag across a project.
-router.post('/run-by-tag', requireAuth, runByTag);
+router.post('/run-by-tag', requireAuth, requireCredits(1), runByTag);
 
 /**
  * @swagger
@@ -335,7 +335,7 @@ router.post('/run-by-tag', requireAuth, runByTag);
  *         description: Priority run started
  */
 // Run tests filtered by priority across a project.
-router.post('/run-by-priority', requireAuth, runByPriority);
+router.post('/run-by-priority', requireAuth, requireCredits(1), runByPriority);
 
 /**
  * @swagger
