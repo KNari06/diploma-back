@@ -11,6 +11,7 @@ import { env } from '@/config/environment/env';
 import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
 import { ArtifactRetentionJob } from '@/jobs/artifact-retention.job';
 import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
+import { ExpiringPlansJob } from '@/jobs/expiring-plans.job';
 import { StaleRunReaperJob } from '@/jobs/stale-run-reaper.job';
 import { AiCallLogsRetentionJob } from '@/jobs/ai-call-logs-retention.job';
 import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
@@ -55,6 +56,11 @@ async function main(): Promise<void> {
   // single-instance reasoning as the sweeps above.
   AiCallLogsRetentionJob.start();
 
+  // Daily "plan expiring in 3 days" reminder. Emails paid users whose
+  // current_period_end is within 3 days; per-period dedup marker prevents
+  // re-sending. Single-instance (same Cloud Run reasoning as the sweeps above).
+  ExpiringPlansJob.start();
+
   // Per-step screenshot retention. Prunes `${userId}/step-screenshots/...`
   // older than SCREENSHOT_RETENTION_DAYS. Only meaningful while per-step
   // capture is enabled (default ON) — skip the sweep otherwise so we don't
@@ -75,6 +81,7 @@ async function main(): Promise<void> {
       StaleRunReaperJob.stop();
       AiCallLogsRetentionJob.stop();
       ArtifactRetentionJob.stop();
+      ExpiringPlansJob.stop();
       await TestSchedulerJobHandler.waitForIdle();
     } finally {
       process.exit(0);

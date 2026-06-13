@@ -15,6 +15,7 @@ import { initLogBridge } from '@/utils/core/log-bridge';
 import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
 import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
 import { AiCallLogsRetentionJob } from '@/jobs/ai-call-logs-retention.job';
+import { ExpiringPlansJob } from '@/jobs/expiring-plans.job';
 import { logger } from '@/utils/core/logger';
 
 initLogBridge();
@@ -48,6 +49,16 @@ async function main(): Promise<void> {
   } catch (error) {
     failed = true;
     logger.error('[SCHEDULER_DAILY] AI call-logs retention failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  try {
+    const reminded = await ExpiringPlansJob.tick();
+    logger.info('[SCHEDULER_DAILY] Expiring-plans reminder done', reminded);
+  } catch (error) {
+    failed = true;
+    logger.error('[SCHEDULER_DAILY] Expiring-plans reminder failed', {
       error: error instanceof Error ? error.message : String(error),
     });
   }

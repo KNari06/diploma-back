@@ -107,6 +107,33 @@ export interface GeneralInfoEmailData {
   cta?: { label: string; url: string };
 }
 
+export interface PlanExpiringEmailData {
+  recipientEmail: string;
+  recipientName?: string;
+  /** ISO timestamp when the current billing period ends. */
+  expiresAt: string;
+  /** true = auto-renews (heads-up); false = lapses (cancel_at_period_end). */
+  willAutoRenew: boolean;
+  frontendUrl: string;
+}
+
+export interface PaymentFailedEmailData {
+  recipientEmail: string;
+  recipientName?: string;
+  amountCents: number;
+  currency: string;
+  frontendUrl: string;
+}
+
+export interface SubscriptionCanceledEmailData {
+  recipientEmail: string;
+  recipientName?: string;
+  planName: string;
+  /** ISO date the plan access ends, when known. */
+  endsOn?: string | null;
+  frontendUrl: string;
+}
+
 // ─── Brand constants ────────────────────────────────────────────────────
 const BRAND = {
   tiffany: '#0ab8b2',
@@ -1010,6 +1037,147 @@ ${name}, спасибо за интерес к QAIT.dev. К сожалению, 
         recipientEmail: data.recipientEmail,
       });
       return { success: false, error: 'Failed to send general info email' };
+    }
+  }
+
+  /** "Your plan expires soon" reminder (driven by the daily ExpiringPlansJob). */
+  static buildPlanExpiringHtml(data: PlanExpiringEmailData): string {
+    const name = esc(data.recipientName || 'there');
+    const dateStr = formatDate(data.expiresAt);
+    const lead = data.willAutoRenew
+      ? `Your QAIT.dev plan renews on <strong style="color:${BRAND.gray900};">${dateStr}</strong>. No action needed &mdash; this is just a heads-up. If you want to make changes, you can manage your plan any time.`
+      : `Your QAIT.dev plan is set to end on <strong style="color:${BRAND.gray900};">${dateStr}</strong> and won&rsquo;t renew. To keep running tests without interruption, renew before then.`;
+    const bodyHtml = `
+        <p style="margin:0 0 16px;font-size:16px;color:${BRAND.gray700};">Hi ${name},</p>
+        <p style="margin:0 0 20px;font-size:15px;color:${BRAND.gray600};line-height:1.7;">${lead}</p>`;
+    return buildEmailTemplate({
+      heroIcon: '',
+      heroTitle: data.willAutoRenew ? 'Your plan renews soon' : 'Your plan expires soon',
+      heroSubtitle: dateStr,
+      bodyHtml,
+      cta: { label: 'Manage your plan', url: data.frontendUrl },
+    });
+  }
+
+  static async sendPlanExpiringEmail(data: PlanExpiringEmailData): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (!process.env.SMTP_PASSWORD) {
+        logger.error('[EMAIL_SERVICE] SMTP_PASSWORD not configured in .env');
+        return { success: false, error: 'SMTP not configured' };
+      }
+      const subject = data.willAutoRenew ? 'Your QAIT.dev plan renews soon' : 'Your QAIT.dev plan expires soon';
+      await this.createTransporter().sendMail({
+        from: '"QAIT.dev" <yera@qait.dev>',
+        to: data.recipientEmail,
+        subject,
+        text: `Hi ${data.recipientName || 'there'},\n\n${subject} (${formatDate(data.expiresAt)}). Manage your plan: ${data.frontendUrl}`,
+        html: this.buildPlanExpiringHtml(data),
+      });
+      logger.info('[EMAIL_SERVICE] Plan expiring email sent successfully', { recipientEmail: data.recipientEmail });
+      return { success: true };
+    } catch (error) {
+      logger.error('[EMAIL_SERVICE] Failed to send plan expiring email', {
+        error: error instanceof Error ? error.message : String(error),
+        recipientEmail: data.recipientEmail,
+      });
+      return { success: false, error: 'Failed to send plan expiring email' };
+    }
+  }
+
+  /** Payment-failed (card declined / dunning) notice. */
+  static buildPaymentFailedHtml(data: PaymentFailedEmailData): string {
+    const name = esc(data.recipientName || 'there');
+    // Only name the amount when we actually have one; a $0.00 invoice reads oddly.
+    const amountPhrase =
+      data.amountCents > 0
+        ? ` of <strong style="color:${BRAND.gray900};">${formatMoney(data.amountCents, data.currency)}</strong>`
+        : '';
+    const bodyHtml = `
+        <p style="margin:0 0 16px;font-size:16px;color:${BRAND.gray700};">Hi ${name},</p>
+        <p style="margin:0 0 20px;font-size:15px;color:${BRAND.gray600};line-height:1.7;">
+          We couldn&rsquo;t process your payment${amountPhrase} for QAIT.dev. This usually means your card expired or was declined.
+        </p>
+        <p style="margin:0 0 20px;font-size:15px;color:${BRAND.gray600};line-height:1.7;">
+          Please update your payment method to keep your plan active &mdash; we&rsquo;ll retry automatically once it&rsquo;s fixed.
+        </p>`;
+    return buildEmailTemplate({
+      heroIcon: '',
+      heroTitle: 'Payment failed',
+      bodyHtml,
+      cta: { label: 'Update payment method', url: data.frontendUrl },
+    });
+  }
+
+  static async sendPaymentFailedEmail(data: PaymentFailedEmailData): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (!process.env.SMTP_PASSWORD) {
+        logger.error('[EMAIL_SERVICE] SMTP_PASSWORD not configured in .env');
+        return { success: false, error: 'SMTP not configured' };
+      }
+      await this.createTransporter().sendMail({
+        from: '"QAIT.dev" <yera@qait.dev>',
+        to: data.recipientEmail,
+        subject: 'Action needed: your QAIT.dev payment failed',
+        text: `Hi ${data.recipientName || 'there'},\n\nWe couldn't process your payment of ${formatMoney(data.amountCents, data.currency)}. Update your payment method: ${data.frontendUrl}`,
+        html: this.buildPaymentFailedHtml(data),
+      });
+      logger.info('[EMAIL_SERVICE] Payment failed email sent successfully', { recipientEmail: data.recipientEmail });
+      return { success: true };
+    } catch (error) {
+      logger.error('[EMAIL_SERVICE] Failed to send payment failed email', {
+        error: error instanceof Error ? error.message : String(error),
+        recipientEmail: data.recipientEmail,
+      });
+      return { success: false, error: 'Failed to send payment failed email' };
+    }
+  }
+
+  /** Subscription canceled / will-not-renew notice. */
+  static buildSubscriptionCanceledHtml(data: SubscriptionCanceledEmailData): string {
+    const name = esc(data.recipientName || 'there');
+    const endsLine = data.endsOn
+      ? ` You&rsquo;ll keep access until <strong style="color:${BRAND.gray900};">${formatDate(data.endsOn)}</strong>.`
+      : '';
+    const bodyHtml = `
+        <p style="margin:0 0 16px;font-size:16px;color:${BRAND.gray700};">Hi ${name},</p>
+        <p style="margin:0 0 20px;font-size:15px;color:${BRAND.gray600};line-height:1.7;">
+          Your <strong style="color:${BRAND.gray900};">${esc(data.planName)}</strong> plan on QAIT.dev has been canceled and won&rsquo;t renew.${endsLine}
+        </p>
+        <p style="margin:0 0 20px;font-size:15px;color:${BRAND.gray600};line-height:1.7;">
+          Changed your mind? You can resubscribe any time and pick up right where you left off.
+        </p>`;
+    return buildEmailTemplate({
+      heroIcon: '',
+      heroTitle: 'Your plan was canceled',
+      heroSubtitle: esc(data.planName),
+      bodyHtml,
+      cta: { label: 'Resubscribe', url: data.frontendUrl },
+    });
+  }
+
+  static async sendSubscriptionCanceledEmail(
+    data: SubscriptionCanceledEmailData
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (!process.env.SMTP_PASSWORD) {
+        logger.error('[EMAIL_SERVICE] SMTP_PASSWORD not configured in .env');
+        return { success: false, error: 'SMTP not configured' };
+      }
+      await this.createTransporter().sendMail({
+        from: '"QAIT.dev" <yera@qait.dev>',
+        to: data.recipientEmail,
+        subject: `Your QAIT.dev ${data.planName} plan was canceled`,
+        text: `Hi ${data.recipientName || 'there'},\n\nYour ${data.planName} plan was canceled and won't renew. Resubscribe any time: ${data.frontendUrl}`,
+        html: this.buildSubscriptionCanceledHtml(data),
+      });
+      logger.info('[EMAIL_SERVICE] Subscription canceled email sent successfully', { recipientEmail: data.recipientEmail });
+      return { success: true };
+    } catch (error) {
+      logger.error('[EMAIL_SERVICE] Failed to send subscription canceled email', {
+        error: error instanceof Error ? error.message : String(error),
+        recipientEmail: data.recipientEmail,
+      });
+      return { success: false, error: 'Failed to send subscription canceled email' };
     }
   }
 
