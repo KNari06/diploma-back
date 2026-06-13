@@ -270,6 +270,45 @@ export async function getIntentTestCase(req: Request, res: Response): Promise<vo
 }
 
 /**
+ * Transitive precondition (dependency) steps for a test case, grouped by
+ * owning dependency in execution order. Read-only — backs the "Run Before"
+ * panel in the editor so the user sees exactly what runs before this test.
+ * GET /api/v1/preview/intent-test-cases/:id/preconditions
+ */
+export async function getPreconditions(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = (req as any).user?.id;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const { id } = req.params;
+
+    // Verify access to the root case before exposing its dependency chain.
+    const testCase = await IntentTestCaseService.getById(id, userId);
+    if (!testCase) {
+      res.status(404).json({ error: 'Test case not found' });
+      return;
+    }
+
+    const groups = await IntentTestCaseService.collectPreconditionGroups(id);
+
+    res.json({
+      success: true,
+      data: { groups },
+    });
+  } catch (error) {
+    logger.error('[PREVIEW_CONTROLLER] Failed to get preconditions', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to get preconditions',
+    });
+  }
+}
+
+/**
  * List intent test cases for a project
  * GET /api/v1/preview/intent-test-cases?projectId=...&flowId=...
  */
@@ -597,6 +636,19 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
     if (!testCase) {
       res.status(404).json({ error: 'Intent test case not found' });
       return;
+    }
+
+    // 1a. Inline transitive dependency (precondition) steps so they run
+    // in-session BEFORE this test's own steps (shared browser → shared
+    // login/cookies/data). Borrowed steps carry `_preconditionSource`.
+    const preconditionSteps = await IntentTestCaseService.collectPreconditionSteps(id);
+    if (preconditionSteps.length > 0) {
+      testCase.stepsJson = [...preconditionSteps, ...(testCase.stepsJson || [])];
+      logger.info('[PREVIEW_CONTROLLER] Inlined precondition steps', {
+        intentTestCaseId: id,
+        preconditionSteps: preconditionSteps.length,
+        totalSteps: testCase.stepsJson.length,
+      });
     }
 
     // 2. Validate project if override provided

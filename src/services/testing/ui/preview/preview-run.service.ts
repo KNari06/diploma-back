@@ -585,6 +585,26 @@ export class PreviewRunService {
           throw new Error('Test case not found or has no saved steps');
         }
         savedSteps = testCase.stepsJson;
+
+        // Inline transitive dependency (precondition) steps so they execute
+        // in-session BEFORE this test's own steps (shared browser → shared
+        // login/cookies/data). Runtime-only: borrowed steps carry namespaced
+        // ids + `_preconditionSource`, so the per-step persistence in
+        // runStepsOnPreview never writes them back into this test's steps_json.
+        // Skipped for "Apply New Only" (startFromIndex) — those continue
+        // mid-session, so re-running preconditions (and shifting indices) is wrong.
+        if (testCase.dependsOn?.length && !options?.startFromIndex) {
+          const preconditionSteps = await IntentTestCaseService.collectPreconditionSteps(intentTestCaseId);
+          if (preconditionSteps.length > 0) {
+            savedSteps = [...preconditionSteps, ...savedSteps];
+            logger.info('[PreviewRun] Inlined precondition steps', {
+              previewSessionId,
+              intentTestCaseId,
+              preconditionSteps: preconditionSteps.length,
+              totalSteps: savedSteps.length,
+            });
+          }
+        }
       }
       if (!startUrl) {
         startUrl = testCase?.startUrl || testCase?.url || undefined;

@@ -64,6 +64,10 @@ jest.mock('@/services/testing/ui/manualTest.service', () => ({
   ManualTestService: { runTest: jest.fn() },
 }));
 
+jest.mock('@/services/testing/ui/preview/intent-test-case.service', () => ({
+  IntentTestCaseService: { collectPreconditionSteps: jest.fn(async () => []) },
+}));
+
 jest.mock('@/services/testing/regression/regression-report-assembler.service', () => ({
   RegressionReportAssemblerService: {
     buildFullReport: jest.fn(),
