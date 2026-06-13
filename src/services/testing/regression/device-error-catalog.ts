@@ -36,6 +36,16 @@ const CATALOG: Record<string, DeviceErrorInfo> = {
       'On-device accessibility agent failed to attach to the Flutter app. Cold-boot the emulator and retry; ensure the app is a debug/profile build.',
     category: 'environment',
   },
+  A11Y_AGENT_UNAVAILABLE: {
+    label: "Couldn't start test",
+    remediation:
+      'On-device accessibility agent failed to bind, so the native a11y tree (needed for Flutter element resolution) was unavailable. Usually transient under emulator/host resource pressure — let the device settle (or cold-boot it) and retry.',
+    // Infrastructure noise: the agent never bound, so the test never ran.
+    // MUST be 'environment' so it is excluded from flaky / fail-rate math
+    // (same as FLUTTER_NOT_DETECTED, which this code split off from on the
+    // agent-bind path in qait-mobile-runner).
+    category: 'environment',
+  },
   DEVICE_UNAUTHORIZED: {
     label: 'Device not authorized',
     remediation: 'Approve the USB-debugging prompt on the device, then retry.',
