@@ -259,6 +259,124 @@ export class IntentTestCaseService {
   }
 
   /**
+   * Collect the steps of ALL transitive dependencies (preconditions) of a test
+   * case, ordered dependency-first, deduped, and cycle-safe. Returns an empty
+   * array when the case has no dependencies.
+   *
+   * Each returned step is tagged with `_preconditionSource` (the owning
+   * test-case id) so post-run compiled-plan writeback can exclude borrowed
+   * steps from the target's persisted `steps_json`. The root's OWN steps are
+   * NOT included — the caller appends them after these.
+   *
+   * Access is assumed pre-validated on the root by the caller; dependencies are
+   * constrained to the same project/owner at save time, so they are fetched by
+   * id without a per-user filter.
+   */
+  static async collectPreconditionSteps(rootId: string): Promise<IntentStep[]> {
+    const MAX_NODES = 200; // safety bound against pathological fan-out
+
+    // 1. Fetch the whole dependency closure — one query per depth level (no N+1).
+    const byId = new Map<string, { dependsOn: string[]; steps: IntentStep[] }>();
+    let frontier = [rootId];
+    while (frontier.length > 0) {
+      const { data, error } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, depends_on, steps_json')
+        .in('id', frontier);
+
+      if (error) {
+        logger.error('[INTENT_TEST_CASE] Failed to load dependency closure', { error, rootId });
+        throw new Error(`Failed to resolve preconditions: ${error.message}`);
+      }
+
+      const next: string[] = [];
+      for (const row of data || []) {
+        const deps: string[] = row.depends_on || [];
+        byId.set(row.id, { dependsOn: deps, steps: (row.steps_json as IntentStep[]) || [] });
+        for (const d of deps) if (!byId.has(d)) next.push(d);
+      }
+
+      if (byId.size > MAX_NODES) {
+        logger.warn('[INTENT_TEST_CASE] Precondition closure exceeded cap — truncating', {
+          rootId,
+          nodes: byId.size,
+          cap: MAX_NODES,
+        });
+        break;
+      }
+
+      frontier = [...new Set(next)];
+    }
+
+    // 2. Post-order DFS: deps emitted before dependents, each once, cycle-safe
+    // via `visited` (a cycle simply stops recursing, never loops).
+    const visited = new Set<string>();
+    const order: string[] = [];
+    const dfs = (id: string): void => {
+      if (visited.has(id)) return;
+      visited.add(id);
+      const node = byId.get(id);
+      if (!node) return;
+      for (const dep of node.dependsOn) dfs(dep);
+      if (id !== rootId) order.push(id); // root's own steps are appended by the caller
+    };
+    dfs(rootId);
+
+    // 3. Flatten in dependency-first order. Namespace each borrowed step id
+    // (`pre_<sourceId>_<originalId>`) so it can NEVER collide with the target's
+    // own step ids. `batchUpdateStepsFromRun` merges compiled plans by id
+    // against the target's saved `steps_json`; without the namespace a shared
+    // step id (e.g. a login flow duplicated into both cases) would let a
+    // dependency's plan overwrite a same-id target step. The prefix also keeps
+    // borrowed steps from writing back onto the SOURCE case. `_preconditionSource`
+    // is retained purely for run reporting / debugging.
+    return order.flatMap((id) =>
+      (byId.get(id)?.steps || []).map((s) => ({
+        ...s,
+        id: `pre_${id}_${s.id}`,
+        _preconditionSource: id,
+      })),
+    );
+  }
+
+  /**
+   * Like `collectPreconditionSteps`, but grouped by owning dependency for UI
+   * display — one entry per dependency in execution order, each with its name
+   * and its steps. Namespaced step ids are preserved so the editor's run panel
+   * can map `preview:run:step` events back to these rows. Empty when none.
+   */
+  static async collectPreconditionGroups(
+    rootId: string,
+  ): Promise<Array<{ testCaseId: string; name: string; steps: IntentStep[] }>> {
+    const steps = await this.collectPreconditionSteps(rootId);
+    if (steps.length === 0) return [];
+
+    // DFS emits each source's steps contiguously — collect distinct source ids
+    // in execution order.
+    const orderedSourceIds: string[] = [];
+    for (const s of steps) {
+      const src = s._preconditionSource;
+      if (src && orderedSourceIds[orderedSourceIds.length - 1] !== src) {
+        orderedSourceIds.push(src);
+      }
+    }
+
+    const { data } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, name')
+      .in('id', orderedSourceIds);
+    const nameById = new Map<string, string>(
+      ((data as Array<{ id: string; name: string }>) || []).map((r) => [r.id, r.name]),
+    );
+
+    return orderedSourceIds.map((id) => ({
+      testCaseId: id,
+      name: nameById.get(id) || 'Unknown',
+      steps: steps.filter((s) => s._preconditionSource === id),
+    }));
+  }
+
+  /**
    * List test cases for a project
    */
   static async listByProject(params: {
