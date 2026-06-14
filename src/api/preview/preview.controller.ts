@@ -18,6 +18,8 @@ import { buildMetadataFromTestCase } from '@/services/mobile/mobile-runner.types
 import { cancelTest } from '@/services/testing/ui/manual/test-cancellation';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
+import { refreshIdle as refreshPreviewIdle } from '@/services/testing/ui/preview/preview-idle.service';
+import { getIO } from '@/websocket/core/server';
 import { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -102,6 +104,15 @@ export async function startPreview(req: Request, res: Response): Promise<void> {
       startUrl: safeStartUrl,
       viewport: parsedViewport,
     });
+
+    // Opening the editor is a REST call, so it never passes through the socket
+    // `socket.use` middleware that refreshes the per-user idle timer. Arm it
+    // here so the user gets a full IDLE_TTL window from the moment the session
+    // exists — otherwise the timer keeps counting from the last live-preview
+    // socket event and can fire moments after reopening a test case. Mirrors
+    // the mobile editor (session.controller.ts). Subsequent preview interaction
+    // keeps refreshing it via the middleware.
+    try { refreshPreviewIdle(userId, getIO()); } catch { /* non-fatal */ }
 
     // Get viewport metadata for coordinate mapping
     const viewportMeta = sessionService.getViewportMetadata(result.previewSessionId, userId);

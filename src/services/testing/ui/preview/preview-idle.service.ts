@@ -124,7 +124,7 @@ async function onIdleFire(userId: string, io: SocketIOServer): Promise<void> {
     // does), so a hung Playwright teardown would block the redirect event
     // and leave the user in a frozen editor. Emitting first guarantees
     // the redirect; the cleanup below is idempotent and best-effort.
-    io.to(`user:${userId}`).emit('preview:session:expired', { reason: 'idle' });
+    io.to(`user:${userId}`).emit('preview:session:expired', { reason: 'idle', previewSessionId: stoppedSessionId });
 
     try {
       await sessionService.stopSession(stoppedSessionId, userId);

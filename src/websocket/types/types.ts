@@ -318,7 +318,11 @@ export interface ServerToClientEvents {
   // `intentTestCaseId` from the URL, toasts the user, and bounces back to
   // the Repository view. The Playwright preview session is stopped server-
   // side before this event is emitted (cheap to re-create on reopen).
-  'preview:session:expired': (data: { reason: 'idle' | 'disconnect' }) => void;
+  // `previewSessionId` scopes the event to the session that expired so the
+  // frontend can ignore a stale/phantom expiry meant for a session it has
+  // already replaced (e.g. reopening a test case right after an idle kick).
+  // Optional for backwards-compat with older clients during deploy skew.
+  'preview:session:expired': (data: { reason: 'idle' | 'disconnect'; previewSessionId?: string }) => void;
 
   // Preview video stream lifecycle. Emitted when the backend tears down the
   // video stream for reasons the FE watchdog cannot infer from frame gaps
