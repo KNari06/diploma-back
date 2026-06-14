@@ -1,5 +1,4 @@
 import { requireAuth, requireCredits } from '@/middleware/auth.middleware';
-import { sharedReportRateLimiter } from '@/middleware/rate-limiter.middleware';
 import { Router } from 'express';
 import {
   applyDoctorFindingHandler,
@@ -20,7 +19,6 @@ import {
   getRunExecutions,
   getRunReport,
   getRunStats,
-  getSharedReport,
   getTestCaseCommands,
   listRuns,
   listSavedTestCases,
@@ -543,26 +541,10 @@ router.get('/runs/:runId/executions/:executionId/detail', requireAuth, getExecut
  */
 router.post('/runs/:runId/share', requireAuth, createShareLink);
 
-/**
- * @swagger
- * /api/v1/regression/shared/{shareToken}:
- *   get:
- *     summary: View a shared regression run report (public, no auth)
- *     description: Returns the full run report for a publicly shared link
- *     tags: [Regression]
- *     parameters:
- *       - in: path
- *         name: shareToken
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       200:
- *         description: Shared run report
- *       404:
- *         description: Shared report not found
- */
-router.get('/shared/:shareToken', sharedReportRateLimiter, getSharedReport);
+// NOTE: GET /shared/:shareToken is intentionally NOT defined here. This router
+// is mounted with `requireAuth, requireApproved`, so any /shared route here
+// would be auth-gated. The public shared-report endpoint lives in src/index.ts,
+// registered BEFORE this mount. Do not re-add a /shared route in this router.
 
 // ============================================================================
 // REGRESSION DOCTOR (Phase-1 — drift aggregation findings)
