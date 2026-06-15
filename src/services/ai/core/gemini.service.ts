@@ -25,6 +25,63 @@ function getGeminiClient(): GoogleGenerativeAI {
   return genAI;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Transient-error retry. Gemini periodically returns 503 "model is
+// experiencing high demand" / 429 / 5xx — temporary per Google's own message.
+// A SINGLE quick retry resolves the vast majority without meaningfully slowing
+// the hot path. We deliberately keep it to ONE short-backoff retry (not the 3×
+// exponential embedding.service uses) because several callers (element-resolver,
+// confirmation-classifier) already chain their OWN Gemini→OpenAI fallback — a
+// long retry here would just delay that fallback. The retry is skipped when the
+// caller's AbortSignal has fired (cancellation/timeout already won).
+// ─────────────────────────────────────────────────────────────────────────────
+const GEMINI_RETRY_BACKOFF_MS = 400;
+
+function isTransientGeminiError(err: unknown): boolean {
+  const status = (err as { status?: number })?.status;
+  if (status === 503 || status === 502 || status === 500 || status === 429) return true;
+  const code = (err as { code?: string })?.code;
+  if (code === 'ECONNRESET' || code === 'ETIMEDOUT') return true;
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('503') ||
+    msg.includes('502') ||
+    msg.includes('500') ||
+    msg.includes('429') ||
+    msg.includes('service unavailable') ||
+    msg.includes('high demand') ||
+    msg.includes('overloaded') ||
+    msg.includes('rate limit')
+  );
+}
+
+/**
+ * Run a single Gemini SDK call with one transient-fault retry. `attempt` runs
+ * the actual `generateContent` race (model call vs timeout). On a transient
+ * failure we wait a short backoff and try once more — unless the caller's
+ * signal has aborted, in which case we surface immediately. Non-transient
+ * errors (bad request, auth, parse) throw on the first try with no retry.
+ */
+async function callGeminiWithRetry<T>(
+  attempt: () => Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  try {
+    return await attempt();
+  } catch (err) {
+    if (!isTransientGeminiError(err) || signal?.aborted) throw err;
+    logger.warn('[GEMINI] Transient error, one retry', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    await new Promise((r) => {
+      const t = setTimeout(r, GEMINI_RETRY_BACKOFF_MS);
+      (t as any)?.unref?.();
+    });
+    if (signal?.aborted) throw err; // caller gave up during the backoff
+    return await attempt();
+  }
+}
+
 /**
  * Gemini response with usage tracking
  */
@@ -79,18 +136,20 @@ export async function generateTextWithGemini(params: {
     }
 
     // V23: forward signal to SDK for real cancellation; timeout stays as cap.
-    const resultPromise = genModel.generateContent(prompt, signal ? { signal } : undefined);
-    let timeoutId: NodeJS.Timeout | null = null;
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutId = setTimeout(() => reject(new Error('Gemini request timeout')), timeout);
-      (timeoutId as any)?.unref?.();
-    });
-    let genResult;
-    try {
-      genResult = await Promise.race([resultPromise, timeoutPromise]);
-    } finally {
-      if (timeoutId) clearTimeout(timeoutId);
-    }
+    // Wrapped in one transient-fault retry (see callGeminiWithRetry).
+    const genResult = await callGeminiWithRetry(async () => {
+      const resultPromise = genModel.generateContent(prompt, signal ? { signal } : undefined);
+      let timeoutId: NodeJS.Timeout | null = null;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error('Gemini request timeout')), timeout);
+        (timeoutId as any)?.unref?.();
+      });
+      try {
+        return await Promise.race([resultPromise, timeoutPromise]);
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+      }
+    }, signal);
 
     const response = genResult.response;
     const text = response.text();
@@ -276,22 +335,24 @@ export async function getChatCompletionWithGemini(params: {
     }
 
     const sendOptions = signal ? { signal } : undefined;
-    const resultPromise = chat.sendMessage(lastMessage.parts[0].text, sendOptions);
 
     // Timeout promise still races as a hard ceiling. When SDK signal works
     // (V23+), cancellation arrives via the abort path; this remains as a
-    // last-resort cap if both signal AND SDK time out.
-    let timeoutId: NodeJS.Timeout | null = null;
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutId = setTimeout(() => reject(new Error('Gemini request timeout')), timeout);
-      (timeoutId as any)?.unref?.();
-    });
-    let genResult;
-    try {
-      genResult = await Promise.race([resultPromise, timeoutPromise]);
-    } finally {
-      if (timeoutId) clearTimeout(timeoutId);
-    }
+    // last-resort cap if both signal AND SDK time out. Wrapped in one
+    // transient-fault retry (see callGeminiWithRetry).
+    const genResult = await callGeminiWithRetry(async () => {
+      const resultPromise = chat.sendMessage(lastMessage.parts[0].text, sendOptions);
+      let timeoutId: NodeJS.Timeout | null = null;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error('Gemini request timeout')), timeout);
+        (timeoutId as any)?.unref?.();
+      });
+      try {
+        return await Promise.race([resultPromise, timeoutPromise]);
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+      }
+    }, signal);
 
     const response = genResult.response;
     const text = response.text();
@@ -442,24 +503,24 @@ export async function generateTextWithGeminiVision(params: {
       },
     ];
 
-    // Create timeout promise (unref to avoid keeping event loop alive)
-    let timeoutId: NodeJS.Timeout | null = null;
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutId = setTimeout(() => reject(new Error('Gemini vision request timeout')), timeout);
-      (timeoutId as any)?.unref?.();
-    });
-
     if (signal?.aborted) {
       throw new Error('Gemini vision request aborted before send');
     }
-    const resultPromise = genModel.generateContent(parts, signal ? { signal } : undefined);
 
-    let genResult;
-    try {
-      genResult = await Promise.race([resultPromise, timeoutPromise]);
-    } finally {
-      if (timeoutId) clearTimeout(timeoutId);
-    }
+    // Wrapped in one transient-fault retry (see callGeminiWithRetry).
+    const genResult = await callGeminiWithRetry(async () => {
+      let timeoutId: NodeJS.Timeout | null = null;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error('Gemini vision request timeout')), timeout);
+        (timeoutId as any)?.unref?.();
+      });
+      const resultPromise = genModel.generateContent(parts, signal ? { signal } : undefined);
+      try {
+        return await Promise.race([resultPromise, timeoutPromise]);
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+      }
+    }, signal);
 
     const response = genResult.response;
     const text = response.text();
@@ -532,3 +593,10 @@ export async function generateTextWithGeminiVision(params: {
     throw error;
   }
 }
+
+// Test-only: expose the transient-retry internals for unit coverage without
+// hitting the live Gemini SDK.
+export const _retryInternals = {
+  isTransientGeminiError,
+  callGeminiWithRetry,
+};
