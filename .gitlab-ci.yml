@@ -1,25 +1,22 @@
 # ─────────────────────────────────────────────────────────────────
-# QAI Backend — GitLab CI/CD
+# QAI Backend — GitLab CI/CD (Azure)
 #
-# Одна Docker image → деплой двух Cloud Run сервисов:
+# Одна Docker image → деплой двух Container Apps:
 #   • qai-api-prod    — CMD: node -r tsconfig-paths/register dist/index.js
-#   • qai-worker-prod — CMD: node -r tsconfig-paths/register dist/worker/index.js
+#   • qai-worker-prod — CMD: node ... + HTTP health server на 8080
 #
-# Образ хранится в Google Artifact Registry (GCP-native, Cloud Run тянет без доп. auth).
-# Перед первым запуском CI создай репозиторий один раз:
-#   gcloud artifacts repositories create qai \
-#     --repository-format=docker --location=europe-north1 --project=qait-dev
+# Образ хранится в Azure Container Registry (ACR). Container Apps тянут
+# через Managed Identity (без паролей).
 #
-# CI/CD Variables (Settings → CI/CD → Variables):
-#   GCP_PROJECT_ID      — qait-dev
-#   GCP_PROJECT_NUMBER  — 728473466858
-#   GCP_REGION          — europe-north1
-#   GCP_RUNNER_SA_EMAIL — SA email из: terraform output gitlab_runner_sa_email
-#   GCP_WIF_PROVIDER    — Provider из:  terraform output wif_provider_name
-#   WIF_POOL_ID         — gitlab-pool-prod2 (optional fallback)
-#   WIF_PROVIDER_ID     — gitlab-provider-prod2 (optional fallback)
-#   CLOUD_RUN_API       — qai-api-prod
-#   CLOUD_RUN_WORKER    — qai-worker-prod
+# Required CI/CD Variables (Group: qait.dev):
+#   AZURE_CLIENT_ID       — terraform output gitlab_runner_client_id
+#   AZURE_TENANT_ID       — terraform output azure_tenant_id
+#   AZURE_SUBSCRIPTION_ID — terraform output azure_subscription_id
+#   RESOURCE_GROUP        — qai-prod-rg
+#   ACR_NAME              — qaiprodacr24d6d7 (БЕЗ .azurecr.io)
+#   ACR_LOGIN_SERVER      — qaiprodacr24d6d7.azurecr.io
+#   CONTAINER_APP_API     — qai-api-prod
+#   CONTAINER_APP_WORKER  — qai-worker-prod
 # ─────────────────────────────────────────────────────────────────
 
 variables:
@@ -27,174 +24,143 @@ variables:
   DOCKER_TLS_CERTDIR: "/certs"
   DOCKER_TLS_VERIFY: "1"
   DOCKER_CERT_PATH: "/certs/client"
-  # Shared runner image may not include buildx plugin; use classic docker build.
   DOCKER_BUILDKIT: "0"
-  GCP_REGION: "europe-north1"
-  AR_HOST: "europe-north1-docker.pkg.dev"
-  # Полный путь: europe-north1-docker.pkg.dev/qait-dev/qai/qai-backend
-  IMAGE: "${AR_HOST}/${GCP_PROJECT_ID}/qai/qai-backend:${CI_COMMIT_SHORT_SHA}"
-  IMAGE_LATEST: "${AR_HOST}/${GCP_PROJECT_ID}/qai/qai-backend:latest"
+  IMAGE: "${ACR_LOGIN_SERVER}/qai-backend:${CI_COMMIT_SHORT_SHA}"
+  IMAGE_LATEST: "${ACR_LOGIN_SERVER}/qai-backend:latest"
 
 stages:
   - build
   - deploy
 
 # ─────────────────────────────────────────────────────────────────
-# Шаблон: авторизация в GCP через Workload Identity Federation
+# Шаблон: авторизация в Azure через OIDC Federated Identity
+# (аналог .gcp_auth в GCP версии)
 # ─────────────────────────────────────────────────────────────────
-.gcp_auth: &gcp_auth
+.azure_auth: &azure_auth
   id_tokens:
-    GCP_JWT:
-      aud: "//iam.googleapis.com/${GCP_WIF_PROVIDER}"
+    AZURE_TOKEN:
+      aud: https://gitlab.com
   before_script:
     - |
-      RAW_WIF_PROVIDER="${GCP_WIF_PROVIDER}"
-      if [ -z "${RAW_WIF_PROVIDER}" ]; then
-        if [ -n "${GCP_PROJECT_NUMBER}" ] && [ -n "${WIF_POOL_ID}" ] && [ -n "${WIF_PROVIDER_ID}" ]; then
-          RAW_WIF_PROVIDER="projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
-          echo "ℹ️ GCP_WIF_PROVIDER is empty, using fallback from GCP_PROJECT_NUMBER/WIF_POOL_ID/WIF_PROVIDER_ID"
-        else
-          echo "❌ GCP_WIF_PROVIDER is empty."
-          echo "Set one of the following in GitLab CI/CD Variables:"
-          echo "  1) GCP_WIF_PROVIDER = \$(terraform -chdir=gcp/terraform output -raw wif_provider_name)"
-          echo "  2) GCP_PROJECT_NUMBER + WIF_POOL_ID + WIF_PROVIDER_ID"
-          exit 1
-        fi
-      fi
-
-      case "${RAW_WIF_PROVIDER}" in
-        projects/*)
-          WIF_PROVIDER="${RAW_WIF_PROVIDER}"
-          ;;
-        //iam.googleapis.com/*)
-          WIF_PROVIDER="${RAW_WIF_PROVIDER#//iam.googleapis.com/}"
-          ;;
-        https://iam.googleapis.com/*)
-          WIF_PROVIDER="${RAW_WIF_PROVIDER#https://iam.googleapis.com/}"
-          ;;
-        *)
-          echo "❌ Invalid GCP_WIF_PROVIDER value: ${RAW_WIF_PROVIDER}"
-          echo "Expected one of:"
-          echo "  projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>"
-          echo "  //iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>"
-          echo "  https://iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>"
-          exit 1
-          ;;
-      esac
-
-      echo "$GCP_JWT" > /tmp/gitlab-jwt.json
-      gcloud iam workload-identity-pools create-cred-config "$WIF_PROVIDER" \
-        --service-account="$GCP_RUNNER_SA_EMAIL" \
-        --credential-source-file=/tmp/gitlab-jwt.json \
-        --output-file=/tmp/gcp-creds.json
-      gcloud auth login --cred-file=/tmp/gcp-creds.json --quiet
-      gcloud config set project "$GCP_PROJECT_ID"
-  after_script:
-    - rm -f /tmp/gitlab-jwt.json /tmp/gcp-creds.json
+      az login --federated-token "$AZURE_TOKEN" \
+        --service-principal \
+        -u "$AZURE_CLIENT_ID" \
+        --tenant "$AZURE_TENANT_ID" --output none
+      az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 
 # ─────────────────────────────────────────────────────────────────
-# Сборка Docker образа и push в Artifact Registry
-# Используем google/cloud-sdk + docker-dind сервис
+# Сборка Docker образа и push в ACR
+# (аналог build в GCP — Artifact Registry → ACR)
 # ─────────────────────────────────────────────────────────────────
 build:
   stage: build
-  image: google/cloud-sdk:alpine
+  image: mcr.microsoft.com/azure-cli:azurelinux3.0
   services:
     - name: docker:26-dind
       alias: docker
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
-  <<: *gcp_auth
+  <<: *azure_auth
   script:
-    - apk add --no-cache docker-cli
-    - gcloud auth configure-docker "${AR_HOST}" --quiet
-    - echo "🔨 Building $IMAGE"
     - |
+      set -euo pipefail
+
+      echo "🐳 Installing Docker CLI (Azure Linux uses tdnf, не apk)"
+      tdnf install -y moby-cli ca-certificates
+      tdnf clean all
+
+      echo "⏳ Waiting for Docker daemon..."
+      for i in $(seq 1 30); do
+        docker info >/dev/null 2>&1 && break
+        sleep 2
+      done
+      docker info >/dev/null
+
+      echo "🔐 Login to ACR via Managed Identity"
+      az acr login --name "$ACR_NAME"
+
+      echo "🔨 Building $IMAGE"
+      docker pull "$IMAGE_LATEST" 2>/dev/null || true
       docker build \
         --cache-from "$IMAGE_LATEST" \
         --tag "$IMAGE" \
         --tag "$IMAGE_LATEST" \
         .
-    - echo "⬆️  Pushing to Artifact Registry..."
-    - docker push "$IMAGE"
-    - docker push "$IMAGE_LATEST"
+
+      echo "⬆️ Pushing to ACR..."
+      docker push "$IMAGE"
+      docker push "$IMAGE_LATEST"
 
 # ─────────────────────────────────────────────────────────────────
-# Деплой API — Cloud Run (HTTP API, публичный)
+# Деплой API — Container App (публичный ingress на 3000)
+# Terraform имеет ignore_changes на image — CI безопасно обновляет
 # ─────────────────────────────────────────────────────────────────
 deploy:api:
   stage: deploy
-  image: google/cloud-sdk:alpine
+  image: mcr.microsoft.com/azure-cli:azurelinux3.0
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
   needs: [build]
-  <<: *gcp_auth
+  <<: *azure_auth
   script:
-    - echo "🚀 Deploying API → $CLOUD_RUN_API"
+    - echo "🚀 Deploying API → $CONTAINER_APP_API"
     - |
-      gcloud run deploy "$CLOUD_RUN_API" \
-        --image="$IMAGE" \
-        --region="$GCP_REGION" \
-        --platform=managed \
-        --allow-unauthenticated \
-        --port=3000 \
-        --execution-environment=gen2 \
-        --quiet
+      az containerapp update \
+        --name "$CONTAINER_APP_API" \
+        --resource-group "$RESOURCE_GROUP" \
+        --image "$IMAGE" \
+        --output none
     - |
-      URL=$(gcloud run services describe "$CLOUD_RUN_API" \
-        --region="$GCP_REGION" --format="value(status.url)")
-      echo "✅ API deployed → $URL"
+      URL=$(az containerapp show \
+        --name "$CONTAINER_APP_API" \
+        --resource-group "$RESOURCE_GROUP" \
+        --query "properties.configuration.ingress.fqdn" -o tsv)
+      echo "✅ API deployed → https://$URL"
   environment:
     name: production/api
     url: https://api.qait.dev
 
 # ─────────────────────────────────────────────────────────────────
-# Деплой Worker — Cloud Run (приватный, другой entrypoint)
+# Деплой Worker — Container App (internal, другой entrypoint)
+# Worker command/args заданы в Terraform — обновляем только image
 # ─────────────────────────────────────────────────────────────────
 deploy:worker:
   stage: deploy
-  image: google/cloud-sdk:alpine
+  image: mcr.microsoft.com/azure-cli:azurelinux3.0
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
   needs: [build]
-  <<: *gcp_auth
+  <<: *azure_auth
   script:
-    - echo "🚀 Deploying Worker → $CLOUD_RUN_WORKER"
+    - echo "🚀 Deploying Worker → $CONTAINER_APP_WORKER"
+    # command/args заданы в Terraform — CI обновляет только image
     - |
-      gcloud run deploy "$CLOUD_RUN_WORKER" \
-        --image="$IMAGE" \
-        --region="$GCP_REGION" \
-        --platform=managed \
-        --no-allow-unauthenticated \
-        --port=3000 \
-        --execution-environment=gen2 \
-        --command="node" \
-        --args="-e,require('http').createServer((...a)=>a[1].end('ok')).listen(process.env.PORT||8080);require('tsconfig-paths/register');require('./dist/worker/index.js');" \
-        --quiet
+      az containerapp update \
+        --name "$CONTAINER_APP_WORKER" \
+        --resource-group "$RESOURCE_GROUP" \
+        --image "$IMAGE" \
+        --output none
     - echo "✅ Worker deployed"
   environment:
     name: production/worker
 
 # ─────────────────────────────────────────────────────────────────
-# DEV deploy to VM via shell runner (does not affect production jobs)
+# DEV deploy to Azure VM via shell runner
 # Runner requirements:
 #   - executor: shell
 #   - tags: dev-back-runner
 #   - docker installed on VM
 # Optional CI/CD variables:
-#   BACKEND_ENV_FILE      - absolute path to .env on VM (default: /opt/qait/dev/backend/.env)
-#   BACKEND_CONTAINER_PORT - exposed API port on VM (default: 3000)
+#   BACKEND_ENV_FILE       - путь к .env на VM (default: репо .env)
+#   BACKEND_CONTAINER_PORT - exposed API порт (default: 3000)
 # ─────────────────────────────────────────────────────────────────
 deploy:dev:vm:
   stage: deploy
   tags:
     - dev-back-runner
-#  rules:
-#    - if: '$CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "develop"'
   rules:
-    - when: never
+    - if: '$CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "develop"'
   variables:
-    # Use repo .env by default; override in GitLab variables if needed
     BACKEND_ENV_FILE: "$CI_PROJECT_DIR/.env"
     BACKEND_CONTAINER_PORT: "3000"
 
@@ -257,4 +223,3 @@ deploy:dev:vm:
       echo "🌍 API URL: http://$(hostname -I | awk '{print $1}'):${BACKEND_CONTAINER_PORT}"
   environment:
     name: development/backend-vm
-
