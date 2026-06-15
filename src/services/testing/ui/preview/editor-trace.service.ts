@@ -1516,6 +1516,9 @@ export class EditorTraceService {
    * Log a mobile lint request (user clicked "Find" in mobile editor).
    */
   writeMobileLintRequest(data: {
+    /** Correlates this request with its result/error event (spanId is a global
+     *  counter and lint events carry no stepId, so it can't pair them). */
+    requestId: string;
     description: string;
     actionType: string;
     sessionId: string;
@@ -1535,10 +1538,15 @@ export class EditorTraceService {
    * LLM usage, and final result.
    */
   writeMobileLintResult(data: {
+    /** Pairs with the matching `mobile_lint_request` (see writeMobileLintRequest). */
+    requestId: string;
     description: string;
     actionType: string;
     sessionId: string;
     latencyMs: number;
+    /** Platform that produced the result — distinguishes a Flutter empty-Semantics
+     *  miss from a native one without a second lookup. */
+    framework?: string;
     result: {
       status: string;
       confidence?: number;
@@ -1549,8 +1557,19 @@ export class EditorTraceService {
       message?: string;
       /** Total visible A11y nodes — 0 means empty/WebView screen. */
       visibleNodeCount?: number;
-      /** Text labels of first 10 visible nodes — shows what IS on screen when not_found. */
-      topNodes?: string[];
+      /**
+       * Structured sample of the first 10 visible nodes — shows what IS on screen
+       * when not_found. Each entry carries type/bounds/resourceId/creationLocation
+       * so an unlabeled Flutter tree (empty labels) is still legible rather than
+       * an empty list.
+       */
+      topNodes?: Array<{
+        type?: string;
+        label?: string;
+        bounds?: { left: number; top: number; right: number; bottom: number };
+        resourceId?: string;
+        creationLocation?: string;
+      }>;
       /** Words the text-fallback scored against — confirms label vs intent mismatch. */
       intentWords?: string[];
     };

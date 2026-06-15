@@ -687,8 +687,22 @@ export class MobileRunnerClient {
     /** Compiled locator plan built from the resolved node — persist onto IntentStep. */
     compiledPlan?: import('./mobile-runner.types').MobileCompiledPlan;
     visibleNodeCount?: number;
-    topNodes?: string[];
+    /**
+     * Structured sample of the first ~10 visible nodes (was `string[]`). Carries
+     * type/bounds/resourceId/creationLocation so a Flutter screen with unbuilt
+     * Semantics — unlabeled View containers — is legible in the editor trace
+     * instead of collapsing to an empty list. Trace-only; not returned to the FE.
+     */
+    topNodes?: Array<{
+      type?: string;
+      label?: string;
+      bounds?: { left: number; top: number; right: number; bottom: number };
+      resourceId?: string;
+      creationLocation?: string;
+    }>;
     intentWords?: string[];
+    /** Platform that produced the result — labels Flutter vs native in the trace. */
+    framework?: 'android' | 'ios' | 'flutter';
   }> {
     return this.request('POST', `/api/commands/${sessionId}/lint`, {
       // Only attach bindingHints when we actually have some — keeps the wire
@@ -697,7 +711,12 @@ export class MobileRunnerClient {
       body: bindingHints && Object.keys(bindingHints).length > 0
         ? { intent, actionType, bindingHints }
         : { intent, actionType },
-      timeoutMs: 15_000, // LLM resolve can take a few seconds
+      // Must exceed the runner's lint phase budget (RUN_LINT_PHASE_BUDGET_MS,
+      // default 16s) so the runner's own budget-abort wins and returns a clean
+      // phase-named error, instead of this client cutting the connection first.
+      // The runner needs headroom on slow emulators for the Flutter VM-Service
+      // bounds walk (a keyed node found instantly still needs its on-screen box).
+      timeoutMs: 18_000,
       userId: opts?.userId,
     });
   }
