@@ -280,6 +280,64 @@ export class ProjectService {
   }
 
   /**
+   * Resolve the project a workspace's home dashboard should fall back to when
+   * the client hasn't selected one explicitly.
+   *
+   * Picks the project with the MOST RECENT regression run — i.e. where the
+   * user actually works — rather than the most-recently-*created* project,
+   * which is usually an empty new project and would zero out every metric and
+   * list on the dashboard.
+   *
+   * Falls back to the newest project (and finally `undefined`) when the
+   * workspace has no runs yet, so a brand-new workspace still resolves to a
+   * project the per-project lists can render.
+   *
+   * @returns the project id, or `undefined` when the workspace has no projects.
+   */
+  static async getMostRecentlyActiveProjectId(
+    workspaceId: string,
+    userId: string
+  ): Promise<string | undefined> {
+    const projects = await this.getProjectsByWorkspace(workspaceId, userId);
+    if (projects.length === 0) return undefined;
+
+    // getProjectsByWorkspace already orders newest-first, so projects[0] is the
+    // newest — our last-resort fallback.
+    const newestProjectId = projects[0].id as string;
+    if (projects.length === 1) return newestProjectId;
+
+    const projectIds = projects.map((p) => p.id as string);
+
+    try {
+      // The most recent run across all the workspace's projects tells us which
+      // project to surface. One row is enough.
+      const { data, error } = await supabaseAdmin
+        .from('regression_runs')
+        .select('project_id')
+        .in('project_id', projectIds)
+        .order('started_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (error) {
+        logger.warn('[PROJECT] Failed to resolve most-active project, using newest', {
+          error: error.message,
+          workspaceId,
+        });
+        return newestProjectId;
+      }
+
+      return (data?.project_id as string) || newestProjectId;
+    } catch (error) {
+      logger.warn('[PROJECT] Error resolving most-active project, using newest', {
+        error: error instanceof Error ? error.message : String(error),
+        workspaceId,
+      });
+      return newestProjectId;
+    }
+  }
+
+  /**
    * Update project
    * Requires: owner or full_access role in the workspace
    */

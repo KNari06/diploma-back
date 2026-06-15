@@ -1219,6 +1219,15 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
     return;
   }
 
+  // Hoisted so the catch block can emit a lint result/error trace event with the
+  // same correlation id — a timed-out / thrown lint must leave a row, not a hole
+  // (the missing "Order" results in the 2026-06-15 Flutter trace were this gap).
+  const requestId = randomUUID();
+  const trace = EditorTraceService.getOrCreate(`mobile-${sessionId}`, req.user.id);
+  let lintStart = 0;
+  let lintDescription = '';
+  let lintActionType = 'tap';
+
   try {
     const client = getMobileRunnerClient();
 
@@ -1276,10 +1285,10 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
     const actionType = ACTION_TYPE_MAP[stepType] || 'tap';
 
     // Trace logging for mobile editor
-    const traceSessionId = `mobile-${sessionId}`;
-    const trace = EditorTraceService.getOrCreate(traceSessionId, req.user.id);
-    trace.writeMobileLintRequest({ description, actionType, sessionId });
-    const lintStart = Date.now();
+    lintDescription = description;
+    lintActionType = actionType;
+    trace.writeMobileLintRequest({ requestId, description, actionType, sessionId });
+    lintStart = Date.now();
 
     // Pull bindingHints off the draft — the frontend sends either the
     // authored-from-recording set nested under intentStep, or the
@@ -1305,10 +1314,12 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
 
     // Log the result for debugging element resolution issues
     trace.writeMobileLintResult({
+      requestId,
       description,
       actionType,
       sessionId,
       latencyMs: Date.now() - lintStart,
+      framework: lintResult.framework,
       result: {
         status: lintResult.status,
         confidence: lintResult.confidence,
@@ -1359,14 +1370,27 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
       ...(lintResult.compiledPlan ? { compiled: lintResult.compiledPlan } : {}),
     });
   } catch (error) {
-    logger.warn('[MOBILE_SESSION] Lint failed', {
-      sessionId,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    const message = error instanceof Error ? error.message : String(error);
+    logger.warn('[MOBILE_SESSION] Lint failed', { sessionId, error: message });
+    // Leave a trace row for a failed lint so a slow/errored search isn't an
+    // invisible hole in the JSONL (the missing "Order" results). Paired to the
+    // request by requestId. Guard on lintStart > 0: it's set immediately after
+    // writeMobileLintRequest, so a throw BEFORE the request (client init / module
+    // import) writes no result — avoids an orphan result with no paired request.
+    if (lintStart > 0) {
+      trace.writeMobileLintResult({
+        requestId,
+        description: lintDescription,
+        actionType: lintActionType,
+        sessionId,
+        latencyMs: Date.now() - lintStart,
+        result: { status: 'error', message },
+      });
+    }
     res.status(500).json({
       success: false,
       error: 'Lint failed',
-      message: error instanceof Error ? error.message : String(error),
+      message,
     });
   }
 }

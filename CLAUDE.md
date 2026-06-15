@@ -71,6 +71,7 @@ Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 | …work on the per-test-case ("AI Agent inside a test case") chat       | `src/api/chat/chat.controller.ts` (testCaseId branch), `src/api/chat/general/handler.ts` (editor flow + trace), `src/services/chat/chat-test-trace.service.ts` — see Hard invariant #16              |
 | …send a transactional email (welcome/approval/invite/purchase/report) | `src/services/core/email.service.ts` (`EmailService`) — see "Transactional email" flow below                                                                                                         |
 | …check DB schema                                                      | `supabase-migrations/supabase-schema.sql`                                                                                                                                                            |
+| …read a runtime trace / log                                           | `test_logs/<feature>/<YYYY-MM-DD_HH-MM-SS>_<testId>.jsonl` — `editor/` (preview traces), `chat_test/` (per-test-case chat). Always-on JSONL; auto-pruned after `EDITOR_LOG_RETENTION_DAYS` (default 3) by `src/jobs/artifact-retention.job.ts` |
 
 ---
 
