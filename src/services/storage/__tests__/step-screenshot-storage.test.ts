@@ -22,7 +22,34 @@ import {
   uploadStepScreenshotToStorage,
   uploadMobileStepScreenshots,
   processAndDeferStepScreenshot,
+  decodeBase64Screenshot,
 } from '../step-screenshot.service';
+
+describe('decodeBase64Screenshot', () => {
+  // A 1x1 PNG and JPEG, base64-encoded, with their magic-byte prefixes.
+  const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgAB';
+  const JPEG_B64 = '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAEBAQ=';
+
+  it('treats a bare /9j/-prefixed string as JPEG', () => {
+    const { sourceExt } = decodeBase64Screenshot(JPEG_B64);
+    expect(sourceExt).toBe('jpg');
+  });
+
+  it('treats a bare PNG base64 string as PNG', () => {
+    const { sourceExt } = decodeBase64Screenshot(PNG_B64);
+    expect(sourceExt).toBe('png');
+  });
+
+  it('strips a data: URI prefix and uses its MIME to pick the format', () => {
+    const jpeg = decodeBase64Screenshot(`data:image/jpeg;base64,${JPEG_B64}`);
+    const png = decodeBase64Screenshot(`data:image/png;base64,${PNG_B64}`);
+    expect(jpeg.sourceExt).toBe('jpg');
+    expect(png.sourceExt).toBe('png');
+    // The prefix is stripped before decoding — the buffer matches the bare form.
+    expect(jpeg.buffer.equals(Buffer.from(JPEG_B64, 'base64'))).toBe(true);
+    expect(png.buffer.equals(Buffer.from(PNG_B64, 'base64'))).toBe(true);
+  });
+});
 
 describe('buildStepScreenshotPath', () => {
   it('places passing-step shots under step-screenshots/<testId>/', () => {

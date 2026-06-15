@@ -1024,6 +1024,26 @@ export interface RunReportQualityChecks {
 /**
  * Single execution entry in a run report
  */
+/**
+ * Why a run failed BEFORE any step executed — device attach / session setup /
+ * runner unreachable. Surfaced on the run report so the case card can show a
+ * "couldn't start" banner with remediation, instead of a bare red ✗.
+ */
+export interface RunReportFailureReason {
+  /** Runner / job error code, e.g. 'FLUTTER_NOT_DETECTED'. 'UNKNOWN' if untyped. */
+  code: string;
+  /** Short human label, e.g. "Couldn't start test". */
+  label: string;
+  /** Raw failure message from the runner / job. */
+  message: string;
+  /** One-line remediation hint, when known. */
+  remediation?: string;
+  /** Where the failure happened. 'job' = before any step ran. */
+  layer: 'job';
+  /** Coarse bucket; 'environment' = infrastructure, not a real test outcome. */
+  category: 'environment' | 'configuration' | 'unknown';
+}
+
 export interface RunReportExecution {
   id: string;
   testCaseId: string;
@@ -1063,6 +1083,12 @@ export interface RunReportExecution {
   failureClassification?: 'flaky' | 'real_bug' | 'environment' | 'test_drift' | null;
   rootCauseStep?: number | null;
   classificationEvidence?: string[];
+  /**
+   * Set when the run failed BEFORE any step executed (device attach / session
+   * setup / runner unreachable). Drives the case-level failure banner in the
+   * report. Absent for normal pass / step-failure executions.
+   */
+  failureReason?: RunReportFailureReason;
 }
 
 /**

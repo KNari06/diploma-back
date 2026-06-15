@@ -16,6 +16,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { ExecutionService } from '../executions/execution.service';
 import { RegressionPlanService } from '../plans/regression-plan.service';
 import { ManualTestService } from '../ui/manualTest.service';
+import { IntentTestCaseService } from '../ui/preview/intent-test-case.service';
 import { deriveRunStatus } from '@/utils/testing/run-status.utils';
 import {
   RegressionReportAssemblerService,
@@ -123,6 +124,20 @@ export class RegressionRunService {
 
       // 1. Get intent test case
       const intentCase = await RegressionTestQueryService.getSavedTestCase(intentTestCaseId, userId);
+
+      // 1a. Inline transitive dependency (precondition) steps so they run
+      // in-session BEFORE this test's own steps (shared browser → shared
+      // login/cookies/data). Borrowed steps carry `_preconditionSource` and
+      // are excluded from this case's persisted steps_json at writeback time.
+      const preconditionSteps = await IntentTestCaseService.collectPreconditionSteps(intentTestCaseId);
+      if (preconditionSteps.length > 0) {
+        intentCase.steps_json = [...preconditionSteps, ...(intentCase.steps_json || [])];
+        logger.info('[REGRESSION_RUN] Inlined precondition steps', {
+          intentTestCaseId,
+          preconditionSteps: preconditionSteps.length,
+          totalSteps: intentCase.steps_json.length,
+        });
+      }
 
       // 1b. Credit check + deduction for single test case
       await this.checkCreditBalance(

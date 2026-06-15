@@ -1,5 +1,4 @@
-import { requireAuth } from '@/middleware/auth.middleware';
-import { sharedReportRateLimiter } from '@/middleware/rate-limiter.middleware';
+import { requireAuth, requireCredits } from '@/middleware/auth.middleware';
 import { Router } from 'express';
 import {
   applyDoctorFindingHandler,
@@ -20,7 +19,6 @@ import {
   getRunExecutions,
   getRunReport,
   getRunStats,
-  getSharedReport,
   getTestCaseCommands,
   listRuns,
   listSavedTestCases,
@@ -143,7 +141,7 @@ router.post('/save', requireAuth, saveTestCase);
  *         description: Resource not found
  */
 // Run/replay: execute a saved test case (creates new execution run records).
-router.post('/run', requireAuth, runRegression);
+router.post('/run', requireAuth, requireCredits(1), runRegression);
 
 /**
  * @swagger
@@ -216,7 +214,7 @@ router.get('/runs', requireAuth, listRuns);
  *         description: Plan run started
  */
 // Run a regression plan (a custom selection of tests).
-router.post('/run-plan', requireAuth, runPlan);
+router.post('/run-plan', requireAuth, requireCredits(1), runPlan);
 
 /**
  * @swagger
@@ -245,7 +243,7 @@ router.post('/run-plan', requireAuth, runPlan);
  *         description: Module run started
  */
 // Run all tests under a module (hierarchy shortcut).
-router.post('/run-module', requireAuth, runModule);
+router.post('/run-module', requireAuth, requireCredits(1), runModule);
 
 /**
  * @swagger
@@ -274,7 +272,7 @@ router.post('/run-module', requireAuth, runModule);
  *         description: Flow run started
  */
 // Run all tests under a flow (hierarchy shortcut).
-router.post('/run-flow', requireAuth, runFlow);
+router.post('/run-flow', requireAuth, requireCredits(1), runFlow);
 
 /**
  * @swagger
@@ -304,7 +302,7 @@ router.post('/run-flow', requireAuth, runFlow);
  *         description: Tag run started
  */
 // Run tests filtered by tag across a project.
-router.post('/run-by-tag', requireAuth, runByTag);
+router.post('/run-by-tag', requireAuth, requireCredits(1), runByTag);
 
 /**
  * @swagger
@@ -335,7 +333,7 @@ router.post('/run-by-tag', requireAuth, runByTag);
  *         description: Priority run started
  */
 // Run tests filtered by priority across a project.
-router.post('/run-by-priority', requireAuth, runByPriority);
+router.post('/run-by-priority', requireAuth, requireCredits(1), runByPriority);
 
 /**
  * @swagger
@@ -543,26 +541,10 @@ router.get('/runs/:runId/executions/:executionId/detail', requireAuth, getExecut
  */
 router.post('/runs/:runId/share', requireAuth, createShareLink);
 
-/**
- * @swagger
- * /api/v1/regression/shared/{shareToken}:
- *   get:
- *     summary: View a shared regression run report (public, no auth)
- *     description: Returns the full run report for a publicly shared link
- *     tags: [Regression]
- *     parameters:
- *       - in: path
- *         name: shareToken
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       200:
- *         description: Shared run report
- *       404:
- *         description: Shared report not found
- */
-router.get('/shared/:shareToken', sharedReportRateLimiter, getSharedReport);
+// NOTE: GET /shared/:shareToken is intentionally NOT defined here. This router
+// is mounted with `requireAuth, requireApproved`, so any /shared route here
+// would be auth-gated. The public shared-report endpoint lives in src/index.ts,
+// registered BEFORE this mount. Do not re-add a /shared route in this router.
 
 // ============================================================================
 // REGRESSION DOCTOR (Phase-1 — drift aggregation findings)

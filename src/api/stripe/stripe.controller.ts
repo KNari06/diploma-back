@@ -1,8 +1,8 @@
 import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
+import { EmailService } from '@/services/core/email.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { WorkspaceCreditsService } from '@/services/core/workspace-credits.service';
-import { SUBSCRIPTION_PLANS, WORKSPACE_PLANS } from '@/services/core/token-calculator.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import Stripe from 'stripe';
@@ -351,7 +351,7 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
   // Get user by Stripe customer ID
   const { data: user } = await supabaseAdmin
     .from('users')
-    .select('id')
+    .select('id, email, name')
     .eq('stripe_customer_id', customerId)
     .maybeSingle();
 
@@ -504,6 +504,42 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
     });
     // Don't throw - notification failure shouldn't break webhook processing
   }
+
+  // Branded "plan canceled" email — fire-and-forget, only for a GENUINE
+  // cancellation: a hard delete, or an updated event whose status is actually
+  // 'canceled'. We deliberately do NOT email on transient inactive states
+  // (past_due / unpaid / paused / incomplete_expired) — those are dunning, not
+  // a cancellation, and the payment-failed handler covers them. Stripe's
+  // notification block above is in-app only.
+  const wasCanceled =
+    event.type === 'customer.subscription.deleted' ||
+    (event.type === 'customer.subscription.updated' && subscription.status === 'canceled');
+  // Only surface an end date that's still in the future (a hard delete often
+  // carries a past current_period_end → "access until <past date>" reads wrong).
+  const endsOn = currentPeriodEnd && new Date(currentPeriodEnd) > new Date() ? currentPeriodEnd : null;
+  if (user.email && wasCanceled) {
+    EmailService.sendSubscriptionCanceledEmail({
+      recipientEmail: user.email,
+      recipientName: user.name || undefined,
+      planName: subscriptionPlanLabel,
+      endsOn,
+      frontendUrl: env.FRONTEND_URL || 'http://localhost:3000',
+    })
+      .then((result) => {
+        if (!result.success) {
+          logger.error('[STRIPE_WEBHOOK] Cancellation email not sent', {
+            userId: user.id,
+            error: result.error,
+          });
+        }
+      })
+      .catch((err) =>
+        logger.error('[STRIPE_WEBHOOK] Failed to send cancellation email', {
+          userId: user.id,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      );
+  }
 }
 
 async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void> {
@@ -524,7 +560,7 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
 
   const { data: user } = await supabaseAdmin
     .from('users')
-    .select('id, last_credits_invoice_id, stripe_price_id')
+    .select('id, email, name, last_credits_invoice_id, stripe_price_id')
     .eq('stripe_customer_id', customerId)
     .maybeSingle();
 
@@ -775,6 +811,43 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
   }
 
   await supabaseAdmin.from('users').update(userUpdateData).eq('id', user.id);
+
+  // Branded purchase confirmation — fire-and-forget so a mail failure never
+  // breaks webhook processing (Stripe still sends its own receipt).
+  // Only on the FIRST charge of a subscription (`subscription_create`) or a
+  // one-off (`manual`/`subscription_update`) — NOT on monthly renewals
+  // (`subscription_cycle`), which would spam "Payment confirmed" every cycle.
+  // Stripe still sends its own receipt for every charge.
+  const billingReason = (invoice as Stripe.Invoice).billing_reason;
+  const isFirstOrOneOff =
+    !billingReason || billingReason === 'subscription_create' || billingReason === 'manual' || billingReason === 'subscription_update';
+  if (user.email && isFirstOrOneOff) {
+    EmailService.sendPlanPurchasedEmail({
+      recipientEmail: user.email,
+      recipientName: user.name || undefined,
+      planName: subscriptionPlanLabel,
+      amountCents: transactionData.amount,
+      currency: transactionData.currency,
+      creditsIncluded: creditsPerPeriod || undefined,
+      frontendUrl: env.FRONTEND_URL || 'http://localhost:3000',
+    })
+      .then((result) => {
+        if (!result.success) {
+          logger.error('[STRIPE_WEBHOOK] Purchase email not sent', {
+            userId: user.id,
+            invoiceId: invoice.id,
+            error: result.error,
+          });
+        }
+      })
+      .catch((err) =>
+        logger.error('[STRIPE_WEBHOOK] Failed to send purchase email', {
+          userId: user.id,
+          invoiceId: invoice.id,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      );
+  }
 }
 
 async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {
@@ -794,7 +867,7 @@ async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {
 
   const { data: user } = await supabaseAdmin
     .from('users')
-    .select('id')
+    .select('id, email, name')
     .eq('stripe_customer_id', customerId)
     .maybeSingle();
 
@@ -862,6 +935,38 @@ async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {
       invoiceId: invoice.id,
     });
     // Don't throw - notification failure shouldn't break webhook processing
+  }
+
+  // Branded payment-failed email — fire-and-forget (the in-app notification
+  // above is separate). Stripe retries a failed invoice several times and
+  // fires invoice.payment_failed on EACH attempt; only email on the FINAL
+  // failure (next_payment_attempt === null) so the user gets one email per
+  // invoice, not one per retry. Stripe also runs its own dunning if configured.
+  const isFinalAttempt = invoice.next_payment_attempt == null;
+  if (user.email && isFinalAttempt) {
+    EmailService.sendPaymentFailedEmail({
+      recipientEmail: user.email,
+      recipientName: user.name || undefined,
+      amountCents: invoice.amount_due || 0,
+      currency: invoice.currency || 'usd',
+      frontendUrl: env.FRONTEND_URL || 'http://localhost:3000',
+    })
+      .then((result) => {
+        if (!result.success) {
+          logger.error('[STRIPE_WEBHOOK] Payment failed email not sent', {
+            userId: user.id,
+            invoiceId: invoice.id,
+            error: result.error,
+          });
+        }
+      })
+      .catch((err) =>
+        logger.error('[STRIPE_WEBHOOK] Failed to send payment failed email', {
+          userId: user.id,
+          invoiceId: invoice.id,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      );
   }
 }
 

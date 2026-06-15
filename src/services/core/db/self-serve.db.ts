@@ -6,21 +6,30 @@ import { supabaseAdmin } from '@/db/supabase';
  * Each function throws on DB/network error; the calling service wraps in try/catch.
  */
 
+export interface ApprovedUserRow {
+  id: string;
+  email: string | null;
+  name: string | null;
+}
+
 /**
  * Approve a user who is awaiting approval. Scoped to `pending_approval` only,
  * so a manual 'rejected' or already-'approved' row is never touched. Returns
- * the number of rows updated (0 when the user was not pending).
+ * the freshly-approved row (id + email + name) when the pending→approved
+ * transition just happened, or null when nothing was updated (not pending).
+ * The email/name let the caller send the approval email exactly once, on the
+ * transition, without a second query.
  */
-export async function approvePendingUser(userId: string): Promise<number> {
+export async function approvePendingUser(userId: string): Promise<ApprovedUserRow | null> {
   const { data, error } = await supabaseAdmin
     .from('users')
     .update({ status: 'approved', updated_at: new Date().toISOString() })
     .eq('id', userId)
     .eq('status', 'pending_approval')
-    .select('id');
+    .select('id, email, name');
 
   if (error) throw error;
-  return data?.length ?? 0;
+  return data?.[0] ?? null;
 }
 
 /**

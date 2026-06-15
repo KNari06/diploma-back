@@ -27,13 +27,16 @@ import type { MobileTestJobData, MobileRunStepsResponse, MobileIntentStep } from
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { sanitizeMobileAppPackageSteps } from '@/services/testing/regression/intent-step-dispatch.service';
+import { describeDeviceError, type DeviceFailureCategory } from '@/services/testing/regression/device-error-catalog';
 import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
 import { env } from '@/config/environment/env';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { MOBILE_STEP_CREDIT_MULTIPLIER } from '@/services/core/token-calculator.service';
 import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
-import { uploadMobileStepScreenshots } from '@/services/storage/step-screenshot.service';
+import { uploadMobileStepScreenshots, processAndUploadStepScreenshot, decodeBase64Screenshot } from '@/services/storage/step-screenshot.service';
 // Phase 2 (May 2026) telemetry helpers. Kept in a side-effect-free
 // module so unit tests can exercise them without booting supabase/BullMQ.
 import { sumStepDurations } from './helpers/telemetry';
@@ -693,6 +696,40 @@ export class MobileTestRunJobHandler {
         telemetrySessionClaimMs: tlm.sessionClaimMs,
       });
 
+      // ── Billing: charge mobile steps at the mobile multiplier ─────────
+      // A mobile run never went through the per-step web billing path
+      // (test-executor); it runs as a batch RPC to the runner. Charge here,
+      // once, for the user-authored test steps (the scenario_setup prefix —
+      // logins etc. — is excluded). Mobile steps cost MOBILE_STEP_CREDIT_
+      // MULTIPLIER× a web step (emulator COGS). Best-effort: a failed
+      // deduction must never fail the run the user already received.
+      if (userId) {
+        const billableSteps = Math.max(
+          0,
+          (runResult.steps?.length ?? 0) - (tlm.scenarioStepCount ?? 0),
+        );
+        const mobileCredits = billableSteps * MOBILE_STEP_CREDIT_MULTIPLIER;
+        if (mobileCredits > 0) {
+          try {
+            await CreditCostTrackerService.deductCreditsForTest({
+              userId,
+              testType: 'intelligent',
+              credits: mobileCredits,
+              costUSD: 0,
+              testId,
+              description: `Mobile run — ${billableSteps} steps × ${MOBILE_STEP_CREDIT_MULTIPLIER}`,
+            });
+          } catch (creditError) {
+            logger.warn('[MOBILE-TEST] Credit deduction failed (non-critical)', {
+              testId,
+              userId,
+              billableSteps,
+              error: creditError instanceof Error ? creditError.message : String(creditError),
+            });
+          }
+        }
+      }
+
       // ── Diagnostic: aborted/timed-out steps ──────────────────────────
       // The runner pushes per-step results with `error: 'Client aborted'`
       // or `'Run timed out'` when its `req.on('close')` handler fires
@@ -774,6 +811,30 @@ export class MobileTestRunJobHandler {
       // place so both the Redis append below and createTestResult see URLs.
       if (ScreenshotCaptureFeature.isEnabled()) {
         await uploadMobileStepScreenshots(runResult.steps, testId, userId);
+        // "Step 0" initial screenshot — the starting screen before any step
+        // ran. Uploaded base64→URL (stepIndex 0) so the report can show it
+        // alongside the per-step shots. Best-effort: never fail the test path.
+        if (typeof runResult.initialScreenshot === 'string' && runResult.initialScreenshot) {
+          const shot = runResult.initialScreenshot;
+          if (shot.startsWith('http://') || shot.startsWith('https://')) {
+            // Already a URL (defensive) — keep as-is.
+          } else {
+            try {
+              const { buffer, sourceExt } = decodeBase64Screenshot(shot);
+              runResult.initialScreenshot = await processAndUploadStepScreenshot(
+                buffer,
+                sourceExt,
+                { testId, userId: userId || 'anonymous', stepIndex: 0, isFailure: false, ts: Date.now() },
+              );
+            } catch (err) {
+              logger.debug('[MOBILE-TEST] initial (step 0) screenshot upload failed (non-fatal)', {
+                testId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+              runResult.initialScreenshot = undefined;
+            }
+          }
+        }
       }
 
       // Human-readable step labels: the runner returns per-step results keyed
@@ -1084,7 +1145,18 @@ export class MobileTestRunJobHandler {
       const retryableError = error instanceof MobileRunnerError
         ? error.statusCode === undefined || error.statusCode === 0 || error.statusCode >= 500 || error.statusCode === 429
         : true;
-      if (retryableError && shouldRetry(error, retryCount, MAX_MOBILE_RETRIES)) {
+      // The retry works by re-throwing so BullMQ re-runs the job — which only
+      // happens when the queue is configured with >1 attempt. The
+      // mobile-test-run queue is attempts=1 (queues.ts: "No auto-retry — mobile
+      // runner handles step-level failures"), so a re-throw here would just
+      // kill the job WITHOUT running the failure-persistence branch below
+      // (createFailedJobTestResult + finalizeAnalyticsLinkage). The run would
+      // then be finalized by the abandoned-test reaper with NO failureReason /
+      // env marker — a bare "no steps" card that also counts toward flaky.
+      // Only re-throw when BullMQ has a spare attempt; otherwise fall through to
+      // terminal failure handling (same path non-retryable errors already take).
+      const bullmqWillRetry = (job.opts?.attempts ?? 1) > 1;
+      if (retryableError && bullmqWillRetry && shouldRetry(error, retryCount, MAX_MOBILE_RETRIES)) {
         const delay = calculateRetryDelay(retryCount);
         logger.info('[MOBILE-TEST] Retrying job', {
           testId,
@@ -1096,11 +1168,9 @@ export class MobileTestRunJobHandler {
         try {
           await job.updateData({ ...job.data, retryCount: retryCount + 1 });
         } catch { /* non-fatal — counter increment failed but BullMQ retry still runs */ }
-        // Re-throw triggers BullMQ retry (the queue is configured with
-        // exponential backoff and finite attempts elsewhere in
-        // QueueManager). Doing the rethrow BEFORE the failure-state DB
-        // writes is important — those writes are for the FINAL failure
-        // path, not transient retries.
+        // Re-throw triggers BullMQ retry. Doing the rethrow BEFORE the
+        // failure-state DB writes is important — those writes are for the FINAL
+        // failure path, not transient retries.
         throw new Error(`Mobile test retry ${retryCount + 1}/${MAX_MOBILE_RETRIES}: ${errorMessage}`);
       }
 
@@ -1123,12 +1193,18 @@ export class MobileTestRunJobHandler {
         workspaceId,
       );
 
-      // Same finalizer as the success path, different outcome.
+      // Same finalizer as the success path, different outcome. For environment
+      // failures (device attach / session setup — the test never ran) we also
+      // stamp a marker on the execution row so flaky / fail-rate math can
+      // exclude it as infrastructure noise, not a test outcome.
       await MobileTestRunJobHandler.finalizeAnalyticsLinkage({
         analyticsExecutionId,
         intelligentSessionId,
         passed: false,
         errorMessage,
+        failureTestId: testId,
+        failureCode: errorCode,
+        failureCategory: describeDeviceError(errorCode).category,
       });
 
       // Persist snapshot even on job-level failure (session couldn't
@@ -1344,6 +1420,13 @@ export class MobileTestRunJobHandler {
         workspace_id: workspaceId,
         metadata: {
           platform: 'mobile',
+          // "Step 0" — the starting screen captured before any step ran. URL
+          // (uploaded above). The report assembler surfaces it as a labeled
+          // gallery entry, mirroring the final screenshot.
+          ...(typeof runResult.initialScreenshot === 'string'
+            && runResult.initialScreenshot.startsWith('http')
+            ? { initialScreenshot: runResult.initialScreenshot }
+            : {}),
           steps: runResult.steps.map((s) => ({
             stepId: s.stepId,
             success: s.success,
@@ -1465,6 +1548,12 @@ export class MobileTestRunJobHandler {
     totalSteps?: number;
     firstError?: string;
     errorMessage?: string;
+    // Job-level failure provenance. When `failureCategory === 'environment'`
+    // the execution's `result` is stamped with the marker that flaky / fail-
+    // rate detection reads to exclude infrastructure failures.
+    failureTestId?: string;
+    failureCode?: string;
+    failureCategory?: DeviceFailureCategory;
   }): Promise<void> {
     const {
       analyticsExecutionId,
@@ -1474,7 +1563,19 @@ export class MobileTestRunJobHandler {
       totalSteps,
       firstError,
       errorMessage,
+      failureTestId,
+      failureCode,
+      failureCategory,
     } = params;
+    // Re-stamp the execution `result` with the env marker. Keep the same
+    // `{ type, testId }` shape the orchestrator seeds at dispatch so the
+    // `result->>testId` matchers (test-completion / executed-resources) and the
+    // report assembler's `result.testId` lookup keep working — trigger/startedAt
+    // are intentionally not carried (no reader depends on them post-failure).
+    const envMarker =
+      failureCategory === 'environment' && failureTestId
+        ? { type: 'ui', testId: failureTestId, failureLayer: 'job', errorCode: failureCode, failureCategory }
+        : undefined;
 
     // All three targets are independent — parallelize. allSettled so one
     // failure doesn't skip the others; per-branch try/catch logs locally.
@@ -1488,6 +1589,7 @@ export class MobileTestRunJobHandler {
             status: passed ? 'passed' : 'failed',
             ...(durationMs !== undefined ? { durationMs } : {}),
             ...((firstError || errorMessage) ? { errorMessage: firstError || errorMessage } : {}),
+            ...(envMarker ? { result: envMarker } : {}),
           });
         } catch (err) {
           logger.warn('[MOBILE-TEST] Failed to finalize test_executions', {

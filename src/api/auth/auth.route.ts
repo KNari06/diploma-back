@@ -21,6 +21,7 @@ import {
   passwordUpdate,
   refresh,
   resendVerification,
+  sendInfoEmailHandler,
   sendMagicLink,
   signup,
   updateProfile,
@@ -859,5 +860,12 @@ router.get('/users/pending', requireAuth, requireAdmin, asyncHandler(getPendingU
  * Body: { status: 'approved' | 'rejected' | 'pending_approval' }
  */
 router.patch('/users/:userId/status', requireAuth, requireAdmin, asyncHandler(updateUserStatus));
+
+/**
+ * POST /auth/admin/send-info-email
+ * Send a general-info / announcement email to one or more users (admin only)
+ * Body: { userIds?: string[], emails?: string[], heading, body, subject?, cta? }
+ */
+router.post('/admin/send-info-email', requireAuth, requireAdmin, asyncHandler(sendInfoEmailHandler));
 
 export default router;

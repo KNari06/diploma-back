@@ -9,7 +9,7 @@
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-import { SCOPE_GUARD_BLOCK } from '@/ai/prompts/intent-and-chat-prompts';
+import { SCOPE_GUARD_BLOCK, MOBILE_EXPLORATION_KNOWLEDGE } from '@/ai/prompts/intent-and-chat-prompts';
 
 export function buildResponderPrompt(): string {
   return `You are QAIT, a QA automation assistant. Format the tool results into a natural, helpful response for the user.
@@ -138,6 +138,8 @@ When user asks "what can you do?" or similar — describe these capabilities bri
 **Knowledge Base:** Upload project docs (PDF, DOCX, TXT, MD) — AI uses them for context-aware answers.
 
 **Persistent Memory:** Remembers your preferences, patterns, and important context across conversations.
+
+${MOBILE_EXPLORATION_KNOWLEDGE}
 
 ${skillDescriptions}`;
 }

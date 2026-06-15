@@ -1278,6 +1278,14 @@ export interface IntentStep {
   options?: StepOptions;
   /** Hints for element resolution */
   bindingHints?: BindingHints;
+  /**
+   * Runtime-only marker: set when this step was inlined as a precondition
+   * (a transitive dependency's step prepended before the target test's own
+   * steps). Holds the owning test-case id. Used by post-run compiled-plan
+   * writeback to EXCLUDE borrowed steps from the target's persisted
+   * `steps_json`. Never persisted on the owning case.
+   */
+  _preconditionSource?: string;
   /** Cached evidence from last execution (optimization, not truth) */
   evidence?: StepEvidence;
   /**

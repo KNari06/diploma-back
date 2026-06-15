@@ -27,6 +27,9 @@ import { MobileExplorationRelay } from '@/services/mobile/mobile-exploration-rel
 import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { ChatService } from '@/services/utils/chat.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { MOBILE_STEP_CREDIT_MULTIPLIER } from '@/services/core/token-calculator.service';
+import { EXPLORATION_DISCOVERY_CREDITS } from '@/config/testing/intelligent-test-limits';
 import { logger } from '@/utils/core/logger';
 
 export class MobileExplorationRunJobHandler {
@@ -125,6 +128,31 @@ export class MobileExplorationRunJobHandler {
           durationMs: Date.now() - startedAt,
           testCasesCount: savedCount,
         });
+
+        // Billing: mobile discovery charges the web discovery cost × the mobile
+        // multiplier (emulator COGS is higher). Charged once on success, best-
+        // effort — a failed deduction must never fail the run the user got.
+        // Mirrors mobile-test-run.job and the web exploration discovery charge.
+        if (userId) {
+          const mobileExplorationCredits =
+            EXPLORATION_DISCOVERY_CREDITS * MOBILE_STEP_CREDIT_MULTIPLIER;
+          try {
+            await CreditCostTrackerService.deductCreditsForTest({
+              userId,
+              testType: 'intelligent',
+              credits: mobileExplorationCredits,
+              costUSD: 0,
+              testId: explorationId,
+              description: `Mobile exploration discovery — ${appId} (${platform})`,
+            });
+          } catch (creditError) {
+            logger.warn('[MOBILE_EXPLORATION_JOB] credit deduction failed (non-critical)', {
+              explorationId,
+              userId,
+              error: creditError instanceof Error ? creditError.message : String(creditError),
+            });
+          }
+        }
 
         if (chatSessionId) {
           ChatService.saveChatMessages(chatSessionId, [{

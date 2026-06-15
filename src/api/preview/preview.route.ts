@@ -13,6 +13,7 @@ import {
   createIntentTestCase,
   deleteIntentTestCase,
   getIntentTestCase,
+  getPreconditions,
   listIntentTestCases,
   runIntentTestCase,
   startPreview,
@@ -642,6 +643,26 @@ router.get('/intent-test-cases', requireAuth, listIntentTestCases);
  *         description: Test case details
  */
 router.get('/intent-test-cases/:id', requireAuth, getIntentTestCase);
+
+/**
+ * @swagger
+ * /api/v1/preview/intent-test-cases/{id}/preconditions:
+ *   get:
+ *     summary: Transitive precondition (dependency) steps grouped by dependency
+ *     tags: [Intent Test Cases]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Ordered precondition groups (testCaseId, name, steps)
+ */
+router.get('/intent-test-cases/:id/preconditions', requireAuth, getPreconditions);
 
 /**
  * @swagger

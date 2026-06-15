@@ -451,7 +451,7 @@ export class WorkspaceMembersService {
           // Get workspace name for email
           const { data: workspace } = await supabaseAdmin
             .from('workspaces')
-            .select('project_name')
+            .select('name')
             .eq('id', workspaceId)
             .single();
 
@@ -459,7 +459,7 @@ export class WorkspaceMembersService {
           const emailResult = await EmailService.sendWorkspaceInvite({
             inviteId: invite.id,
             workspaceId,
-            workspaceName: workspace?.project_name,
+            workspaceName: workspace?.name,
             recipientEmail: normalizedEmail,
             role,
             frontendUrl,
@@ -745,14 +745,14 @@ export class WorkspaceMembersService {
           // Existing user: send custom email (Supabase won't re-invite confirmed users)
           const { data: workspace } = await supabaseAdmin
             .from('workspaces')
-            .select('project_name')
+            .select('name')
             .eq('id', invite.workspace_id)
             .single();
 
           const emailResult = await EmailService.sendWorkspaceInvite({
             inviteId: invite.id,
             workspaceId: invite.workspace_id,
-            workspaceName: workspace?.project_name,
+            workspaceName: workspace?.name,
             recipientEmail: invite.email,
             role: invite.role,
             frontendUrl,

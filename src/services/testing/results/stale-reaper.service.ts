@@ -152,7 +152,7 @@ export class StaleReaperService {
    * user is notified and any linked regression run recomputes.
    */
   static async handleAbandonedTest(testId: string, reason: string): Promise<void> {
-    const { flipped, error } = await finalizeAbandonedTest(testId, 'failed', reason);
+    const { flipped, error } = await finalizeAbandonedTest(testId, 'failed');
 
     if (error) {
       logger.error('[ABANDONED_TEST] Failed to finalize abandoned test', { testId, error });

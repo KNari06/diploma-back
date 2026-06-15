@@ -8,6 +8,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { executionCompletionEmitter } from '../executions/execution-completion-emitter';
 import { ExecutionService } from '../executions/execution.service';
 import { ManualTestService } from '../ui/manualTest.service';
+import { IntentTestCaseService } from '../ui/preview/intent-test-case.service';
 import { mobileTestRunQueue, mobileTestRunQueueEvents } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import type { ExecutableTestCase } from '@/types/testing.types';
@@ -527,6 +528,24 @@ export class TestExecutionOrchestratorService {
             // Run UI test without creating nested regression_runs
             const savedCase = await RegressionTestQueryService.getSavedTestCase(testCase.testCaseId, userId);
 
+            // Inline transitive dependency (precondition) steps so they run
+            // in-session BEFORE this case's own steps (shared browser → shared
+            // login/cookies/data) — same behavior as the editor / single run.
+            // Borrowed steps carry namespaced ids + `_preconditionSource`, so
+            // compiled-plan writeback never pollutes this case's steps_json.
+            if (savedCase.depends_on?.length) {
+              const preconditionSteps = await IntentTestCaseService.collectPreconditionSteps(testCase.testCaseId);
+              if (preconditionSteps.length > 0) {
+                savedCase.steps_json = [...preconditionSteps, ...(savedCase.steps_json || [])];
+                logger.info('[REGRESSION_RUN] Inlined precondition steps', {
+                  runId,
+                  testCaseId: testCase.testCaseId,
+                  preconditionSteps: preconditionSteps.length,
+                  totalSteps: savedCase.steps_json.length,
+                });
+              }
+            }
+
             // Route: mobile tests → mobile runner queue, web tests → Playwright queue
             const isMobile = savedCase.platform?.startsWith('mobile_');
             let testId: string;
@@ -957,6 +976,27 @@ export class TestExecutionOrchestratorService {
             ),
           ),
         );
+
+        // A timed-out execution means the worker never signalled it, so no
+        // completion event will ever recompute the run — without this trigger
+        // the run stays 'running' until the 30-minute stale reaper. Recompute
+        // now that the rows are stamped; if later levels are still pending the
+        // recompute is a safe early-return, and its optimistic lock makes a
+        // redundant call a no-op. Dynamic import mirrors mobile-test-run.job.ts
+        // (avoids a static import cycle with the completion handler).
+        if (timedOutExecIds.length > 0) {
+          try {
+            const { TestCompletionHandlerService } = await import(
+              '../results/test-completion-handler.service'
+            );
+            await TestCompletionHandlerService.recomputeRunStatusById(runId);
+          } catch (err) {
+            logger.warn('[REGRESSION_RUN] Post-timeout run recompute failed', {
+              runId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
       }
 
       emitProgress('level_completed', `Level ${levelIdx + 1}/${totalLevels} completed`, {

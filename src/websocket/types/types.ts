@@ -318,7 +318,11 @@ export interface ServerToClientEvents {
   // `intentTestCaseId` from the URL, toasts the user, and bounces back to
   // the Repository view. The Playwright preview session is stopped server-
   // side before this event is emitted (cheap to re-create on reopen).
-  'preview:session:expired': (data: { reason: 'idle' | 'disconnect' }) => void;
+  // `previewSessionId` scopes the event to the session that expired so the
+  // frontend can ignore a stale/phantom expiry meant for a session it has
+  // already replaced (e.g. reopening a test case right after an idle kick).
+  // Optional for backwards-compat with older clients during deploy skew.
+  'preview:session:expired': (data: { reason: 'idle' | 'disconnect'; previewSessionId?: string }) => void;
 
   // Preview video stream lifecycle. Emitted when the backend tears down the
   // video stream for reasons the FE watchdog cannot infer from frame gaps
@@ -461,6 +465,25 @@ export interface ServerToClientEvents {
     score?: number;
     /** v3 — diagnostic list of which weights fired. Old clients ignore. */
     triggers?: string[];
+    timestamp: string;
+  }) => void;
+
+  /**
+   * Stage 3 — proactive background-observer hint. Emitted by `observer.service`
+   * ONLY when emission is enabled (flag `OBSERVER_LLM_EMIT`, separate from the
+   * shadow-logging flag) AND the LLM returned a non-`none` verdict above the
+   * confidence floor. Advisory: the editor shows an unobtrusive, dismissable
+   * chip — it never blocks the user or auto-acts. `kind` tailors the copy.
+   *   'login_required' — the flow hit a login gate
+   *   'step_missing'   — an obvious step looks missing before the next one
+   *   'blocked'        — captcha / verification / error blocks progress
+   *   'wrong_page'     — the latest step looks recorded on a different page
+   */
+  'preview:observer:hint': (data: {
+    previewSessionId: string;
+    kind: 'login_required' | 'step_missing' | 'blocked' | 'wrong_page';
+    message: string;
+    confidence: number;
     timestamp: string;
   }) => void;
 

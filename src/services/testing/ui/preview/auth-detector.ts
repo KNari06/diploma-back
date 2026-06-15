@@ -61,6 +61,8 @@
 import type { Page, Frame } from 'playwright';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
+import { observe, clearObserverSession } from './observer.service';
+import { LOGIN_URL_RE } from './login-url.util';
 
 // ── Tunables ───────────────────────────────────────────────────────────────
 const THRESHOLD = 0.55;
@@ -80,8 +82,10 @@ const OAUTH_RETURN_WINDOW_MS = 2 * 60_000; // post-OAuth return silence
 // the +0.30 URL signal fires for non-English clients. Cyrillic
 // characters are matched directly (no `\b` involved here — anchoring is
 // by `/` and `?`/`#`/end-of-string, which are URL-structural).
-const LOGIN_URL_RE =
-  /(?:^|\/)(?:login|log[-_]?in|signin|sign[-_]?in|oauth|sso|saml|idp|session|вход|войти|авторизация|регистрация)(?:\/|$|\?|#)/i;
+// LOGIN_URL_RE is imported from ./login-url.util (single source of truth,
+// shared with the Observer pre-gate). Re-export kept for back-compat with any
+// existing importers that referenced it from this module.
+export { LOGIN_URL_RE };
 
 // Negative keywords — if URL path contains one, we're probably NOT on
 // the login gate itself. Covers three families:
@@ -622,10 +626,19 @@ export function attachAuthDetector(
     } catch {
       /* page may be closing */
     }
+    // Background observer (Stage 2) — navigation is an authoring moment worth a
+    // proactive look. Reuses this lifecycle hook (already off the hot path) so
+    // we don't attach a second global 'load' listener. Fire-and-forget,
+    // flag-gated, debounced, fail-open. The observer owns its own page-context
+    // fetch — it does NOT consume the auth detector's DOM probe.
+    try {
+      observe(sessionId, 'navigation', userId);
+    } catch { /* advisory */ }
   });
 
   page.once('close', () => {
     clearAuthDetectorSession(sessionId);
+    clearObserverSession(sessionId);
   });
 }
 

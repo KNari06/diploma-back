@@ -33,6 +33,7 @@ import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
 import { AiCallLogsRetentionJob } from '@/jobs/ai-call-logs-retention.job';
 import { ArtifactRetentionJob } from '@/jobs/artifact-retention.job';
 import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
+import { ExpiringPlansJob } from '@/jobs/expiring-plans.job';
 import { StaleRunReaperJob } from '@/jobs/stale-run-reaper.job';
 import { TestSchedulerJobHandler } from '@/jobs/test-scheduler.job';
 import { logger } from '@/utils/core/logger';
@@ -80,26 +81,28 @@ let stopped = false;
 // the TTL so a partitioned leader can't keep running a second bundle.
 let renewFailingSince: number | null = null;
 
-/** Start the six single-instance jobs. Mirrors src/scheduler/index.ts main(). */
+/** Start the single-instance jobs. Mirrors src/scheduler/index.ts main(). */
 export function startSchedulerBundle(): void {
   TestSchedulerJobHandler.start(60000);
   AutoLearnRetireJob.start();
   AccountDeletionPurgeJob.start();
   StaleRunReaperJob.start();
   AiCallLogsRetentionJob.start();
+  ExpiringPlansJob.start();
   if (ScreenshotCaptureFeature.isEnabled()) {
     ScreenshotCaptureFeature.logStatus();
     ArtifactRetentionJob.start();
   }
 }
 
-/** Stop the six jobs. Mirrors src/scheduler/index.ts shutdown(). */
+/** Stop the jobs. Mirrors src/scheduler/index.ts shutdown(). */
 export function stopSchedulerBundle(): void {
   TestSchedulerJobHandler.stop();
   AutoLearnRetireJob.stop();
   AccountDeletionPurgeJob.stop();
   StaleRunReaperJob.stop();
   AiCallLogsRetentionJob.stop();
+  ExpiringPlansJob.stop();
   ArtifactRetentionJob.stop();
 }
 

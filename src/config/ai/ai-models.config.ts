@@ -102,6 +102,15 @@ export const AI_TASK_MODELS = {
    * sacrificing determinism).
    */
   recordedDescription: 'gemini-2.5-flash-lite' as const,
+  /**
+   * Background editor Observer (observer.service.ts) — proactive hint
+   * classifier (login_required / step_missing / blocked / wrong_page / none).
+   * Same flash-lite tier as the other preview classifiers: it runs off the hot
+   * path on every meaningful editor event, so predictable sub-second latency +
+   * native JSON mode + multilingual matter more than raw quality. temp=0 for a
+   * stable verdict given the same page+steps signature (drives the verdict cache).
+   */
+  observer: 'gemini-2.5-flash-lite' as const,
   /** AI check assertion evaluation */
   aiCheck: AI_MODELS.fast,
   /** AI check with screenshot (needs vision) */

@@ -961,7 +961,7 @@ export class IntentStepLintService {
           logEntityType: 'test_execution',
           logEntityId: params.previewSessionId,
         },
-        () => IntentStepLintService._lintStepWithAIImpl(params, (url, count) => {
+        () => IntentStepLintService._lintStepWithAIImplWithRetry(params, (url, count) => {
           lastUrl = url;
           domNodeCount = count;
         }),
@@ -1022,6 +1022,60 @@ export class IntentStepLintService {
       } catch { /* never break lint on diagnostics */ }
       throw err;
     }
+  }
+
+  /**
+   * Circuit-broken retry wrapper around `_lintStepWithAIImpl` for the explicit
+   * Find button.
+   *
+   * WHY: a descriptor-poor framework-clickable wrapper (e.g. the documentolog
+   * header "Login": a role-less `<div onClick>` with no id/testid) is located by
+   * Phase 3.5 `assignAgentRefs` via bbox/`elementsFromPoint` — the coordinate-
+   * sensitive path (invariant #18). That match intermittently fails to stamp
+   * `data-agent-ref`; an element without a ref is filtered out of the candidate
+   * set, so the resolver never sees it and returns a SPURIOUS `not_found` even
+   * though the element is present (confirmed: same step flips not_found↔resolved
+   * across consecutive Find clicks, 1:1 with ref present/absent). Apply (Run)
+   * hides this behind its readiness settle + retry; Find is single-shot.
+   *
+   * Mirror that resilience: on `not_found`, re-collect a FRESH snapshot
+   * (re-runs refAssign, which usually stamps the ref on a later try) up to 3
+   * attempts, with a short settle between so any layout shift completes. Gated
+   * to the user-initiated Find — debounced auto-lint / pick dry-run / apply
+   * pre-lint either tolerate not_found (mid-typing) or already retry (apply), so
+   * they must not pay the extra LLM round-trips.
+   */
+  private static async _lintStepWithAIImplWithRetry(
+    params: {
+      previewSessionId: string;
+      stepDraft: IntentStep;
+      pageRef?: string;
+      userId: string;
+      includeAlternatives?: boolean;
+      forceFreshSnapshot?: boolean;
+      auditTrigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'pick_dry_run' | 'other';
+    },
+    onContext?: (url: string | undefined, domNodeCount: number) => void,
+  ): Promise<LintResult> {
+    const maxAttempts = params.auditTrigger === 'find_button' ? 3 : 1;
+    const SETTLE_MS = 250;
+
+    let result = await IntentStepLintService._lintStepWithAIImpl(params, onContext);
+    for (let attempt = 2; attempt <= maxAttempts && result.status === 'not_found'; attempt++) {
+      logger.debug('[INTENT_LINT] not_found — retrying with fresh snapshot (refAssign coordinate flake)', {
+        previewSessionId: params.previewSessionId,
+        attempt,
+        maxAttempts,
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, SETTLE_MS));
+      // forceFreshSnapshot bypasses the 500ms throttle so the retry actually
+      // re-collects (and re-runs refAssign) instead of reusing the cached DOM.
+      result = await IntentStepLintService._lintStepWithAIImpl(
+        { ...params, forceFreshSnapshot: true },
+        onContext,
+      );
+    }
+    return result;
   }
 
   private static async _lintStepWithAIImpl(params: {

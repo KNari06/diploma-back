@@ -771,6 +771,10 @@ function isInteractiveNodeTier1(
   // Attribute-based interactive signals (no role / no native tag,
   // but framework-bound or test-targeted).
   if (attrs.has('onclick')) return true;
+  // Runtime framework click handler (React fiber / Vue / Angular) stamped by
+  // tagFrameworkClickable BEFORE captureSnapshot — invisible to an
+  // attribute-only DOMSnapshot otherwise. See FRAMEWORK_CLICK_MARKER.
+  if (attrs.has(FRAMEWORK_CLICK_MARKER)) return true;
   if (attrs.has('data-testid') || attrs.has('data-test') || attrs.has('data-test-id')
       || attrs.has('data-cy') || attrs.has('data-qa')) return true;
   if (attrs.has('data-toggle') || attrs.has('aria-haspopup')) return true;
@@ -883,6 +887,41 @@ function isInteractiveNode(
   return isInteractiveNodeTier1(tagName, attrs) || isInteractiveNodeTier2(styles);
 }
 
+/**
+ * Marker attribute stamped on framework-clickable elements (React fiber /
+ * Vue instance/vnode / Angular context with a real click handler) by
+ * `tagFrameworkClickable` BEFORE `DOMSnapshot.captureSnapshot`, then read by
+ * `isInteractiveNodeTier1` to promote them to Tier-1 so they survive the
+ * MAX_TIER2_ELEMENTS cap.
+ *
+ * WHY (restores invariant #5 — collector symmetry): the evaluate-path
+ * collector (snapshot-collector.ts "Tier 1: Framework event bindings") detects
+ * runtime JS-prop handlers in-page and includes those elements. A CDP
+ * DOMSnapshot exposes attributes + computed styles but NOT JS-prop handlers —
+ * React keeps `onClick` in the fiber (`__reactProps$*.onClick`), Vue in the
+ * instance/vnode — so the CDP path was framework-BLIND and a role-less
+ * `<div onClick>` (e.g. documentolog.com/en "Login": `<div><svg/><p>Login</p>
+ * </div>`) was only a `cursor:pointer` Tier-2 candidate. On dense pages (>300
+ * such nodes) the cap dropped it and the resolver never saw it ("element not
+ * found"). Stamping a marker pre-capture closes the gap and re-aligns the two
+ * collectors. NOTE: attribute-based frameworks (Alpine/HTMX/Stimulus/Knockout/
+ * Qwik) are ALREADY Tier-1 here via attribute checks — only the runtime
+ * frameworks need this pass.
+ *
+ * Removed again in collect()'s finally so it never persists on the live
+ * (screencast) DOM. Read ONLY by the Tier-1 predicate and never copied into
+ * the LiteElement (the builder uses curated fields), so it cannot leak into
+ * the resolver / LLM payload.
+ */
+const FRAMEWORK_CLICK_MARKER = 'data-qait-fwclick';
+
+/**
+ * Toggle for the framework-clickable promotion pass. Module const (not env)
+ * so it's trivially revertible — flip to false to restore the pre-fix
+ * behaviour where the Tier-2 cap may drop JS-prop-onClick buttons.
+ */
+const PROMOTE_FRAMEWORK_CLICKABLE = true;
+
 /** Symmetric cap with evaluate-path's MAX_SECONDARY_ELEMENTS. */
 const MAX_TIER2_ELEMENTS = 300;
 
@@ -970,7 +1009,21 @@ function buildLiteElementFromNode(args: {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const axRole = (axNode as any)?.role?.value as string | undefined;
   const explicitRole = attrs.get('role') ?? undefined;
-  const role = (axRole || explicitRole || '').toLowerCase();
+  const rawRole = (axRole || explicitRole || '').toLowerCase();
+  // Framework-clickable role promotion (collector symmetry, invariant #5).
+  // A role-less `<div onClick>` / `<span onClick>` carrying FRAMEWORK_CLICK_MARKER
+  // is a real button to the user, but Chrome's AX engine labels it role="generic".
+  // That presentational role makes the LLM candidate pruner drop it AND trips the
+  // resolver's structural-actionability guard (isPresentationalRole + no
+  // affordance) — so the CDP path can't resolve it while the evaluate path (which
+  // surfaces it as a button) can. Promote to `button`. Scoped to div/span so a
+  // React onScroll/animation handler on an <h1>/<p> (the known false-positive
+  // class the actionability guard exists to catch) is NOT mislabelled.
+  const role = (
+    attrs.has(FRAMEWORK_CLICK_MARKER)
+    && (rawRole === '' || rawRole === 'generic' || rawRole === 'none')
+    && (tagName === 'div' || tagName === 'span')
+  ) ? 'button' : rawRole;
 
   // Accessible name from AX. Per WAI-ARIA spec, AX `name` already
   // applied the full label cascade (aria-labelledby > aria-label >
@@ -1324,6 +1377,9 @@ export class CdpSnapshotService {
     //   classic "CDP sessions accumulate, browser slows down" leak.
     const cdp = options.existingCdpSession ?? await page.context().newCDPSession(page);
     const ownsCdpSession = options.existingCdpSession === undefined;
+    // Count of elements stamped by Phase 1.5 — drives the finally cleanup so we
+    // only pay the untag round-trip when something was actually marked.
+    let fwClickTagged = 0;
 
     try {
       // Phase 1: optional stability wait. Skipped when the caller
@@ -1336,6 +1392,18 @@ export class CdpSnapshotService {
       // pipe but Chrome processes them concurrently — wall time is
       // max(DS, AX), not sum. This is the only point where we eat
       // the CDP round-trip cost — measure it precisely.
+      // Phase 1.5: stamp framework-clickable elements (React fiber / Vue /
+      // Angular runtime click handlers) with FRAMEWORK_CLICK_MARKER BEFORE
+      // captureSnapshot, so isInteractiveNodeTier1 promotes them to Tier-1 and
+      // they survive the Tier-2 cap (restores collector symmetry, invariant
+      // #5). Best-effort: a failure here must never block the snapshot, so it
+      // swallows its own errors and just returns 0 (= pre-fix behaviour). Runs
+      // via page.evaluate (Playwright managed channel) — NOT a CDP-session
+      // reuse, so invariant #3 (screencast) is unaffected.
+      if (PROMOTE_FRAMEWORK_CLICKABLE) {
+        fwClickTagged = await this.tagFrameworkClickable(page, diagId);
+      }
+
       const cdpStart = Date.now();
       const raw = await this.fetchRawBundle(cdp, diagId);
       const cdpParallelMs = Date.now() - cdpStart;
@@ -1842,6 +1910,15 @@ export class CdpSnapshotService {
 
       return snapshot;
     } finally {
+      // Remove the framework-click markers stamped pre-capture so they never
+      // persist on the live (screencast) DOM under the page-under-test. Runs
+      // even on the error path; skipped when nothing was tagged so a page with
+      // no framework-clickable elements pays no extra round-trip. Best-effort
+      // (page may already be gone).
+      if (PROMOTE_FRAMEWORK_CLICKABLE && fwClickTagged > 0) {
+        await this.untagFrameworkClickable(page).catch(() => { /* page gone — nothing to clean */ });
+      }
+
       // Detach only sessions we opened — a caller-supplied session
       // belongs to them and we must not pull it out from under them.
       if (ownsCdpSession) {
@@ -1878,6 +1955,112 @@ export class CdpSnapshotService {
    *   - AX rejected: ax_domain_unavailable (warn-once, fall through
    *     with empty axTree — NOT thrown; mapping handles)
    */
+  /**
+   * Phase 1.5 — stamp framework-clickable elements with FRAMEWORK_CLICK_MARKER
+   * before DOMSnapshot.captureSnapshot. Mirrors the evaluate-path collector's
+   * "Tier 1: Framework event bindings" runtime detection (snapshot-collector.ts)
+   * so the CDP path stops being framework-blind (invariant #5).
+   *
+   * Scope: ONLY runtime frameworks (React fiber / Vue instance+vnode / Angular
+   * context) whose handlers live in JS, not attributes — attribute frameworks
+   * (Alpine/HTMX/Stimulus/Knockout/Qwik) are already Tier-1 via attribute checks
+   * in isInteractiveNodeTier1. Native tags / onclick / href / tabindex are
+   * skipped (already Tier-1, keeps the marker set tight).
+   *
+   * A CONFIRMED handler is required (no "fiber present → assume clickable"
+   * fallback the evaluate path's doc-order-capped secondary pass can afford),
+   * because Tier-1 here is effectively uncapped — over-tagging would balloon
+   * the list. Measured on real React pages: a few dozen elements.
+   *
+   * Best-effort: returns the tagged count; swallows all errors (a failed
+   * evaluate just restores pre-fix behaviour — never blocks the snapshot).
+   */
+  private static async tagFrameworkClickable(page: Page, diagId?: string): Promise<number> {
+    try {
+      const count = await page.evaluate((mark: string) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const doc = (globalThis as any).document;
+        if (!doc || !doc.body) return 0;
+        const NATIVE = new Set(['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'OPTION', 'SUMMARY', 'LABEL', 'DETAILS']);
+        const INTERACTIVE_ROLES = new Set(['button', 'link', 'tab', 'menuitem', 'option', 'switch', 'checkbox', 'radio']);
+        let tagged = 0;
+        const els = doc.querySelectorAll('*');
+        // Perf guard: above this DOM size the per-element React-key scan
+        // (Object.keys on every non-native element) erodes the CDP path's whole
+        // reason for existing — speed. Skip promotion on pathologically large
+        // pages; they're already lossy under the Tier-2 / MAX_TOTAL_ELEMENTS cap,
+        // so a missed framework-clickable wrapper is the rare tail there. Return
+        // -1 so the caller logs the skip (not a silent cap).
+        if (els.length > 5000) return -1;
+        for (let i = 0; i < els.length; i++) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const el = els[i] as any;
+          // Skip elements already Tier-1 via attributes — tagging adds nothing.
+          if (NATIVE.has(el.tagName)) continue;
+          if (el.hasAttribute('onclick') || el.hasAttribute('href') || el.hasAttribute('tabindex')) continue;
+
+          let clickable = false;
+          // React — handler lives in the props bag (__reactProps$<id>).
+          try {
+            const keys = Object.keys(el);
+            for (let k = 0; k < keys.length; k++) {
+              const key = keys[k];
+              if (key.charCodeAt(0) === 95 && key.indexOf('__reactProps$') === 0) {
+                const p = el[key];
+                if (p && (p.onClick || p.onChange || p.onMouseDown)) clickable = true;
+                break;
+              }
+            }
+          } catch { /* hostile getter — ignore */ }
+          // Vue 2 — $listeners; Vue 3 — vnode.props.
+          if (!clickable && el.__vue__) {
+            const ls = el.__vue__.$listeners || {};
+            if (ls.click || ls.input || ls.change) clickable = true;
+          }
+          if (!clickable && el.__vueParentComponent) {
+            const vnode = el.__vueParentComponent.vnode;
+            const vp = vnode && vnode.props;
+            if (vp && (vp.onClick || vp.onInput || vp.onChange)) clickable = true;
+          }
+          // Angular — context marker + an interactive signal.
+          if (!clickable && (el.__ngContext__ || el._ngHost)) {
+            const role = (el.getAttribute('role') || '').toLowerCase();
+            const cls = (el.getAttribute('class') || '').toLowerCase();
+            if (INTERACTIVE_ROLES.has(role) || /btn|button|click|link/.test(cls)) clickable = true;
+          }
+
+          if (clickable) { el.setAttribute(mark, '1'); tagged++; }
+        }
+        return tagged;
+      }, FRAMEWORK_CLICK_MARKER);
+      if (count === -1) {
+        // Perf guard tripped — DOM too large; promotion skipped this collect.
+        logger.debug('[CDP_SNAPSHOT] framework-clickable promotion skipped — DOM too large', { diagId });
+        return 0;
+      }
+      if (count > 0) {
+        logger.debug('[CDP_SNAPSHOT] framework-clickable promotion stamped elements', { diagId, count });
+      }
+      return count;
+    } catch (err) {
+      logger.debug('[CDP_SNAPSHOT] tagFrameworkClickable failed (non-fatal)', {
+        diagId, error: err instanceof Error ? err.message : String(err),
+      });
+      return 0;
+    }
+  }
+
+  /** Remove every FRAMEWORK_CLICK_MARKER stamped by tagFrameworkClickable. */
+  private static async untagFrameworkClickable(page: Page): Promise<void> {
+    await page.evaluate((mark: string) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const doc = (globalThis as any).document;
+      if (!doc) return;
+      const els = doc.querySelectorAll('[' + mark + ']');
+      for (let i = 0; i < els.length; i++) els[i].removeAttribute(mark);
+    }, FRAMEWORK_CLICK_MARKER);
+  }
+
   private static async fetchRawBundle(cdp: CDPSession, diagId?: string): Promise<RawCdpBundle> {
     const dsStart = Date.now();
     const axStart = Date.now();
@@ -2097,35 +2280,63 @@ export class CdpSnapshotService {
         layoutByNodeIdx.set(layoutNodeIndex[i], i);
       }
 
-      // Direct-text accumulator: walk DS textValue array and build a
-      // map { parentNodeIndex → concatenated direct-child text, capped
-      // at 100 chars }. Mirrors the Phase 3c-Node textByParent gather
-      // (line ~2089), but built per-doc here so iframe text reaches
-      // LiteElement.text. AX `name` would not capture this on
-      // descriptor-poor div-buttons (`<div><span>Save</span></div>`)
-      // — without raw text the resolver loses the only matchable
-      // string for half the buttons on icon-heavy SPAs.
+      // Text accumulator. CDP `captureSnapshot` stores a node's text in the
+      // FLAT `nodeValue` array (string index, or -1 for none) — NOT in
+      // `textValue`, which is the RareStringData of `<textarea>` values only
+      // and is EMPTY on pages without textareas. (The previous code read
+      // `textValue`, so the CDP path never recovered text-node text at all —
+      // it leaned entirely on AX `name`, which is empty for role=generic
+      // div-buttons; that is the documentolog "Login" miss.) We build two maps
+      // off the #text (nodeType 3) nodes:
+      //   • textByParentIdx     — a node's DIRECT child text.
+      //   • descendantTextByIdx — text from DEEPER descendants (bounded depth),
+      //                           bubbled up to ancestors.
+      // Why both: a descriptor-poor wrapper `<div><svg/><p>Login</p></div>`
+      // (documentolog header; role=generic, empty AX name) has NO direct text —
+      // the label lives one level down. Without subtree text the resolver has
+      // no string to match "Login" against and rejects it. The evaluate-path
+      // collector reads `el.textContent` (full subtree), so this realigns the
+      // two collectors (invariant #5). Per-node cap 100 chars.
       const textByParentIdx = new Map<number, string>();
-      const tv = nodes.textValue;
-      if (tv && Array.isArray(tv.index) && Array.isArray(tv.value)) {
-        const indexes: number[] = tv.index;
-        const values: number[] = tv.value;
+      const descendantTextByIdx = new Map<number, string>();
+      {
+        const nodeValue: number[] = Array.isArray(nodes.nodeValue) ? nodes.nodeValue : [];
+        const nodeType: number[] = Array.isArray(nodes.nodeType) ? nodes.nodeType : [];
         const parentIdx: number[] = Array.isArray(nodes.parentIndex) ? nodes.parentIndex : [];
-        for (let i = 0; i < indexes.length; i++) {
-          const textNodeIdx = indexes[i];
-          const parent = parentIdx[textNodeIdx];
-          if (typeof parent === 'number' && parent >= 0) {
-            const existing = textByParentIdx.get(parent) ?? '';
-            if (existing.length < 100) {
-              const chunk = getStr(values[i]).trim();
-              if (chunk.length > 0) {
-                const next = (existing.length > 0 ? existing + ' ' : '') + chunk;
-                textByParentIdx.set(parent, next.slice(0, 100));
-              }
-            }
+        const MAX_BUBBLE_DEPTH = 4;
+        const append = (map: Map<number, string>, key: number, chunk: string): void => {
+          const existing = map.get(key) ?? '';
+          if (existing.length >= 100) return;
+          map.set(key, ((existing.length > 0 ? existing + ' ' : '') + chunk).slice(0, 100));
+        };
+        for (let i = 0; i < nodeValue.length; i++) {
+          if (nodeType[i] !== 3) continue;             // TEXT_NODE only (skip comment/cdata)
+          const vIdx = nodeValue[i];
+          if (typeof vIdx !== 'number' || vIdx < 0) continue;
+          const chunk = getStr(vIdx).trim();
+          if (chunk.length === 0) continue;
+          const directParent = parentIdx[i];
+          if (typeof directParent !== 'number' || directParent < 0) continue;
+          append(textByParentIdx, directParent, chunk);
+          // Bubble to ancestors ABOVE the direct parent so a clickable wrapper
+          // inherits its descendants' visible text.
+          let anc = parentIdx[directParent];
+          let depth = 0;
+          while (typeof anc === 'number' && anc >= 0 && depth < MAX_BUBBLE_DEPTH) {
+            append(descendantTextByIdx, anc, chunk);
+            anc = parentIdx[anc];
+            depth++;
           }
         }
       }
+      // Direct text wins; descendant subtree text is the fallback. AX name is
+      // applied separately in buildLiteElementFromNode, so this only fills the
+      // case where a kept element has neither direct text nor an AX name.
+      const effectiveText = (idx: number): string | undefined => {
+        const direct = textByParentIdx.get(idx);
+        if (direct && direct.length > 0) return direct;
+        return descendantTextByIdx.get(idx);
+      };
 
       const nodeCount = Array.isArray(nodes.nodeName) ? nodes.nodeName.length : 0;
 
@@ -2205,7 +2416,7 @@ export class CdpSnapshotService {
         const elBuilt = buildLiteElementFromNode({
           tagName, attrs, bounds, styles, axNode,
           dsNodeIndex: i, docIndex: docIdx, docUrl,
-          rawText: textByParentIdx.get(i),
+          rawText: effectiveText(i),
         });
         if (boundsWereMissing) {
           // Mark rescue so forensic / consumers can distinguish "real
@@ -2289,7 +2500,7 @@ export class CdpSnapshotService {
         elements.push(buildLiteElementFromNode({
           tagName, attrs, bounds, styles, axNode,
           dsNodeIndex: i, docIndex: docIdx, docUrl,
-          rawText: textByParentIdx.get(i),
+          rawText: effectiveText(i),
         }));
         if (forensic) {
           iconishKept++;
@@ -2419,7 +2630,7 @@ export class CdpSnapshotService {
         elements.push(buildLiteElementFromNode({
           tagName: c.tagName, attrs: c.attrs, bounds: c.bounds, styles: c.styles, axNode,
           dsNodeIndex: c.nodeIdx, docIndex: docIdx, docUrl,
-          rawText: textByParentIdx.get(c.nodeIdx),
+          rawText: effectiveText(c.nodeIdx),
         }));
         if (forensic) {
           tier2Kept++;
@@ -2712,6 +2923,10 @@ export class CdpSnapshotService {
       ariaLabel: string;
       placeholder: string;
       testId: string;
+      // Visible text (incl. from descendants — see LiteElement.text). Drives the
+      // Stage C text fallback for descriptor-poor wrappers (id-less `<div onClick>`
+      // whose label lives in a child) when Stage B's bbox match flakes.
+      text: string;
       // Identity slot for selector — first non-dynamic id/testId/name
       // gives us a fast path. When all are absent we fall back to
       // bbox + tag matching in-page (rare; only for descriptor-poor
@@ -2807,6 +3022,7 @@ export class CdpSnapshotService {
         ariaLabel: el.ariaLabel || '',
         placeholder: el.placeholder || '',
         testId: testIdAttr,
+        text: el.text || '',
         bboxX: el.bounds?.x ?? 0,
         bboxY: el.bounds?.y ?? 0,
         bboxW,
@@ -2828,6 +3044,7 @@ export class CdpSnapshotService {
     const requests: RefAssignmentRequest[] = indexed.map((r) => ({
       tag: r.tag, role: r.role, type: r.type, name: r.name,
       id: r.id, ariaLabel: r.ariaLabel, placeholder: r.placeholder, testId: r.testId,
+      text: r.text,
       bboxX: r.bboxX, bboxY: r.bboxY, bboxW: r.bboxW, bboxH: r.bboxH,
     }));
 
@@ -3318,6 +3535,45 @@ export class CdpSnapshotService {
           try {
             const candidate = doc.querySelector(`${req.tag}[placeholder="${attrEscape(req.placeholder)}"]`);
             if (candidate && !refAlreadyAssigned(candidate)) { diag.stageHit = 'C.placeholder'; return candidate; }
+          } catch { /* ignore */ }
+        }
+
+        // Stage C — TEXT descriptor fallback (location-only). Closes a real gap:
+        // Stage C matched aria-label / placeholder but NOT visible text, even
+        // though text is the only stable descriptor a role-less
+        // `<div onClick><svg/><p>Login</p></div>` has (documentolog header). For
+        // such id-less generic wrappers Stage B's bbox/elementsFromPoint match is
+        // coordinate-flaky (layout-shift drift, atPoint landing on a child,
+        // walk-up collision) and intermittently returns null — the element then
+        // gets no ref and is filtered out, so the resolver reports a spurious
+        // not_found. Here we locate it by exact visible text + nearest bbox.
+        // IMPORTANT: this returns the DOM NODE only; the ref VALUE is still
+        // assigned by the existing stable mechanism downstream, so ref stability
+        // across snapshots (evidence shortcuts / compiled plans) is untouched.
+        if (tagIsGeneric && req.text && req.text.trim().length >= 2) {
+          try {
+            const wanted = req.text.trim().toLowerCase();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const cands: any = doc.querySelectorAll(req.tag);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            let best: any = null;
+            let bestDist = Infinity;
+            const SCAN_CAP = 2000; // bound cost on div-heavy pages
+            for (let i = 0; i < cands.length && i < SCAN_CAP; i++) {
+              const c = cands[i];
+              if (refAlreadyAssigned(c)) continue;
+              // Whole-text equality (not substring) — a container whose subtree
+              // text is "Login + more" won't match, only the tight wrapper does.
+              const t = (c.textContent || '').trim().toLowerCase();
+              if (t !== wanted) continue;
+              const live = measureLive(c);
+              if (!live) continue;
+              const dist = Math.abs(live.x - req.bboxX) + Math.abs(live.y - req.bboxY);
+              if (dist < bestDist) { bestDist = dist; best = c; }
+            }
+            // Require proximity to the request bbox so a same-text element
+            // elsewhere on the page (e.g. a footer "Login" link) isn't grabbed.
+            if (best && bestDist <= 80) { diag.stageHit = 'C.text'; return best; }
           } catch { /* ignore */ }
         }
 

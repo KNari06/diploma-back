@@ -722,4 +722,85 @@ describe('CdpSnapshotService — real Chromium integration', () => {
       }
     }, PER_TEST_TIMEOUT_MS);
   });
+
+  // ──────────────────────────────────────────────────────────────────
+  // Framework-clickable role-less wrapper — the documentolog "Login"
+  // regression. A role-LESS <div> with a JS-prop (React fiber) onClick whose
+  // label lives in a CHILD <p>. Three collector fixes must hold together:
+  //   (a) tagFrameworkClickable marks it → isInteractiveNodeTier1 → Tier-1, so
+  //       it survives the MAX_TIER2_ELEMENTS cap under cursor:pointer noise;
+  //   (b) text comes from the nodeValue descendant (the child <p>), NOT the
+  //       textarea-only `textValue` (which is empty) → the resolver has "Login";
+  //   (c) Chrome AX role=generic is promoted to button so the LLM candidate
+  //       pruner keeps it and the resolver's actionability guard accepts it.
+  // Drop any one and the live editor's "Find" returned "element not found" on
+  // documentolog.com/en while the evaluate path resolved it (a collector-
+  // symmetry break — preview/CLAUDE.md invariant #5).
+  // ──────────────────────────────────────────────────────────────────
+  describe('framework-clickable role-less wrapper (documentolog "Login")', () => {
+    // <div onClick><svg/><p>Login</p></div> — role-less, NO `onclick` attribute;
+    // the handler is a JS prop only, surfaced via a simulated React fiber props
+    // bag (the exact `__reactProps$*.onClick` signal the tag pass reads). The
+    // child <svg>/<p> are pinned to cursor:auto so they don't become their own
+    // Tier-2 candidates and add noise.
+    async function buildLoginPage(p: Page, decoyCount: number): Promise<void> {
+      const decoys = Array.from(
+        { length: decoyCount },
+        (_, i) => `<div class="decoy" data-i="${i}" style="cursor:pointer;width:30px;height:15px;display:inline-block;"></div>`,
+      ).join('');
+      await p.setContent(`
+        <header>
+          <div id="login-wrapper" style="cursor:pointer;width:62px;height:48px;display:inline-block;">
+            <svg width="16" height="16" viewBox="0 0 16 16" style="cursor:auto;"></svg>
+            <p style="cursor:auto;">Login</p>
+          </div>
+        </header>
+        <main>${decoys}</main>
+      `);
+      // Attach a React-style fiber props bag carrying onClick. role-less + no
+      // `onclick` attribute means this handler is invisible to the attribute-only
+      // DOMSnapshot; only the runtime tag pass (Object.keys → __reactProps$*) sees it.
+      await p.evaluate(() => {
+        const doc = (globalThis as unknown as {
+          document: { querySelector(s: string): Record<string, unknown> | null };
+        }).document;
+        const el = doc.querySelector('#login-wrapper');
+        if (el) el['__reactProps$qaittest'] = { onClick: () => { /* noop */ } };
+      });
+    }
+
+    it('promotes the role-less <div onClick> to a candidate with text + role=button', async () => {
+      await buildLoginPage(page, 0);
+
+      const snapshot = await CdpSnapshotService.collect(page);
+      const login = snapshot.elements.find((e) => e.htmlId === 'login-wrapper');
+
+      expect(login).toBeDefined();
+      expect(login?.tag).toBe('div');
+      // (c) Chrome AX reports role=generic; promotion lifts it to button.
+      expect(login?.role).toBe('button');
+      // (b) Label is in the child <p> — descendant text bubbles it to the wrapper.
+      expect(login?.text).toContain('Login');
+    }, PER_TEST_TIMEOUT_MS);
+
+    it('survives the Tier-2 cap under cursor:pointer pressure (promotion → Tier-1)', async () => {
+      // 350 textless cursor:pointer decoys > MAX_TIER2_ELEMENTS (300). They are
+      // smaller (area 450) than the target (2976), so the Tier-2 priority sort
+      // fills the cap with decoys first and would crowd the target out — UNLESS
+      // the framework-click marker promoted it to (uncapped) Tier-1.
+      await buildLoginPage(page, 350);
+
+      const snapshot = await CdpSnapshotService.collect(page);
+      const login = snapshot.elements.find((e) => e.htmlId === 'login-wrapper');
+
+      // (a) Present despite the cap pressure → it took the Tier-1 path.
+      expect(login).toBeDefined();
+      expect(login?.role).toBe('button');
+      expect(login?.text).toContain('Login');
+      // Sanity: the cap actually fired (not all 350 decoys survived) — otherwise
+      // the "pressure" is fake and the survival assertion proves nothing.
+      const keptDecoys = snapshot.elements.filter((e) => e.tag === 'div' && e.htmlId !== 'login-wrapper').length;
+      expect(keptDecoys).toBeLessThan(350);
+    }, PER_TEST_TIMEOUT_MS);
+  });
 });

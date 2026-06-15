@@ -1373,7 +1373,30 @@ app.use(`/api/${env.API_VERSION}/admin`, adminRegressionMetricsRoutes);
 app.use(`/api/${env.API_VERSION}/playwright`, requireAuth, requireApproved, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, requireAuth, requireApproved, reportsRoutes);
 app.use(`/api/${env.API_VERSION}/test-visualization`, requireAuth, requireApproved, testVisualizationRoutes);
-// Shared report: public endpoint (no auth) — must be registered before auth-protected regression routes
+/**
+ * @swagger
+ * /api/v1/regression/shared/{shareToken}:
+ *   get:
+ *     summary: View a shared regression run report (public, no auth)
+ *     description: Returns the full run report for a publicly shared link
+ *     tags: [Regression]
+ *     parameters:
+ *       - in: path
+ *         name: shareToken
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Shared run report
+ *       404:
+ *         description: Shared report not found
+ */
+// Shared report is PUBLIC (no auth). It MUST stay registered BEFORE the auth-gated
+// `/regression` mount below: Express matches in registration order, so this handler
+// intercepts `/regression/shared/:shareToken` before `requireAuth` can run. Do not
+// move it below the mount, and do not re-add a `/shared` route inside regressionRoutes
+// (it would be auth-gated there).
 app.get(`/api/${env.API_VERSION}/regression/shared/:shareToken`, sharedReportRateLimiter, getSharedReport);
 app.use(`/api/${env.API_VERSION}/regression`, requireAuth, requireApproved, regressionRoutes);
 app.use(`/api/${env.API_VERSION}/platforms`, requireAuth, requireApproved, platformsRoutes);
@@ -1585,6 +1608,15 @@ const startServer = async () => {
     try {
       server = app.listen(env.PORT, async () => {
         logger.info(`QAIT Backend started | port=${env.PORT} env=${env.NODE_ENV}`);
+
+        // Verify SMTP at boot so a dead/missing credential is loud here instead
+        // of silently dropping every user-facing email. Non-fatal — fire and log.
+        try {
+          const { EmailService } = await import('@/services/core/email.service');
+          void EmailService.verifyConfig();
+        } catch (mailerError) {
+          logger.error('[SERVER] Failed to verify SMTP config', { error: formatError(mailerError) });
+        }
 
         // V21: Start system health monitor (polls Supabase, broadcasts maintenance
         // banner to all connected clients on outage). Independent from zombie cleanup

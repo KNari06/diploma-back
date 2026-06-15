@@ -231,6 +231,55 @@ describe('RegressionReportAssemblerService.assembleReport', () => {
     expect(steps.map((s) => s.status)).toEqual(['passed', 'passed']); // final attempt wins
   });
 
+  it('surfaces a job-level failure reason and marks it an environment issue (test never ran)', async () => {
+    mockGetStats.mockResolvedValue(makeStats({ total: 1, passed: 0, failed: 1 }));
+    mockGetByRunId.mockResolvedValue([makeExec({ status: 'failed', platform: 'mobile_flutter' })]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Bank-2' }]);
+    // The mobile job persisted a device-attach failure (FLUTTER_NOT_DETECTED).
+    // The test never ran, so there are no executed steps.
+    mockGetMobileTestResults.mockResolvedValue([
+      {
+        test_id: 'test-1',
+        errors: [{ type: 'job_failure', code: 'FLUTTER_NOT_DETECTED', message: 'agent failed to attach' }],
+        metadata: { failureLayer: 'job', errorCode: 'FLUTTER_NOT_DETECTED', errorMessage: 'agent failed to attach' },
+      },
+    ]);
+    // The health aggregator would emit a green "no console errors" finding —
+    // the assembler must NOT call it for a test that never ran.
+    mockAggHealth.mockReturnValue({
+      findings: [{ category: 'console_errors', severity: 'pass', message: 'No console errors' }],
+      checkedAt: 'x',
+    } as any);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+
+    const exec = report.executions[0];
+    expect(exec.failureReason).toMatchObject({
+      code: 'FLUTTER_NOT_DETECTED',
+      category: 'environment',
+      layer: 'job',
+      message: 'agent failed to attach',
+    });
+    expect(exec.failureReason?.label).toBeTruthy();
+    expect(exec.failureReason?.remediation).toBeTruthy();
+    // Environment failure → classified as such even without an AI verdict.
+    expect(exec.failureClassification).toBe('environment');
+    // Misleading green health chips are suppressed for a non-started test.
+    expect(exec.healthChecks).toBeUndefined();
+    expect(mockAggHealth).not.toHaveBeenCalled();
+  });
+
+  it('does not attach a failureReason for a normal step-level failure', async () => {
+    mockGetStats.mockResolvedValue(makeStats({ total: 1, passed: 0, failed: 1 }));
+    mockGetByRunId.mockResolvedValue([makeExec({ status: 'failed' })]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Login' }]);
+    mockGetTestResults.mockResolvedValue([{ test_id: 'test-1', ai_summary: { bugs: [] } }]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+
+    expect(report.executions[0].failureReason).toBeUndefined();
+  });
+
   it('splits negative executions into a separate negativeSummary', async () => {
     mockGetStats.mockResolvedValue(makeStats({ total: 2, passed: 1, failed: 1 }));
     mockGetByRunId.mockResolvedValue([
@@ -288,6 +337,31 @@ describe('RegressionReportAssemblerService.assembleReport', () => {
     expect(exec.artifacts.screenshots.map((s) => s.url)).toContain('https://cdn/mobile-final.webp');
     expect(exec.artifacts.networkLogs).toHaveLength(1);
     expect(exec.artifacts.consoleLogs).toEqual(['hello']);
+  });
+
+  it('leads the gallery with the "Step 0" initial screenshot from mobile metadata', async () => {
+    mockGetByRunId.mockResolvedValue([makeExec()]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Bank' }]);
+    mockGetMobileTestResults.mockResolvedValue([
+      {
+        test_id: 'test-1',
+        screenshot: 'https://cdn/mobile-final.webp',
+        metadata: { platform: 'mobile', initialScreenshot: 'https://cdn/step-0-initial.webp' },
+      },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+    const exec = report.executions[0];
+
+    // Initial screenshot is first, labeled "Step 0", ahead of the final shot.
+    expect(exec.artifacts.screenshots[0]).toMatchObject({
+      url: 'https://cdn/step-0-initial.webp',
+      stepName: 'Step 0: Initial screen',
+    });
+    expect(exec.artifacts.screenshots.map((s) => s.url)).toEqual([
+      'https://cdn/step-0-initial.webp',
+      'https://cdn/mobile-final.webp',
+    ]);
   });
 
   // ── Per-step screenshots (runtimeMeta.stepScreenshotUrl) ──

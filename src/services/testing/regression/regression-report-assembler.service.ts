@@ -9,6 +9,7 @@ import {
   getTestCasePhaseInfoByIds,
 } from './db/regression-report.db';
 import { getProjectWorkspaceId, getActiveWorkspaceMemberIds } from './db/regression.db';
+import { describeDeviceError } from './device-error-catalog';
 import { ExecutionService } from '../executions/execution.service';
 import { HealthCheckAggregatorService } from './health-check-aggregator.service';
 import { TestReportGeneratorService } from '../results/test-report-generator.service';
@@ -20,6 +21,7 @@ import type {
   RunReportScreenshot,
   RunReportSummary,
   RunReportArtifactsSummary,
+  RunReportFailureReason,
   EnrichedBug,
   ExecutionHealthChecks,
   NegativeSummary,
@@ -138,6 +140,40 @@ export class RegressionReportAssemblerService {
   }
 
   /**
+   * Derive a case-level failure reason from a (mobile) test_result row when the
+   * run failed BEFORE any step executed — device attach / session setup / runner
+   * unreachable. The mobile job persists this on `mobile_test_results` (see
+   * `createFailedJobTestResult`): `metadata.failureLayer = 'job'` with an
+   * `errorCode`, plus a `{ type: 'job_failure', code, message }` entry in
+   * `errors`. Returns null for normal pass / step-failure rows so the banner
+   * only shows when the test genuinely never ran.
+   */
+  private static deriveFailureReason(testResult: any, platform?: string): RunReportFailureReason | null {
+    if (!testResult) return null;
+    // Job-failure markers only exist on the mobile path (createFailedJobTestResult).
+    // Guard on platform so a future web/API result that happens to carry a
+    // job_failure-typed error can't trip a false "couldn't start" banner.
+    if (!platform || !platform.startsWith('mobile')) return null;
+    const meta = testResult.metadata;
+    const jobErr = Array.isArray(testResult.errors)
+      ? testResult.errors.find((e: any) => e?.type === 'job_failure')
+      : null;
+    const isJobFailure = meta?.failureLayer === 'job' || !!jobErr;
+    if (!isJobFailure) return null;
+    const code: string = meta?.errorCode || jobErr?.code || 'UNKNOWN';
+    const message: string = meta?.errorMessage || jobErr?.message || '';
+    const info = describeDeviceError(code);
+    return {
+      code,
+      label: info.label,
+      message: message || info.label,
+      remediation: info.remediation,
+      layer: 'job',
+      category: info.category,
+    };
+  }
+
+  /**
    * Shared report assembly logic used by both buildFullReport and buildPublicReport.
    * Fetches executions, test results, steps, bugs, artifacts and assembles RunReport.
    */
@@ -252,6 +288,15 @@ export class RegressionReportAssemblerService {
     for (const exec of executions) {
       const testCaseName = namesMap.get(exec.testCaseId) || 'Unknown';
       const testId = exec.result?.testId;
+
+      // Case-level "couldn't start" reason (device attach / session setup / runner
+      // unreachable) — only present when the run failed before any step ran. When
+      // set, the test never executed, so health aggregation below is skipped: its
+      // "no console errors" findings would be misleadingly green.
+      const failureReason = RegressionReportAssemblerService.deriveFailureReason(
+        testId ? testResultsMap.get(testId) : null,
+        exec.platform,
+      );
 
       // Build steps from executed_steps
       const steps: RunReportStep[] = [];
@@ -377,6 +422,13 @@ export class RegressionReportAssemblerService {
               .filter((s: string) => typeof s === 'string' && !s.startsWith('data:'))
               .map((url: string): RunReportScreenshot => ({ url, stepName: 'Final screenshot' }));
           }
+          // "Step 0": the starting screen captured before any step ran (mobile).
+          // Stored as a URL on mobile_test_results.metadata.initialScreenshot.
+          // Lead the gallery with it so the report reads start → steps → final.
+          const initialShot = testResult.metadata?.initialScreenshot;
+          if (typeof initialShot === 'string' && initialShot && !initialShot.startsWith('data:')) {
+            execArtifacts.screenshots.unshift({ url: initialShot, stepName: 'Step 0: Initial screen' });
+          }
           if (testResult.logs) {
             execArtifacts.consoleLogs = Array.isArray(testResult.logs) ? testResult.logs : [];
           }
@@ -400,9 +452,14 @@ export class RegressionReportAssemblerService {
             };
           }
 
-          // Aggregate health checks from existing test result data
+          // Aggregate health checks from existing test result data — but NOT when
+          // the test never ran (job-level failure). A non-started test has no real
+          // console/network signal; emitting "no errors" here would render as a
+          // misleading green health badge next to a "couldn't start" failure.
           const isMobileExec = typeof exec.platform === 'string' && exec.platform.startsWith('mobile');
-          execHealthChecks = HealthCheckAggregatorService.aggregateFromTestResult(testResult, { isMobile: isMobileExec });
+          execHealthChecks = failureReason
+            ? undefined
+            : HealthCheckAggregatorService.aggregateFromTestResult(testResult, { isMobile: isMobileExec });
 
           // Aggregate into run-level artifacts
           if (execArtifacts.videoUrl && !aggArtifacts.videoUrl) aggArtifacts.videoUrl = execArtifacts.videoUrl;
@@ -514,8 +571,14 @@ export class RegressionReportAssemblerService {
 
       // V14: Extract failure classification from AI summary
       const execAiSummary = testId ? (testResultsMap.get(testId)?.ai_summary) : null;
-      const failureClassification = execAiSummary?.failureClassification || null;
+      const aiFailureClassification = execAiSummary?.failureClassification || null;
       const rootCauseStep = execAiSummary?.rootCauseStep ?? null;
+      // An environment failure means the test never ran, so the AI verdict (run
+      // on an artifact-less failed row) can't be trusted — the derived
+      // 'environment' category WINS over any AI classification. `failureReason`
+      // was computed at the top of the loop (also gates health aggregation).
+      const failureClassification =
+        failureReason?.category === 'environment' ? 'environment' : aiFailureClassification;
 
       reportExecutions.push({
         id: exec.id,
@@ -543,6 +606,7 @@ export class RegressionReportAssemblerService {
         ...(execAiSummary?.classificationEvidence?.length > 0 && {
           classificationEvidence: execAiSummary.classificationEvidence,
         }),
+        ...(failureReason && { failureReason }),
       });
     }
 

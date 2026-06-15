@@ -3442,6 +3442,23 @@ export class SnapshotCollector {
       return 'No interactive elements found on page.';
     }
 
+    // Normalize an anchor href for the LLM picker: keep host+path(+hash) so
+    // same-text links ("Learn more" ×6) become distinguishable, but DROP the
+    // query string — it can carry tokens/session ids/OTPs and exposing it in
+    // the prompt would violate the secret-redaction invariant. Hash is kept
+    // because hash-router SPAs encode the route there. Length-capped to keep
+    // token cost bounded.
+    const normalizeHref = (raw: string): string => {
+      try {
+        const u = new URL(raw);
+        const out = `${u.host}${u.pathname}${u.hash}`.replace(/\/$/, '');
+        return out.length > 120 ? `${out.slice(0, 120)}…` : out;
+      } catch {
+        const noQuery = raw.split(/[?]/)[0];
+        return noQuery.length > 120 ? `${noQuery.slice(0, 120)}…` : noQuery;
+      }
+    };
+
     // Filter elements: pruner-based (dynamic) or legacy (priority sort + cap)
     let elements = snapshot.elements;
     if (keepRefs && keepRefs.size > 0) {
@@ -3539,6 +3556,17 @@ export class SnapshotCollector {
         }
 
         if (el.context) line += ` (${el.context})`;  // Parent context
+        // Stable identity hints for the picker LLM. These are already
+        // collected (and filtered: liveStableId drops React/Radix/MUI
+        // generated ids) and feed the resolver's TargetFingerprint — surfacing
+        // them here lets the LLM disambiguate same-text siblings (e.g. 6×
+        // "Learn more" links that differ only by href) instead of guessing.
+        if (el.testIdAttr) line += ` testid="${el.testIdAttr}"`;
+        if (el.id) line += ` id="${el.id}"`;
+        if (el.href) line += ` href="${normalizeHref(el.href)}"`;
+        // First standalone text fragment — disambiguates wrapped anchors like
+        // <a><h3>Title</h3><span>desc</span></a> whose name is the glued whole.
+        if (el.firstTextFragment) line += ` firstText="${el.firstTextFragment}"`;
         if (el.type) line += ` type=${el.type}`;
         if (el.placeholder) line += ` placeholder="${el.placeholder}"`;
         if (el.disabled) line += ' [DISABLED]';
