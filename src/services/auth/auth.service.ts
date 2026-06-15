@@ -1104,7 +1104,10 @@ export async function requestPasswordReset(
 
   try {
     const { error } = await supabase.auth.resetPasswordForEmail(email.trim().toLowerCase(), {
-      redirectTo: redirectTo || `${env.FRONTEND_URL}/auth/reset-password`,
+      // Path must match the actual frontend route (/reset-password, NOT
+      // /auth/reset-password — the latter 404s). Clients usually pass their own
+      // redirectTo; this is the fallback when they don't.
+      redirectTo: redirectTo || `${env.FRONTEND_URL}/reset-password`,
     });
 
     if (error) {
@@ -1185,48 +1188,102 @@ export async function resendVerificationEmail(
 }
 
 /**
- * Update password
- * @param accessToken - User access token
- * @param newPassword - New password
- * @returns Success status
+ * Resolve a Supabase recovery credential into a user id, tolerant of every
+ * shape a "reset password" link can deliver. Supabase's recovery flow has
+ * changed over time and depends on dashboard config, so we accept all three:
+ *
+ *   - `code`        — PKCE flow (current default). Exchanged for a session.
+ *   - `tokenHash`   — `?token_hash=...&type=recovery` links. Verified via OTP.
+ *   - `accessToken` — implicit flow (`#access_token=...`) / legacy. Read directly.
+ *
+ * Returns the userId. Throws on an invalid/expired credential. Used by
+ * {@link recoverPassword}; not exported as an endpoint on its own.
  */
-export async function updatePassword(
-  accessToken: string,
-  newPassword: string
-): Promise<{ success: boolean }> {
-  // Validate inputs
-  if (!accessToken || typeof accessToken !== 'string' || accessToken.length < 10) {
-    throw new Error('Invalid access token');
+async function resolveRecoveryUserId(params: {
+  code?: string;
+  tokenHash?: string;
+  accessToken?: string;
+}): Promise<string> {
+  const { code, tokenHash, accessToken } = params;
+
+  // 1) PKCE: ?code=... → exchange for a session, read its user.
+  // exchangeCodeForSession only exists on the anon client AND writes the
+  // recovered session into that shared singleton (persistSession:true). Clear
+  // it in finally so we never leave a stranger's session — and its background
+  // autoRefresh timer — alive on the process-wide client.
+  if (code && typeof code === 'string') {
+    try {
+      const { data, error } = await supabase.auth.exchangeCodeForSession(code);
+      if (error || !data.user) {
+        logger.error('[AUTH] Recovery code exchange failed', { error: error?.message });
+        throw new Error('Invalid or expired reset link');
+      }
+      return data.user.id;
+    } finally {
+      // Local-only: drop the session this exchange stored on the shared client.
+      await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined);
+    }
   }
+
+  // 2) token_hash: verify as a recovery OTP. Use the ADMIN client
+  // (persistSession:false) so the verified session is never stored on a shared
+  // client — no contamination, nothing to clean up.
+  if (tokenHash && typeof tokenHash === 'string') {
+    const { data, error } = await supabaseAdmin.auth.verifyOtp({
+      token_hash: tokenHash,
+      type: 'recovery',
+    });
+    if (error || !data.user) {
+      logger.error('[AUTH] Recovery token_hash verify failed', { error: error?.message });
+      throw new Error('Invalid or expired reset link');
+    }
+    return data.user.id;
+  }
+
+  // 3) implicit / legacy: a real JWT access_token. getUser(jwt) is token-scoped
+  // and writes no session — safe on the admin client.
+  if (accessToken && typeof accessToken === 'string') {
+    const { data, error } = await supabaseAdmin.auth.getUser(accessToken);
+    if (error || !data.user) {
+      logger.error('[AUTH] Recovery access_token invalid', { error: error?.message });
+      throw new Error('Invalid or expired reset link');
+    }
+    return data.user.id;
+  }
+
+  throw new Error('Missing reset credential (code, token_hash, or access_token required)');
+}
+
+/**
+ * Complete a password reset from a recovery link. Accepts whichever credential
+ * the link delivered ({@link resolveRecoveryUserId}) plus the new password,
+ * resolves the user, and sets the password via the admin API. This is the
+ * endpoint the "Reset Password" email link flow should call — it works
+ * regardless of whether Supabase is on the PKCE or implicit recovery flow.
+ */
+export async function recoverPassword(params: {
+  code?: string;
+  tokenHash?: string;
+  accessToken?: string;
+  newPassword: string;
+}): Promise<{ success: boolean }> {
+  const { newPassword } = params;
 
   if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 6) {
     throw new Error('Password must be at least 6 characters long');
   }
 
   try {
-    // Get user data from token
-    const { data: authData, error: getUserError } = await supabase.auth.getUser(accessToken);
+    const userId = await resolveRecoveryUserId(params);
 
-    if (getUserError || !authData.user) {
-      logger.error('[AUTH] Invalid token for password update', {
-        error: getUserError?.message,
-        hasUser: !!authData.user,
-      });
-      throw new Error('Invalid token');
-    }
+    logger.info('[AUTH] Recovering password', { userId });
 
-    const userId = authData.user.id;
-
-    logger.info('[AUTH] Updating password', { userId });
-
-    // Use admin API to update password
-    const { error } = await supabaseAdmin.auth.admin.updateUserById(
-      userId,
-      { password: newPassword }
-    );
+    const { error } = await supabaseAdmin.auth.admin.updateUserById(userId, {
+      password: newPassword,
+    });
 
     if (error) {
-      logger.error('[AUTH] Password update error', {
+      logger.error('[AUTH] Password recovery update error', {
         userId,
         error: error.message,
         code: error.status,
@@ -1234,11 +1291,10 @@ export async function updatePassword(
       throw error;
     }
 
-    logger.info('[AUTH] Password updated successfully', { userId });
-
+    logger.info('[AUTH] Password recovered successfully', { userId });
     return { success: true };
   } catch (error) {
-    logger.error('[AUTH] Password update error', {
+    logger.error('[AUTH] Password recovery error', {
       error: error instanceof Error ? error.message : String(error),
     });
     throw error;

@@ -17,8 +17,8 @@ import {
   login,
   logout,
   me,
+  passwordRecover,
   passwordResetRequest,
-  passwordUpdate,
   refresh,
   resendVerification,
   sendInfoEmailHandler,
@@ -62,8 +62,11 @@ const resendVerificationSchema = z.object({
   redirectTo: z.string().url().optional(),
 });
 
-const passwordUpdateSchema = z.object({
+const passwordRecoverSchema = z.object({
   newPassword: z.string().min(6, 'Password must be at least 6 characters'),
+  code: z.string().min(1).optional(),
+  tokenHash: z.string().min(1).optional(),
+  accessToken: z.string().min(1).optional(),
 });
 
 const updateProfileSchema = z.object({
@@ -616,38 +619,16 @@ router.get('/verify-email', asyncHandler(async (req: Request, res: Response) => 
 }));
 
 /**
- * @swagger
- * /api/v1/auth/password/update:
- *   post:
- *     summary: Обновить пароль
- *     description: Обновляет пароль авторизованного пользователя
- *     tags: [Auth]
- *     security:
- *       - bearerAuth: []
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required:
- *               - newPassword
- *             properties:
- *               newPassword:
- *                 type: string
- *                 minLength: 6
- *                 example: "newpassword123"
- *     responses:
- *       200:
- *         description: Пароль обновлен
- *       401:
- *         description: Не авторизован
+ * POST /api/v1/auth/password/recover
+ * Complete a password reset from a recovery email link. Accepts the recovery
+ * credential in any Supabase shape (code / tokenHash / accessToken) + the new
+ * password. Public (the recovery credential IS the auth).
  */
-router.post('/password/update', asyncHandler(async (req: Request, res: Response) => {
+router.post('/password/recover', asyncHandler(async (req: Request, res: Response) => {
   try {
-    const validatedData = passwordUpdateSchema.parse(req.body);
+    const validatedData = passwordRecoverSchema.parse(req.body);
     req.body = validatedData;
-    await passwordUpdate(req, res);
+    await passwordRecover(req, res);
   } catch (error) {
     handleValidationError(error);
   }
