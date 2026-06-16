@@ -141,6 +141,9 @@ const wheelCoalesceState = new Map<string, {
   lastX: number | undefined;
   lastY: number | undefined;
   flushScheduled: boolean;
+  /** Last time a forced preview:page snapshot was emitted for this scroll —
+   *  used to throttle the per-event force-snapshot (see WHEEL_SNAPSHOT_THROTTLE_MS). */
+  lastSnapshotAt: number;
 }>();
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -770,9 +773,21 @@ interface StreamContext {
 }
 const previewStreamContext = new Map<string, StreamContext>();
 
-// DOM update interval for preview:page (check every 500ms, emit only on change)
-const DOM_UPDATE_INTERVAL_MS = 500;
+// DOM update interval for preview:page (check every 1000ms, emit only on change).
+// This is the always-on cost: a full page.evaluate() snapshot per tick per session.
+// 1000ms (was 500ms) halves that baseline. The frontend batches `ln` updates and
+// gates spinners on `ln:action:result` (not this cadence), and action/nav paths emit
+// their own forced snapshot — so only autonomous (non-action) DOM changes reflect in
+// the node panel up to ~1s later instead of ~0.5s.
+const DOM_UPDATE_INTERVAL_MS = 1000;
 const activeDomUpdateIntervals = new Map<string, NodeJS.Timeout>();
+
+// Min interval between forced (throttle-bypassing) preview:page snapshots triggered
+// by wheel events. The wheel side-effect used to force a fresh page.evaluate() on
+// EVERY WS event (~8/s during a scroll), piling up heavy snapshots. The periodic
+// DOM tick (DOM_UPDATE_INTERVAL_MS, onlyIfChanged) still lands the final state after
+// the scroll settles, so the panel catches up within ≤1000ms regardless.
+const WHEEL_SNAPSHOT_THROTTLE_MS = 400;
 const activeDomUpdateTicks = new Set<string>();
 
 /**
@@ -3315,6 +3330,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           lastX: typeof data.x === 'number' ? data.x : undefined,
           lastY: typeof data.y === 'number' ? data.y : undefined,
           flushScheduled: false,
+          lastSnapshotAt: 0,
         };
         wheelCoalesceState.set(wheelKey, wState);
       } else {
@@ -3347,8 +3363,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       // wheel call lands in Playwright. Errors from the actual page.mouse.wheel() call
       // are logged at debug level inside executeMouseWheel and don't affect this path.
       {
-        // Scroll may reveal lazy-loaded content – always emit for visual feedback
-        setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+        // Scroll may reveal lazy-loaded content – emit a fresh snapshot for visual
+        // feedback, but THROTTLE it: forcing a throttle-bypassing page.evaluate() on
+        // every wheel event piled up heavy snapshots (~8/s) and was the dominant
+        // preview-lag source. Leading-edge throttle emits at most once per
+        // WHEEL_SNAPSHOT_THROTTLE_MS; the periodic DOM tick lands the trailing state.
+        const nowTs = Date.now();
+        if (nowTs - wState.lastSnapshotAt >= WHEEL_SNAPSHOT_THROTTLE_MS) {
+          wState.lastSnapshotAt = nowTs;
+          setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+        }
 
         // Editor trace: log scroll input
         const scrollTrace = EditorTraceService.get(previewSessionId);
