@@ -45,6 +45,7 @@
  */
 
 import { logger } from '@/utils/core/logger';
+import { localTraceFilenameParts } from '@/utils/helpers/trace-filename';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -167,9 +168,8 @@ export class LiteTraceWriter {
 
     // Create file path: test_logs/<date>_<time>_<testId>.jsonl
     // Date+time first for easy sorting; testId last for identification.
-    const now = new Date();
-    const datePart = now.toISOString().slice(0, 10); // YYYY-MM-DD
-    const timePart = now.toISOString().slice(11, 19).replace(/:/g, '-'); // HH-MM-SS
+    // Local wall-clock (not UTC) so the filename matches when you saw it.
+    const { datePart, timePart } = localTraceFilenameParts();
     const safeTestId = LiteTraceWriter.sanitizeFilePart(this.testId);
     this.filePath = path.join(this.logsDir, `${datePart}_${timePart}_${safeTestId}.jsonl`);
 
