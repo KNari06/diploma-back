@@ -12,7 +12,7 @@ import {
   signOut,
   signUpWithEmail,
   BusinessEmailError,
-  updatePassword,
+  recoverPassword,
   updateUserProfile,
   invalidateAuthCache,
   invalidateAuthCacheForUser,
@@ -521,42 +521,48 @@ export const resendVerification = async (req: Request, res: Response): Promise<v
 };
 
 /**
- * Update password
- * POST /auth/password/update
+ * Complete a password reset from a recovery email link.
+ * POST /auth/password/recover
+ * Body: { newPassword, and one of: code | tokenHash | accessToken }
+ *
+ * Tolerates every Supabase recovery link shape (PKCE ?code, ?token_hash, or
+ * implicit #access_token) so the reset works regardless of the project's auth
+ * flow config. Bearer header is also accepted as the accessToken fallback.
  */
-export const passwordUpdate = async (req: Request, res: Response): Promise<void> => {
+export const passwordRecover = async (req: Request, res: Response): Promise<void> => {
   try {
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.replace('Bearer ', '') || '';
-    const { newPassword } = req.body;
+    const { code, tokenHash, accessToken, newPassword } = req.body || {};
+    const bearer = req.headers.authorization?.replace('Bearer ', '') || undefined;
 
-    if (!token) {
-      res.status(401).json({
-        success: false,
-        error: 'Unauthorized: No token provided',
-      });
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 6) {
+      res.status(400).json({ success: false, error: 'Password must be at least 6 characters' });
       return;
     }
 
-    if (!newPassword || newPassword.length < 6) {
+    const resolvedAccessToken =
+      (typeof accessToken === 'string' && accessToken) || bearer || undefined;
+
+    if (!code && !tokenHash && !resolvedAccessToken) {
       res.status(400).json({
         success: false,
-        error: 'Password must be at least 6 characters',
+        error: 'Missing reset credential (code, tokenHash, or accessToken)',
       });
       return;
     }
 
-    await updatePassword(token, newPassword);
-
-    res.json({
-      success: true,
-      message: 'Password updated successfully',
+    await recoverPassword({
+      code: typeof code === 'string' ? code : undefined,
+      tokenHash: typeof tokenHash === 'string' ? tokenHash : undefined,
+      accessToken: resolvedAccessToken,
+      newPassword,
     });
+
+    res.json({ success: true, message: 'Password reset successfully' });
   } catch (error: any) {
-    logger.error('Password update error', error);
+    logger.error('Password recover error', { error: error?.message });
     res.status(400).json({
       success: false,
-      error: error.message || 'Failed to update password',
+      error: error.message || 'Failed to reset password',
     });
   }
 };

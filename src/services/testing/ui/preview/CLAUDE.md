@@ -54,6 +54,7 @@ Element resolution and auto-healing serve all three.
 |---|---|
 | [html-context.service.ts](html-context.service.ts) | Builds compact page-structure context (scene summary) for LLM prompts. |
 | [preview-video-stream.service.ts](preview-video-stream.service.ts) | CDP screencast for live video. Owns the **screencast** CDP session — do NOT piggyback `CdpSnapshotService` on it (100% freeze measured). |
+| [preview-dirty-observer.service.ts](preview-dirty-observer.service.ts) | (Phase 2/3) Event-driven `preview:page` trigger. In-page `MutationObserver` (animation-filtered, throttled, `subtree:true`) signals real DOM changes via `exposeFunction` → server collects+emits on change instead of polling. Re-injects on `framenavigated`, re-armed on page switch, torn down in `stopPreviewStreams` + on page close. Flag-gated (`PREVIEW_DIRTY_OBSERVER` / `_SHADOW`, default OFF). When active+driving, the periodic DOM tick downshifts to `DOM_UPDATE_SAFETY_NET_INTERVAL_MS` (the tick stays as the backstop for cross-origin iframes / text-only mutations). When OFF, never started → behaviour unchanged. |
 | [preview-devtools-collector.service.ts](preview-devtools-collector.service.ts) | Console / Network / HTML / Accessibility tabs in the editor. |
 | [editor-trace.service.ts](editor-trace.service.ts) | JSONL traces for every step capture/apply. Used for postmortem debugging. |
 | [editor-trace-upload.ts](editor-trace-upload.ts) | Upload trace bundles to storage when user reports a problem. |
