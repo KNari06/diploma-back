@@ -774,12 +774,17 @@ interface StreamContext {
 const previewStreamContext = new Map<string, StreamContext>();
 
 // DOM update interval for preview:page (check every 1000ms, emit only on change).
-// This is the always-on cost: a full page.evaluate() snapshot per tick per session.
-// 1000ms (was 500ms) halves that baseline. The frontend batches `ln` updates and
-// gates spinners on `ln:action:result` (not this cadence), and action/nav paths emit
-// their own forced snapshot — so only autonomous (non-action) DOM changes reflect in
-// the node panel up to ~1s later instead of ~0.5s.
+// NORMAL cadence, used when the event-driven dirty observer is off. 1000ms (was
+// 500ms) halves the always-on baseline; the frontend batches `ln` updates and gates
+// spinners on `ln:action:result` (not this cadence), and action/nav paths emit their
+// own forced snapshot — so only autonomous (non-action) DOM changes reflect up to ~1s
+// later instead of ~0.5s.
 const DOM_UPDATE_INTERVAL_MS = 1000;
+// Safety-net cadence used ONLY when the dirty observer is actively driving emits
+// (Phase 3). The observer catches real DOM changes within a frame; this slow tick
+// just backstops its blind spots (cross-origin iframes, missed signals after a
+// failed re-inject, pure text-only mutations).
+const DOM_UPDATE_SAFETY_NET_INTERVAL_MS = 3000;
 const activeDomUpdateIntervals = new Map<string, NodeJS.Timeout>();
 
 // Min interval between forced (throttle-bypassing) preview:page snapshots triggered
@@ -1095,7 +1100,12 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
     } catch { /* non-critical */ }
 
     // Start DOM update interval (emit preview:page only on change)
-    const domInterval = setInterval(async () => {
+    // Collect a DOM snapshot and emit preview:page if it changed. Shared by the
+    // periodic tick AND (when enabled) the event-driven dirty observer, so both
+    // use identical guards (no-overlap via the tick guard, skip-during-run,
+    // shutdown-race tolerance) and the same signature dedup — no second copy of
+    // this delicate logic.
+    const collectAndEmitDomSnapshot = async (source: 'tick' | 'dirty-observer'): Promise<void> => {
       if (!acquireDomTickGuard(previewSessionId, activeDomUpdateTicks)) {
         return;
       }
@@ -1157,6 +1167,7 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
 
             logger.debug('[PREVIEW_STREAM] Emitted preview:page (DOM changed)', {
               previewSessionId,
+              source,
               domVersion: snapshot.domVersion,
               nodeCount: snapshot.domNodes?.length || 0,
             });
@@ -1188,7 +1199,64 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
       } finally {
         releaseDomTickGuard(previewSessionId, activeDomUpdateTicks);
       }
-    }, DOM_UPDATE_INTERVAL_MS);
+    };
+
+    // Phase 2/3: event-driven snapshot trigger (flag-gated, default OFF). An
+    // in-page MutationObserver signals real DOM changes so we collect+emit on
+    // the change instead of polling. When the observer is confirmed running and
+    // driving emits (real flag, not shadow), the periodic tick below is
+    // downshifted to a slow safety-net cadence; otherwise the tick keeps its
+    // normal cadence. When the flag is OFF this whole block is a no-op and the
+    // tick runs normally — behaviour is unchanged.
+    //
+    // Imported into the function scope (not the critical stream-setup import
+    // block) so an import hiccup can never break video/devtools/tick setup, and
+    // so the page-switch handler below can re-arm the observer on the new page.
+    let observerApi: typeof import('@/services/testing/ui/preview/preview-dirty-observer.service') | null = null;
+    try {
+      observerApi = await import('@/services/testing/ui/preview/preview-dirty-observer.service');
+    } catch (err) {
+      logger.debug('[DIRTY_OBSERVER] module import failed (non-fatal)', {
+        previewSessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Server-side handler for an in-page "DOM dirty" signal. Shadow mode logs
+    // only (the tick still drives); real mode collects + emits via the shared path.
+    const handleDirtySignal = (): void => {
+      if (!observerApi) return;
+      if (observerApi.isDirtyObserverShadowOnly()) {
+        logger.info('[DIRTY_OBSERVER] (shadow) DOM dirty — tick still drives emit', { previewSessionId });
+        return;
+      }
+      void collectAndEmitDomSnapshot('dirty-observer');
+    };
+
+    let tickIntervalMs = DOM_UPDATE_INTERVAL_MS;
+    if (observerApi && observerApi.isDirtyObserverActive()) {
+      try {
+        const started = await observerApi.startDirtyObserver({ previewSessionId, page, onDirty: handleDirtySignal });
+        if (started && !observerApi.isDirtyObserverShadowOnly()) {
+          // Observer confirmed running and driving emits — downshift the tick so
+          // it stops doing redundant full snapshots and becomes a pure backstop.
+          tickIntervalMs = DOM_UPDATE_SAFETY_NET_INTERVAL_MS;
+          logger.info('[DIRTY_OBSERVER] tick downshifted to safety-net cadence', {
+            previewSessionId,
+            intervalMs: tickIntervalMs,
+          });
+        }
+      } catch (err) {
+        logger.debug('[DIRTY_OBSERVER] start wiring failed (non-fatal)', {
+          previewSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    const domInterval = setInterval(() => {
+      void collectAndEmitDomSnapshot('tick');
+    }, tickIntervalMs);
 
     activeDomUpdateIntervals.set(previewSessionId, domInterval);
 
@@ -1209,6 +1277,23 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
           // Restart devtools collectors
           devtoolsRegistry.stop(previewSessionId);
           devtoolsRegistry.start(previewSessionId, room, newPage, nsp);
+
+          // Phase 3: re-arm the dirty observer on the NEW page — the previous
+          // observer was bound to the old page object and dies with it. Without
+          // this, after a page switch the popup's later autonomous DOM changes
+          // would only be caught by the (now slow) safety-net tick. No-op when
+          // the observer flag is OFF.
+          if (observerApi && observerApi.isDirtyObserverActive()) {
+            try {
+              await observerApi.cancelDirtyObserverForSession(previewSessionId);
+              await observerApi.startDirtyObserver({ previewSessionId, page: newPage, onDirty: handleDirtySignal });
+            } catch (err) {
+              logger.debug('[DIRTY_OBSERVER] re-arm after page switch failed (non-fatal)', {
+                previewSessionId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
 
           logger.info('[PREVIEW_STREAM] Streams restarted after page switch', { previewSessionId });
 
@@ -1325,6 +1410,19 @@ const stopPreviewStreams = async (previewSessionId: string): Promise<void> => {
     activeDomUpdateIntervals.delete(previewSessionId);
   }
   activeDomUpdateTicks.delete(previewSessionId);
+
+  // Phase 2: tear down the event-driven dirty observer (no-op if never started).
+  // The observer also self-cleans on page 'close', so this covers the explicit
+  // stream-stop path (last subscriber leaves / session stop).
+  try {
+    const { cancelDirtyObserverForSession } = await import('@/services/testing/ui/preview/preview-dirty-observer.service');
+    await cancelDirtyObserverForSession(previewSessionId);
+  } catch (err) {
+    logger.debug('[DIRTY_OBSERVER] stop cleanup failed (non-fatal)', {
+      previewSessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 
   // Stop video stream
   try {
@@ -4244,8 +4342,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'refresh', true);
-        // Snapshot is already kicked off inside refreshPage() via setImmediate —
-        // the DOM-update interval (500ms) will pick it up and emit preview:page.
+        // Emit the refreshed DOM explicitly instead of waiting for the periodic
+        // DOM tick to pick it up. After a same-page reload the tick sees
+        // changed:false (refreshPage's own collect already advanced the signature),
+        // so delivery used to depend on a progressive re-render happening to
+        // coincide with a tick. emitSnapshotForHandshake force-collects + emits with
+        // bypassDedup, so the node panel updates deterministically and independently
+        // of the poll cadence (prerequisite for event-driven snapshotting).
+        setImmediate(() => {
+          void emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId);
+        });
 
         // V13: Re-arm the first-frame guarantee instead of issuing a single
         // injectFrame. After page.reload() the existing CDP screencast may
@@ -4392,8 +4498,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'back', true);
-        // Snapshot is already kicked off inside goBack() via setImmediate —
-        // the DOM-update interval (500ms) will pick it up and emit preview:page.
+        // Emit the post-back DOM explicitly instead of relying on the periodic tick
+        // (see preview:page:refresh for the rationale — same-tab history nav doesn't
+        // trigger onPageSwitch, so the tick can't be counted on to deliver it).
+        // Decouples nav delivery from poll cadence.
+        setImmediate(() => {
+          void emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId);
+        });
 
         // V13: Re-arm first-frame guarantee instead of single injectFrame.
         try {
@@ -4476,8 +4587,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'forward', true);
-        // Snapshot is already kicked off inside goForward() via setImmediate —
-        // the DOM-update interval (500ms) will pick it up and emit preview:page.
+        // Emit the post-forward DOM explicitly instead of relying on the periodic
+        // tick (see preview:page:refresh for the rationale). Decouples nav delivery
+        // from poll cadence.
+        setImmediate(() => {
+          void emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId);
+        });
 
         // V13: Re-arm first-frame guarantee instead of single injectFrame.
         try {
