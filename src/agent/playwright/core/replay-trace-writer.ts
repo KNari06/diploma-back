@@ -24,6 +24,7 @@
 
 import { logger } from '@/utils/core/logger';
 import { REPLAY_TRACE_CONFIG } from '@/config/testing/playwright-tuning';
+import { localTraceFilenameParts } from '@/utils/helpers/trace-filename';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -99,9 +100,8 @@ export class ReplayTraceWriter {
 
     // File path: test_logs/regressions/{YYYY-MM-DD}_{HH-MM-SS}_{testId}.jsonl
     // (folder override: REGRESSION_LOGS_DIR / legacy REPLAY_LOGS_DIR)
-    const now = new Date();
-    const datePart = now.toISOString().slice(0, 10);
-    const timePart = now.toISOString().slice(11, 19).replace(/:/g, '-'); // HH-MM-SS
+    // Local wall-clock (not UTC) so the filename matches when you saw it.
+    const { datePart, timePart } = localTraceFilenameParts();
     const safeTestId = ReplayTraceWriter.sanitizeFilePart(this.testId);
     this.filePath = path.join(logsDir, `${datePart}_${timePart}_${safeTestId}.jsonl`);
 
