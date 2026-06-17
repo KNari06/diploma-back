@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { isValidUUID } from '@/utils/validation/validation';
+import { redactCredentials } from '@/utils/security/redact-credentials';
 import { generateEmbedding } from '../core/embedding.service';
 
 /**
@@ -78,9 +79,12 @@ export async function embedChatMessage(
     // - English: ~4 chars/token → 15K chars = ~3,750 tokens ✅
     // - Russian: ~2.5 chars/token → 15K chars = ~6,000 tokens ✅
     // - Chinese: ~1.5 chars/token → 15K chars = ~10,000 tokens ⚠️ (rare, but safe margin)
-    let truncatedContent = content;
-    if (content.length > 15000) {
-      truncatedContent = content.substring(0, 15000) + '... [truncated]';
+    // Redact secrets (pasted bot tokens / webhook URLs) before they enter the
+    // long-lived embedding store — chat_messages keeps the verbatim value, but
+    // this vector copy must not.
+    let truncatedContent = redactCredentials(content);
+    if (truncatedContent.length > 15000) {
+      truncatedContent = truncatedContent.substring(0, 15000) + '... [truncated]';
       logger.warn('[CHAT_EMBEDDINGS] Message truncated for embedding', {
         messageId,
         originalLength: content.length,

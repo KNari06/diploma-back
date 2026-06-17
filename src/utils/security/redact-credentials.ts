@@ -40,13 +40,28 @@ const VALUE = `["']?((?:[A-Za-z0-9]{6,80})|(?:[^\\s"',.;!?]*[\\d!@#$%^&*+\\-_/\\
 
 const SENSITIVE_ASSIGNMENT_RE = new RegExp(`\\b${KEYWORD}\\b${SEP}${VALUE}`, 'gi');
 
+// ─── Bare-shape secrets ──────────────────────────────────────────────────
+// Some credentials arrive WITHOUT a keyword separator — a user pastes the raw
+// value into chat ("8977713030:AAG..."). The assignment regex above can't see
+// those. Match the unmistakable shapes directly so connect-flow pastes don't
+// land verbatim in chat history / logs.
+//
+// Telegram bot token: <bot_id digits>:<35-char A-Za-z0-9_- secret>. Anchored on
+// the 30+ char tail so ordinary "12:34" / time-like tokens never match.
+const TELEGRAM_BOT_TOKEN_RE = /\b\d{6,12}:[A-Za-z0-9_-]{30,}\b/g;
+// Slack incoming webhook URL.
+const SLACK_WEBHOOK_RE = /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/_-]+/gi;
+
 /**
- * Mask credential-like assignments in a single string. Returns the sanitised
- * string; leaves non-matching prose untouched. Never throws.
+ * Mask credential-like assignments AND bare-shape secrets in a single string.
+ * Returns the sanitised string; leaves non-matching prose untouched. Never throws.
  */
 export function redactCredentials(input: string): string {
   if (!input || typeof input !== 'string') return typeof input === 'string' ? input : '';
-  return input.replace(SENSITIVE_ASSIGNMENT_RE, (_match, label) => `${label}: [REDACTED]`);
+  return input
+    .replace(SENSITIVE_ASSIGNMENT_RE, (_match, label) => `${label}: [REDACTED]`)
+    .replace(TELEGRAM_BOT_TOKEN_RE, '[REDACTED_TELEGRAM_TOKEN]')
+    .replace(SLACK_WEBHOOK_RE, '[REDACTED_SLACK_WEBHOOK]');
 }
 
 /**

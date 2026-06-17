@@ -124,6 +124,9 @@ export class ChatRepository {
     }
 
     // 1ms increment per message preserves ordering within the same batch.
+    // Content is stored verbatim so a multi-turn connect flow can read a pasted
+    // token/chat_id back on a later turn. Secrets are redacted on the way OUT to
+    // long-lived sinks (embeddings/summaries/traces), never at write time.
     const baseTime = Date.now();
     const records = validMessages.map((msg, index) => ({
       session_id: sessionId,

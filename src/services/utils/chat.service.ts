@@ -89,6 +89,10 @@ export class ChatService {
       // When saving multiple messages (user + AI), they should have different timestamps
       // to maintain correct order. Add 1ms between each message.
       const baseTime = Date.now();
+      // NOTE: message content is stored verbatim (incl. pasted bot tokens) so a
+      // multi-turn connect flow can read the value back from history on a later
+      // turn. Secrets are redacted on the way OUT to long-lived / external sinks
+      // (embeddings, summaries, JSONL traces) via redactCredentials — never here.
       const records = validMessages.map((msg, index) => ({
         session_id: sessionId,
         role: msg.role,

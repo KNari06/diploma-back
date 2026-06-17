@@ -78,6 +78,13 @@ EDGE CASES:
 - Quantitative questions about test metrics → single_tool (qa_read) — always requires tool call
 - Ambiguous request with no clear tool target → single_tool with best-guess category (confidence 0.6)
 - NEVER classify integration/setup requests as simple_chat — always use single_tool
+- Connect/setup, even when the service name is vague or implicit → single_tool with that service's category:
+  • "подключи телеграм" / "connect telegram" / "хочу интегрировать телеграм" → telegram
+  • "настрой вебхук slack" / "connect my slack webhook" / "подключи slack" → slack
+  • "authorize jira" / "подключи jira" / "интегрируй jira" → jira
+  • "connect github" / "привяжи гитхаб" → github
+  • "integrate notion" / "подключи notion" → notion
+- Mid-setup FOLLOW-UP — the previous turn asked for a credential/value and the user answers, pastes it, or asks how to get it ("вот токен ...", "открыл бот, как получить chat_id", "where do I find the webhook url") → single_tool with the SAME integration category from the recent conversation. NEVER simple_chat — the connect flow is still active.
 - "найди последний тест кейс" / "find the last test case" → single_tool (qa_read) — temporal queries ALWAYS need tools
 - "покажи все тесты" / "show all tests" → single_tool (qa_read)
 - "сколько у меня тестов?" / "how many tests?" → single_tool (qa_read)

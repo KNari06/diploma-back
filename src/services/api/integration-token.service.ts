@@ -79,7 +79,10 @@ export class IntegrationTokenService {
         query = query.or(`workspace_id.eq.${workspaceId},workspace_id.is.null`);
       }
 
+      // Workspace-scoped token wins over global even if older — a stale global
+      // row must not shadow the integration connected for this workspace.
       const { data, error } = await query
+        .order('workspace_id', { ascending: false, nullsFirst: false })
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();

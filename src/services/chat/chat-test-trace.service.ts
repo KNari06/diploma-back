@@ -25,6 +25,7 @@
 
 import { LiteTraceWriter } from '@/agent/core/lite/trace/lite-trace-writer';
 import { logger } from '@/utils/core/logger';
+import { redactCredentials } from '@/utils/security/redact-credentials';
 import * as path from 'path';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -141,11 +142,14 @@ export class ChatTestTraceService {
    */
   private static scrubValue(value: unknown): unknown {
     if (typeof value !== 'string') return value;
-    return value
+    const masked = value
       // Mask resolved/placeholder secret references.
       .replace(/\{\{\s*secrets\.[^}]+\}\}/gi, '[SECRET]')
       // Mask "password: xxx" / "пароль xxx" style inline credentials.
       .replace(/\b(password|passwd|pwd|пароль|secret|token|otp|api[_-]?key)\b\s*[:=]?\s*\S+/gi, '$1 [REDACTED]');
+    // Also mask bare-shape secrets the keyword regex above misses — a pasted
+    // Telegram bot token / Slack webhook with no preceding keyword.
+    return redactCredentials(masked);
   }
 
   private static scrubDeep(obj: Record<string, unknown>): Record<string, unknown> {

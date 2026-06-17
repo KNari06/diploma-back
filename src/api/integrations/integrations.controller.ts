@@ -1087,6 +1087,18 @@ export async function setupTelegram(req: Request, res: Response) {
       return;
     }
 
+    // Validate chat_id SHAPE — numeric id or @channel handle, never a bot
+    // username (storing the bot username here makes every send fail).
+    const { isValidTelegramChatId } = await import('@/services/api/telegram.service');
+    if (!isValidTelegramChatId(chat_id)) {
+      res.status(400).json({
+        success: false,
+        error:
+          'Invalid chat_id. It must be a numeric chat ID (e.g. 8238452651, or a negative number for groups) or a public @channel handle — not the bot username. Message your bot and get the numeric chat ID from @userinfobot or @getidsbot.',
+      });
+      return;
+    }
+
     // Save token to integration_tokens table
     const savedToken = await IntegrationTokenService.saveToken(
       userId,

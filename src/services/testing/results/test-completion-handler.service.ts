@@ -784,8 +784,47 @@ export class TestCompletionHandlerService {
         userId,
         runId,
       });
-      // Don't throw - Telegram failure shouldn't break completion pipeline
+      // A token EXISTS but delivery failed — the user configured Telegram and
+      // would otherwise never know it silently broke. Surface it in-app with an
+      // actionable reason. Best-effort: never let this break the pipeline.
+      await this.notifyTelegramDeliveryFailure(userId, runId, error).catch(() => {});
     }
+  }
+
+  /**
+   * Map a Telegram send failure to an in-app notification so the user learns
+   * their configured bot stopped delivering (and why). Best-effort.
+   */
+  private static async notifyTelegramDeliveryFailure(
+    userId: string,
+    runId: string,
+    error: unknown,
+  ): Promise<void> {
+    const msg = error instanceof Error ? error.message : String(error);
+    let reason: string;
+    if (/Telegram API error: (401|403)/i.test(msg) || /Unauthorized/i.test(msg)) {
+      reason = 'Your bot token is invalid or was revoked. Reconnect Telegram with a fresh token from @BotFather.';
+    } else if (/chat not found|invalid.*chat|peer_id_invalid|chat_id is empty/i.test(msg)) {
+      reason = 'The chat ID is wrong or the bot was never started in that chat. Message your bot, get the numeric chat ID from @userinfobot, then reconnect Telegram.';
+    } else {
+      reason = 'We could not deliver the message to Telegram. Check your Telegram integration settings.';
+    }
+
+    await NotificationService.createNotification({
+      userId,
+      type: 'personal',
+      category: 'system',
+      title: 'Telegram notification not delivered',
+      message: reason,
+      actionUrl: '/integrations',
+      metadata: {
+        runId,
+        kind: 'telegram_delivery_failure',
+        // Fires at most once per run — run finalization is gated by the
+        // optimistic lock in recomputeRunStatus, so no extra dedupe needed.
+        dedupeKey: `telegram_delivery_failure:${runId}`,
+      },
+    });
   }
 
   /**
