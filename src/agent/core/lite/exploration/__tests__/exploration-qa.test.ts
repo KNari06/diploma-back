@@ -12,13 +12,14 @@
  */
 
 import { TestCaseBuilder } from '../test-case-builder';
-import { toIntentSteps, toIntentTestCase } from '../types';
-import type {
-  DiscoveredStep,
-  DiscoveredTestCase,
-  FlowExplorationTask,
-  EntryPoint,
-  ExplorationConfig,
+import {
+  toIntentSteps,
+  toIntentTestCase,
+  type DiscoveredStep,
+  type DiscoveredTestCase,
+  type FlowExplorationTask,
+  type EntryPoint,
+  type ExplorationConfig,
 } from '../types';
 import type { ExplorationTree } from '../exploration-tree';
 import type { BudgetTracker } from '../budget-tracker';
@@ -169,6 +170,83 @@ describe('toIntentSteps — action type mapping completeness', () => {
     const result = toIntentSteps(steps);
     expect(result[0].bindingHints).toBeDefined();
     expect(result[0].bindingHints!.label).toBe('submit-btn');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPILED-PLAN PROPAGATION
+// A DiscoveredStep frozen with a compiled locator plan (captured at action
+// time in flow-runner) must carry that plan into the persisted IntentStep so
+// the first regression run hits replay's stage-1 fast path instead of
+// re-resolving every element via the LLM. Before this, toIntentSteps dropped
+// `compiled` entirely (0/183 prod exploration cases had a plan).
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('toIntentSteps — compiled locator plan propagation', () => {
+  /** Minimal valid CompiledStepPlan with one locator. */
+  function makeCompiled(): NonNullable<DiscoveredStep['compiled']> {
+    return {
+      locatorPlan: [
+        { strategy: 'testId', value: 'submit', confidence: 0.95 },
+      ],
+      action: { type: 'click' },
+      context: { pageUrl: 'https://x.com', compiledAt: '2026-06-17T00:00:00.000Z' },
+      unverified: false,
+    };
+  }
+
+  it('propagates step.compiled onto the produced IntentStep', () => {
+    const steps: DiscoveredStep[] = [
+      {
+        stepNumber: 1,
+        description: 'Click submit',
+        action: 'click',
+        ref: 'submit-btn',
+        pageUrl: 'https://x.com',
+        compiled: makeCompiled(),
+      },
+    ];
+    const result = toIntentSteps(steps);
+    expect(result[0].compiled).toBeDefined();
+    expect(result[0].compiled!.locatorPlan).toHaveLength(1);
+    expect(result[0].compiled!.locatorPlan[0].value).toBe('submit');
+    expect(result[0].compiled!.unverified).toBe(false);
+  });
+
+  it('leaves compiled undefined when the discovered step has none (unchanged legacy behavior)', () => {
+    const steps: DiscoveredStep[] = [
+      { stepNumber: 1, description: 'Click submit', action: 'click', ref: 'submit-btn', pageUrl: 'https://x.com' },
+    ];
+    const result = toIntentSteps(steps);
+    expect(result[0].compiled).toBeUndefined();
+  });
+
+  it('carries the compiled plan all the way through toIntentTestCase.stepsJson (the DB shape)', () => {
+    const discovered: DiscoveredTestCase = {
+      id: 'tc-compiled',
+      name: 'Login Flow',
+      description: 'Complete login',
+      category: 'authentication',
+      priority: 'high',
+      testType: 'positive',
+      explored: true,
+      status: 'passed',
+      steps: [
+        { stepNumber: 1, description: 'Click submit', action: 'click', ref: 'submit', pageUrl: 'https://x.com', compiled: makeCompiled() },
+      ],
+      entryUrl: 'https://x.com',
+      requiresAuth: false,
+      tags: [],
+      errors: [],
+      errorClassification: 'no_errors',
+      sourcePageUrl: 'https://x.com',
+    };
+
+    const intentCase = toIntentTestCase(discovered, 'proj-1', 'user-1');
+    const persistedStep = intentCase.stepsJson![0];
+    // This is exactly what exploration-storage.service writes into steps_json.
+    expect(persistedStep.compiled).toBeDefined();
+    expect(persistedStep.compiled!.locatorPlan[0].value).toBe('submit');
   });
 });
 

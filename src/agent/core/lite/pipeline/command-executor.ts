@@ -484,6 +484,7 @@ export class CommandExecutor {
       return {
         success: true,
         output: `Filled ${fieldDesc} with ${is_sensitive ? '[CREDENTIALS]' : `"${value}"`}`,
+        resolvedElement: element,
       };
     }
 
@@ -577,7 +578,7 @@ export class CommandExecutor {
     if (result.success) {
       const elementDesc = element ? `"${element.name || element.role}" (${element.tag})` : ref;
       const postAction = await this.collectPostActionContext(ref);
-      return { success: true, output: `Clicked ${elementDesc}${postAction}` };
+      return { success: true, output: `Clicked ${elementDesc}${postAction}`, resolvedElement: element };
     }
 
     return { success: false, output: '', error: result.error || `Failed to click ${ref}` };

@@ -12,7 +12,7 @@
  * - "Blackboard" = Shared mutable state between all agents
  */
 
-import type { AICommand, LiteSnapshot } from '../lite-types';
+import type { AICommand, LiteSnapshot, LiteElement } from '../lite-types';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PLAYWRIGHT COMMANDS (what the Executor LLM calls to control the browser)
@@ -55,6 +55,13 @@ export interface CommandResult {
   done?: boolean;
   /** Terminal: test is blocked — pipeline should stop */
   blocked?: boolean;
+  /**
+   * The snapshot element this command acted on. Set on success for targeting
+   * actions (click/fill/…) so the exploration step recorder can freeze a
+   * compiled locator plan from the element's stable attributes without a
+   * second resolution pass. Undefined for non-targeting / failed commands.
+   */
+  resolvedElement?: LiteElement;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

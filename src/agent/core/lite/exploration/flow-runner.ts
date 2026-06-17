@@ -30,21 +30,25 @@ import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.se
 import { OverlayDismisser } from './overlay-dismisser';
 import { VisualStability } from '../collectors/visual-stability';
 
-import type {
-  ExplorationConfig,
-  EntryPoint,
-  FlowExplorationTask,
-  FlowExplorationStatus,
-  FlowRunnerCheckpoint,
-  DiscoveredStep,
-  CapturedApiCall,
-  FlowError,
-  ErrorClassification,
-  BlockerType,
-  ExplorationProgressCallback,
+import {
+  ACTION_TO_INTENT_TYPE,
+  type ExplorationConfig,
+  type EntryPoint,
+  type FlowExplorationTask,
+  type FlowExplorationStatus,
+  type FlowRunnerCheckpoint,
+  type DiscoveredStep,
+  type CapturedApiCall,
+  type FlowError,
+  type ErrorClassification,
+  type BlockerType,
+  type ExplorationProgressCallback,
 } from './types';
 import type { NetworkSuccess } from '../lite-types';
 import { attributeCallsToSteps } from './network-assertions';
+import { LocatorPlanBuilder } from '@/services/testing/ui/preview/locator-plan-builder.service';
+import { adaptLiteElementsToInteractiveNodes } from '@/agent/execution/background-dom-collector';
+import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import { FlowQueue } from './flow-queue';
 import { BudgetTracker } from './budget-tracker';
 import { StateManager } from './state-manager';
@@ -611,7 +615,7 @@ export class FlowRunner {
       //    NetworkTracker has been running since `new NetworkTracker(page)`
       //    above, so everything captured since `pipelineStartTime` belongs
       //    to this flow.
-      const { steps: baseSteps, stepsByRound } = this.extractSteps(pipelineResult);
+      const { steps: baseSteps, stepsByRound } = await this.extractSteps(pipelineResult, page);
       const successfulCalls = this.collectSuccessfulCalls(networkTracker, pipelineStartTime);
       const discoveredSteps = attributeCallsToSteps({
         steps: baseSteps,
@@ -788,7 +792,7 @@ export class FlowRunner {
                   canUserHelp = undefined;
                   // Merge steps — reuse the same attribution pipeline so
                   // network calls captured during the retry get attached too.
-                  const { steps: retrySteps, stepsByRound: retryStepsByRound } = this.extractSteps(retryResult);
+                  const { steps: retrySteps, stepsByRound: retryStepsByRound } = await this.extractSteps(retryResult, page);
                   const retryCalls = this.collectSuccessfulCalls(retryNetworkTracker, retryStartTime);
                   const retryAttributed = attributeCallsToSteps({
                     steps: retrySteps,
@@ -1040,10 +1044,10 @@ export class FlowRunner {
    * assertion pipeline to attribute captured API calls back to the action
    * that triggered them.
    */
-  private extractSteps(result: TestPipelineResult): {
+  private async extractSteps(result: TestPipelineResult, page?: Page): Promise<{
     steps: DiscoveredStep[];
     stepsByRound: Array<number | null>;
-  } {
+  }> {
     const steps: DiscoveredStep[] = [];
     const stepsByRound: Array<number | null> = [];
     let stepNumber = 0;
@@ -1061,6 +1065,11 @@ export class FlowRunner {
         const step = this.commandToStep(executed, stepNumber + 1, roundPageUrl);
         if (step) {
           step.stepNumber = ++stepNumber;
+          // Freeze a compiled locator plan from the element the executor
+          // actually acted on. Best-effort: a failure here must never drop
+          // the step or fail the flow — the step simply falls back to
+          // runtime resolution on first replay (the pre-change behavior).
+          await this.attachCompiledPlan(step, executed, roundPageUrl, page);
           steps.push(step);
           lastStepIdxInRound = steps.length - 1;
         }
@@ -1070,6 +1079,66 @@ export class FlowRunner {
     }
 
     return { steps, stepsByRound };
+  }
+
+  /**
+   * Build a compiled locator plan for a targeting step from the element the
+   * executor resolved at action time (`result.resolvedElement`) and attach it
+   * to `step.compiled`. Reuses the same `LocatorPlanBuilder` the preview
+   * Run-All and mobile paths use, so exploration-discovered cases hit replay's
+   * stage-1 fast path on their first regression run instead of re-resolving
+   * every element through the LLM.
+   *
+   * Passing the live `page` validates each locator (live `count()`), flipping
+   * the plan to `unverified: false` and dropping dead locators. With no page
+   * the plan is still built but marked `unverified`.
+   *
+   * Best-effort by contract: any throw is swallowed (step keeps working,
+   * just without a frozen plan). PoC scope: click + fill only.
+   */
+  private async attachCompiledPlan(
+    step: DiscoveredStep,
+    executed: ExecutedCommand,
+    pageUrl: string,
+    page?: Page,
+  ): Promise<void> {
+    const resolvedElement = executed.result.resolvedElement;
+    if (!resolvedElement) return;
+    // PoC: only the two highest-frequency targeting actions for now.
+    if (step.action !== 'click' && step.action !== 'fill') return;
+
+    try {
+      const [node] = adaptLiteElementsToInteractiveNodes([resolvedElement]);
+      if (!node) return;
+
+      const intentType = ACTION_TO_INTENT_TYPE[step.action] || 'click';
+      const planStep: IntentStep = {
+        id: `step-${step.stepNumber}`,
+        type: intentType,
+        description: step.description,
+        ...(step.action === 'fill' && !step.isSensitive && step.value
+          ? { value: step.value }
+          : {}),
+      };
+
+      const compiled = await LocatorPlanBuilder.buildCompiledPlan({
+        step: planStep,
+        resolvedNode: node,
+        pageUrl,
+        page, // live page → validated plan (unverified: false)
+      });
+
+      // Only keep a plan that actually carries at least one locator.
+      if (compiled?.locatorPlan?.length) {
+        step.compiled = compiled;
+      }
+    } catch (err) {
+      logger.debug('[FLOW_RUNNER] Compiled-plan capture skipped', {
+        action: step.action,
+        ref: step.ref,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**
