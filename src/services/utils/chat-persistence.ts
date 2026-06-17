@@ -39,22 +39,6 @@ import { ChatService } from './chat.service';
 import { TestCaseChatService } from './test-case-chat.service';
 import type { ChatMessageInput, ChatMessageRow, SavedMessage } from './chat-repository';
 import type { ChatStore } from './chat-store';
-import { redactCredentials } from '@/utils/security/redact-credentials';
-
-/**
- * Redact bare-shape secrets (pasted bot tokens, webhook URLs, `token: ...`
- * assignments) from message text BEFORE it is persisted. The connect tool has
- * already consumed the real value earlier in the request — what we store and
- * later replay into LLM context must not carry a live credential. String
- * content only; multimodal/array content is left untouched (images etc.).
- */
-function redactMessageContent(messages: ChatMessageInput[]): ChatMessageInput[] {
-  return messages.map((m) =>
-    typeof m.content === 'string'
-      ? { ...m, content: redactCredentials(m.content) }
-      : m,
-  );
-}
 
 export class ChatPersistence {
   /**
@@ -72,11 +56,10 @@ export class ChatPersistence {
     sessionId: string,
     messages: ChatMessageInput[],
   ): Promise<SavedMessage[]> {
-    const safe = redactMessageContent(messages);
     if (store.kind === 'testcase') {
-      return TestCaseChatService.saveMessages(sessionId, safe);
+      return TestCaseChatService.saveMessages(sessionId, messages);
     }
-    return ChatService.saveChatMessages(sessionId, safe);
+    return ChatService.saveChatMessages(sessionId, messages);
   }
 
   /**

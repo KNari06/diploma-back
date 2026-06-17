@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { logger } from '@/utils/core/logger';
+import { redactCredentials } from '@/utils/security/redact-credentials';
 
 /**
  * Service for chat-related database operations
@@ -89,10 +90,14 @@ export class ChatService {
       // When saving multiple messages (user + AI), they should have different timestamps
       // to maintain correct order. Add 1ms between each message.
       const baseTime = Date.now();
+      // Redact bare-shape secrets (pasted bot tokens, webhook URLs, `token: ...`)
+      // at the persistence choke point so EVERY caller is covered, not just the
+      // general-chat path. The connect tool consumed the real value earlier in
+      // the request; what we store + replay into LLM context must not carry it.
       const records = validMessages.map((msg, index) => ({
         session_id: sessionId,
         role: msg.role,
-        content: msg.content.trim(),
+        content: redactCredentials(msg.content.trim()),
         metadata: msg.metadata && typeof msg.metadata === 'object' ? msg.metadata : {},
         created_at: new Date(baseTime + index).toISOString(), // Increment by 1ms per message
       }));
