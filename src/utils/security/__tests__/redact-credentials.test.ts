@@ -13,6 +13,27 @@ describe('redactCredentials', () => {
     expect(quoted).not.toContain('abc-def123');
   });
 
+  it('masks bare-shape Telegram bot tokens (no keyword separator)', () => {
+    expect(redactCredentials('8977713030:AAG4MhWRp0I67t_7cr3s5Tvd3f4XxY54zNU')).toBe(
+      '[REDACTED_TELEGRAM_TOKEN]',
+    );
+    expect(
+      redactCredentials('вот токен 8977713030:AAG4MhWRp0I67t_7cr3s5Tvd3f4XxY54zNU спасибо'),
+    ).toBe('вот токен [REDACTED_TELEGRAM_TOKEN] спасибо');
+  });
+
+  it('masks bare Slack incoming-webhook URLs', () => {
+    expect(redactCredentials('https://hooks.slack.com/services/T00/B00/XXXXXXXXXXXX')).toBe(
+      '[REDACTED_SLACK_WEBHOOK]',
+    );
+  });
+
+  it('does NOT mask time-like or short colon values, nor chat IDs', () => {
+    expect(redactCredentials('встреча в 12:30, тест 9:45')).toBe('встреча в 12:30, тест 9:45');
+    expect(redactCredentials('ID проекта 42:abc')).toBe('ID проекта 42:abc');
+    expect(redactCredentials('my chat id is -1001234567890')).toBe('my chat id is -1001234567890');
+  });
+
   it('leaves free-form prose untouched (no separator)', () => {
     const prose = 'type the password into the login field';
     expect(redactCredentials(prose)).toBe(prose);
