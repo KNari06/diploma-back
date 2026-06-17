@@ -2167,6 +2167,20 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         }
       } catch { /* observer is advisory — never break apply */ }
 
+      // Invariant #12 — before persisting an applied step to the DB, rewind any
+      // interpolated value/assertionText back to the placeholder form the FE
+      // submitted. `stepDraft` still holds `{{secrets.X}}`/`{{key}}` (applyStep
+      // interpolated only a local copy of it), so without this a resolved secret
+      // gets baked into intent_test_cases.steps_json and every re-run then reads
+      // a stale literal. Mirrors PreviewRunService.preserveOriginalStep; the
+      // WS-emit redaction (redactObj above) is a separate sink.
+      const restoreInterpolatedForPersist = <T extends { value?: string; assertionText?: string }>(applied: T): T => {
+        const origValue = (stepDraft as { value?: string }).value;
+        const origAssertion = (stepDraft as { assertionText?: string }).assertionText;
+        if (applied.value === origValue && applied.assertionText === origAssertion) return applied;
+        return { ...applied, value: origValue, assertionText: origAssertion };
+      };
+
       // V8: Auto-persist to DB if intentTestCaseId provided and apply succeeded.
       // Skip if a run is active (the run will batch-persist at the end).
       // Awaited instead of setImmediate to prevent race with run:start.
@@ -2178,9 +2192,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             // Etap 1D.2 — clear stale failureEvidence on success. The
             // step that just succeeded is no longer "needs review"; the
             // bundle from the previous failed apply would be misleading.
-            const stepToPersist = result.appliedStep.failureEvidence
-              ? { ...result.appliedStep, failureEvidence: undefined }
-              : result.appliedStep;
+            const stepToPersist = restoreInterpolatedForPersist(
+              result.appliedStep.failureEvidence
+                ? { ...result.appliedStep, failureEvidence: undefined }
+                : result.appliedStep,
+            );
             const updated = await IntentTestCaseService.updateStepFromPreviewApply({
               intentTestCaseId,
               appliedStep: stepToPersist,
@@ -2227,7 +2243,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
             await IntentTestCaseService.updateStepFromPreviewApply({
               intentTestCaseId,
-              appliedStep: result.appliedStep,
+              appliedStep: restoreInterpolatedForPersist(result.appliedStep),
               userId: ensuredUserId,
             });
             logger.info('[WebSocket] Persisted proven-plan from failed apply', {
@@ -2265,7 +2281,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
             await IntentTestCaseService.updateStepFromPreviewApply({
               intentTestCaseId,
-              appliedStep: result.appliedStep,
+              appliedStep: restoreInterpolatedForPersist(result.appliedStep),
               userId: ensuredUserId,
             });
             logger.info('[WebSocket] Persisted failureEvidence', {
