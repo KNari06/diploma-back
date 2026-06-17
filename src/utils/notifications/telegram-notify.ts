@@ -67,7 +67,8 @@ const SEVERITY_ICON: Record<string, string> = {
 
 // ─── Builder ────────────────────────────────────────────────────────────
 
-function buildTelegramMessage(payload: TgNotificationPayload): string {
+// Exported for unit testing — pure function, no side effects.
+export function buildTelegramMessage(payload: TgNotificationPayload): string {
   const lines: string[] = [];
 
   // Header
@@ -111,8 +112,10 @@ function buildTelegramMessage(payload: TgNotificationPayload): string {
     lines.push('');
   }
 
-  // CTA
-  lines.push(`<a href="${payload.ctaUrl}">${escTg(payload.ctaLabel)}</a>`);
+  // CTA — the href value MUST be escaped too: a raw `&` (common in URLs with
+  // query params) makes Telegram's HTML parser reject the whole message with a
+  // 400 "can't parse entities", so the notification silently never arrives.
+  lines.push(`<a href="${escTg(payload.ctaUrl)}">${escTg(payload.ctaLabel)}</a>`);
 
   return lines.join('\n');
 }

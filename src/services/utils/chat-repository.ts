@@ -21,7 +21,6 @@
 
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
-import { redactCredentials } from '@/utils/security/redact-credentials';
 import type { ChatStore } from './chat-store';
 
 const QUERY_TIMEOUT_MS = 10_000;
@@ -125,13 +124,14 @@ export class ChatRepository {
     }
 
     // 1ms increment per message preserves ordering within the same batch.
-    // Redact bare-shape secrets (pasted bot tokens / webhook URLs) at this
-    // single write choke point so every chat surface is covered.
+    // Content is stored verbatim so a multi-turn connect flow can read a pasted
+    // token/chat_id back on a later turn. Secrets are redacted on the way OUT to
+    // long-lived sinks (embeddings/summaries/traces), never at write time.
     const baseTime = Date.now();
     const records = validMessages.map((msg, index) => ({
       session_id: sessionId,
       role: msg.role,
-      content: redactCredentials(msg.content.trim()),
+      content: msg.content.trim(),
       metadata: msg.metadata && typeof msg.metadata === 'object' ? msg.metadata : {},
       created_at: new Date(baseTime + index).toISOString(),
     }));

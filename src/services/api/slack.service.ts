@@ -65,7 +65,10 @@ export async function getSlackToken(userId: string, workspaceId?: string): Promi
       query = query.or(`workspace_id.eq.${workspaceId},workspace_id.is.null`);
     }
 
+    // Precedence: workspace-scoped token wins over global even if older, so a
+    // stale global webhook can't shadow the one connected for this workspace.
     const { data, error } = await query
+      .order('workspace_id', { ascending: false, nullsFirst: false })
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
