@@ -73,7 +73,10 @@ export async function getTelegramToken(userId: string, workspaceId?: string): Pr
       .eq('enabled', true);
 
     if (workspaceId) {
-      query = query.eq('workspace_id', workspaceId);
+      // Match workspace-scoped tokens OR global tokens (workspace_id IS NULL),
+      // mirroring IntegrationTokenService.getToken — a globally-connected bot
+      // must still resolve when a caller passes a workspaceId.
+      query = query.or(`workspace_id.eq.${workspaceId},workspace_id.is.null`);
     }
 
     const { data, error } = await query
