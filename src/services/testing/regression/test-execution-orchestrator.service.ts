@@ -4,6 +4,8 @@ import { TokenCalculatorService } from '@/services/core/token-calculator.service
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { logger } from '@/utils/core/logger';
 import { topologicalSort } from '@/utils/graph/topological-sort';
+import { collapseLevelsIfBarrierDisabled } from './level-dispatch.util';
+import { isRegressionLevelBarrierDisabled } from '@/config/features/regression-scheduling';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { executionCompletionEmitter } from '../executions/execution-completion-emitter';
 import { ExecutionService } from '../executions/execution.service';
@@ -121,7 +123,14 @@ export class TestExecutionOrchestratorService {
     }
 
     // Topological sort by depends_on
-    const { levels, hasCycle, cycleNodes, blockedByCycleNodes } = topologicalSort(testCases);
+    const { levels: topoLevels, hasCycle, cycleNodes, blockedByCycleNodes } = topologicalSort(testCases);
+
+    // Level barrier (default ON): dependency levels run in order — a dependent
+    // waits for its dependency's standalone run. When REGRESSION_DISABLE_LEVEL_BARRIER
+    // is ON, collapse to a single level so every non-cyclic test dispatches together
+    // (bounded only by worker concurrency). Inlining of dependency steps and cycle
+    // detection are unaffected; cycle nodes are already excluded from `levels`.
+    const levels = collapseLevelsIfBarrierDisabled(topoLevels, isRegressionLevelBarrierDisabled());
 
     // Dependencies pointing OUTSIDE this run (test case in depends_on but
     // not in the plan/selection) are ignored for ordering — the dependent

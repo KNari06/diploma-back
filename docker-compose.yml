@@ -35,6 +35,13 @@ services:
     environment:
       - QUEUE_PREFIX=${QUEUE_PREFIX:-qait-prod}
       - LOG_LEVEL=info
+      # Pin web regression concurrency to exactly 5 tests at a time, each in its
+      # own isolated BrowserContext. MIN=MAX makes it scaler-proof regardless of
+      # SCALE_ENABLED (queue-monitor clamps to [5,5]). This worker is a single
+      # replica (fixed container_name), so 5 here is the global cap.
+      # Watch host RAM (~0.5–1 GB per concurrent test) and LLM rate limits.
+      - TEST_RUN_CONCURRENCY_MIN=5
+      - TEST_RUN_CONCURRENCY_MAX=5
     volumes:
       - ./logs:/app/logs
     extra_hosts:
