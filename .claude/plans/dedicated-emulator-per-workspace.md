@@ -200,6 +200,13 @@ Confirmed: mutex is per-`sessionId` (`mobile-runner.ts:283` `sessionMutexes.get(
 
 ---
 
+## Phase 6 — STATUS: BACKEND DONE (runner half pending)
+- **6.1 (backend, done):** job `finally` cleanup now branches `pool → releaseSession`, `dedicated → endDedicatedSession`, else `destroySession`. A dedicated session is NEVER destroyed (destroySession → emulatorManager.stop → adb emu kill would tear down the container).
+- **Client method (done):** `MobileRunnerClient.endDedicatedSession(sessionId)` → `POST /api/sessions/:id/end-dedicated` (noRetry, 15s). Until the runner ships the endpoint it 404s → caught by the existing try/catch → logged; the container is NOT destroyed either way (the safety property). Test pins method+path (POST, never DELETE).
+- **6.2 (runner, PENDING — separate repo/branch):** implement `POST /api/sessions/:id/end-dedicated` = the app-reset half of `resetSession` (force-stop + clear data + end session + drop run manager + end trace) WITHOUT `releaseAndroidDevice`/`emulatorManager.stop`.
+- **6.3 (runner, PENDING):** exclude dedicated sessions from TTL device-teardown (TTL may end the session but must NEVER stop the host container) — mark via an isDedicated flag or the markPooled exclusion mechanism.
+- Tests: client 2/2; tsc clean. (Job-finally branch itself is thin handler logic — not separately unit-tested per testing rules.)
+
 ## Phase 6 — 🆕 Lifecycle: don't destroy the dedicated container (CRITICAL — the v1 miss)
 Confirmed: worker `finally` (mobile-test-run.job.ts:1299) routes every non-`pool` session → `client.destroySession`, and `destroySession` → `releaseAndroidDevice(serial)` → `emulatorManager.stop(serial)` → `adb -s <serial> emu kill` against the REMOTE redroid container (session-manager.ts:479-484, 1846/1856). So a dedicated session would disrupt/kill the dedicated container every run.
 - **6.1** Backend: track `sessionSource` through to the finally. For `'dedicated'`, do NOT call `destroySession`. Instead call a reset-without-destroy that ends the session + resets app state but leaves the container alive.

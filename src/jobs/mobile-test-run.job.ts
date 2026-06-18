@@ -1294,12 +1294,20 @@ export class MobileTestRunJobHandler {
         await TestExecutedStepsRedisService.finalizeToDb(testId);
       }
 
-      // ── Cleanup: release pooled session or destroy adhoc/warmed ──
+      // ── Cleanup: release pooled / end-dedicated / destroy adhoc+warmed ──
+      // A dedicated session is pinned to a workspace's persistent container —
+      // it must be ENDED (app-state reset) but NEVER destroyed, since
+      // destroySession tears down the remote container (emulatorManager.stop →
+      // adb emu kill). Pool sessions reset-and-return; everything else (cold /
+      // warmup adhoc) is destroyed as before.
       if (sessionId) {
         try {
           if (sessionSource === 'pool') {
             await client.releaseSession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Pool session released', { testId, sessionId });
+          } else if (sessionSource === 'dedicated') {
+            await client.endDedicatedSession(sessionId, { userId });
+            logger.debug('[MOBILE-TEST] Dedicated session ended (container preserved)', { testId, sessionId });
           } else {
             await client.destroySession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Session destroyed', { testId, sessionId, sessionSource });
