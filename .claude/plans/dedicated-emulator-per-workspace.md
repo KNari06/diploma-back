@@ -121,6 +121,15 @@ Backend reads via `supabaseAdmin` (bypasses RLS). RLS via existing `check_worksp
 
 ---
 
+## Phase 2 — STATUS: DONE (impl notes vs plan)
+- **2.0 IDOR guard (blocker):** `warmupSession` now calls `ProjectService.getProject(projectId, userId)` right after projectId validation → 404 on no-access (getProject returns null for non-members, no info leak). `autoBootAndInstall` already loaded the project but didn't block — added explicit early-return when getProject returns null. (Upload route is requireAuth only, NOT project-scoped — confirmed; this is the real guard.)
+- **2.1/2.2 acquire intercept:** `acquireSession` takes `workspaceId`; runs `resolveDedicatedDevice` as **tier-0** before pool/warmup/cold. On hit → `createSession({deviceSelector:{serial}, ownerId:workspaceId})`, returns `sessionSource:'dedicated'`, NO shared fallback on failure. Added `'dedicated'` to the sessionSource union here + in mobile-test-run.job.
+- **2.3 warmup + auto-boot:** both resolve dedicated and, on hit, force `deviceSelector={serial}` + `ownerId=workspaceId`. warmup reuses its pinned-create path (a serial auto-selects skipPool); auto-boot spreads deviceSelector into createSession.
+- **2.5 ownerId coupling:** dedicated forces `ownerId=workspaceId` regardless of MOBILE_MULTI_USER_ISOLATION (isolation comes from the container; ownerId is defense-in-depth, no-op if runner multi-user off).
+- workspaceId is ALWAYS server-derived: job payload (dispatcher) or access-checked `project.workspace_id` (warmup/auto-boot) — never the request body.
+- Tests: session-acquisition.dedicated 3/3 (pin+skip-ladder, no-fallback-on-failure, fall-through). Full mobile suite 186/186. tsc clean.
+- NOTE: Phase 6 (don't destroy the dedicated container in the job finally) NOT yet done — the worker still routes `sessionSource!=='pool'` → destroySession. MUST land before enabling the flag.
+
 ## Phase 2 — Backend routing + security
 
 ### 2.0 🆕 SECURITY PREREQUISITE (HARD BLOCKER — must land before/with 2.x)

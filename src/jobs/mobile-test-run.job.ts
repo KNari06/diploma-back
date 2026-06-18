@@ -285,7 +285,7 @@ export class MobileTestRunJobHandler {
     const acquirePlatform = isFlutter ? 'android' : platform;
 
     let sessionId: string | null = null;
-    let sessionSource: 'pool' | 'warmup' | 'cold' = 'cold';
+    let sessionSource: 'pool' | 'warmup' | 'cold' | 'dedicated' = 'cold';
     // Fast-auth: filled from compileResult.fastAuthRestores. Each entry is a
     // snapshot the worker will restore via runner HTTP between Phase 3b
     // (prepApp) and Phase 4 (runSteps). Empty array (not undefined) so the
@@ -412,6 +412,7 @@ export class MobileTestRunJobHandler {
         platform: acquirePlatform,
         browser,
         userId,
+        workspaceId,
         projectId,
         chatSessionId,
       });

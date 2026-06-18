@@ -3,6 +3,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileRunnerClient } from './mobile-runner-client';
 import type { MobilePlatform } from './mobile-runner.types';
+import { resolveDedicatedDevice } from './dedicated-device.service';
 import { env } from '@/config/environment/env';
 
 /**
@@ -38,15 +39,16 @@ export class MobileSessionAcquisitionService {
     platform: MobilePlatform;
     browser: string;
     userId: string;
+    workspaceId: string | undefined;
     projectId: string | undefined;
     chatSessionId: string | undefined;
   }): Promise<{
     sessionId: string;
-    sessionSource: 'pool' | 'warmup' | 'cold';
+    sessionSource: 'pool' | 'warmup' | 'cold' | 'dedicated';
     sessionClaimMs: number;
     coldStartUsed: boolean;
   }> {
-    const { client, testId, platform, browser, userId, projectId, chatSessionId } = params;
+    const { client, testId, platform, browser, userId, workspaceId, projectId, chatSessionId } = params;
 
     // Announce session start to the frontend
     try {
@@ -89,7 +91,40 @@ export class MobileSessionAcquisitionService {
     // observable infrastructure wait times.
     const sessionClaimT0 = Date.now();
     let sessionId: string | null = null;
-    let sessionSource: 'pool' | 'warmup' | 'cold' = 'cold';
+    let sessionSource: 'pool' | 'warmup' | 'cold' | 'dedicated' = 'cold';
+
+    // Tier 0: Dedicated emulator (runs BEFORE pool/warmup/cold). When the
+    // workspace has an active dedicated device, pin the run to it and SKIP the
+    // shared ladder entirely — running first is what preempts a stale shared
+    // warmed session being claimed for a dedicated workspace. Resolver is a
+    // no-op (null) unless the feature flag is on AND a row exists, so this
+    // block is inert in the default deploy.
+    const dedicated = await resolveDedicatedDevice(workspaceId, platform);
+    if (dedicated) {
+      emitSessionPhase(`Starting your dedicated ${platform} emulator…`, 12);
+      // ownerId=workspaceId gives per-workspace Android multi-user isolation
+      // on the runner IF it has multi-user enabled; harmless no-op otherwise.
+      // Isolation primarily comes from the dedicated container itself, not the
+      // Android user. NO shared-pool fallback on failure — a dedicated workspace
+      // must never silently land on a shared device (that breaks isolation).
+      const session = await client.createSession(platform, {
+        deviceSelector: { serial: dedicated.serial },
+        ownerId: workspaceId,
+        userId,
+      });
+      logger.info('[MOBILE-TEST] Dedicated session created', {
+        testId,
+        sessionId: session.sessionId,
+        platform,
+        workspaceId,
+      });
+      return {
+        sessionId: session.sessionId,
+        sessionSource: 'dedicated',
+        sessionClaimMs: Math.max(0, Date.now() - sessionClaimT0),
+        coldStartUsed: false,
+      };
+    }
 
     try {
       // Try 1: Pool claim (runner pre-booted sessions, fastest path ~0-15s).
