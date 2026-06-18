@@ -792,11 +792,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // non-fatal above and never reach here.
     emitWarmupProgress(userId, 'boot_emulator', 0, message);
 
-    res.status(500).json({
-      success: false,
-      error: 'Failed to warm up emulator session',
-      message,
-    });
+    sendMobileRunnerError(res, error, 'Failed to warm up emulator session');
   }
 }
 
@@ -875,11 +871,7 @@ export async function destroySession(req: Request, res: Response): Promise<void>
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json({
-      success: false,
-      error: 'Failed to destroy session',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Failed to destroy session');
   }
 }
 
@@ -1012,11 +1004,7 @@ export async function goHomeSession(req: Request, res: Response): Promise<void> 
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Go home failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Go home failed');
   }
 }
 
@@ -1048,11 +1036,7 @@ export async function goBackSession(req: Request, res: Response): Promise<void> 
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Go back failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Go back failed');
   }
 }
 
@@ -1091,11 +1075,7 @@ export async function typeSession(req: Request, res: Response): Promise<void> {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Type text failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Type text failed');
   }
 }
 
@@ -1135,11 +1115,7 @@ export async function keySession(req: Request, res: Response): Promise<void> {
       keycode,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Key press failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Key press failed');
   }
 }
 
@@ -1179,11 +1155,7 @@ export async function commandSession(req: Request, res: Response): Promise<void>
       type,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Command failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Command failed');
   }
 }
 
@@ -1400,32 +1372,11 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
         result: { status: 'error', message },
       });
     }
-    // Forward the REAL cause to the editor instead of a blanket "Lint failed".
-    // The old response hardcoded error:'Lint failed' and buried `message`, and
-    // the FE prefers `error` — so the user only ever saw "Lint failed" with no
-    // detail (the actual cause lived only in this server log). Now `error`
-    // carries the cause text and we pass through the runner's status/typed code
-    // when present, so a session that died mid-lint (despite the up-front
-    // guard — TOCTOU) still surfaces as SESSION_EXPIRED, and a transient
-    // runner/timeout error reads as itself.
-    const runnerErr = error as { statusCode?: number; code?: string };
-    const sessionGone = runnerErr?.statusCode === 404
-      && /session not found/i.test(message);
-    if (sessionGone) {
-      res.status(410).json({
-        success: false,
-        code: 'SESSION_EXPIRED',
-        error: 'Session expired',
-        message: 'The device session is no longer available. Reopen the test case to continue.',
-      });
-      return;
-    }
-    res.status(runnerErr?.statusCode && runnerErr.statusCode >= 400 ? runnerErr.statusCode : 500).json({
-      success: false,
-      error: message || 'Lint failed',
-      ...(runnerErr?.code ? { code: runnerErr.code } : {}),
-      message,
-    });
+    // Forward the REAL cause (shared helper) instead of a blanket "Lint failed":
+    // carries the cause in `error`, passes the runner's typed code/status, and
+    // maps a session that died mid-lint (TOCTOU past the up-front guard) to a
+    // typed 410 SESSION_EXPIRED.
+    sendMobileRunnerError(res, error, 'Lint failed');
   }
 }
 
@@ -1589,11 +1540,7 @@ export async function applySession(req: Request, res: Response): Promise<void> {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Apply failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Apply failed');
   }
 }
 
@@ -2234,11 +2181,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
       intentTestCaseId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Failed to run test case',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Failed to run test case');
   }
 }
 

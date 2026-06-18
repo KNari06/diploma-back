@@ -31,6 +31,20 @@ export function sendMobileRunnerError(res: Response, error: unknown, fallback: s
   const message = error instanceof Error ? error.message : String(error);
   const runnerErr = error as { statusCode?: number; code?: string };
 
+  // Streaming guard: runTestCaseOnSession streams NDJSON (Content-Type
+  // application/x-ndjson + res.write per step), so an error AFTER the first
+  // chunk reaches this catch with headers already sent — `res.status().json()`
+  // would then throw ERR_HTTP_HEADERS_SENT (latent before this consolidation).
+  // Emit a terminal NDJSON error line + end the stream instead, so the editor
+  // gets a real failure event rather than a hung/aborted connection.
+  if (res.headersSent) {
+    try {
+      res.write(JSON.stringify({ type: 'error', error: message || fallback, ...(runnerErr?.code ? { code: runnerErr.code } : {}) }) + '\n');
+    } catch { /* socket already torn down — nothing we can do */ }
+    res.end();
+    return;
+  }
+
   // A session the runner no longer has (idle TTL / pool reset / redeploy) →
   // typed 410 so the editor routes it through its session-expiry flow instead
   // of showing a dead-end error that only a reload "fixes".
