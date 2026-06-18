@@ -71,6 +71,14 @@ Implemented on branch `mobile/dedicated-emulator-per-workspace`. Adjustments fou
 
 ---
 
+## Phase 1 — STATUS: DONE (impl notes vs plan)
+- Migration `features/workspace-dedicated-device.sql` — mirrors workspace_credits; **owner-only** RLS (read+write) since runner_serial is internal infra. Registered in INDEX.md.
+- db/: `src/services/mobile/db/dedicated-device.db.ts` — `getActiveDedicatedDevice` via supabaseAdmin, never throws (DB error → null → shared-pool fallback).
+- Service: `src/services/mobile/dedicated-device.service.ts` — `resolveDedicatedDevice(workspaceId, platform)` with 60s TTL cache (incl. negative caching). **flutter → android device row** (flutter runs on android containers); **ios → null in v1**.
+- Flag: `DEDICATED_MOBILE_EMULATOR_ENABLED` (env.ts, default false) + `DedicatedDeviceFeature.isEnabled()`.
+- Types kept LOCAL to db/service (not in mobile-runner.types.ts) — self-contained concern, not runner wire protocol.
+- Tests: 9/9 (flag off, ios, no-row, missing-ws, platform-mismatch, flutter-maps-android, caching ±). tsc clean.
+
 ## Phase 1 — Table + resolver + flag
 
 ### 1.1 Migration `features/workspace-dedicated-device.sql` (mirror `workspace_credits`)

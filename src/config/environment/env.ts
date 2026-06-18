@@ -247,6 +247,13 @@ const envSchema = z.object({
   // for tenants that require strict isolation between backend users.
   MOBILE_MULTI_USER_ISOLATION: z.string().transform(v => v === 'true').default('false'),
 
+  // Dedicated-emulator-per-workspace master switch. When ON, a mobile session
+  // for a workspace that has an active `workspace_dedicated_device` row is
+  // pinned to that runner_serial (skips the shared pool entirely). Default OFF
+  // — the resolver short-circuits to null, so behaviour is unchanged until a
+  // deploy flips this AND ops provisions a dedicated container + DB row.
+  DEDICATED_MOBILE_EMULATOR_ENABLED: z.string().transform(v => v === 'true').default('false'),
+
   // Intent classifier fast-path — set to 'true' to disable the deterministic
   // whitelist that short-circuits trivial messages (greetings, cancels, yes/no
   // after pending confirmation). Kill-switch for the rare case the whitelist
