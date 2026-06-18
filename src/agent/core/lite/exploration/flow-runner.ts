@@ -388,6 +388,11 @@ export class FlowRunner {
         durationMs: task.durationMs,
         progressScore: task.progressScore,
         blockerType: task.blockerType || undefined,
+        // Human-readable blocker reason + whether the user can unblock it
+        // (CAPTCHA/2FA/login). The FE renders these live on a blocked flow;
+        // both are populated alongside blockerType when status==='blocked'.
+        blockerReason: task.blockedReason || undefined,
+        canUserHelp: task.canUserHelp ?? undefined,
         errorMessage: task.errors.length > 0 ? task.errors[0].message : undefined,
         failedAtStep: task.errors.length > 0 ? task.errors[0].stepNumber : undefined,
         errorsCount: task.errors.length,
@@ -666,7 +671,10 @@ export class FlowRunner {
           count: discoveredSteps.length,
         });
 
-        // Emit flow_step events for real-time frontend updates
+        // Emit flow_step events for real-time frontend updates.
+        // `extractSteps` keeps ONLY successful commands (failed ones are
+        // filtered out above), so every emitted step is a success — the FE
+        // reads `data.success` to render the per-step ✓ indicator.
         for (const step of discoveredSteps) {
           this.emitProgress('flow_step', {
             entryPointId: entryPoint.id,
@@ -676,6 +684,7 @@ export class FlowRunner {
             description: step.description,
             value: step.value,
             pageUrl: step.pageUrl,
+            success: true,
           });
         }
       }
