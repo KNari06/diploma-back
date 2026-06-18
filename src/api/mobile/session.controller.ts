@@ -19,6 +19,7 @@ import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { ProjectService } from '@/services/core/project.service';
 import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
+import { sendMobileRunnerError } from './mobile-error-mapper';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
 import { refreshIdle, cancelIdle } from '@/services/mobile/mobile-idle.service';
@@ -919,11 +920,7 @@ export async function tapSession(req: Request, res: Response): Promise<void> {
       y,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Tap failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Tap failed');
   }
 }
 
@@ -983,11 +980,7 @@ export async function swipeSession(req: Request, res: Response): Promise<void> {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Swipe failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Swipe failed');
   }
 }
 
