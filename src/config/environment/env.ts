@@ -126,6 +126,16 @@ const envSchema = z.object({
   AGENT_TIMEOUT: z.string().transform(Number).default('300000'),
   AGENT_MAX_RETRIES: z.string().transform(Number).default('3'),
   AGENT_BASE_URL: z.string().default('http://localhost:3001'),
+  // Replay readiness recollect (default OFF). Background/regression replay
+  // snapshots the DOM right before LLM element resolution. On redirect-heavy
+  // flows (SSO/OAuth) that snapshot can land on a half-loaded / mid-redirect
+  // page with only a handful of interactive nodes — the resolver then picks a
+  // stray element and drifts the run onto the wrong page. When ON, a sparse
+  // fresh snapshot triggers one `waitForPageInteractive` gate + recollect (the
+  // same gate the editor/lite paths already use). Only fires on the first
+  // attempt and only when the snapshot is sparse, so healthy pages pay no extra
+  // wait. Validate before enabling broadly. See agent/execution/replay-readiness.ts.
+  REPLAY_READINESS_RECOLLECT_ENABLED: z.string().transform(v => v === 'true').default('false'),
   EXPLORATION_TIMEOUT_MS: z.string().transform(Number).default('300000'),
 
   // Logging
