@@ -384,6 +384,43 @@ const NO_RETRY_STEP_TYPES = new Set(['ai_check', 'wait', 'timeout', 'wait_for_em
 const RETRY_SETTLE_MS = 1500;
 
 /**
+ * Delay (ms) for the guarded catch-up screenshot scheduled after a
+ * navigation-class step and at run completion. Long enough to land late async
+ * paint (lazy images, fonts, post-XHR content, slide-in overlays) that finishes
+ * AFTER the DOM-settle gate, short enough to feel immediate. During a run the
+ * live screencast is throttled and a now-static page emits no correcting
+ * compositor frame, so without this the picture sits on the pre-paint
+ * screenshot until the user interacts.
+ */
+const CATCH_UP_FRAME_DELAY_MS = 600;
+
+/** Final-frame DOM settle (run completion only): cap so it can't stall the
+ *  preview:run:completed event; stability window matches the navigation floor. */
+const FINAL_FRAME_SETTLE_MAX_MS = 1500;
+const FINAL_FRAME_SETTLE_STABLE_MS = 300;
+
+/**
+ * Fire-and-forget guarded catch-up screenshot, delayed by `delayMs`.
+ *
+ * The per-step / final `injectSyncFrame` is a single point-in-time screenshot.
+ * During a Run the live CDP screencast is throttled by apply/readiness
+ * contention and a static page emits no new compositor frame, so content that
+ * paints LATE (lazy images, fonts, post-XHR render, slide-in overlays) can be
+ * missing from that one screenshot and never corrected until the user
+ * interacts. This schedules ONE extra `injectSyncFrame` after the late paint
+ * should have landed. `injectSyncFrame` is itself guarded (skips when
+ * paused/zombie/empty-room, or when a frame is already in flight via
+ * pendingFrames), so this cannot pile screenshots onto the stream. The timer is
+ * unref'd so it never keeps the process alive past shutdown.
+ */
+export function scheduleCatchUpFrame(previewSessionId: string, delayMs: number): void {
+  const timer = setTimeout(() => {
+    getPreviewVideoStreamRegistry().injectSyncFrame(previewSessionId).catch(() => {});
+  }, delayMs);
+  if (typeof timer.unref === 'function') timer.unref();
+}
+
+/**
  * Internal state for active runs
  */
 interface RunState {
@@ -1766,6 +1803,18 @@ export class PreviewRunService {
         // emitted after the loop so the last step's result is shown too.
         getPreviewVideoStreamRegistry().injectSyncFrame(previewSessionId).catch(() => {});
 
+        // The frame above reflects the PREVIOUS step's result. Navigation-class
+        // steps (click/open/toggle/select) routinely paint late — lazy images,
+        // fonts, post-XHR content, slide-in overlays — AFTER the DOM-settle that
+        // gated it. The screencast is throttled during a run and a static page
+        // emits no correcting frame, so schedule ONE guarded catch-up screenshot.
+        // Gated to navigation-class so plain input/assertion steps add no
+        // screenshot load (injectSyncFrame's pendingFrames guard bounds the rest).
+        const prevExecutedStep = i > 0 ? stepsToExecute[i - 1] : undefined;
+        if (prevExecutedStep && getActionCategory(prevExecutedStep.type) === 'navigation') {
+          scheduleCatchUpFrame(previewSessionId, CATCH_UP_FRAME_DELAY_MS);
+        }
+
         // NOTE: We do NOT emit chat:processing:step here. The draft run is fire-and-forget
         // so clientRequestInFlightRef is already false on the frontend, and processing steps
         // would be silently discarded. Frontend subscribes to preview:run:* directly instead.
@@ -3038,10 +3087,24 @@ export class PreviewRunService {
       } catch { /* non-fatal */ }
 
       // Final sync: the per-step inject above shows each step's result on the
-      // NEXT iteration's 'running' tick — the last step has no next iteration,
-      // so push one frame now to land the picture on the run's end state
-      // (pass screen, failed step, or the page where it stopped).
+      // NEXT iteration's 'running' tick — the last step has no next iteration
+      // AND its lookahead settle is skipped (the loop only looks ahead while
+      // i < length-1), so without help the picture lands on a PRE-paint
+      // screenshot of the last step. Settle the DOM first (capped so it can't
+      // stall preview:run:completed), push the frame, then schedule ONE catch-up
+      // for very-late async paint — the static end page emits no screencast
+      // frame on its own, so otherwise the user sees missing blocks until the
+      // first manual interaction.
+      const finalSession = getPreviewSessionService().getSession(previewSessionId);
+      if (finalSession?.page && !finalSession.page.isClosed()) {
+        await waitForDOMStability(
+          finalSession.page,
+          FINAL_FRAME_SETTLE_MAX_MS,
+          FINAL_FRAME_SETTLE_STABLE_MS,
+        ).catch(() => {});
+      }
       getPreviewVideoStreamRegistry().injectSyncFrame(previewSessionId).catch(() => {});
+      scheduleCatchUpFrame(previewSessionId, CATCH_UP_FRAME_DELAY_MS);
 
       webSocketService.emitToUser(userId, 'preview:run:completed', {
         previewSessionId,
