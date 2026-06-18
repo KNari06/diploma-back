@@ -112,6 +112,7 @@ export class MobileSessionAcquisitionService {
         deviceSelector: { serial: dedicated.serial },
         ownerId: workspaceId,
         userId,
+        dedicated: true,
       });
       logger.info('[MOBILE-TEST] Dedicated session created', {
         testId,

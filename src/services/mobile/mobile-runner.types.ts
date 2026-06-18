@@ -96,6 +96,13 @@ export interface MobileSessionConfig {
    * or whatever `DEVICE_DEFAULT_SOURCE` says).
    */
   deviceSelector?: MobileDeviceSelector;
+  /**
+   * When true, the runner marks this session as DEDICATED: excluded from TTL
+   * cleanup + capacity eviction (so its persistent container survives) and
+   * guarded by a per-serial lock. Set ONLY on the dedicated-emulator routing
+   * path alongside a pinned `deviceSelector.serial`. See dedicated-device.service.
+   */
+  dedicated?: boolean;
 }
 
 // ── Action Types (mirror of runner's IntentActionType) ───────────

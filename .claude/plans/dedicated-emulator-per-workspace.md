@@ -226,6 +226,13 @@ Deep-dive result: there is **no `session_source` column**. `test_executions` per
 - **Decision pending user:** persist `session_source` (queryable adoption/breakage metrics, +1 migration +3 edits) vs log-only 7.2 (zero schema, covers the "silent breakage" alarm). Recommend **log-only 7.2 now**, defer the column until adoption metrics are actually needed.
 - Aggregation: do NOT add a write to `regression_runs.total_*` outside `recomputeRunStatus` (invariant #11 single funnel).
 
+## RUNNER — STATUS: DONE (qait-mobile-runner branch `mobile/dedicated-emulator-per-workspace`, commit e375bbf)
+- **Phase 6 (done):** `dedicated` flag on createSessionSchema → createSession opts → POST /sessions marks the session dedicated. `markDedicated/unmarkDedicated/isDedicated` (+ `dedicatedSessionIds` Set) excluded from BOTH the TTL loop AND `evictOldestIdleSession` (the v1 terrain map missed the eviction path — re-verified). New `POST /sessions/:id/end-dedicated` → `resetSession` (app-reset, no device teardown), 404 on gone session.
+- **Phase 5 (done):** `createAndroidSession` rejects `DEVICE_BUSY` when a dedicated create targets a serial that already has a live session (mirrors the physical-device guard). Backend retries.
+- **Phase 3 (done):** `config.pool.androidExcludedPorts` (POOL_ANDROID_EXCLUDED_PORTS); pool `init` steps over reserved ports.
+- Tests: session-manager 30/30, session-pool 18/18, routes 45/45. tsc clean. (2 pre-existing foreground-test failures unrelated.)
+- DEFERRED: `recoverBroken` port-pick was flagged in v1 as a second collision site — in current code recoverBroken lets EmulatorManager assign (no fixed port), so it does NOT re-collide with a dedicated port. No change needed; noted here so it isn't re-investigated.
+
 ## RUNNER terrain map (Phase 5/6/3 — for the runner-repo branch)
 - **6 endpoint:** `POST /api/sessions/:id/end-dedicated` = wrap `requireSessionOwnership(runner)` → call **`runner.resetSession(id)`** (NOT destroy). resetSession already = app-reset MINUS device teardown; `destroySession` = resetSession + `releaseAndroidDevice`→`emulatorManager.stop` (the container kill). Insert after the `/release` route (~session.routes.ts:400).
 - **6.3 TTL:** mirror the existing `pooledSessionIds`/`markPooled` pattern with `dedicatedSessionIds` + `if (this.dedicatedSessionIds.has(id)) continue;` in the TTL loop (session-manager.ts:228). Add `isDedicated?: boolean` to AndroidSession/IosSession (session-types.ts).

@@ -58,11 +58,13 @@ describe('acquireSession — dedicated intercept', () => {
     expect(r.sessionId).toBe('sess-ded');
     expect(r.sessionSource).toBe('dedicated');
     expect(r.coldStartUsed).toBe(false);
-    // Pinned with the resolved serial and ownerId=workspaceId.
+    // Pinned with the resolved serial, ownerId=workspaceId, and the dedicated
+    // flag so the runner excludes it from TTL/eviction + applies the serial lock.
     expect(client.createSession).toHaveBeenCalledWith('android', {
       deviceSelector: { serial: '10.0.0.5:5606' },
       ownerId: 'ws-1',
       userId: 'user-1',
+      dedicated: true,
     });
     // The shared ladder is never touched.
     expect(client.claimSession).not.toHaveBeenCalled();

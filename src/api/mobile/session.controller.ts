@@ -649,6 +649,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         ownerId: effectiveOwnerId,
         deviceSelector,
         userId,
+        ...(dedicated ? { dedicated: true } : {}),
       }));
     } else {
       try {
@@ -1706,7 +1707,7 @@ export async function autoBootAndInstall(
       const session = await client.createSession(platform, {
         ownerId: autoBootOwnerId,
         userId,
-        ...(dedicated ? { deviceSelector: { serial: dedicated.serial } } : {}),
+        ...(dedicated ? { deviceSelector: { serial: dedicated.serial }, dedicated: true } : {}),
       });
       sessionId = session.sessionId;
 
