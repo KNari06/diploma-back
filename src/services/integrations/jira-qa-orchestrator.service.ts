@@ -237,7 +237,7 @@ export class JiraQaOrchestratorService {
 
         // 5. Integration status — which providers are connected
         import('@/services/api/integration-token.service')
-          .then(m => m.IntegrationTokenService.getIntegrationSummary(userId, workspaceId || ''))
+          .then(m => m.IntegrationTokenService.getIntegrationSummary(userId, workspaceId ?? undefined))
           .catch(() => ''),
       ]);
 
