@@ -49,6 +49,7 @@ import { attributeCallsToSteps } from './network-assertions';
 import { LocatorPlanBuilder } from '@/services/testing/ui/preview/locator-plan-builder.service';
 import { adaptLiteElementsToInteractiveNodes } from '@/agent/execution/background-dom-collector';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
+import type { TestAction } from '../test-case/types';
 import { FlowQueue } from './flow-queue';
 import { BudgetTracker } from './budget-tracker';
 import { StateManager } from './state-manager';
@@ -76,6 +77,28 @@ const FLOW_NAV_TIMEOUT_MS = 15_000;
  * against a non-interactive page and flake.
  */
 const FLOW_NAV_WAIT_UNTIL = 'load' as const;
+
+/**
+ * Element-targeting actions that earn a compiled locator plan (frozen from the
+ * element the executor resolved at action time). Excludes non-targeting steps
+ * (navigate/press/scroll/scrollToElement) and synthetic verify steps — those
+ * have no durable element target. `clear` maps to a `click` intent type
+ * upstream (ACTION_TO_INTENT_TYPE), but its LOCATOR is still the field, so the
+ * frozen plan is correct; the action-type quirk is pre-existing and orthogonal.
+ */
+export const PLAN_WORTHY_ACTIONS: ReadonlySet<TestAction> = new Set<TestAction>([
+  'click', 'fill', 'select', 'hover', 'toggle', 'setRange', 'selectDate', 'clear',
+]);
+
+/**
+ * Subset whose `value` is meaningful to replay and safe to freeze into the
+ * plan: typed text (fill), chosen option (select), range number (setRange),
+ * date string (selectDate). Sensitive values are still excluded at call time.
+ * click/hover/toggle/clear carry no value.
+ */
+export const VALUE_CARRYING_ACTIONS: ReadonlySet<TestAction> = new Set<TestAction>([
+  'fill', 'select', 'setRange', 'selectDate',
+]);
 
 /** Semaphore for bounding concurrent flows */
 class Semaphore {
@@ -1104,21 +1127,27 @@ export class FlowRunner {
   ): Promise<void> {
     const resolvedElement = executed.result.resolvedElement;
     if (!resolvedElement) return;
-    // PoC: only the two highest-frequency targeting actions for now.
-    if (step.action !== 'click' && step.action !== 'fill') return;
+    // Only element-targeting actions get a compiled locator plan. Non-targeting
+    // (navigate/press/scroll) and synthetic (verify) steps have no durable
+    // target — they never set `resolvedElement` anyway, but gate explicitly so
+    // a future executor change can't silently start compiling them.
+    if (!PLAN_WORTHY_ACTIONS.has(step.action)) return;
 
     try {
       const [node] = adaptLiteElementsToInteractiveNodes([resolvedElement]);
       if (!node) return;
 
       const intentType = ACTION_TO_INTENT_TYPE[step.action] || 'click';
+      // Carry the value only for actions whose value is meaningful to replay
+      // (select option / range number / date string / typed text) AND not a
+      // credential — secrets must never be frozen into a persisted plan.
+      const carriesValue =
+        VALUE_CARRYING_ACTIONS.has(step.action) && !step.isSensitive && !!step.value;
       const planStep: IntentStep = {
         id: `step-${step.stepNumber}`,
         type: intentType,
         description: step.description,
-        ...(step.action === 'fill' && !step.isSensitive && step.value
-          ? { value: step.value }
-          : {}),
+        ...(carriesValue ? { value: step.value } : {}),
       };
 
       const compiled = await LocatorPlanBuilder.buildCompiledPlan({

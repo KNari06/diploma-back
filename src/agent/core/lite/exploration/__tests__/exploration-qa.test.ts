@@ -15,12 +15,14 @@ import { TestCaseBuilder } from '../test-case-builder';
 import {
   toIntentSteps,
   toIntentTestCase,
+  ACTION_TO_INTENT_TYPE,
   type DiscoveredStep,
   type DiscoveredTestCase,
   type FlowExplorationTask,
   type EntryPoint,
   type ExplorationConfig,
 } from '../types';
+import { PLAN_WORTHY_ACTIONS, VALUE_CARRYING_ACTIONS } from '../flow-runner';
 import type { ExplorationTree } from '../exploration-tree';
 import type { BudgetTracker } from '../budget-tracker';
 
@@ -221,6 +223,42 @@ describe('toIntentSteps — compiled locator plan propagation', () => {
     expect(result[0].compiled).toBeUndefined();
   });
 
+  it('propagates compiled for a value-carrying non-fill action (select)', () => {
+    const steps: DiscoveredStep[] = [
+      {
+        stepNumber: 1,
+        description: 'Select country',
+        action: 'select',
+        ref: 'country',
+        value: 'Kazakhstan',
+        pageUrl: 'https://x.com',
+        compiled: { ...makeCompiled(), action: { type: 'select', value: 'Kazakhstan' } },
+      },
+    ];
+    const result = toIntentSteps(steps);
+    expect(result[0].type).toBe('select');
+    expect(result[0].value).toBe('Kazakhstan');
+    expect(result[0].compiled).toBeDefined();
+    expect(result[0].compiled!.action.value).toBe('Kazakhstan');
+  });
+
+  it('propagates compiled for a valueless targeting action (hover)', () => {
+    const steps: DiscoveredStep[] = [
+      {
+        stepNumber: 1,
+        description: 'Hover menu',
+        action: 'hover',
+        ref: 'menu',
+        pageUrl: 'https://x.com',
+        compiled: { ...makeCompiled(), action: { type: 'hover' } },
+      },
+    ];
+    const result = toIntentSteps(steps);
+    expect(result[0].type).toBe('hover');
+    expect(result[0].compiled).toBeDefined();
+    expect(result[0].compiled!.locatorPlan).toHaveLength(1);
+  });
+
   it('carries the compiled plan all the way through toIntentTestCase.stepsJson (the DB shape)', () => {
     const discovered: DiscoveredTestCase = {
       id: 'tc-compiled',
@@ -247,6 +285,42 @@ describe('toIntentSteps — compiled locator plan propagation', () => {
     // This is exactly what exploration-storage.service writes into steps_json.
     expect(persistedStep.compiled).toBeDefined();
     expect(persistedStep.compiled!.locatorPlan[0].value).toBe('submit');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPILED-PLAN GATE — the action sets must stay coherent
+// Guards the real regression: someone adds an action to one set but forgets the
+// map, or accidentally marks a non-targeting action (navigate/scroll/press) as
+// plan-worthy and starts freezing meaningless locators.
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('compiled-plan gate — PLAN_WORTHY_ACTIONS / VALUE_CARRYING_ACTIONS', () => {
+  it('never marks a non-targeting or synthetic action as plan-worthy', () => {
+    const forbidden = ['navigate', 'press', 'scroll', 'verify', 'wait'] as const;
+    for (const a of forbidden) {
+      expect(PLAN_WORTHY_ACTIONS.has(a as any)).toBe(false);
+    }
+  });
+
+  it('every plan-worthy action maps to a real targeting intent type (never navigate/ai_check/wait)', () => {
+    for (const action of PLAN_WORTHY_ACTIONS) {
+      const intentType = ACTION_TO_INTENT_TYPE[action];
+      expect(intentType).toBeDefined();
+      expect(['navigate', 'ai_check', 'wait']).not.toContain(intentType);
+    }
+  });
+
+  it('every value-carrying action is also plan-worthy (a value with no plan is meaningless here)', () => {
+    for (const action of VALUE_CARRYING_ACTIONS) {
+      expect(PLAN_WORTHY_ACTIONS.has(action)).toBe(true);
+    }
+  });
+
+  it('covers the actions widened beyond the click+fill PoC', () => {
+    for (const a of ['select', 'hover', 'toggle', 'setRange', 'selectDate', 'clear'] as const) {
+      expect(PLAN_WORTHY_ACTIONS.has(a)).toBe(true);
+    }
   });
 });
 

@@ -609,8 +609,9 @@ export class CommandExecutor {
     const result = await this.actionExecutor.execute(command, snapshot);
 
     if (result.success) {
+      const element = snapshot.elements.find(el => el.ref === ref);
       const postAction = await this.collectPostActionContext(ref);
-      return { success: true, output: `Selected "${value}" from dropdown ${ref}${postAction}` };
+      return { success: true, output: `Selected "${value}" from dropdown ${ref}${postAction}`, resolvedElement: element };
     }
 
     return { success: false, output: '', error: result.error || `Failed to select "${value}" in ${ref}` };
@@ -643,7 +644,7 @@ export class CommandExecutor {
     if (result.success) {
       const element = snapshot.elements.find(el => el.ref === ref);
       const elementDesc = element ? `"${element.name || element.role}" (${element.tag})` : ref;
-      return { success: true, output: `Hovered over ${elementDesc}` };
+      return { success: true, output: `Hovered over ${elementDesc}`, resolvedElement: element };
     }
 
     return { success: false, output: '', error: result.error || `Failed to hover ${ref}` };
@@ -818,7 +819,7 @@ export class CommandExecutor {
       const element = snapshot.elements.find(el => el.ref === ref);
       const elementDesc = element ? `"${element.name || element.role}" (${element.tag})` : ref;
       const postAction = await this.collectPostActionContext(ref);
-      return { success: true, output: `Toggled ${elementDesc}${postAction}` };
+      return { success: true, output: `Toggled ${elementDesc}${postAction}`, resolvedElement: element };
     }
 
     return { success: false, output: '', error: result.error || `Failed to toggle ${ref}` };
@@ -850,7 +851,7 @@ export class CommandExecutor {
     if (result.success) {
       const element = snapshot.elements.find(el => el.ref === ref);
       const elementDesc = element ? `"${element.name || element.role}" (${element.tag})` : ref;
-      return { success: true, output: `Set range ${elementDesc} to ${value}` };
+      return { success: true, output: `Set range ${elementDesc} to ${value}`, resolvedElement: element };
     }
 
     return { success: false, output: '', error: result.error || `Failed to set range ${ref} to ${value}` };
@@ -882,7 +883,7 @@ export class CommandExecutor {
     if (result.success) {
       const element = snapshot.elements.find(el => el.ref === ref);
       const elementDesc = element ? `"${element.name || element.role}" (${element.tag})` : ref;
-      return { success: true, output: `Set date ${elementDesc} to "${value}"` };
+      return { success: true, output: `Set date ${elementDesc} to "${value}"`, resolvedElement: element };
     }
 
     return { success: false, output: '', error: result.error || `Failed to set date ${ref} to ${value}` };
@@ -914,7 +915,7 @@ export class CommandExecutor {
     if (result.success) {
       const element = snapshot.elements.find(el => el.ref === ref);
       const elementDesc = element ? `"${element.name || element.role}" (${element.tag})` : ref;
-      return { success: true, output: `Cleared ${elementDesc}` };
+      return { success: true, output: `Cleared ${elementDesc}`, resolvedElement: element };
     }
 
     return { success: false, output: '', error: result.error || `Failed to clear ${ref}` };
