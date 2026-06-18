@@ -82,3 +82,12 @@ Negatives run web-only: `expandNegatives` / `getEnabledTestCaseIds` skip `testTy
 - `PATCH /negatives/:id` `{enabled}` and `DELETE /negatives/:id` — per-negative toggle/delete.
 
 Per-negative + regenerate routes are NOT plan-scoped, so they authorize via project access (owner OR workspace member, `hasProjectAccess` mirroring `RegressionRunService`), not bare `user_id`. Frontend: `NegativeTestsPanel.jsx` (prominent toggle + plan estimate + inline preview with per-item enable/delete + regenerate); ScopeTab fetches the negatives list once and passes slices down.
+
+## Preview / intent-test-case domain (third db/ example)
+
+`src/services/testing/ui/preview/` follows the same rule for its CRUD service:
+
+| File | What it holds |
+|---|---|
+| `db/intent-test-case.db.ts` | All `intent_test_cases` reads/writes (create / owner-scoped get / internal get / project list + count / dependency-closure + name resolution / steps_json read+write / owner update / delete / mark-negatives-stale) plus the `projects.workspace_id` access-check read and the `regression_plan_items` cleanup delete. Query-builder factories — each returns the awaitable Supabase query, so the service keeps its existing error-handling, logging, and merge logic |
+| `intent-test-case.service.ts` | Orchestration only: precondition DFS, the V16/V27 step-merge + compiled-plan invalidation, the `canWriteTestCase` access gate (owner OR workspace member), cache invalidation, and row → `IntentTestCase` mapping (`mapToIntentTestCase`). No `supabaseAdmin` import |
