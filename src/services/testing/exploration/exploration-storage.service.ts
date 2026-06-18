@@ -266,6 +266,52 @@ export class ExplorationStorageService {
   }
 
   /**
+   * Backstop reaper: mark exploration runs stuck in 'running' since before
+   * `cutoffIso` as 'timed_out'. Exploration finalization is event-driven
+   * (completeRun/failRun in the job); if the worker dies without throwing
+   * (OOM / killed mid-deploy / stall-death) no terminal write ever lands and
+   * the row stays 'running' forever (perpetual spinner in history, no cancel).
+   * This single bulk UPDATE is the missing trigger, called from the periodic
+   * StaleReaperService sweep.
+   *
+   * Idempotent: the `status = 'running'` filter excludes already-terminal rows,
+   * so re-runs only ever touch genuinely-stuck rows. Requires the 'timed_out'
+   * status (migration 20260618_exploration_runs_terminal_status.sql).
+   *
+   * @returns count of rows flipped this sweep (0 on error — best-effort).
+   */
+  static async reapStaleRunningRuns(cutoffIso: string): Promise<number> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('exploration_runs')
+        .update({
+          status: 'timed_out',
+          error_message: 'Run abandoned — no terminal status before timeout (worker died or stalled)',
+          completed_at: new Date().toISOString(),
+        })
+        .eq('status', 'running')
+        .lt('started_at', cutoffIso)
+        .select('exploration_id');
+
+      if (error) {
+        logger.error('[EXPLORATION_STORAGE] Failed to reap stale runs', { error: error.message });
+        return 0;
+      }
+
+      const count = data?.length ?? 0;
+      if (count > 0) {
+        logger.info('[EXPLORATION_STORAGE] Reaped stale exploration runs', { count });
+      }
+      return count;
+    } catch (error) {
+      logger.error('[EXPLORATION_STORAGE] Error reaping stale runs', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 0;
+    }
+  }
+
+  /**
    * Save discovered test cases to intent_test_cases table.
    * Returns inserted IDs.
    */

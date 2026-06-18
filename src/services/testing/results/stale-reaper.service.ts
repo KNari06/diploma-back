@@ -8,6 +8,7 @@ import {
   type StaleRunRow,
 } from '@/services/testing/results/db/test-completion.db';
 import { TestCompletionHandlerService } from '@/services/testing/results/test-completion-handler.service';
+import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -138,6 +139,18 @@ export class StaleReaperService {
     }
 
     return { scanned: ids.length };
+  }
+
+  /**
+   * Backstop reaper for `exploration_runs` stuck in 'running'. Exploration
+   * finalization is event-driven in the job (completeRun/failRun); a worker that
+   * dies without throwing leaves the row 'running' forever. Flips such rows to
+   * 'timed_out'. Same poll cadence + threshold as the tests/runs reapers.
+   */
+  static async reapStaleExplorations(thresholdMinutes = 30): Promise<{ scanned: number }> {
+    const cutoff = new Date(Date.now() - thresholdMinutes * 60 * 1000).toISOString();
+    const count = await ExplorationStorageService.reapStaleRunningRuns(cutoff);
+    return { scanned: count };
   }
 
   /**
