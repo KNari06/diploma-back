@@ -13,6 +13,7 @@ import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { getTelegramToken, sendMessage as sendTelegramMessage } from '@/services/api/telegram.service';
+import { escTg } from '@/utils/notifications/telegram-notify';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { RegressionRunProgressPayload } from '@/websocket/types/types';
 import { env } from '@/config/environment/env';
@@ -765,9 +766,12 @@ export class TestCompletionHandlerService {
         // Continue without share link — still send the notification
       }
 
+      // title/message here are built from hardcoded strings + numeric counts
+      // (safe). shareUrl is a generated URL — escape it so a `&` in query
+      // params can't break Telegram's HTML parsing (400 → lost notification).
       let htmlMessage = `<b>${title}</b>\n\n${message}`;
       if (shareUrl) {
-        htmlMessage += `\n\n<a href="${shareUrl}">View full report</a>`;
+        htmlMessage += `\n\n<a href="${escTg(shareUrl)}">View full report</a>`;
       }
 
       await sendTelegramMessage(tokenData.access_token, tokenData.external_id, htmlMessage, 'HTML');

@@ -1231,6 +1231,26 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
   try {
     const client = getMobileRunnerClient();
 
+    // Liveness guard. Unlike warmup/apply/run (which call sessionExists), lint
+    // used to forward straight to the runner with whatever sessionId the editor
+    // still held — so a session the runner had reclaimed (idle TTL ~25min, pool
+    // reset, runner redeploy) produced a bare runner 404 that the catch below
+    // flattened into a useless "Lint failed". Detect the dead session up front
+    // and return a TYPED 410 the editor recognizes (code SESSION_EXPIRED), so it
+    // can surface "session expired — reopen" instead of a generic error. Cheap
+    // (~one GET /api/sessions, 5s cap) and only on the lint path.
+    const alive = await client.sessionExists(sessionId);
+    if (!alive) {
+      logger.info('[MOBILE_SESSION] Lint on a session the runner no longer has', { sessionId });
+      res.status(410).json({
+        success: false,
+        code: 'SESSION_EXPIRED',
+        error: 'Session expired',
+        message: 'The device session is no longer available (it was reclaimed after inactivity or a restart). Reopen the test case to continue.',
+      });
+      return;
+    }
+
     const stepType = stepDraft.type || stepDraft.kind || 'click';
     const rawDescription = (stepDraft.elementDescription || stepDraft.description || '').trim();
 
@@ -1387,9 +1407,30 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
         result: { status: 'error', message },
       });
     }
-    res.status(500).json({
+    // Forward the REAL cause to the editor instead of a blanket "Lint failed".
+    // The old response hardcoded error:'Lint failed' and buried `message`, and
+    // the FE prefers `error` — so the user only ever saw "Lint failed" with no
+    // detail (the actual cause lived only in this server log). Now `error`
+    // carries the cause text and we pass through the runner's status/typed code
+    // when present, so a session that died mid-lint (despite the up-front
+    // guard — TOCTOU) still surfaces as SESSION_EXPIRED, and a transient
+    // runner/timeout error reads as itself.
+    const runnerErr = error as { statusCode?: number; code?: string };
+    const sessionGone = runnerErr?.statusCode === 404
+      && /session not found/i.test(message);
+    if (sessionGone) {
+      res.status(410).json({
+        success: false,
+        code: 'SESSION_EXPIRED',
+        error: 'Session expired',
+        message: 'The device session is no longer available. Reopen the test case to continue.',
+      });
+      return;
+    }
+    res.status(runnerErr?.statusCode && runnerErr.statusCode >= 400 ? runnerErr.statusCode : 500).json({
       success: false,
-      error: 'Lint failed',
+      error: message || 'Lint failed',
+      ...(runnerErr?.code ? { code: runnerErr.code } : {}),
       message,
     });
   }

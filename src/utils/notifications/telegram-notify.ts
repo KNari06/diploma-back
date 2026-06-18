@@ -17,7 +17,9 @@ export { getTelegramToken };
 // Telegram HTML mode only supports: <b>, <i>, <u>, <s>, <code>, <pre>, <a>.
 // ALL other text must have <, >, & escaped.
 
-function escTg(text: string): string {
+// Exported so other Telegram HTML senders (automation, skills) reuse ONE
+// escaper instead of interpolating raw values and tripping a 400.
+export function escTg(text: string): string {
   return text
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
