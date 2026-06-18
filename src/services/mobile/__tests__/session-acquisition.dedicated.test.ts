@@ -1,9 +1,14 @@
 import { MobileSessionAcquisitionService } from '../session-acquisition.service';
 import { resolveDedicatedDevice } from '../dedicated-device.service';
+import { DedicatedDeviceFeature } from '@/config/features/dedicated-device';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
+import { logger } from '@/utils/core/logger';
 
 jest.mock('../dedicated-device.service', () => ({
   resolveDedicatedDevice: jest.fn(),
+}));
+jest.mock('@/config/features/dedicated-device', () => ({
+  DedicatedDeviceFeature: { isEnabled: jest.fn() },
 }));
 jest.mock('@/api/mobile/session.controller', () => ({
   claimWarmedSession: jest.fn(),
@@ -11,9 +16,14 @@ jest.mock('@/api/mobile/session.controller', () => ({
 jest.mock('@/websocket/core/websocket.service', () => ({
   webSocketService: { emitTestProgress: jest.fn() },
 }));
+jest.mock('@/utils/core/logger', () => ({
+  logger: { info: jest.fn(), warn: jest.fn(), debug: jest.fn(), error: jest.fn() },
+}));
 
 const mockResolve = resolveDedicatedDevice as jest.Mock;
+const mockFlag = DedicatedDeviceFeature.isEnabled as jest.Mock;
 const mockWarmed = claimWarmedSession as jest.Mock;
+const mockWarn = logger.warn as jest.Mock;
 
 function makeClient() {
   return {
@@ -82,5 +92,49 @@ describe('acquireSession — dedicated intercept', () => {
     expect(r.sessionSource).toBe('pool');
     expect(r.sessionId).toBe('sess-pool');
     expect(client.claimSession).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('acquireSession — dedicated observability (Phase 7 log-only)', () => {
+  it('warns when the feature is ON but no device resolves (silent routing breakage)', async () => {
+    mockFlag.mockReturnValue(true);
+    mockResolve.mockResolvedValue(null);
+    const client = makeClient();
+    client.claimSession.mockResolvedValue({ sessionId: 'sess-pool' });
+
+    await MobileSessionAcquisitionService.acquireSession(baseParams(client));
+
+    const warned = mockWarn.mock.calls.some(([msg]) =>
+      String(msg).includes('Dedicated feature on but no device resolved'),
+    );
+    expect(warned).toBe(true);
+  });
+
+  it('does NOT warn when the feature is OFF (default deploy — fall-through is expected)', async () => {
+    mockFlag.mockReturnValue(false);
+    mockResolve.mockResolvedValue(null);
+    const client = makeClient();
+    client.claimSession.mockResolvedValue({ sessionId: 'sess-pool' });
+
+    await MobileSessionAcquisitionService.acquireSession(baseParams(client));
+
+    const warned = mockWarn.mock.calls.some(([msg]) =>
+      String(msg).includes('Dedicated feature on but no device resolved'),
+    );
+    expect(warned).toBe(false);
+  });
+
+  it('does NOT warn for ios (expected fall-through — no dedicated iOS in v1)', async () => {
+    mockFlag.mockReturnValue(true);
+    mockResolve.mockResolvedValue(null);
+    const client = makeClient();
+    client.claimSession.mockResolvedValue({ sessionId: 'sess-pool' });
+
+    await MobileSessionAcquisitionService.acquireSession({ ...baseParams(client), platform: 'ios' as const });
+
+    const warned = mockWarn.mock.calls.some(([msg]) =>
+      String(msg).includes('Dedicated feature on but no device resolved'),
+    );
+    expect(warned).toBe(false);
   });
 });

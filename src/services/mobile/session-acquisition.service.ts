@@ -4,6 +4,7 @@ import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileRunnerClient } from './mobile-runner-client';
 import type { MobilePlatform } from './mobile-runner.types';
 import { resolveDedicatedDevice } from './dedicated-device.service';
+import { DedicatedDeviceFeature } from '@/config/features/dedicated-device';
 import { env } from '@/config/environment/env';
 
 /**
@@ -124,6 +125,22 @@ export class MobileSessionAcquisitionService {
         sessionClaimMs: Math.max(0, Date.now() - sessionClaimT0),
         coldStartUsed: false,
       };
+    }
+
+    // Observability (Phase 7, log-only): the dedicated feature is ON and we
+    // have a workspace, yet no dedicated device resolved — this run is about to
+    // fall through to the SHARED pool. For a workspace that's supposed to be
+    // dedicated this is silent routing breakage (missing/inactive row, platform
+    // mismatch, or an ios-v1 run). Surface a warn ops can alert on; there's no
+    // session_source column to make this visible in telemetry. iOS is excluded
+    // from the warn — it's an expected fall-through (no dedicated iOS in v1),
+    // not a misconfiguration.
+    if (DedicatedDeviceFeature.isEnabled() && workspaceId && platform !== 'ios') {
+      logger.warn('[MOBILE-TEST] Dedicated feature on but no device resolved — falling back to shared pool', {
+        testId,
+        workspaceId,
+        platform,
+      });
     }
 
     try {

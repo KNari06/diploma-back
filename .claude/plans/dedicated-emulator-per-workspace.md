@@ -218,11 +218,27 @@ Confirmed: worker `finally` (mobile-test-run.job.ts:1299) routes every non-`pool
 
 ---
 
-## Phase 7 — 🆕 Observability
-Confirmed: `sessionSource` ∈ {pool,warmup,cold}; a dedicated run would otherwise report 'cold', indistinguishable — so silent routing breakage (workspace lost dedicated → lands shared) is invisible.
-- **7.1** Add `'dedicated'` to the `sessionSource` union end-to-end (acquire return, telemetry, test_executions if persisted).
-- **7.2** Log at acquire: dedicated hit (workspaceId, serial-redacted) vs dedicated-miss-fellthrough. An ops alert can watch for a dedicated workspace whose runs report a non-dedicated source.
-- **7.3** Telemetry writes stay best-effort (Hard invariant #11) — never fail the test path.
+## Phase 7 — 🆕 Observability — DEEP-DIVE FINDINGS (pre-impl)
+Deep-dive result: there is **no `session_source` column**. `test_executions` persists only `cold_start_used` (bool) + `session_claim_ms`; the aggregation funnel (`recomputeRunStatus`) reads only `cold_start_used`. A dedicated run records `coldStartUsed:false` (same as pool/warmup) → indistinguishable. So making dedicated observable is NOT a 1-liner — it needs a new column.
+- `sessionSource` union ALREADY widened to include 'dedicated' in the only two typed spots (session-acquisition.service.ts:47/94, mobile-test-run.job.ts:288) — no other narrowing exists; nothing broken.
+- **7.1 (if we persist):** migration `ALTER TABLE test_executions ADD COLUMN session_source TEXT NULL;` → thread `tlm.sessionSource` → `ExecutionService.persistTelemetryByTestId` (add `session_source?: string|null`). Both writes already wrapped in try/catch (invariant #11 safe — mirror exactly).
+- **7.2 (cheap, no schema):** acquire already logs `[MOBILE-TEST] Dedicated session created {workspaceId}`. Add a counterpart "dedicated workspace fell through to <source>" warn when a flag-on workspace with a row resolves null — that single log line is enough for an ops alert WITHOUT a column.
+- **Decision pending user:** persist `session_source` (queryable adoption/breakage metrics, +1 migration +3 edits) vs log-only 7.2 (zero schema, covers the "silent breakage" alarm). Recommend **log-only 7.2 now**, defer the column until adoption metrics are actually needed.
+- Aggregation: do NOT add a write to `regression_runs.total_*` outside `recomputeRunStatus` (invariant #11 single funnel).
+
+## RUNNER terrain map (Phase 5/6/3 — for the runner-repo branch)
+- **6 endpoint:** `POST /api/sessions/:id/end-dedicated` = wrap `requireSessionOwnership(runner)` → call **`runner.resetSession(id)`** (NOT destroy). resetSession already = app-reset MINUS device teardown; `destroySession` = resetSession + `releaseAndroidDevice`→`emulatorManager.stop` (the container kill). Insert after the `/release` route (~session.routes.ts:400).
+- **6.3 TTL:** mirror the existing `pooledSessionIds`/`markPooled` pattern with `dedicatedSessionIds` + `if (this.dedicatedSessionIds.has(id)) continue;` in the TTL loop (session-manager.ts:228). Add `isDedicated?: boolean` to AndroidSession/IosSession (session-types.ts).
+- **5 per-serial lock:** mirror the existing physical-device `DEVICE_BUSY` guard in `createAndroidSession` (session-manager.ts:627-640) — a `serialMutexes` map keyed by serial, acquired after the emulator is resolved (~617), released in destroySession finally (~1874). Recommended v1: reject with `DEVICE_BUSY` if a live session already exists for that serial (backend retries) — simpler than a queuing mutex, no deadlock risk vs the existing RwLock.
+- **3 excluded-ports:** `config.pool.dedicatedPorts` (CSV) → skip in `resolveAndroidDevice` (~427) AND `recoverBroken` port pick.
+
+## Phase 7 — STATUS: DONE (log-only, per user decision)
+- Chose **log-only** (no `session_source` column) — covers the silent-breakage alarm without a migration; adoption metrics deferred until needed.
+- acquire emits a warn `[MOBILE-TEST] Dedicated feature on but no device resolved — falling back to shared pool {workspaceId, platform}` ONLY when flag is ON + workspaceId present + platform≠ios (ios fall-through is expected in v1, not a misconfig). Dedicated-hit info log already exists (Phase 2).
+- Ops alert: watch that warn line. No schema change; sessionSource union already widened (Phase 2).
+- Tests: 6/6 (warn on flag-on miss; no-warn on flag-off; no-warn on ios). Full mobile suite 191/191.
+
+## Phase 7 — 🆕 Observability (original spec)
 
 ---
 
