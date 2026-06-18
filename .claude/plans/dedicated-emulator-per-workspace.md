@@ -249,7 +249,13 @@ Deep-dive result: there is **no `session_source` column**. `test_executions` per
 
 ---
 
-## Phase 4 — Infra + docs
+## Phase 4 — STATUS: DONE
+- qait-infra `azure/scripts/setup-emulator-vm.sh`: ops runbook comment block — how to add a dedicated container (new port outside pool range → table row → POOL_ANDROID_EXCLUDED_PORTS → MOBILE_RUNNER_ALLOWED_HOSTS + flag). All four must move together; no auto-provision.
+- qai-backend CLAUDE.md: mobile-regression flow now documents the tier-0 dedicated intercept + endDedicatedSession cleanup + server-derived workspaceId.
+- qait-mobile-runner CLAUDE.md: session-lifecycle dedicated paragraph + `POST /:id/end-dedicated` route + `POOL_ANDROID_EXCLUDED_PORTS` env.
+- FEATURE COMPLETE across all 3 repos. Remaining to GO LIVE: provision a container + table row + the 4 env/flag settings (ops), then flip DEDICATED_MOBILE_EMULATOR_ENABLED.
+
+## Phase 4 — Infra + docs (original spec)
 - **4.1** `qait-infra/azure/scripts/setup-emulator-vm.sh` + README: "add a dedicated container" = new redroid container on a port OUTSIDE pool range + row in `workspace_dedicated_device` + add port to `POOL_ANDROID_EXCLUDED_PORTS` + host in `MOBILE_RUNNER_ALLOWED_HOSTS`. No automation v1.
 - **4.2** 🆕 Config-sync checklist (must move together): backend `DEDICATED_MOBILE_EMULATOR_ENABLED` + `MOBILE_RUNNER_ALLOWED_HOSTS` (incl. dedicated host) ↔ runner `POOL_ANDROID_EXCLUDED_PORTS`. A row in the table is useless if the host isn't allowlisted (SSRF guard rejects) or the port isn't excluded (pool steals it).
 - **4.3** CLAUDE.md (same change):

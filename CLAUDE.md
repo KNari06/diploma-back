@@ -137,6 +137,8 @@ stabilization-retry tail; (4) compiled-plan persistence happens explicitly via
 from a runner-side pool (warmup → cold-start fallback) and released in the
 finally block. See `mobile-test-run.job.ts` for the full lifecycle.
 
+**Dedicated emulator per workspace** (gated by `DEDICATED_MOBILE_EMULATOR_ENABLED`, default off). Before the pool→warmup→cold ladder, `MobileSessionAcquisitionService.acquireSession` runs a **tier-0 dedicated intercept**: `resolveDedicatedDevice(workspaceId, platform)` ([dedicated-device.service.ts](src/services/mobile/dedicated-device.service.ts) → [db/dedicated-device.db.ts](src/services/mobile/db/dedicated-device.db.ts), table `workspace_dedicated_device`) returns the workspace's pinned `runner_serial` or null. On a hit it pins the session (`createSession({deviceSelector:{serial}, ownerId:workspaceId, dedicated:true})`, `sessionSource:'dedicated'`), SKIPS the shared ladder, and on cleanup calls `endDedicatedSession` (reset-without-destroy) instead of `destroySession` — the runner keeps the container alive. NO shared-pool fallback on failure (preserves isolation). The same intercept runs at the other 3 session-birth sites: editor warmup + auto-boot ([session.controller.ts](src/api/mobile/session.controller.ts)). `workspaceId` is ALWAYS server-derived (job payload or access-checked `project.workspace_id`), never the request body. Runner side: per-serial DEVICE_BUSY lock + TTL/eviction exclusion + `POOL_ANDROID_EXCLUDED_PORTS` (qait-mobile-runner). Map populated MANUALLY by ops (no auto-provision) — see qait-infra `setup-emulator-vm.sh`. iOS is shared-only in v1 (no remote simulator farm).
+
 ### Scheduled cron
 
 Scheduler bundle ticks every 60s (the `TestSchedulerJobHandler` loop)
