@@ -10,6 +10,64 @@ import { MAX_UPLOAD_SIZE_BYTES, ALLOWED_UPLOAD_EXTENSIONS } from '@/services/mob
 
 const MB = 1024 * 1024;
 
+/**
+ * Write an HTTP error response for a mobile session/command/lint/apply handler
+ * that caught a thrown error while talking to the runner.
+ *
+ * WHY THIS EXISTS: every such handler used to respond
+ *   { success:false, error:'<X> failed' (HARDCODED), message:'<real cause>' }
+ * and the editor surfaced the generic `error`, dropping `message`. So a dead
+ * session, a Gemini 503, a device-init failure all read as "Apply failed" /
+ * "Command failed" / "Failed to warm up emulator session". This helper makes
+ * the response carry the REAL cause in `error`, forwards the runner's typed
+ * `code` + HTTP status when present, and special-cases a reclaimed session as
+ * a typed 410 SESSION_EXPIRED so the editor can prompt "reopen to continue".
+ * `fallback` is used only when the error has no message at all.
+ *
+ * Keeps `message` too (same string) for any client that reads it. Callers
+ * still do their own logging/tracing — this only shapes the HTTP response.
+ */
+export function sendMobileRunnerError(res: Response, error: unknown, fallback: string): void {
+  const message = error instanceof Error ? error.message : String(error);
+  const runnerErr = error as { statusCode?: number; code?: string };
+
+  // Streaming guard: runTestCaseOnSession streams NDJSON (Content-Type
+  // application/x-ndjson + res.write per step), so an error AFTER the first
+  // chunk reaches this catch with headers already sent — `res.status().json()`
+  // would then throw ERR_HTTP_HEADERS_SENT (latent before this consolidation).
+  // Emit a terminal NDJSON error line + end the stream instead, so the editor
+  // gets a real failure event rather than a hung/aborted connection.
+  if (res.headersSent) {
+    try {
+      res.write(JSON.stringify({ type: 'error', error: message || fallback, ...(runnerErr?.code ? { code: runnerErr.code } : {}) }) + '\n');
+    } catch { /* socket already torn down — nothing we can do */ }
+    res.end();
+    return;
+  }
+
+  // A session the runner no longer has (idle TTL / pool reset / redeploy) →
+  // typed 410 so the editor routes it through its session-expiry flow instead
+  // of showing a dead-end error that only a reload "fixes".
+  const sessionGone = runnerErr?.statusCode === 404 && /session not found/i.test(message);
+  if (sessionGone) {
+    res.status(410).json({
+      success: false,
+      code: 'SESSION_EXPIRED',
+      error: 'Session expired',
+      message: 'The device session is no longer available (reclaimed after inactivity or a restart). Reopen the test case to continue.',
+    });
+    return;
+  }
+
+  const status = runnerErr?.statusCode && runnerErr.statusCode >= 400 ? runnerErr.statusCode : 500;
+  res.status(status).json({
+    success: false,
+    error: message || fallback,
+    ...(runnerErr?.code ? { code: runnerErr.code } : {}),
+    message: message || fallback,
+  });
+}
+
 /** Write the appropriate HTTP response for a tagged service error. */
 export function sendMobileAppError(res: Response, err: MobileAppError): void {
   switch (err.kind) {

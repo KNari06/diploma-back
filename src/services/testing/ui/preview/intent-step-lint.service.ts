@@ -1236,7 +1236,7 @@ export class IntentStepLintService {
               if (hits.length === 1) { identityRescue = true; rescueReason = 'href'; }
             }
             if (!identityRescue && name) {
-              const hits = domNodes.filter(n => (n as any).htmlName === name);
+              const hits = domNodes.filter(n => (n as any).name === name);
               if (hits.length === 1) { identityRescue = true; rescueReason = 'name'; }
             }
           }

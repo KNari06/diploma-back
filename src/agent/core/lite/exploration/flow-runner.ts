@@ -30,21 +30,26 @@ import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.se
 import { OverlayDismisser } from './overlay-dismisser';
 import { VisualStability } from '../collectors/visual-stability';
 
-import type {
-  ExplorationConfig,
-  EntryPoint,
-  FlowExplorationTask,
-  FlowExplorationStatus,
-  FlowRunnerCheckpoint,
-  DiscoveredStep,
-  CapturedApiCall,
-  FlowError,
-  ErrorClassification,
-  BlockerType,
-  ExplorationProgressCallback,
+import {
+  ACTION_TO_INTENT_TYPE,
+  type ExplorationConfig,
+  type EntryPoint,
+  type FlowExplorationTask,
+  type FlowExplorationStatus,
+  type FlowRunnerCheckpoint,
+  type DiscoveredStep,
+  type CapturedApiCall,
+  type FlowError,
+  type ErrorClassification,
+  type BlockerType,
+  type ExplorationProgressCallback,
 } from './types';
 import type { NetworkSuccess } from '../lite-types';
 import { attributeCallsToSteps } from './network-assertions';
+import { LocatorPlanBuilder } from '@/services/testing/ui/preview/locator-plan-builder.service';
+import { adaptLiteElementsToInteractiveNodes } from '@/agent/execution/background-dom-collector';
+import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
+import type { TestAction } from '../test-case/types';
 import { FlowQueue } from './flow-queue';
 import { BudgetTracker } from './budget-tracker';
 import { StateManager } from './state-manager';
@@ -72,6 +77,28 @@ const FLOW_NAV_TIMEOUT_MS = 15_000;
  * against a non-interactive page and flake.
  */
 const FLOW_NAV_WAIT_UNTIL = 'load' as const;
+
+/**
+ * Element-targeting actions that earn a compiled locator plan (frozen from the
+ * element the executor resolved at action time). Excludes non-targeting steps
+ * (navigate/press/scroll/scrollToElement) and synthetic verify steps — those
+ * have no durable element target. `clear` maps to a `click` intent type
+ * upstream (ACTION_TO_INTENT_TYPE), but its LOCATOR is still the field, so the
+ * frozen plan is correct; the action-type quirk is pre-existing and orthogonal.
+ */
+export const PLAN_WORTHY_ACTIONS: ReadonlySet<TestAction> = new Set<TestAction>([
+  'click', 'fill', 'select', 'hover', 'toggle', 'setRange', 'selectDate', 'clear',
+]);
+
+/**
+ * Subset whose `value` is meaningful to replay and safe to freeze into the
+ * plan: typed text (fill), chosen option (select), range number (setRange),
+ * date string (selectDate). Sensitive values are still excluded at call time.
+ * click/hover/toggle/clear carry no value.
+ */
+export const VALUE_CARRYING_ACTIONS: ReadonlySet<TestAction> = new Set<TestAction>([
+  'fill', 'select', 'setRange', 'selectDate',
+]);
 
 /** Semaphore for bounding concurrent flows */
 class Semaphore {
@@ -361,6 +388,11 @@ export class FlowRunner {
         durationMs: task.durationMs,
         progressScore: task.progressScore,
         blockerType: task.blockerType || undefined,
+        // Human-readable blocker reason + whether the user can unblock it
+        // (CAPTCHA/2FA/login). The FE renders these live on a blocked flow;
+        // both are populated alongside blockerType when status==='blocked'.
+        blockerReason: task.blockedReason || undefined,
+        canUserHelp: task.canUserHelp ?? undefined,
         errorMessage: task.errors.length > 0 ? task.errors[0].message : undefined,
         failedAtStep: task.errors.length > 0 ? task.errors[0].stepNumber : undefined,
         errorsCount: task.errors.length,
@@ -611,7 +643,7 @@ export class FlowRunner {
       //    NetworkTracker has been running since `new NetworkTracker(page)`
       //    above, so everything captured since `pipelineStartTime` belongs
       //    to this flow.
-      const { steps: baseSteps, stepsByRound } = this.extractSteps(pipelineResult);
+      const { steps: baseSteps, stepsByRound } = await this.extractSteps(pipelineResult, page);
       const successfulCalls = this.collectSuccessfulCalls(networkTracker, pipelineStartTime);
       const discoveredSteps = attributeCallsToSteps({
         steps: baseSteps,
@@ -639,7 +671,10 @@ export class FlowRunner {
           count: discoveredSteps.length,
         });
 
-        // Emit flow_step events for real-time frontend updates
+        // Emit flow_step events for real-time frontend updates.
+        // `extractSteps` keeps ONLY successful commands (failed ones are
+        // filtered out above), so every emitted step is a success — the FE
+        // reads `data.success` to render the per-step ✓ indicator.
         for (const step of discoveredSteps) {
           this.emitProgress('flow_step', {
             entryPointId: entryPoint.id,
@@ -649,6 +684,7 @@ export class FlowRunner {
             description: step.description,
             value: step.value,
             pageUrl: step.pageUrl,
+            success: true,
           });
         }
       }
@@ -788,7 +824,7 @@ export class FlowRunner {
                   canUserHelp = undefined;
                   // Merge steps — reuse the same attribution pipeline so
                   // network calls captured during the retry get attached too.
-                  const { steps: retrySteps, stepsByRound: retryStepsByRound } = this.extractSteps(retryResult);
+                  const { steps: retrySteps, stepsByRound: retryStepsByRound } = await this.extractSteps(retryResult, page);
                   const retryCalls = this.collectSuccessfulCalls(retryNetworkTracker, retryStartTime);
                   const retryAttributed = attributeCallsToSteps({
                     steps: retrySteps,
@@ -1040,10 +1076,10 @@ export class FlowRunner {
    * assertion pipeline to attribute captured API calls back to the action
    * that triggered them.
    */
-  private extractSteps(result: TestPipelineResult): {
+  private async extractSteps(result: TestPipelineResult, page?: Page): Promise<{
     steps: DiscoveredStep[];
     stepsByRound: Array<number | null>;
-  } {
+  }> {
     const steps: DiscoveredStep[] = [];
     const stepsByRound: Array<number | null> = [];
     let stepNumber = 0;
@@ -1061,6 +1097,11 @@ export class FlowRunner {
         const step = this.commandToStep(executed, stepNumber + 1, roundPageUrl);
         if (step) {
           step.stepNumber = ++stepNumber;
+          // Freeze a compiled locator plan from the element the executor
+          // actually acted on. Best-effort: a failure here must never drop
+          // the step or fail the flow — the step simply falls back to
+          // runtime resolution on first replay (the pre-change behavior).
+          await this.attachCompiledPlan(step, executed, roundPageUrl, page);
           steps.push(step);
           lastStepIdxInRound = steps.length - 1;
         }
@@ -1070,6 +1111,72 @@ export class FlowRunner {
     }
 
     return { steps, stepsByRound };
+  }
+
+  /**
+   * Build a compiled locator plan for a targeting step from the element the
+   * executor resolved at action time (`result.resolvedElement`) and attach it
+   * to `step.compiled`. Reuses the same `LocatorPlanBuilder` the preview
+   * Run-All and mobile paths use, so exploration-discovered cases hit replay's
+   * stage-1 fast path on their first regression run instead of re-resolving
+   * every element through the LLM.
+   *
+   * Passing the live `page` validates each locator (live `count()`), flipping
+   * the plan to `unverified: false` and dropping dead locators. With no page
+   * the plan is still built but marked `unverified`.
+   *
+   * Best-effort by contract: any throw is swallowed (step keeps working,
+   * just without a frozen plan). PoC scope: click + fill only.
+   */
+  private async attachCompiledPlan(
+    step: DiscoveredStep,
+    executed: ExecutedCommand,
+    pageUrl: string,
+    page?: Page,
+  ): Promise<void> {
+    const resolvedElement = executed.result.resolvedElement;
+    if (!resolvedElement) return;
+    // Only element-targeting actions get a compiled locator plan. Non-targeting
+    // (navigate/press/scroll) and synthetic (verify) steps have no durable
+    // target — they never set `resolvedElement` anyway, but gate explicitly so
+    // a future executor change can't silently start compiling them.
+    if (!PLAN_WORTHY_ACTIONS.has(step.action)) return;
+
+    try {
+      const [node] = adaptLiteElementsToInteractiveNodes([resolvedElement]);
+      if (!node) return;
+
+      const intentType = ACTION_TO_INTENT_TYPE[step.action] || 'click';
+      // Carry the value only for actions whose value is meaningful to replay
+      // (select option / range number / date string / typed text) AND not a
+      // credential — secrets must never be frozen into a persisted plan.
+      const carriesValue =
+        VALUE_CARRYING_ACTIONS.has(step.action) && !step.isSensitive && !!step.value;
+      const planStep: IntentStep = {
+        id: `step-${step.stepNumber}`,
+        type: intentType,
+        description: step.description,
+        ...(carriesValue ? { value: step.value } : {}),
+      };
+
+      const compiled = await LocatorPlanBuilder.buildCompiledPlan({
+        step: planStep,
+        resolvedNode: node,
+        pageUrl,
+        page, // live page → validated plan (unverified: false)
+      });
+
+      // Only keep a plan that actually carries at least one locator.
+      if (compiled?.locatorPlan?.length) {
+        step.compiled = compiled;
+      }
+    } catch (err) {
+      logger.debug('[FLOW_RUNNER] Compiled-plan capture skipped', {
+        action: step.action,
+        ref: step.ref,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**

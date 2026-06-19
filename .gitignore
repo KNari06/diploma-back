@@ -2,7 +2,10 @@
 temporary/
 
 # Dependencies
-node_modules/
+# No trailing slash so a git-worktree node_modules SYMLINK (a file, not a dir)
+# is ignored too — a `node_modules/` pattern matches only directories and let a
+# worktree symlink slip into a commit.
+node_modules
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

@@ -9,6 +9,7 @@ import {
   isValidTelegramChatId,
 } from '@/services/api/telegram.service';
 import { IntegrationTokenService } from '@/services/api/integration-token.service';
+import { escTg } from '@/utils/notifications/telegram-notify';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 
@@ -750,7 +751,11 @@ async function handleSendNotification(
   };
 
   const emoji = levelEmoji[level] || levelEmoji.info;
-  const formattedText = `${emoji} <b>${title}</b>\n\n${body}\n\n<i>Sent via QAIT</i>`;
+  // title/body are plain text the code wraps in <b>/<i> — escape them so a
+  // stray & or < doesn't make Telegram reject the message with a 400.
+  // (Note: handleSendMessage intentionally does NOT escape — that tool
+  // documents raw-HTML input; this one does not.)
+  const formattedText = `${emoji} <b>${escTg(title)}</b>\n\n${escTg(body)}\n\n<i>Sent via QAIT</i>`;
 
   try {
     const message = await sendMessage(botToken, chat_id, formattedText, 'HTML');

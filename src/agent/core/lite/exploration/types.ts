@@ -17,7 +17,7 @@
  */
 
 import type { TestAction, TestCase, TestStep } from '../test-case/types';
-import type { IntentStep, IntentActionType } from '@/services/testing/ui/preview/preview.types';
+import type { IntentStep, IntentActionType, CompiledStepPlan } from '@/services/testing/ui/preview/preview.types';
 import type { IntentTestCase, Priority } from '@/types/testing.types';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -408,6 +408,13 @@ export interface DiscoveredStep {
    * Empty/undefined for reads (observe_page) and on non-interactive steps.
    */
   networkCalls?: CapturedApiCall[];
+  /**
+   * Compiled locator plan frozen from the resolved element at action time.
+   * Present only for targeting actions whose executor returned a
+   * `resolvedElement`. Carries the step into replay's stage-1 fast path so
+   * the first regression run does NOT re-resolve the element via the LLM.
+   */
+  compiled?: CompiledStepPlan;
 }
 
 /**
@@ -515,7 +522,7 @@ export function toTestCase(discovered: DiscoveredTestCase): TestCase {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /** Map DiscoveredStep action to IntentActionType */
-const ACTION_TO_INTENT_TYPE: Record<string, IntentActionType> = {
+export const ACTION_TO_INTENT_TYPE: Record<string, IntentActionType> = {
   navigate: 'navigate',
   click: 'click',
   fill: 'type',
@@ -573,6 +580,13 @@ export function toIntentSteps(steps: DiscoveredStep[]): IntentStep[] {
         label: step.ref,
         nearText: step.description,
       };
+    }
+
+    // Carry the compiled locator plan (frozen at action time) into the
+    // persisted step so replay's stage-1 fast path hits on the first run
+    // instead of re-resolving every element through the LLM.
+    if (step.compiled) {
+      intentStep.compiled = step.compiled;
     }
 
     return intentStep;

@@ -730,7 +730,7 @@ export async function collectInteractiveNodes(page: Page, maxNodes?: number): Pr
  * keep their `eN` ref untouched — downstream consumers don't care
  * about the literal prefix.
  */
-function adaptLiteElementsToInteractiveNodes(elements: LiteElement[]): InteractiveNode[] {
+export function adaptLiteElementsToInteractiveNodes(elements: LiteElement[]): InteractiveNode[] {
   const out: InteractiveNode[] = [];
   // Per-iframe counter so the rewritten refs are unique within their
   // frame namespace and stable across the same snapshot. We keep

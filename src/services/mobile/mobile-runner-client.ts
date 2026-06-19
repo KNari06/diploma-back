@@ -160,6 +160,29 @@ export class MobileRunnerClient {
     await this.request('DELETE', `/api/sessions/${sessionId}`, { userId: opts?.userId });
   }
 
+  /**
+   * End a DEDICATED session without destroying its device.
+   *
+   * A dedicated emulator container is pinned to a workspace and must outlive a
+   * single run — `destroySession` would tear down the remote container (it
+   * calls `emulatorManager.stop(serial)` → `adb emu kill`). This endpoint ends
+   * the session and resets app state (force-stop + clear data) but leaves the
+   * container alive for the workspace's next run.
+   *
+   * Runner contract (qait-mobile-runner): `POST /api/sessions/:id/end-dedicated`
+   * — the app-reset half of `resetSession` WITHOUT `releaseAndroidDevice`.
+   * Until the runner ships it, this 404s and the caller's catch logs it; the
+   * container is NOT destroyed either way, which is the safety property that
+   * matters.
+   */
+  async endDedicatedSession(sessionId: string, opts?: { userId?: string }): Promise<void> {
+    await this.request('POST', `/api/sessions/${sessionId}/end-dedicated`, {
+      timeoutMs: 15_000,
+      noRetry: true,
+      userId: opts?.userId,
+    });
+  }
+
   async sessionExists(sessionId: string): Promise<boolean> {
     try {
       const sessions = await this.request<{ id: string }[]>('GET', '/api/sessions', {

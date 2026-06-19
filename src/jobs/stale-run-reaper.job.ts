@@ -93,10 +93,13 @@ export class StaleRunReaperJob {
     }
   }
 
-  /** Process one tick — sweep orphaned regression runs AND standalone tests. */
-  static async tick(): Promise<{ runs: number; tests: number }> {
+  /** Process one tick — sweep orphaned regression runs, standalone tests, and
+   *  abandoned exploration runs. Each is independent + best-effort; one failing
+   *  must not skip the others. */
+  static async tick(): Promise<{ runs: number; tests: number; explorations: number }> {
     const runs = await StaleReaperService.reapStaleRuns(THRESHOLD_MINUTES);
     const tests = await StaleReaperService.reapStaleTests(THRESHOLD_MINUTES);
-    return { runs: runs.scanned, tests: tests.scanned };
+    const explorations = await StaleReaperService.reapStaleExplorations(THRESHOLD_MINUTES);
+    return { runs: runs.scanned, tests: tests.scanned, explorations: explorations.scanned };
   }
 }

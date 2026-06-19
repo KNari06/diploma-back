@@ -205,6 +205,19 @@ describe('steps_json validation', () => {
   });
 });
 
+describe('workspace resolution', () => {
+  it('throws and does not enqueue when the project has no workspace', async () => {
+    (regressionDb.getProjectWorkspaceId as jest.Mock).mockResolvedValueOnce(null);
+
+    await expect(
+      MobileTestDispatcherService.dispatchMobileTest(baseCase(), 'user-1', 'manual'),
+    ).rejects.toThrow(/no workspace assigned/);
+
+    expect(dbAdminService.createTest).not.toHaveBeenCalled();
+    expect(QueueManager.addMobileTestRunJob).not.toHaveBeenCalled();
+  });
+});
+
 // ── App build ID resolution ──────────────────────────────────────────────────
 
 describe('appBuildId in return value', () => {

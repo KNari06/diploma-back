@@ -91,7 +91,7 @@ export class FailureAnalysisService {
       this.fetchTestResults(testId),
       this.fetchIntelligentSession(testId),
       import('@/services/api/integration-token.service')
-        .then(m => m.IntegrationTokenService.getIntegrationSummary(userId, workspaceId || ''))
+        .then(m => m.IntegrationTokenService.getIntegrationSummary(userId, workspaceId ?? undefined))
         .catch(() => ''),
     ]);
 

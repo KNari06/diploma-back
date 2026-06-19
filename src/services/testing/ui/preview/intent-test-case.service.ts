@@ -4,12 +4,13 @@
  * V2: Added step-level updates for runtime heal persistence
  */
 
-import { supabaseAdmin } from '@/db/supabase';
+import * as intentTestCaseDb from './db/intent-test-case.db';
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import type { CompiledStepPlan, IntentStep, IntentTestCase, StepEvidence } from './preview.types';
 import { injectAutoWaitForSteps } from './auto-wait-for.utils';
+import { emitTestCaseMutated } from '@/websocket/helpers/project-mutation-emit';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Per-testCase in-memory mutex (prevents concurrent read-modify-write races)
@@ -49,11 +50,7 @@ async function canWriteTestCase(
   if (testCaseOwnerId === userId) return true;
 
   try {
-    const { data: project } = await supabaseAdmin
-      .from('projects')
-      .select('workspace_id')
-      .eq('id', testCaseProjectId)
-      .maybeSingle();
+    const { data: project } = await intentTestCaseDb.getProjectWorkspaceRow(testCaseProjectId);
 
     const workspaceId = (project as any)?.workspace_id as string | undefined;
     if (!workspaceId) return false;
@@ -179,34 +176,30 @@ export class IntentTestCaseService {
       }
     }
 
-    const { data, error } = await supabaseAdmin
-      .from('intent_test_cases')
-      .insert({
-        project_id: projectId,
-        user_id: userId,
-        name,
-        description: description || null,
-        start_url: startUrl || null,
-        steps_json: this.normalizeSteps(steps),
-        flow_id: flowId || null,
-        status,
-        kind,
-        platform,
-        // 'medium' by default (see params.priority comment above);
-        // explicit null leaves the DB column NULL.
-        priority,
-        // Only set when the caller supplied preconditions — otherwise let the
-        // column default ('{}') apply rather than writing an explicit empty array.
-        ...(preconditions !== undefined && { preconditions }),
-        // Import provenance — only written by import paths; omitted otherwise so
-        // the columns stay NULL / default for manually-created tests.
-        ...(importId !== undefined && { import_id: importId }),
-        ...(sourceStatus !== undefined && { source_status: sourceStatus }),
-        ...(stepsDegraded !== undefined && { steps_degraded: stepsDegraded }),
-        resource_bindings: resourceBindings,
-      })
-      .select('*')
-      .single();
+    const { data, error } = await intentTestCaseDb.insertTestCaseRow({
+      project_id: projectId,
+      user_id: userId,
+      name,
+      description: description || null,
+      start_url: startUrl || null,
+      steps_json: this.normalizeSteps(steps),
+      flow_id: flowId || null,
+      status,
+      kind,
+      platform,
+      // 'medium' by default (see params.priority comment above);
+      // explicit null leaves the DB column NULL.
+      priority,
+      // Only set when the caller supplied preconditions — otherwise let the
+      // column default ('{}') apply rather than writing an explicit empty array.
+      ...(preconditions !== undefined && { preconditions }),
+      // Import provenance — only written by import paths; omitted otherwise so
+      // the columns stay NULL / default for manually-created tests.
+      ...(importId !== undefined && { import_id: importId }),
+      ...(sourceStatus !== undefined && { source_status: sourceStatus }),
+      ...(stepsDegraded !== undefined && { steps_degraded: stepsDegraded }),
+      resource_bindings: resourceBindings,
+    });
 
     if (error) {
       logger.error('[INTENT_TEST_CASE] Failed to create', { error });
@@ -218,6 +211,15 @@ export class IntentTestCaseService {
       await cache.delByPattern(`qait:cache:ptree:flow:${flowId}:*`);
     }
 
+    // Live cache invalidation for other open editors (best-effort).
+    emitTestCaseMutated({
+      projectId,
+      action: 'created',
+      id: data.id,
+      name,
+      flowId: flowId || undefined,
+    });
+
     return this.mapToIntentTestCase(data);
   }
 
@@ -225,12 +227,7 @@ export class IntentTestCaseService {
    * Get a test case by ID
    */
   static async getById(id: string, userId: string): Promise<IntentTestCase | null> {
-    const { data, error } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('*, test_flows(name)')
-      .eq('id', id)
-      .eq('user_id', userId)
-      .single();
+    const { data, error } = await intentTestCaseDb.getTestCaseRowByIdForUser(id, userId);
 
     if (error) {
       if (error.code === 'PGRST116') {
@@ -244,10 +241,7 @@ export class IntentTestCaseService {
 
     // Resolve dependency names in a single query
     if (item.dependsOn && item.dependsOn.length > 0) {
-      const { data: depRows } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, name')
-        .in('id', item.dependsOn);
+      const { data: depRows } = await intentTestCaseDb.getTestCaseNamesByIds(item.dependsOn);
 
       item.resolvedDependencies = (item.dependsOn || []).map((depId) => {
         const dep = depRows?.find((r: any) => r.id === depId);
@@ -279,10 +273,7 @@ export class IntentTestCaseService {
     const byId = new Map<string, { dependsOn: string[]; steps: IntentStep[] }>();
     let frontier = [rootId];
     while (frontier.length > 0) {
-      const { data, error } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, depends_on, steps_json')
-        .in('id', frontier);
+      const { data, error } = await intentTestCaseDb.getDependencyClosureRows(frontier);
 
       if (error) {
         logger.error('[INTENT_TEST_CASE] Failed to load dependency closure', { error, rootId });
@@ -361,10 +352,7 @@ export class IntentTestCaseService {
       }
     }
 
-    const { data } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('id, name')
-      .in('id', orderedSourceIds);
+    const { data } = await intentTestCaseDb.getTestCaseNamesByIds(orderedSourceIds);
     const nameById = new Map<string, string>(
       ((data as Array<{ id: string; name: string }>) || []).map((r) => [r.id, r.name]),
     );
@@ -388,27 +376,12 @@ export class IntentTestCaseService {
   }): Promise<{ items: IntentTestCase[]; total: number }> {
     const { projectId, userId, flowId, limit = 50, offset = 0 } = params;
 
-    // Build base query — join test_flows to get flow name
-    let countQuery = supabaseAdmin
-      .from('intent_test_cases')
-      .select('id', { count: 'exact', head: true })
-      .eq('project_id', projectId)
-      .eq('user_id', userId);
-
-    let dataQuery = supabaseAdmin
-      .from('intent_test_cases')
-      .select('*, test_flows(name)')
-      .eq('project_id', projectId)
-      .eq('user_id', userId);
-
-    // Add optional flowId filter
-    if (flowId) {
-      countQuery = countQuery.eq('flow_id', flowId);
-      dataQuery = dataQuery.eq('flow_id', flowId);
-    }
-
     // Get total count
-    const { count, error: countError } = await countQuery;
+    const { count, error: countError } = await intentTestCaseDb.countTestCaseRowsForProject(
+      projectId,
+      userId,
+      flowId,
+    );
 
     if (countError) {
       logger.error('[INTENT_TEST_CASE] Failed to count', { error: countError });
@@ -416,9 +389,13 @@ export class IntentTestCaseService {
     }
 
     // Get items
-    const { data, error } = await dataQuery
-      .order('updated_at', { ascending: false })
-      .range(offset, offset + limit - 1);
+    const { data, error } = await intentTestCaseDb.listTestCaseDataForProject(
+      projectId,
+      userId,
+      flowId,
+      limit,
+      offset,
+    );
 
     if (error) {
       logger.error('[INTENT_TEST_CASE] Failed to list', { error });
@@ -436,10 +413,7 @@ export class IntentTestCaseService {
     }
 
     if (allDepIds.size > 0) {
-      const { data: depRows } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, name')
-        .in('id', [...allDepIds]);
+      const { data: depRows } = await intentTestCaseDb.getTestCaseNamesByIds([...allDepIds]);
 
       const depNameMap = new Map<string, string>();
       for (const row of depRows || []) {
@@ -515,11 +489,7 @@ export class IntentTestCaseService {
 
         if (hasStepsMissingBackendFields) {
           try {
-            const { data: existingRow } = await supabaseAdmin
-              .from('intent_test_cases')
-              .select('steps_json')
-              .eq('id', id)
-              .single();
+            const { data: existingRow } = await intentTestCaseDb.getStepsJsonRow(id);
 
             if (existingRow?.steps_json) {
               const existingById = new Map<string, IntentStep>();
@@ -676,13 +646,7 @@ export class IntentTestCaseService {
         updatedFields: Object.keys(updates),
       });
 
-      const { data, error } = await supabaseAdmin
-        .from('intent_test_cases')
-        .update(updates)
-        .eq('id', id)
-        .eq('user_id', userId)
-        .select('*')
-        .single();
+      const { data, error } = await intentTestCaseDb.updateTestCaseRowForUser(id, userId, updates);
 
       if (error) {
         logger.error('[INTENT_TEST_CASE] Failed to update', { error, id });
@@ -692,6 +656,22 @@ export class IntentTestCaseService {
       // Invalidate flow mode cache
       if (data.flow_id) {
         await cache.delByPattern(`qait:cache:ptree:flow:${data.flow_id}:*`);
+      }
+
+      // Live cache invalidation for other open editors (best-effort). Only emit
+      // when a field the editor's cached lists display changed (name / flow /
+      // status) — NOT for pure steps_json persistence from auto-heal / run,
+      // which would spam the room without changing any list-visible data.
+      const listVisibleChanged =
+        name !== undefined || flowId !== undefined || status !== undefined;
+      if (listVisibleChanged && data.project_id) {
+        emitTestCaseMutated({
+          projectId: data.project_id,
+          action: 'updated',
+          id,
+          name: data.name,
+          flowId: data.flow_id || undefined,
+        });
       }
 
       // Mark related negative test cases as stale when steps change
@@ -715,18 +695,10 @@ export class IntentTestCaseService {
     logger.info('[INTENT_TEST_CASE] Deleting test case', { id });
 
     // Fetch flow_id and project_id before delete for cache invalidation
-    const { data: tc } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('flow_id, project_id')
-      .eq('id', id)
-      .eq('user_id', userId)
-      .maybeSingle();
+    const { data: tc } = await intentTestCaseDb.getTestCaseFlowProjectForUser(id, userId);
 
     // Clean up regression plan items referencing this test case
-    const { error: planCleanupError } = await supabaseAdmin
-      .from('regression_plan_items')
-      .delete()
-      .eq('test_case_id', id);
+    const { error: planCleanupError } = await intentTestCaseDb.deletePlanItemsForTestCase(id);
 
     if (planCleanupError) {
       logger.warn('[INTENT_TEST_CASE] Failed to cleanup plan items for deleted test case', {
@@ -734,11 +706,7 @@ export class IntentTestCaseService {
       });
     }
 
-    const { error } = await supabaseAdmin
-      .from('intent_test_cases')
-      .delete()
-      .eq('id', id)
-      .eq('user_id', userId);
+    const { error } = await intentTestCaseDb.deleteTestCaseRowForUser(id, userId);
 
     if (error) {
       logger.error('[INTENT_TEST_CASE] Failed to delete', { error, id });
@@ -753,6 +721,16 @@ export class IntentTestCaseService {
     // Invalidate plans cache — deleting a test case removes its regression_plan_items as side-effect
     if (tc?.project_id) {
       await cache.delByPattern(`qait:cache:plans:proj:${tc.project_id}:*`);
+    }
+
+    // Live cache invalidation for other open editors (best-effort).
+    if (tc?.project_id) {
+      emitTestCaseMutated({
+        projectId: tc.project_id,
+        action: 'deleted',
+        id,
+        flowId: tc.flow_id || undefined,
+      });
     }
 
     return true;
@@ -868,11 +846,7 @@ export class IntentTestCaseService {
     try {
       // Fetch steps + ownership fields in one round-trip so the access
       // check below (when userId is supplied) doesn't cost an extra query.
-      const { data: row, error: fetchError } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('steps_json, user_id, project_id')
-        .eq('id', intentTestCaseId)
-        .single();
+      const { data: row, error: fetchError } = await intentTestCaseDb.getStepsJsonWithOwnerRow(intentTestCaseId);
 
       if (fetchError || !row) {
         logger.warn('[INTENT_TEST_CASE] Test case not found for heal update', {
@@ -951,10 +925,7 @@ export class IntentTestCaseService {
       };
 
       // Save back to DB
-      const { error: updateError } = await supabaseAdmin
-        .from('intent_test_cases')
-        .update({ steps_json: steps })
-        .eq('id', intentTestCaseId);
+      const { error: updateError } = await intentTestCaseDb.updateStepsJsonRow(intentTestCaseId, steps);
 
       if (updateError) {
         logger.error('[INTENT_TEST_CASE] Failed to update step after heal', {
@@ -1011,11 +982,7 @@ export class IntentTestCaseService {
       try {
         // Fetch steps + ownership fields in one round-trip so the access
         // check below doesn't cost an extra query.
-        const { data: row, error: fetchError } = await supabaseAdmin
-          .from('intent_test_cases')
-          .select('steps_json, user_id, project_id')
-          .eq('id', intentTestCaseId)
-          .single();
+        const { data: row, error: fetchError } = await intentTestCaseDb.getStepsJsonWithOwnerRow(intentTestCaseId);
 
         if (fetchError || !row) {
           logger.warn('[INTENT_TEST_CASE] Test case not found for preview apply update', {
@@ -1118,13 +1085,7 @@ export class IntentTestCaseService {
         // 3. In IntentTestCaseService.update() — when fully updating test case
 
         // Save back to DB
-        const { error: updateError } = await supabaseAdmin
-          .from('intent_test_cases')
-          .update({
-            steps_json: steps,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', intentTestCaseId);
+        const { error: updateError } = await intentTestCaseDb.updateStepsJsonTouchRow(intentTestCaseId, steps);
 
         if (updateError) {
           logger.error('[INTENT_TEST_CASE] Failed to update step from preview apply', {
@@ -1174,11 +1135,7 @@ export class IntentTestCaseService {
       });
 
       try {
-        const { data: row, error: fetchError } = await supabaseAdmin
-          .from('intent_test_cases')
-          .select('steps_json')
-          .eq('id', intentTestCaseId)
-          .single();
+        const { data: row, error: fetchError } = await intentTestCaseDb.getStepsJsonRow(intentTestCaseId);
 
         if (fetchError || !row) {
           logger.warn('[INTENT_TEST_CASE] Test case not found for batch update', {
@@ -1251,13 +1208,7 @@ export class IntentTestCaseService {
         // Single auto-wait injection pass on the final merged array
         const stepsWithAutoWaits = injectAutoWaitForSteps(steps);
 
-        const { error: updateError } = await supabaseAdmin
-          .from('intent_test_cases')
-          .update({
-            steps_json: stepsWithAutoWaits,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', intentTestCaseId);
+        const { error: updateError } = await intentTestCaseDb.updateStepsJsonTouchRow(intentTestCaseId, stepsWithAutoWaits);
 
         if (updateError) {
           logger.error('[INTENT_TEST_CASE] Failed to batch-update steps from run', {
@@ -1297,11 +1248,7 @@ export class IntentTestCaseService {
    * Use with caution - only for system-level operations
    */
   static async getByIdInternal(id: string): Promise<IntentTestCase | null> {
-    const { data, error } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('*')
-      .eq('id', id)
-      .single();
+    const { data, error } = await intentTestCaseDb.getTestCaseRowByIdInternal(id);
 
     if (error) {
       if (error.code === 'PGRST116') {
@@ -1319,15 +1266,7 @@ export class IntentTestCaseService {
    * Called when the parent happy-path steps change.
    */
   private static async markNegativesStale(sourceTestCaseId: string): Promise<void> {
-    const { error, count } = await supabaseAdmin
-      .from('intent_test_cases')
-      .update({
-        negative_stale_reason: 'parent_steps_changed',
-        updated_at: new Date().toISOString(),
-      })
-      .eq('source_intent_test_case_id', sourceTestCaseId)
-      .eq('is_negative', true)
-      .is('negative_stale_reason', null);
+    const { error, count } = await intentTestCaseDb.markNegativesStaleByParent(sourceTestCaseId);
 
     if (error) {
       logger.warn('[INTENT_TEST_CASE] Failed to mark negatives stale', {
