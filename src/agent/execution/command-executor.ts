@@ -10,6 +10,9 @@ import type { CompiledStepPlan, IntentStep, LocatorEntry, StepRuntimeMeta } from
 import { shouldSkipLookaheadAfter, waitForStepReadiness, type LookaheadResult } from '@/services/testing/ui/preview/step-readiness.service';
 import { runV1WithShadow } from '@/services/testing/ui/preview/step-readiness-v2.service';
 import { evaluateEvidenceShortcut } from '@/services/testing/ui/preview/evidence-shortcut.utils';
+import { waitForPageInteractive } from '@/services/testing/ui/preview/page-interactive.utils';
+import { shouldRecollectForReadiness, REPLAY_READINESS_MAX_WAIT_MS } from './replay-readiness';
+import { isReplayReadinessRecollectEnabled } from '@/config/features/replay-readiness';
 import { waitForHoverEffect } from '@/services/testing/ui/wait-phases/hover-effect-settle';
 import { smartStepWait } from '@/services/testing/ui/smart-step-wait.service';
 // eslint-disable-next-line no-duplicate-imports
@@ -3627,13 +3630,43 @@ export class CommandExecutor {
           !retryCtx.cachedDomNodes ||
           (Date.now() - retryCtx.lastDomCollectionTs > 1500);
 
-        const domNodes = shouldCollectFresh
+        let domNodes = shouldCollectFresh
           ? await collectInteractiveNodes(this.page, this.maxDomNodes)
           : retryCtx.cachedDomNodes!;
 
         if (shouldCollectFresh) {
           retryCtx.cachedDomNodes = domNodes;
           retryCtx.lastDomCollectionTs = Date.now();
+        }
+
+        // Replay readiness recollect (flag-gated, default OFF): a sparse fresh
+        // snapshot usually means the page is still mid-load / mid-redirect
+        // (SSO/OAuth chains), and resolving on it makes the LLM pick a stray
+        // element. Run the SAME page-interactive gate the editor/lite paths use,
+        // then recollect once. Never regress the node set on a worse recollect.
+        if (
+          shouldCollectFresh
+          && shouldRecollectForReadiness({
+            enabled: isReplayReadinessRecollectEnabled(),
+            domNodeCount: domNodes.length,
+            attempt: retryCtx.attempt,
+          })
+        ) {
+          const readiness = await waitForPageInteractive(this.page, { maxWaitMs: REPLAY_READINESS_MAX_WAIT_MS });
+          const recollected = await collectInteractiveNodes(this.page, this.maxDomNodes);
+          logger.info('[COMMAND_EXECUTOR] Replay readiness recollect', {
+            stepId,
+            before: domNodes.length,
+            after: recollected.length,
+            waited: readiness.waited,
+            ready: readiness.ready,
+            finalUrl: readiness.finalUrl,
+          });
+          if (recollected.length > domNodes.length) {
+            domNodes = recollected;
+            retryCtx.cachedDomNodes = domNodes;
+            retryCtx.lastDomCollectionTs = Date.now();
+          }
         }
 
         if (domNodes.length === 0) {
