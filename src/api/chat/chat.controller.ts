@@ -637,27 +637,52 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     }
 
     const routeToHandlerWithLogging = withFunctionLogging(routeToHandler, 'routeToHandler', functionLogger);
-    await routeToHandlerWithLogging(req, res, {
-      message: effectiveMessage,
-      parsedIntent,
-      userId,
-      workspace_id,
-      chatSessionId,
-      conversationId,
-      answers,
-      context,
-      abortSignal, // Pass abort signal for cancellation checks
-      logger: functionLogger,
-      mode: inputResult.mode || 'lite', // Pass mode from request
-      executionStrategy: inputResult.executionStrategy, // Explicit exploration from frontend
-      attachments, // File attachments (images + documents)
-      // Persistence binding: GLOBAL_STORE for legacy, TESTCASE_STORE
-      // when this is a per-test-case chat. Migrated handlers
-      // (general_chat, editor_action) use this to route saves through
-      // ChatPersistence; legacy handlers receive but ignore it.
-      chatStore,
-      testCaseId,
+    // ACTIVE watchdog: race the handler against a real timer. The passive
+    // checkRequestTimeout() above only fires when something calls it between
+    // steps — a handler stalled inside an await (hung LLM/network) would never
+    // reach a checkpoint, so the request hangs and the frontend spinner spins
+    // forever. Racing guarantees we always settle: the loser's rejection drops
+    // into the catch below, which sends an honest 408 + REQUEST_TIMEOUT message
+    // instead of leaving the user on an infinite "Updating…". Covers EVERY
+    // handler, present and future.
+    let watchdog: NodeJS.Timeout | undefined;
+    const timeoutGuard = new Promise<never>((_, reject) => {
+      watchdog = setTimeout(() => {
+        // Signal the in-flight handler to stop work, then reject the race so the
+        // catch sends an honest timeout response.
+        abortController?.abort();
+        reject(new Error(`Request timeout after ${CONSTANTS.CHAT_REQUEST_TIMEOUT / 1000}s`));
+      }, CONSTANTS.CHAT_REQUEST_TIMEOUT);
+      if (typeof watchdog.unref === 'function') watchdog.unref();
     });
+    try {
+      await Promise.race([
+        routeToHandlerWithLogging(req, res, {
+          message: effectiveMessage,
+          parsedIntent,
+          userId,
+          workspace_id,
+          chatSessionId,
+          conversationId,
+          answers,
+          context,
+          abortSignal, // Pass abort signal for cancellation checks
+          logger: functionLogger,
+          mode: inputResult.mode || 'lite', // Pass mode from request
+          executionStrategy: inputResult.executionStrategy, // Explicit exploration from frontend
+          attachments, // File attachments (images + documents)
+          // Persistence binding: GLOBAL_STORE for legacy, TESTCASE_STORE
+          // when this is a per-test-case chat. Migrated handlers
+          // (general_chat, editor_action) use this to route saves through
+          // ChatPersistence; legacy handlers receive but ignore it.
+          chatStore,
+          testCaseId,
+        }),
+        timeoutGuard,
+      ]);
+    } finally {
+      if (watchdog) clearTimeout(watchdog);
+    }
 
     // Advance the compound queue only if the step actually COMPLETED — not if it
     // asked a clarification or a confirm-preview (those need the same step to be
@@ -724,6 +749,30 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
     // Flush logs before handling error
     await functionLogger.flushSync();
+
+    // Watchdog timeout MUST be classified before the cancellation branch below.
+    // The watchdog itself calls abortController.abort() (to stop the in-flight
+    // handler), which sets signal.aborted=true — so without this early check the
+    // cancellation branch would misclassify a timeout as a user-cancel (499)
+    // instead of the honest 408 + REQUEST_TIMEOUT. Keyed on the timeout error
+    // string the watchdog throws, not on signal.aborted.
+    const isTimeoutError =
+      error instanceof Error && error.message.toLowerCase().includes('timeout');
+    if (isTimeoutError) {
+      logger.warn('[CHAT] Request timed out (watchdog)', {
+        chatSessionId,
+        duration: Date.now() - requestStartTime,
+      });
+      if (!res.headersSent && !req.aborted && !req.socket?.destroyed) {
+        res.status(408).json({
+          success: false,
+          error: MESSAGES.REQUEST_TIMEOUT,
+          message: MESSAGES.REQUEST_TIMEOUT,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      return;
+    }
 
     // Check if request was cancelled
     if (error instanceof Error && (

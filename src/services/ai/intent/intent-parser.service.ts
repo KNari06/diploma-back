@@ -1705,6 +1705,54 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
 }
 
 /**
+ * Canonical `manage.action` values per management intent, plus the synonym map
+ * that collapses LLM variants onto them. This is the SINGLE validation gate for
+ * management actions: handlers downstream match these exact tokens, never raw
+ * LLM strings, so a typo/synonym ("converts", "convert_to_mobile", "reassign",
+ * "rename") can't slip past a handler's enum check. Unknown actions return null
+ * → the manage block is dropped and the handler falls back to a clarification.
+ *
+ * For modules, `move` and `convert` are RECOGNIZED but unsupported by
+ * qa_manage_module — surfaced so manage-module.handler can answer honestly. Keep
+ * in sync with request-understanding-prompts.ts (the action enum it documents).
+ */
+const MANAGE_ACTIONS: Record<string, Record<string, string>> = {
+  // Each value maps a normalized synonym → canonical action.
+  manage_schedule: {
+    create: 'create', schedule: 'create', add: 'create',
+    update: 'update', edit: 'update', change: 'update', reschedule: 'update',
+    activate: 'activate', enable: 'activate', resume: 'activate',
+    deactivate: 'deactivate', disable: 'deactivate', pause: 'deactivate',
+    delete: 'delete', remove: 'delete', cancel: 'delete',
+  },
+  manage_module: {
+    create: 'create', add: 'create',
+    update: 'update', rename: 'update', edit: 'update',
+    // Recognized-but-unsupported (honest refusal in the handler):
+    move: 'move', relocate: 'move', reassign: 'move', transfer: 'move',
+    convert: 'convert', changeplatform: 'convert', switchplatform: 'convert', migrate: 'convert',
+  },
+  manage_plan: {
+    create: 'create', add: 'create',
+    update: 'update', edit: 'update', rename: 'update',
+    additem: 'add_item', additems: 'add_item', addtoplan: 'add_item',
+    removeitem: 'remove_item', removeitems: 'remove_item', removefromplan: 'remove_item',
+  },
+};
+
+/**
+ * Normalize a raw LLM `manage.action` to the canonical per-intent value, or null
+ * when unrecognized. Pure. Lowercases and strips non-alphanumerics so
+ * "add_item" / "add-item" / "Add Item" all match the "additem" synonym key.
+ */
+export function normalizeManageAction(intent: string, raw: string): string | null {
+  const map = MANAGE_ACTIONS[intent];
+  if (!map) return null;
+  const key = raw.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return map[key] ?? null;
+}
+
+/**
  * Lift the request-understanding ANALYZE block from the raw LLM JSON into typed
  * IntentResult fields. Defensive: validates each piece independently so a
  * partial/garbage `analysis` never corrupts the result or throws.
@@ -1745,14 +1793,20 @@ function liftAnalysisBlock(parsed: IntentResult, parsedAny: any): void {
 
   // Management params (IMPROVE) → metadata.manage. Consumed by the first-class
   // management handlers (manage_schedule/module/plan). Shallow string-only copy
-  // so a malformed object can't smuggle structures into the tool args.
+  // so a malformed object can't smuggle structures into the tool args. The
+  // action is normalized to a canonical per-intent value so LLM synonyms/typos
+  // ("converts", "convert_to_mobile", "reassign") collapse to one token and
+  // unknown actions drop — handlers then match an exact enum, never raw strings.
   const manage = analysis.manage;
   if (manage && typeof manage === 'object' && typeof manage.action === 'string') {
-    const clean: Record<string, string> = {};
-    for (const [k, v] of Object.entries(manage)) {
-      if (typeof v === 'string' && v.trim().length > 0) clean[k] = v.trim();
+    const action = normalizeManageAction(parsed.intent, manage.action);
+    if (action) {
+      const clean: Record<string, string> = { action };
+      for (const [k, v] of Object.entries(manage)) {
+        if (k !== 'action' && typeof v === 'string' && v.trim().length > 0) clean[k] = v.trim();
+      }
+      parsed.metadata.manage = clean;
     }
-    if (clean.action) parsed.metadata.manage = clean;
   }
 
   // Target selector → typed field.

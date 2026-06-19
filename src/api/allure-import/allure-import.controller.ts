@@ -188,6 +188,10 @@ export async function uploadAllure(req: Request, res: Response): Promise<void> {
       deduplicateTests:  parseBoolField(req.body.deduplicateTests,  true),
       saveDocsToKB:      parseBoolField(req.body.saveDocsToKB,      true),
       defaultStartUrl:   typeof req.body.defaultStartUrl === 'string' ? req.body.defaultStartUrl : undefined,
+      // Multipart field arrives as an unvalidated string; `resolveImportOptions`
+      // validates it against the enum and falls back to 'web' for anything
+      // unexpected (typo, stale client, missing field).
+      platform:          req.body.platform,
     });
 
     const importId = randomUUID();
