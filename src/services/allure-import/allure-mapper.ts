@@ -28,6 +28,7 @@ import type {
   AllureImportedModuleNode,
   AllureImportedFlowNode,
   AllureImportedTestNode,
+  ImportPlatform,
 } from './allure-import.types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -868,7 +869,7 @@ export interface MappedTestCase {
     flowId?: string;
     status: 'draft';
     kind: 'standalone';
-    platform: 'web';
+    platform: ImportPlatform;
     tags: string[];
     priority: 'critical' | 'high' | 'medium' | 'low';
     preconditions: string[];
@@ -891,6 +892,8 @@ export interface MapperOptions {
   userId: string;
   autoCreateModules: boolean;
   autoCreateFlows: boolean;
+  /** Platform written to each created test case. Default: 'web'. */
+  platform: ImportPlatform;
 }
 
 /**
@@ -899,7 +902,7 @@ export interface MapperOptions {
  */
 export async function resolveHierarchy(
   cache: HierarchyCache,
-  webUiPlatformId: string,
+  platformTreeId: string,
   opts: MapperOptions,
   moduleName?: string,
   flowName?: string,
@@ -909,7 +912,7 @@ export async function resolveHierarchy(
   const moduleId = await cache.resolveModule({
     projectId: opts.projectId,
     userId: opts.userId,
-    platformId: webUiPlatformId,
+    platformId: platformTreeId,
     epicName: moduleName,
     autoCreate: opts.autoCreateModules,
   });
@@ -938,11 +941,11 @@ export async function resolveHierarchy(
 export async function mapAllureResultLabelsOnly(
   result: AllureTestResult,
   cache: HierarchyCache,
-  webUiPlatformId: string,
+  platformTreeId: string,
   opts: MapperOptions,
 ): Promise<{ moduleId?: string; flowId?: string; priority: ExtractedLabels['priority'] }> {
   const { moduleName, flowName, priority } = extractLabels(result.labels);
-  const { moduleId, flowId } = await resolveHierarchy(cache, webUiPlatformId, opts, moduleName, flowName);
+  const { moduleId, flowId } = await resolveHierarchy(cache, platformTreeId, opts, moduleName, flowName);
   return { moduleId, flowId, priority };
 }
 
@@ -952,14 +955,15 @@ export async function mapAllureResultLabelsOnly(
  * @param result          - Parsed Allure result
  * @param containerByUuid - Map from result UUID → container (for preconditions)
  * @param cache           - Shared HierarchyCache for this import batch
- * @param webUiPlatformId - The web_ui platform ID for this project
+ * @param platformTreeId  - The platform-tree node ID (web_ui or mobile) that
+ *                          imported Modules/Flows are placed under
  * @param opts            - Import options
  */
 export async function mapAllureResult(
   result: AllureTestResult,
   containerByUuid: Map<string, AllureContainer>,
   cache: HierarchyCache,
-  webUiPlatformId: string,
+  platformTreeId: string,
   opts: MapperOptions,
 ): Promise<MappedTestCase> {
   const { projectId, userId } = opts;
@@ -987,7 +991,7 @@ export async function mapAllureResult(
 
   // ── 5. Resolve hierarchy (Module → Flow) ──────────────────────────────────
   const { moduleId: resolvedModuleId, flowId } = await resolveHierarchy(
-    cache, webUiPlatformId, opts, moduleName, flowName,
+    cache, platformTreeId, opts, moduleName, flowName,
   );
 
   // ── 6. Compose create params ──────────────────────────────────────────────
@@ -1005,7 +1009,7 @@ export async function mapAllureResult(
       ...(flowId && { flowId }),
       status: 'draft',
       kind: 'standalone',
-      platform: 'web',
+      platform: opts.platform,
       tags,
       priority,
       preconditions,
@@ -1023,4 +1027,22 @@ export async function getWebUiPlatformId(
 ): Promise<string> {
   const platforms = await PlatformService.ensurePlatformsExist(projectId, userId);
   return platforms.webUi.id;
+}
+
+/**
+ * Resolve the platform-tree node ID that imported Modules/Flows should be
+ * placed under, based on the chosen import platform. All three mobile
+ * variants share the single `mobile` tree node — the specific variant
+ * (android/ios/flutter) lives on each test case's `platform` field, while
+ * the tree only distinguishes web vs mobile.
+ *
+ * Throws if PlatformService fails (caller should handle).
+ */
+export async function getPlatformTreeId(
+  projectId: string,
+  userId: string,
+  platform: ImportPlatform,
+): Promise<string> {
+  const platforms = await PlatformService.ensurePlatformsExist(projectId, userId);
+  return platform === 'web' ? platforms.webUi.id : platforms.mobile.id;
 }

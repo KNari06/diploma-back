@@ -26,7 +26,7 @@ import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test
 import { parseAllureZip } from './allure-parser';
 import {
   mapAllureResult,
-  getWebUiPlatformId,
+  getPlatformTreeId,
   resolveHierarchy,
   convertImportedStepsWithAI,
   HierarchyCache,
@@ -299,7 +299,7 @@ export async function processAllureImport(
     emitPhase('tests', 0, parsedData.results.length, 'Importing test cases…');
 
     try {
-      const webUiPlatformId = await getWebUiPlatformId(projectId, userId);
+      const platformTreeId = await getPlatformTreeId(projectId, userId, options.platform);
 
       // Fetch existing test names for dedup
       const existingNames = options.deduplicateTests
@@ -328,12 +328,13 @@ export async function processAllureImport(
             result,
             parsedData.containerByResultUuid,
             hierarchyCache,
-            webUiPlatformId,
+            platformTreeId,
             {
               projectId,
               userId,
               autoCreateModules: options.autoCreateModules,
               autoCreateFlows: options.autoCreateFlows,
+              platform: options.platform,
             },
           );
 
@@ -638,7 +639,7 @@ async function processCsvPdfImport(
     emitPhase('tests', 0, parsedTestCases.length, 'Creating test cases…');
 
     try {
-      const webUiPlatformId = await getWebUiPlatformId(projectId, userId);
+      const platformTreeId = await getPlatformTreeId(projectId, userId, options.platform);
 
       const existingNames = options.deduplicateTests
         ? await getExistingTestCaseNames(projectId, userId)
@@ -663,12 +664,13 @@ async function processCsvPdfImport(
           // Resolve hierarchy (module + flow) via cache
           const { moduleId, flowId } = await resolveHierarchy(
             hierarchyCache,
-            webUiPlatformId,
+            platformTreeId,
             {
               projectId,
               userId,
               autoCreateModules: options.autoCreateModules,
               autoCreateFlows: options.autoCreateFlows,
+              platform: options.platform,
             },
             tc.moduleName,
             tc.flowName,
@@ -708,7 +710,7 @@ async function processCsvPdfImport(
             ...(flowId && { flowId }),
             status: 'draft',
             kind: 'standalone',
-            platform: 'web',
+            platform: options.platform,
             priority,
             ...(preconditions.length > 0 && { preconditions }),
             // Import provenance. CSV/PDF are design-time exports with no run
