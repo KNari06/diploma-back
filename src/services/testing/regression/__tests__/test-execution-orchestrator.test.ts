@@ -81,6 +81,10 @@ jest.mock('@/services/mobile/mobile-runner-client', () => ({
   getMobileRunnerClient: jest.fn(() => ({})),
 }));
 
+jest.mock('@/config/features/regression-scheduling', () => ({
+  isRegressionLevelBarrierDisabled: jest.fn(),
+}));
+
 import {
   getRunRoutingInfo,
   getExecutionRefsForRun,
@@ -98,6 +102,7 @@ import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { ApiConfigService } from '@/services/api/api-config.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { mobileTestRunQueue } from '@/config/infrastructure/queues';
+import { isRegressionLevelBarrierDisabled } from '@/config/features/regression-scheduling';
 import { TestExecutionOrchestratorService } from '@/services/testing/regression/test-execution-orchestrator.service';
 import type { ExecutableTestCase } from '@/types/testing.types';
 
@@ -116,6 +121,7 @@ const mockRunTest = ManualTestService.runTest as jest.MockedFunction<any>;
 const mockExecuteApi = ApiConfigService.executeWithConfig as jest.MockedFunction<any>;
 const mockDeductCredits = CreditCostTrackerService.deductCreditsForTest as jest.MockedFunction<any>;
 const mockGetJob = mobileTestRunQueue.getJob as jest.MockedFunction<any>;
+const mockBarrierDisabled = isRegressionLevelBarrierDisabled as jest.MockedFunction<typeof isRegressionLevelBarrierDisabled>;
 
 function apiTC(over: Partial<ExecutableTestCase> = {}): ExecutableTestCase {
   return { testCaseId: 'api-1', testType: 'api', dependsOn: [], ...over } as ExecutableTestCase;
@@ -145,6 +151,8 @@ describe('TestExecutionOrchestratorService.executeTestCasesAsync', () => {
     mockDeductCredits.mockResolvedValue({ success: true });
     mockGetJob.mockResolvedValue(null);
     mockWaitForCompletion.mockResolvedValue('passed');
+    // Barrier ON by default (matches prod default); individual tests opt in to OFF.
+    mockBarrierDisabled.mockReturnValue(false);
   });
 
   afterEach(() => jest.clearAllMocks());
@@ -422,5 +430,59 @@ describe('TestExecutionOrchestratorService.executeTestCasesAsync', () => {
     expect((finalize.summary as any).missingDependencies).toEqual([
       { testCaseId: 'api-1', missingDependencyIds: ['ghost-1'] },
     ]);
+  });
+
+  it('with the level barrier disabled, dependent UI tests dispatch alongside their dependency (no serialization)', async () => {
+    mockBarrierDisabled.mockReturnValue(true);
+    mockGetExecRefs.mockResolvedValue({
+      rows: [
+        { id: 'e1', test_case_id: 'ui-1', test_type: 'ui' },
+        { id: 'e2', test_case_id: 'ui-2', test_type: 'ui' },
+        { id: 'e3', test_case_id: 'ui-3', test_type: 'ui' },
+      ],
+      error: null,
+    });
+    mockGetSavedCase.mockResolvedValue({ platform: 'web' });
+    mockBuildWebReq.mockResolvedValue({});
+    let n = 0;
+    mockRunTest.mockImplementation(async () => ({ success: true, data: { id: `test-${++n}` } }));
+
+    // chain ui-1 ← ui-2 ← ui-3 collapses into one level → all three dispatched
+    await run([
+      uiTC({ testCaseId: 'ui-1' }),
+      uiTC({ testCaseId: 'ui-2', dependsOn: ['ui-1'] }),
+      uiTC({ testCaseId: 'ui-3', dependsOn: ['ui-2'] }),
+    ]);
+
+    expect(mockRunTest).toHaveBeenCalledTimes(3);
+    expect(mockUpdateStatus.mock.calls.some((c: any[]) => c[0].status === 'skipped')).toBe(false);
+  });
+
+  it('with the barrier ON (default), a failed root UI test skips its dependents instead of dispatching them', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [
+        { id: 'e1', test_case_id: 'ui-1', test_type: 'ui' },
+        { id: 'e2', test_case_id: 'ui-2', test_type: 'ui' },
+        { id: 'e3', test_case_id: 'ui-3', test_type: 'ui' },
+      ],
+      error: null,
+    });
+    mockGetSavedCase.mockResolvedValue({ platform: 'web' });
+    mockBuildWebReq.mockResolvedValue({});
+    mockRunTest.mockResolvedValue({ success: true, data: { id: 'test-web-1' } });
+    mockWaitForCompletion.mockResolvedValue('failed'); // root (level 0) fails
+
+    await run([
+      uiTC({ testCaseId: 'ui-1' }),
+      uiTC({ testCaseId: 'ui-2', dependsOn: ['ui-1'] }),
+      uiTC({ testCaseId: 'ui-3', dependsOn: ['ui-2'] }),
+    ]);
+
+    // only the root was dispatched; dependents were skipped, not run
+    expect(mockRunTest).toHaveBeenCalledTimes(1);
+    const skipped = mockUpdateStatus.mock.calls
+      .map((c: any[]) => c[0])
+      .filter((p: any) => p.status === 'skipped');
+    expect(skipped.map((p: any) => p.id).sort()).toEqual(['e2', 'e3']);
   });
 });

@@ -405,6 +405,18 @@ const envSchema = z.object({
   // Desired cap for large batches (testCount > SMALL_BATCH_THRESHOLD).
   // Final cap = min(MAX_CONCURRENCY, poolIdle, LARGE_CAP).
   REGRESSION_MOBILE_LARGE_CAP: z.string().optional().default('3'),
+
+  // Disable the dependency LEVEL BARRIER in a regression run (default OFF).
+  // By default the orchestrator runs depends_on levels in order — a dependent
+  // waits for its dependency's standalone run. But a dependent already INLINES
+  // its dependency's steps as preconditions (collectPreconditionSteps), so that
+  // wait is redundant for setup-style deps and just caps parallelism. When ON,
+  // all (non-cyclic) tests dispatch together, bounded only by worker concurrency.
+  // Inlining and cycle detection are unaffected. Trade-off: the fail-fast "skip a
+  // dependent when its dependency failed" no longer fires — the dependent runs and
+  // fails on its own inlined steps instead. Only yields parallelism when worker
+  // concurrency (TEST_RUN_CONCURRENCY_MIN/MAX) > 1.
+  REGRESSION_DISABLE_LEVEL_BARRIER: z.string().transform(v => v === 'true').default('false'),
 });
 
 // Parse and validate environment variables
