@@ -404,7 +404,8 @@ const envSchema = z.object({
   // all (non-cyclic) tests dispatch together, bounded only by worker concurrency.
   // Inlining and cycle detection are unaffected. Trade-off: the fail-fast "skip a
   // dependent when its dependency failed" no longer fires — the dependent runs and
-  // fails on its own inlined steps instead.
+  // fails on its own inlined steps instead. Only yields parallelism when worker
+  // concurrency (TEST_RUN_CONCURRENCY_MIN/MAX) > 1.
   REGRESSION_DISABLE_LEVEL_BARRIER: z.string().transform(v => v === 'true').default('false'),
 });
 
