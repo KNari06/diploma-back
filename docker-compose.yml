@@ -56,7 +56,7 @@ services:
   # Scheduler process — owns the per-minute sweep that fires due
   # regression schedules + auto-learn retire + account-deletion purge.
   # Must run as its own service: putting it in the backend or worker
-  # container risks N replicas all firing the same schedule (claim is
+  # container risks N replicas all firinывg the same schedule (claim is
   # atomic, but the wasted work + load is real). restart:always ensures
   # a crash never silently kills scheduled regressions — without this,
   # users see "next run in 13h" forever while nothing actually runs.
