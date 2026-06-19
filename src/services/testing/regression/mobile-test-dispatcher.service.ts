@@ -88,7 +88,18 @@ export class MobileTestDispatcherService {
 
     // 2. Fetch project workspace (needed for MobileTestJobData; the APK
     // itself comes from the resolver below, not from project settings).
+    // workspaceId is REQUIRED for a mobile run — it keys billing, telemetry,
+    // and dedicated-emulator routing. After the workspace backfill +
+    // projects.workspace_id NOT NULL migration this can only be null for a
+    // genuinely broken project, so fail loudly instead of persisting a '' key
+    // (an empty workspaceId silently breaks workspace-scoped lookups
+    // downstream).
     const workspaceId = await regressionDb.getProjectWorkspaceId(intentCase.project_id);
+    if (!workspaceId) {
+      throw new Error(
+        `Cannot dispatch mobile test: project ${intentCase.project_id} has no workspace assigned`,
+      );
+    }
 
     // Phase 5: resolve which APK to install.
     // Precedence inside the resolver:
@@ -242,7 +253,7 @@ export class MobileTestDispatcherService {
     const jobData: MobileTestJobData = {
       testId,
       userId,
-      workspaceId: workspaceId || '',
+      workspaceId,
       projectId: intentCase.project_id,
       platform,
       browser,

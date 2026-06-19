@@ -11,6 +11,7 @@ import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
+import { emitFlowMutated, emitTestCaseMutated } from '@/websocket/helpers/project-mutation-emit';
 import { Request, Response } from 'express';
 
 interface AuthenticatedRequest extends Request {
@@ -243,6 +244,18 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
       });
     }
 
+    // Live cache invalidation for other open editors (best-effort).
+    emitFlowMutated({ projectId, action: 'created', id: flow.id, name, moduleId });
+    if (createdTestCaseId) {
+      emitTestCaseMutated({
+        projectId,
+        action: 'created',
+        id: createdTestCaseId,
+        name,
+        flowId: flow.id,
+      });
+    }
+
     res.json({
       success: true,
       data: {
@@ -254,6 +267,19 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
   } catch (error) {
     logger.error('[FLOWS_API] Failed to create flow', { error });
     handleError(res, error, 'Failed to create flow');
+  }
+}
+
+/**
+ * Resolve a flow's projectId via its module — flows don't carry projectId
+ * directly. Best-effort: returns null on any failure so emit callers skip.
+ */
+async function resolveFlowProjectId(moduleId: string, userId: string): Promise<string | null> {
+  try {
+    const module = await ModuleService.getById(moduleId, userId);
+    return module?.projectId ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -322,6 +348,17 @@ export async function updateFlow(req: AuthenticatedRequest, res: Response): Prom
       orderIndex,
     });
 
+    const projectId = await resolveFlowProjectId(flow.moduleId, userId);
+    if (projectId) {
+      emitFlowMutated({
+        projectId,
+        action: 'updated',
+        id: flow.id,
+        name: flow.name,
+        moduleId: flow.moduleId,
+      });
+    }
+
     res.json({ success: true, data: flow, timestamp: new Date() });
   } catch (error) {
     logger.error('[FLOWS_API] Failed to update flow', { error });
@@ -340,6 +377,17 @@ export async function duplicateFlow(req: AuthenticatedRequest, res: Response): P
 
     const flow = await FlowService.duplicate(id, userId);
 
+    const projectId = await resolveFlowProjectId(flow.moduleId, userId);
+    if (projectId) {
+      emitFlowMutated({
+        projectId,
+        action: 'created',
+        id: flow.id,
+        name: flow.name,
+        moduleId: flow.moduleId,
+      });
+    }
+
     res.json({ success: true, data: { flow }, timestamp: new Date() });
   } catch (error) {
     logger.error('[FLOWS_API] Failed to duplicate flow', { error });
@@ -355,7 +403,24 @@ export async function deleteFlow(req: AuthenticatedRequest, res: Response): Prom
     const { id } = req.params;
     const userId = getUserId(req);
 
+    // Capture module/project BEFORE delete — needed for the invalidation emit.
+    let projectId: string | null = null;
+    let moduleId: string | undefined;
+    try {
+      const existing = await FlowService.getById(id, userId);
+      if (existing) {
+        moduleId = existing.moduleId;
+        projectId = await resolveFlowProjectId(existing.moduleId, userId);
+      }
+    } catch {
+      // Best-effort — proceed with delete regardless.
+    }
+
     await FlowService.delete(id, userId);
+
+    if (projectId) {
+      emitFlowMutated({ projectId, action: 'deleted', id, moduleId });
+    }
 
     res.json({ success: true, message: 'Flow deleted', timestamp: new Date() });
   } catch (error) {

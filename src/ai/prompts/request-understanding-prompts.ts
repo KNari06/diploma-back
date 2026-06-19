@@ -162,7 +162,12 @@ Think about what the user actually wants — do NOT pattern-match on words.
    ONLY when the intent is a management op (manage_schedule / manage_module /
    manage_plan), extract the typed params the handler needs. Omit otherwise.
      • action: the operation — schedule: create|update|activate|deactivate|delete;
-       module: create|update; plan: create|update|add_item|remove_item.
+       module: create|update|move|convert; plan: create|update|add_item|remove_item.
+       MODULE move/convert are NOT supported by the tool — tag them so the handler
+       can refuse honestly: "move" = move/relocate test cases to another
+       folder/module; "convert" = change a case's platform (e.g. web→mobile).
+       Use them whenever the user asks to move cases between folders or switch a
+       case's platform, in ANY language. Do NOT mislabel these as "update".
      • name: entity name when stated ("a plan called Auth Smoke" → "Auth Smoke").
      • cronExpression: for a RECURRING schedule, a cron string when derivable
        ("every day at 9am" → "0 9 * * *"); else omit and let the handler ask.

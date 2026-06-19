@@ -60,6 +60,8 @@ import {
   ApiFlowVariableExtractedPayload,
   ApiFlowCompletedPayload,
   ApiFlowFailedPayload,
+  // Project resource mutation payload
+  ProjectResourceMutationPayload,
 } from '../types/types';
 import { getIO, isWebSocketInitialized } from './server';
 
@@ -363,7 +365,7 @@ class WebSocketService {
     if (!this.isReady()) return;
 
     // Validate inputs
-    if (!roomType || !['test', 'chat', 'user', 'preview'].includes(roomType)) {
+    if (!roomType || !['test', 'chat', 'user', 'preview', 'project'].includes(roomType)) {
       logger.warn('[WebSocketService] Invalid roomType in emitToRoom', { roomType, roomId, event });
       return;
     }
@@ -448,6 +450,28 @@ class WebSocketService {
       },
       { testId, userId: payload.userId }
     );
+  }
+
+  // ============================================================================
+  // PROJECT RESOURCE MUTATION EMITS (live cache invalidation)
+  // ============================================================================
+  //
+  // Emitted from the test-case / flow / module CRUD controllers + services
+  // (API process, so `isReady()` is true — no Redis worker fallback needed) to
+  // the `project:<projectId>` room. Open editors in other tabs/sessions/users
+  // patch or refetch their cached lists without a page reload. Best-effort: a
+  // failed emit must never affect the CRUD response (emitToRoom swallows).
+
+  public emitTestCaseMutation(payload: ProjectResourceMutationPayload): void {
+    this.emitToRoom('project', payload.projectId, 'project:testcase:mutated', payload);
+  }
+
+  public emitFlowMutation(payload: ProjectResourceMutationPayload): void {
+    this.emitToRoom('project', payload.projectId, 'project:flow:mutated', payload);
+  }
+
+  public emitModuleMutation(payload: ProjectResourceMutationPayload): void {
+    this.emitToRoom('project', payload.projectId, 'project:module:mutated', payload);
   }
 
   public emitTestStarted(testId: string, payload: TestStartedPayload): void {

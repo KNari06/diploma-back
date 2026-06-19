@@ -126,6 +126,16 @@ const envSchema = z.object({
   AGENT_TIMEOUT: z.string().transform(Number).default('300000'),
   AGENT_MAX_RETRIES: z.string().transform(Number).default('3'),
   AGENT_BASE_URL: z.string().default('http://localhost:3001'),
+  // Replay readiness recollect (default OFF). Background/regression replay
+  // snapshots the DOM right before LLM element resolution. On redirect-heavy
+  // flows (SSO/OAuth) that snapshot can land on a half-loaded / mid-redirect
+  // page with only a handful of interactive nodes — the resolver then picks a
+  // stray element and drifts the run onto the wrong page. When ON, a sparse
+  // fresh snapshot triggers one `waitForPageInteractive` gate + recollect (the
+  // same gate the editor/lite paths already use). Only fires on the first
+  // attempt and only when the snapshot is sparse, so healthy pages pay no extra
+  // wait. Validate before enabling broadly. See agent/execution/replay-readiness.ts.
+  REPLAY_READINESS_RECOLLECT_ENABLED: z.string().transform(v => v === 'true').default('false'),
   EXPLORATION_TIMEOUT_MS: z.string().transform(Number).default('300000'),
 
   // Logging
@@ -246,6 +256,13 @@ const envSchema = z.object({
   // mode where `pm clear` between sessions is sufficient. Flip per-deploy
   // for tenants that require strict isolation between backend users.
   MOBILE_MULTI_USER_ISOLATION: z.string().transform(v => v === 'true').default('false'),
+
+  // Dedicated-emulator-per-workspace master switch. When ON, a mobile session
+  // for a workspace that has an active `workspace_dedicated_device` row is
+  // pinned to that runner_serial (skips the shared pool entirely). Default OFF
+  // — the resolver short-circuits to null, so behaviour is unchanged until a
+  // deploy flips this AND ops provisions a dedicated container + DB row.
+  DEDICATED_MOBILE_EMULATOR_ENABLED: z.string().transform(v => v === 'true').default('false'),
 
   // Intent classifier fast-path — set to 'true' to disable the deterministic
   // whitelist that short-circuits trivial messages (greetings, cancels, yes/no
@@ -388,6 +405,18 @@ const envSchema = z.object({
   // Desired cap for large batches (testCount > SMALL_BATCH_THRESHOLD).
   // Final cap = min(MAX_CONCURRENCY, poolIdle, LARGE_CAP).
   REGRESSION_MOBILE_LARGE_CAP: z.string().optional().default('3'),
+
+  // Disable the dependency LEVEL BARRIER in a regression run (default OFF).
+  // By default the orchestrator runs depends_on levels in order — a dependent
+  // waits for its dependency's standalone run. But a dependent already INLINES
+  // its dependency's steps as preconditions (collectPreconditionSteps), so that
+  // wait is redundant for setup-style deps and just caps parallelism. When ON,
+  // all (non-cyclic) tests dispatch together, bounded only by worker concurrency.
+  // Inlining and cycle detection are unaffected. Trade-off: the fail-fast "skip a
+  // dependent when its dependency failed" no longer fires — the dependent runs and
+  // fails on its own inlined steps instead. Only yields parallelism when worker
+  // concurrency (TEST_RUN_CONCURRENCY_MIN/MAX) > 1.
+  REGRESSION_DISABLE_LEVEL_BARRIER: z.string().transform(v => v === 'true').default('false'),
 });
 
 // Parse and validate environment variables

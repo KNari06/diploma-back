@@ -15,6 +15,7 @@ import { randomUUID } from 'crypto';
 import { env } from '@/config/environment/env';
 import { redisConnection, QueueManager } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { resolveDedicatedDevice } from '@/services/mobile/dedicated-device.service';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { ProjectService } from '@/services/core/project.service';
@@ -209,6 +210,19 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     return;
   }
 
+  // IDOR guard: projectId comes from the request body, so a caller could pass
+  // any project's id. Verify the user actually has access BEFORE deriving any
+  // project-scoped state (workspace, app, dedicated device). getProject returns
+  // null when the user is not a member of the project's workspace (no info
+  // leak). Without this, a user could warm a session against another tenant's
+  // project — and, with dedicated-emulator routing, reach another workspace's
+  // pinned device.
+  const accessibleProject = await ProjectService.getProject(projectId, userId);
+  if (!accessibleProject) {
+    res.status(404).json({ success: false, error: 'Project not found' });
+    return;
+  }
+
   const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
   let platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
   // Self-correct: the editor may warm up with platform='android' for a project
@@ -286,6 +300,23 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     logger.debug('[MOBILE_SESSION] defaulting iOS deviceSelector to local-emulator', {
       userId,
       projectId,
+    });
+  }
+
+  // Dedicated emulator: if this project's workspace has an active dedicated
+  // device, pin the warmed session to it and force ownerId=workspaceId. Setting
+  // a `serial` makes the create/claim block below take the pinned path (skips
+  // the shared pool). Inert (null) unless the feature flag is on AND a row
+  // exists. workspaceId is derived from the access-checked project above — never
+  // from the request body (tenancy invariant).
+  const dedicatedWorkspaceId: string | undefined = accessibleProject.workspace_id ?? undefined;
+  const dedicated = await resolveDedicatedDevice(dedicatedWorkspaceId, sessionCreatePlatform);
+  if (dedicated) {
+    deviceSelector = { serial: dedicated.serial };
+    logger.info('[MOBILE_SESSION] warmup pinned to dedicated device', {
+      projectId,
+      workspaceId: dedicatedWorkspaceId,
+      platform,
     });
   }
 
@@ -592,7 +623,12 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     //      "show emulators in popover" UX without this gate would
     //      silently use whatever's pre-booted instead of the user's
     //      explicit pick. Default (no selector) keeps pool fast-path.
-    const effectiveOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
+    // ownerId: a dedicated session forces ownerId=workspaceId (per-workspace
+    // multi-user isolation on the dedicated container); otherwise the existing
+    // MOBILE_MULTI_USER_ISOLATION gate decides whether to pass the user's owner.
+    const effectiveOwnerId = dedicated
+      ? dedicatedWorkspaceId
+      : (env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined);
     let session: Awaited<ReturnType<typeof client.createSession>>;
     const skipPoolForPhysical = deviceSelector?.source === 'local-physical' || !!deviceSelector?.serial;
 
@@ -614,6 +650,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         ownerId: effectiveOwnerId,
         deviceSelector,
         userId,
+        ...(dedicated ? { dedicated: true } : {}),
       }));
     } else {
       try {
@@ -1583,7 +1620,16 @@ export async function autoBootAndInstall(
     // Reads the platform-sharded slot when available so an Android+iOS
     // dual-platform project pends the correct binary instead of always
     // the legacy singular one (which is whatever was uploaded last).
+    // getProject doubles as the IDOR guard: it returns null when `userId`
+    // has no access to `projectId` (the upload route is requireAuth only,
+    // NOT project-scoped). Bail out before booting/installing — without this
+    // a user could boot a session against another tenant's project, and with
+    // dedicated-emulator routing reach another workspace's pinned device.
     const project = await ProjectService.getProject(projectId, userId);
+    if (!project) {
+      logger.warn('[MOBILE_AUTO_BOOT] No project access — skipping auto-boot', { projectId, userId });
+      return;
+    }
     const projectAppForPend = getProjectMobileApp(project?.settings, platform);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const legacyApp = (project?.settings as any)?.mobileApp;
@@ -1630,8 +1676,20 @@ export async function autoBootAndInstall(
       };
       await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
 
-      const autoBootOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
-      const session = await client.createSession(platform, { ownerId: autoBootOwnerId, userId });
+      // Dedicated emulator: pin auto-boot to the workspace's dedicated device
+      // when one exists. workspaceId comes from the access-checked project
+      // (never the request). Forces ownerId=workspaceId; inert unless the flag
+      // is on AND a row exists.
+      const autoBootWorkspaceId: string | undefined = project.workspace_id ?? undefined;
+      const dedicated = await resolveDedicatedDevice(autoBootWorkspaceId, platform);
+      const autoBootOwnerId = dedicated
+        ? autoBootWorkspaceId
+        : (env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined);
+      const session = await client.createSession(platform, {
+        ownerId: autoBootOwnerId,
+        userId,
+        ...(dedicated ? { deviceSelector: { serial: dedicated.serial }, dedicated: true } : {}),
+      });
       sessionId = session.sessionId;
 
       // Update Redis with the real session ID

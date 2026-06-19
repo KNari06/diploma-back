@@ -702,6 +702,17 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
         .eq('id', projectId)
         .single();
 
+      // workspaceId is REQUIRED for a mobile job (billing, telemetry,
+      // dedicated-emulator routing). Persisting '' silently breaks
+      // workspace-scoped lookups, so fail loudly on a workspace-less project.
+      const workspaceId = project?.workspace_id;
+      if (!workspaceId) {
+        res.status(400).json({
+          error: `Project ${projectId} has no workspace assigned`,
+        });
+        return;
+      }
+
       const PLATFORM_MAP: Record<string, MobilePlatform> = { mobile_ios: 'ios', mobile_flutter: 'flutter' };
       const mobilePlatform: MobilePlatform = PLATFORM_MAP[platform ?? ''] ?? 'android';
       // Read the platform-sharded slot, not the legacy singular one — for
@@ -745,7 +756,7 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
       const jobData: MobileTestJobData = {
         testId,
         userId,
-        workspaceId: project?.workspace_id || '',
+        workspaceId,
         projectId,
         platform: mobilePlatform,
         browser: browser as 'mobile-android' | 'mobile-ios' | 'mobile-flutter',

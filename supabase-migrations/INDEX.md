@@ -76,7 +76,10 @@ supabase-migrations/
 | -------------------------------- | -------------------- | ------------ |
 | `auth-sync.sql`                  | Auth synchronization | None         |
 | `workspaces.sql`                 | Workspace management | auth-sync    |
+| `workspace-projects-workspace-id-backfill.sql` | Backfill projects.workspace_id (re-run, idempotent) | workspaces |
+| `workspace-projects-workspace-id-notnull.sql` | Enforce projects.workspace_id NOT NULL (deploy AFTER backfill) | workspace-projects-workspace-id-backfill |
 | `workspace-org-members.sql`      | B2B org: members, invites, credits, audit | workspaces, auth-sync |
+| `workspace-dedicated-device.sql` | Dedicated mobile emulator pin (workspace → runner_serial) | workspaces, workspace-org-members |
 | `workspace-org-rls-update.sql`   | RLS for membership-based access | workspace-org-members |
 | `default-project.sql`            | Default workspace    | workspaces   |
 | `api-configurations.sql`         | API environments     | workspaces   |

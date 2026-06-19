@@ -3,7 +3,8 @@
  * Tests for "Run from start" feature
  */
 
-import { PreviewRunService } from '../preview-run.service';
+import { PreviewRunService, scheduleCatchUpFrame } from '../preview-run.service';
+import { getPreviewVideoStreamRegistry } from '../preview-video-stream.service';
 import { IntentTestCaseService } from '../intent-test-case.service';
 import { PreviewStepApplyService } from '../preview-step-apply.service';
 import { getPreviewSessionService } from '../preview-session.service';
@@ -510,5 +511,51 @@ describe('PreviewRunService', () => {
 
       expect(PreviewRunService.isRunning(mockPreviewSessionId)).toBe(false);
     });
+  });
+});
+
+// Sibling describe (NOT nested) so the outer resetAllMocks/fake-timer-free
+// beforeEach does not run for these — the catch-up helper needs fake timers.
+describe('scheduleCatchUpFrame (Run picture-sync late-paint catch-up)', () => {
+  let injectSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    // Spy on the real registry singleton — injectSyncFrame is the guarded
+    // screenshot the helper must invoke (and only once, after the delay).
+    injectSpy = jest
+      .spyOn(getPreviewVideoStreamRegistry(), 'injectSyncFrame')
+      .mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    jest.clearAllTimers();
+    jest.useRealTimers();
+    injectSpy.mockRestore();
+  });
+
+  it('does not push a frame before the delay elapses', () => {
+    scheduleCatchUpFrame('sess-1', 600);
+    expect(injectSpy).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(599);
+    expect(injectSpy).not.toHaveBeenCalled();
+  });
+
+  it('pushes exactly one catch-up frame for the session once the delay elapses', () => {
+    scheduleCatchUpFrame('sess-2', 600);
+    jest.advanceTimersByTime(600);
+    expect(injectSpy).toHaveBeenCalledTimes(1);
+    expect(injectSpy).toHaveBeenCalledWith('sess-2');
+  });
+
+  it('swallows an injectSyncFrame rejection (fire-and-forget, no throw)', async () => {
+    injectSpy.mockRejectedValueOnce(new Error('stream gone'));
+    expect(() => {
+      scheduleCatchUpFrame('sess-3', 600);
+      jest.advanceTimersByTime(600);
+    }).not.toThrow();
+    // Flush the rejected promise's .catch so it never surfaces as unhandled.
+    await Promise.resolve();
+    expect(injectSpy).toHaveBeenCalledTimes(1);
   });
 });

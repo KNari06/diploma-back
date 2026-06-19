@@ -41,6 +41,15 @@ export interface ClientToServerEvents {
   ) => void;
   'unsubscribe:chat:testcase': (data: { testCaseId: string }) => void;
 
+  // Project room subscription — receives test-case / flow / module mutation
+  // events for live cache invalidation in the test-suites editor. Access is
+  // verified fail-closed (owner OR active workspace member) at subscribe time.
+  'subscribe:project': (
+    data: { projectId: string },
+    callback?: (response: { ok: boolean; error?: string }) => void,
+  ) => void;
+  'unsubscribe:project': (data: { projectId: string }) => void;
+
   // Preview subscriptions
   'subscribe:preview': (data: { previewSessionId: string }) => void;
   'unsubscribe:preview': (data: { previewSessionId: string }) => void;
@@ -241,6 +250,15 @@ export interface ServerToClientEvents {
   'exploration:progress': (data: ExplorationProgressPayload) => void;
   'exploration:completed': (data: ExplorationCompletedPayload) => void;
   'exploration:clarification:request': (data: ExplorationClarificationPayload) => void;
+
+  // Project resource mutation events — broadcast to the `project:<id>` room
+  // so editors open in other tabs/sessions/users invalidate their cached
+  // test-case / flow / module lists without a page reload. See
+  // `subscribe:project` (subscription.handler.ts) and the emit* methods in
+  // websocket.service.ts.
+  'project:testcase:mutated': (data: ProjectResourceMutationPayload) => void;
+  'project:flow:mutated': (data: ProjectResourceMutationPayload) => void;
+  'project:module:mutated': (data: ProjectResourceMutationPayload) => void;
 
   // Negative testing events
   'negatives:generation:started': (data: any) => void;
@@ -644,6 +662,28 @@ export interface TestCreatedPayload {
   url: string;
   browsers: string[];
   userId?: string;
+  timestamp: string;
+}
+
+/**
+ * Project resource mutation — emitted to the `project:<id>` room when a test
+ * case / flow / module is created, updated, or deleted, so other open editors
+ * invalidate the matching cache slice. Payload is intentionally minimal: the
+ * frontend patches by id where it can (delete → filter, rename → update name)
+ * and refetches the affected flow/module on create. `flowId` / `moduleId`
+ * scope the refetch; `name` lets renames patch in-place without a round-trip.
+ */
+export interface ProjectResourceMutationPayload {
+  projectId: string;
+  action: 'created' | 'updated' | 'deleted';
+  /** Id of the mutated resource (test case / flow / module). */
+  id: string;
+  /** Current name on create/update; omitted on delete. */
+  name?: string;
+  /** Parent flow id for a test-case mutation, when known. */
+  flowId?: string;
+  /** Parent module id for a flow mutation, when known. */
+  moduleId?: string;
   timestamp: string;
 }
 
@@ -2565,7 +2605,7 @@ export interface AIActionLogPayload {
 // ROOM TYPES
 // ============================================================================
 
-export type RoomType = 'test' | 'chat' | 'user' | 'preview';
+export type RoomType = 'test' | 'chat' | 'user' | 'preview' | 'project';
 
 export interface RoomIdentifier {
   type: RoomType;
@@ -2575,8 +2615,10 @@ export interface RoomIdentifier {
 // Helper to create room names
 export const createRoomName = (type: RoomType, id: string): string => {
   // Validate inputs
-  if (!type || !['test', 'chat', 'user', 'preview'].includes(type)) {
-    throw new Error(`Invalid room type: ${type}. Must be 'test', 'chat', 'user', or 'preview'`);
+  if (!type || !['test', 'chat', 'user', 'preview', 'project'].includes(type)) {
+    throw new Error(
+      `Invalid room type: ${type}. Must be 'test', 'chat', 'user', 'preview', or 'project'`,
+    );
   }
 
   if (!id || typeof id !== 'string' || id.trim().length === 0) {
