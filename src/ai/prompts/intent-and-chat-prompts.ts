@@ -406,6 +406,12 @@ AVAILABLE INTENTS: ${intents.join(', ')}
    - Only when user has a live preview session (previewSessionId in context)
    - NOT for questions about the page — use general_chat for those
 
+11. "manage_module" - Create, rename, MOVE, or CONVERT a test MODULE/folder (write op)
+   - "create a mobile module called Checkout", "rename the smoke module" → analysis.manage.action = create | update
+   - "move the cases from the web folder to the mobile folder", "switch these tests from web to mobile" → analysis.manage.action = move | convert
+   - move/convert are RECOGNIZED but the tool can't do them — they MUST still be tagged so the handler refuses honestly (never silently route to general_chat or mislabel as update)
+   - This is about the MODULE/folder or moving cases between folders, NOT recording a new test
+
 --- DECISION TREE ---
 
 1. Short approval message ("yes", "go", "давай", "запусти", "ok", etc.) — look at CONVERSATION HISTORY:
@@ -428,6 +434,8 @@ AVAILABLE INTENTS: ${intents.join(', ')}
 5. Test suggestions ("what should I test", "что протестировать") → test_recommendations
 
 5b. Coverage questions ("what's not covered", "покажи покрытие", "gap analysis") → coverage_analysis
+
+5b-2. Reorganizing test suites — move/relocate test cases to another folder/module, or convert/switch a case's platform (web↔mobile) → manage_module (action:"move" or "convert"). This is a WRITE request about folders, NOT a data lookup — do NOT send it to general_chat.
 
 5c. ANY question about QA data (counts, analytics, lookups, reports, listings, temporal queries) → general_chat
    The agent has QA tools to query the database — don't confuse data questions with test execution requests.
@@ -621,6 +629,14 @@ Ex38: "schedule the nightly plan every day at 9am" / "запускай smoke п�
 
 Ex39: "rename the smoke module to Smoke - Critical" / "переименуй модуль Orders"
 → {"intent": "manage_module", "intent_confidence": 0.88, "analysis": {"manage": {"action": "update", "moduleName": "smoke", "name": "Smoke - Critical"}}, "rawText": "..."}
+
+Ex39b (UNSUPPORTED module op — tag for honest refusal, NEVER mislabel as "update"):
+"move all cases from the web folder to the mobile folder" / "переместите кейсы из web-папки в мобильную" / "кейстерді mobile папкаға жылжыт"
+→ {"intent": "manage_module", "intent_confidence": 0.85, "analysis": {"manage": {"action": "move"}}, "rawText": "..."}
+
+Ex39c (UNSUPPORTED module op — platform change):
+"convert these tests from web to mobile" / "смени платформу кейсов на mobile" / "веб тесттерді мобильдіге ауыстыр"
+→ {"intent": "manage_module", "intent_confidence": 0.85, "analysis": {"manage": {"action": "convert"}}, "rawText": "..."}
 
 Ex40: "create a regression plan called Release v2" / "создай план Release v2"
 → {"intent": "manage_plan", "intent_confidence": 0.9, "analysis": {"manage": {"action": "create", "name": "Release v2"}}, "rawText": "..."}
