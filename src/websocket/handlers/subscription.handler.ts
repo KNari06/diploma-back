@@ -461,6 +461,184 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
     }
   });
 
+  // Subscribe to project resource mutation events (test-case / flow / module
+  // CRUD) for live cache invalidation in the test-suites editor. Access is
+  // verified fail-closed: only the project owner or an active workspace member
+  // may join `project:<projectId>` — this prevents cross-tenant event leakage.
+  socket.on('subscribe:project', async ({ projectId }, callback) => {
+    const ack = (response: { ok: boolean; error?: string }) => {
+      if (typeof callback === 'function') callback(response);
+    };
+
+    try {
+      if (!projectId || typeof projectId !== 'string' || projectId.trim().length === 0) {
+        socket.emit('error', {
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid projectId provided',
+          timestamp: new Date().toISOString(),
+        });
+        ack({ ok: false, error: 'Invalid projectId' });
+        return;
+      }
+
+      if (!socket.connected) {
+        ack({ ok: false, error: 'Socket disconnected' });
+        return;
+      }
+
+      if (!userId) {
+        socket.emit('error', {
+          code: 'AUTH_REQUIRED',
+          message: 'Authentication required',
+          timestamp: new Date().toISOString(),
+        });
+        ack({ ok: false, error: 'Authentication required' });
+        return;
+      }
+
+      const pid = projectId.trim();
+
+      // Fail-closed access check: owner OR active workspace member.
+      try {
+        const { data: project, error: projectError } = await supabaseAdmin
+          .from('projects')
+          .select('user_id, workspace_id')
+          .eq('id', pid)
+          .maybeSingle();
+
+        if (projectError || !project) {
+          logger.warn('[WebSocket] Project not found / lookup failed (denying subscription)', {
+            socketId: socket.id,
+            userId,
+            projectId: pid,
+            error: projectError?.message,
+          });
+          socket.emit('error', {
+            code: 'ACCESS_DENIED',
+            message: 'You do not have access to this project',
+            timestamp: new Date().toISOString(),
+          });
+          ack({ ok: false, error: 'Access denied' });
+          return;
+        }
+
+        let hasAccess = project.user_id === userId;
+
+        if (!hasAccess && project.workspace_id) {
+          const { data: member } = await supabaseAdmin
+            .from('workspace_members')
+            .select('user_id')
+            .eq('workspace_id', project.workspace_id)
+            .eq('user_id', userId)
+            .eq('status', 'active')
+            .maybeSingle();
+          hasAccess = !!member;
+        }
+
+        if (!hasAccess) {
+          logger.warn('[WebSocket] Subscription denied: no project access', {
+            socketId: socket.id,
+            requestingUserId: userId,
+            projectId: pid,
+          });
+          socket.emit('error', {
+            code: 'ACCESS_DENIED',
+            message: 'You do not have access to this project',
+            timestamp: new Date().toISOString(),
+          });
+          ack({ ok: false, error: 'Access denied' });
+          return;
+        }
+      } catch (verifyError) {
+        logger.warn('[WebSocket] Exception verifying project access (denying subscription)', {
+          socketId: socket.id,
+          userId,
+          projectId: pid,
+          error: verifyError instanceof Error ? verifyError.message : String(verifyError),
+        });
+        socket.emit('error', {
+          code: 'ACCESS_DENIED',
+          message: 'Authorization check failed',
+          timestamp: new Date().toISOString(),
+        });
+        ack({ ok: false, error: 'Authorization check failed' });
+        return;
+      }
+
+      const room = createRoomName('project', pid);
+      const rooms = getRoomSet(socket.id);
+
+      // Idempotent subscribe
+      if (rooms.has(room)) {
+        ack({ ok: true });
+        return;
+      }
+
+      if (!canSubscribe(socket.id)) {
+        socket.emit('error', {
+          code: 'SUBSCRIPTION_LIMIT',
+          message: 'Maximum subscription limit reached',
+          timestamp: new Date().toISOString(),
+        });
+        ack({ ok: false, error: 'Subscription limit reached' });
+        return;
+      }
+
+      socket.join(room);
+      rooms.add(room);
+      incrementSubscriptions(socket.id);
+
+      logger.info('[WebSocket] Subscribed to project', {
+        socketId: socket.id,
+        userId,
+        projectId: pid,
+        room,
+      });
+      ack({ ok: true });
+    } catch (error) {
+      logger.error('[WebSocket] Error in subscribe:project', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      socket.emit('error', {
+        code: 'SUBSCRIPTION_ERROR',
+        message: 'Failed to subscribe to project updates',
+        timestamp: new Date().toISOString(),
+      });
+      ack({ ok: false, error: 'Subscription error' });
+    }
+  });
+
+  socket.on('unsubscribe:project', ({ projectId }) => {
+    try {
+      if (!projectId || typeof projectId !== 'string' || projectId.trim().length === 0) {
+        return;
+      }
+
+      const room = createRoomName('project', projectId.trim());
+      socket.leave(room);
+      const rooms = getRoomSet(socket.id);
+      if (rooms.has(room)) {
+        rooms.delete(room);
+        decrementSubscriptions(socket.id);
+      }
+
+      logger.info('[WebSocket] Unsubscribed from project', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+        projectId,
+        room,
+      });
+    } catch (error) {
+      logger.error('[WebSocket] Error in unsubscribe:project', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // Subscribe to chat updates
   // ✅ FIX: Added async ownership verification to prevent cross-user event leakage
   socket.on('subscribe:chat', async ({ sessionId }, callback) => {
