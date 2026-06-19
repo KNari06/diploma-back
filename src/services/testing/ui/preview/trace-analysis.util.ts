@@ -124,6 +124,18 @@ export class TraceSummaryAggregator {
       this.totalSteps++;
       if (payload.status === 'fail') this.failedSteps++;
     }
+    // Mobile editor apply/run path emits `mobile_apply_result` (one per step),
+    // not the web `step_result` — so without this branch the trace_summary for
+    // every mobile-editor session reported totalSteps:0. Skip the synthetic
+    // pre-run reset steps (close_app/open_app/wait_for, id `__synthetic_reset_*`)
+    // so the count reflects the user's real steps. Failure = result.success===false.
+    if (evtType === 'mobile_apply_result') {
+      const stepId = typeof payload.stepId === 'string' ? payload.stepId : '';
+      if (!stepId.startsWith('__synthetic_reset_')) {
+        this.totalSteps++;
+        if (payload.result?.success === false) this.failedSteps++;
+      }
+    }
     if (evtType === 'run_error_summary') {
       this.errors = Math.max(this.errors, payload.totalErrors ?? 0);
     }

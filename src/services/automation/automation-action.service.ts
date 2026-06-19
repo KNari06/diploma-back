@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { getTelegramToken, sendMessage as sendTelegramMessage } from '@/services/api/telegram.service';
+import { escTg } from '@/utils/notifications/telegram-notify';
 import { env } from '@/config/environment/env';
 import * as crypto from 'crypto';
 import type {
@@ -323,10 +324,12 @@ export class AutomationActionService {
       }
     }
 
-    // Build message
-    const title = ctx.eventData.title || `Automation: ${ctx.triggerEvent}`;
-    const body = ctx.eventData.message || '';
-    const shareSection = shareUrl ? `\n\n<a href="${shareUrl}">View full report</a>` : '';
+    // Build message. Escape every dynamic value — title/body come from event
+    // data (test URLs with `&`, names with `<`), and an unescaped `&` makes
+    // Telegram reject the whole message with a 400 → the notification is lost.
+    const title = escTg(ctx.eventData.title || `Automation: ${ctx.triggerEvent}`);
+    const body = escTg(ctx.eventData.message || '');
+    const shareSection = shareUrl ? `\n\n<a href="${escTg(shareUrl)}">View full report</a>` : '';
     const htmlMessage = `<b>${title}</b>\n\n${body}${shareSection}`;
 
     await sendTelegramMessage(tokenData.access_token, chatId, htmlMessage, 'HTML');

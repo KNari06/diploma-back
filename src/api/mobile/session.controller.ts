@@ -20,6 +20,7 @@ import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { ProjectService } from '@/services/core/project.service';
 import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
+import { sendMobileRunnerError } from './mobile-error-mapper';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
 import { refreshIdle, cancelIdle } from '@/services/mobile/mobile-idle.service';
@@ -828,11 +829,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // non-fatal above and never reach here.
     emitWarmupProgress(userId, 'boot_emulator', 0, message);
 
-    res.status(500).json({
-      success: false,
-      error: 'Failed to warm up emulator session',
-      message,
-    });
+    sendMobileRunnerError(res, error, 'Failed to warm up emulator session');
   }
 }
 
@@ -911,11 +908,7 @@ export async function destroySession(req: Request, res: Response): Promise<void>
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json({
-      success: false,
-      error: 'Failed to destroy session',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Failed to destroy session');
   }
 }
 
@@ -956,11 +949,7 @@ export async function tapSession(req: Request, res: Response): Promise<void> {
       y,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Tap failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Tap failed');
   }
 }
 
@@ -1020,11 +1009,7 @@ export async function swipeSession(req: Request, res: Response): Promise<void> {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Swipe failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Swipe failed');
   }
 }
 
@@ -1056,11 +1041,7 @@ export async function goHomeSession(req: Request, res: Response): Promise<void> 
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Go home failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Go home failed');
   }
 }
 
@@ -1092,11 +1073,7 @@ export async function goBackSession(req: Request, res: Response): Promise<void> 
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Go back failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Go back failed');
   }
 }
 
@@ -1135,11 +1112,7 @@ export async function typeSession(req: Request, res: Response): Promise<void> {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Type text failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Type text failed');
   }
 }
 
@@ -1179,11 +1152,7 @@ export async function keySession(req: Request, res: Response): Promise<void> {
       keycode,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Key press failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Key press failed');
   }
 }
 
@@ -1223,11 +1192,7 @@ export async function commandSession(req: Request, res: Response): Promise<void>
       type,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Command failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Command failed');
   }
 }
 
@@ -1267,6 +1232,26 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
 
   try {
     const client = getMobileRunnerClient();
+
+    // Liveness guard. Unlike warmup/apply/run (which call sessionExists), lint
+    // used to forward straight to the runner with whatever sessionId the editor
+    // still held — so a session the runner had reclaimed (idle TTL ~25min, pool
+    // reset, runner redeploy) produced a bare runner 404 that the catch below
+    // flattened into a useless "Lint failed". Detect the dead session up front
+    // and return a TYPED 410 the editor recognizes (code SESSION_EXPIRED), so it
+    // can surface "session expired — reopen" instead of a generic error. Cheap
+    // (~one GET /api/sessions, 5s cap) and only on the lint path.
+    const alive = await client.sessionExists(sessionId);
+    if (!alive) {
+      logger.info('[MOBILE_SESSION] Lint on a session the runner no longer has', { sessionId });
+      res.status(410).json({
+        success: false,
+        code: 'SESSION_EXPIRED',
+        error: 'Session expired',
+        message: 'The device session is no longer available (it was reclaimed after inactivity or a restart). Reopen the test case to continue.',
+      });
+      return;
+    }
 
     const stepType = stepDraft.type || stepDraft.kind || 'click';
     const rawDescription = (stepDraft.elementDescription || stepDraft.description || '').trim();
@@ -1424,11 +1409,11 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
         result: { status: 'error', message },
       });
     }
-    res.status(500).json({
-      success: false,
-      error: 'Lint failed',
-      message,
-    });
+    // Forward the REAL cause (shared helper) instead of a blanket "Lint failed":
+    // carries the cause in `error`, passes the runner's typed code/status, and
+    // maps a session that died mid-lint (TOCTOU past the up-front guard) to a
+    // typed 410 SESSION_EXPIRED.
+    sendMobileRunnerError(res, error, 'Lint failed');
   }
 }
 
@@ -1592,11 +1577,7 @@ export async function applySession(req: Request, res: Response): Promise<void> {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Apply failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Apply failed');
   }
 }
 
@@ -2258,11 +2239,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
       intentTestCaseId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Failed to run test case',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Failed to run test case');
   }
 }
 
