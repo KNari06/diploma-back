@@ -1018,18 +1018,6 @@ export async function mapAllureResult(
 }
 
 /**
- * Ensure the web_ui platform exists for this project and return its ID.
- * Throws if PlatformService fails (caller should handle).
- */
-export async function getWebUiPlatformId(
-  projectId: string,
-  userId: string,
-): Promise<string> {
-  const platforms = await PlatformService.ensurePlatformsExist(projectId, userId);
-  return platforms.webUi.id;
-}
-
-/**
  * Resolve the platform-tree node ID that imported Modules/Flows should be
  * placed under, based on the chosen import platform. All three mobile
  * variants share the single `mobile` tree node — the specific variant

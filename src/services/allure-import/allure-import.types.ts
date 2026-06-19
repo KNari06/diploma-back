@@ -278,11 +278,6 @@ const IMPORT_PLATFORMS: readonly ImportPlatform[] = [
   'web', 'mobile_android', 'mobile_ios', 'mobile_flutter',
 ];
 
-/** True when `platform` is one of the four mobile variants. */
-export function isMobilePlatform(platform: ImportPlatform): boolean {
-  return platform !== 'web';
-}
-
 /**
  * User-configurable options for an Allure import.
  * All fields are optional and default to sane values in the service.
@@ -366,6 +361,17 @@ function normaliseDefaultStartUrl(raw: unknown): string | null {
 }
 
 /**
+ * Validate an arbitrary value against the platform enum. Accepts `unknown`
+ * (the wire field is an unvalidated multipart string) and falls back to
+ * `'web'` for anything outside the enum — typo, stale client, missing field.
+ */
+function normalisePlatform(raw: unknown): ImportPlatform {
+  return typeof raw === 'string' && (IMPORT_PLATFORMS as readonly string[]).includes(raw)
+    ? (raw as ImportPlatform)
+    : 'web';
+}
+
+/**
  * Apply user-provided options on top of defaults.
  */
 export function resolveImportOptions(
@@ -378,11 +384,7 @@ export function resolveImportOptions(
     deduplicateTests:  opts.deduplicateTests  ?? true,
     saveDocsToKB:      opts.saveDocsToKB      ?? true,
     defaultStartUrl:   normaliseDefaultStartUrl(opts.defaultStartUrl),
-    // Anything outside the known enum (typo, stale client) falls back to web
-    // rather than failing the whole import.
-    platform: opts.platform && IMPORT_PLATFORMS.includes(opts.platform)
-      ? opts.platform
-      : 'web',
+    platform:          normalisePlatform(opts.platform),
   };
 }
 

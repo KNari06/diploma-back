@@ -18,7 +18,7 @@ import {
   removeAllureObject,
 } from '@/services/allure-import/allure-import.storage';
 import { PERMISSIONS, WorkspaceAccessService } from '@/services/core/workspace-access.service';
-import type { AllureImportJobData, AllureImportOptions, AllureSourceFormat } from '@/services/allure-import/allure-import.types';
+import type { AllureImportJobData, AllureSourceFormat } from '@/services/allure-import/allure-import.types';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -188,9 +188,10 @@ export async function uploadAllure(req: Request, res: Response): Promise<void> {
       deduplicateTests:  parseBoolField(req.body.deduplicateTests,  true),
       saveDocsToKB:      parseBoolField(req.body.saveDocsToKB,      true),
       defaultStartUrl:   typeof req.body.defaultStartUrl === 'string' ? req.body.defaultStartUrl : undefined,
-      // Multipart field arrives as a string; `resolveImportOptions` validates
-      // it against the enum and falls back to 'web' for anything unexpected.
-      platform:          typeof req.body.platform === 'string' ? req.body.platform as AllureImportOptions['platform'] : undefined,
+      // Multipart field arrives as an unvalidated string; `resolveImportOptions`
+      // validates it against the enum and falls back to 'web' for anything
+      // unexpected (typo, stale client, missing field).
+      platform:          req.body.platform,
     });
 
     const importId = randomUUID();
