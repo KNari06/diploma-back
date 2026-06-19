@@ -10,6 +10,7 @@ import { cache } from '@/utils/core/redis-cache';
 import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import type { CompiledStepPlan, IntentStep, IntentTestCase, StepEvidence } from './preview.types';
 import { injectAutoWaitForSteps } from './auto-wait-for.utils';
+import { emitTestCaseMutated } from '@/websocket/helpers/project-mutation-emit';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Per-testCase in-memory mutex (prevents concurrent read-modify-write races)
@@ -209,6 +210,15 @@ export class IntentTestCaseService {
     if (flowId) {
       await cache.delByPattern(`qait:cache:ptree:flow:${flowId}:*`);
     }
+
+    // Live cache invalidation for other open editors (best-effort).
+    emitTestCaseMutated({
+      projectId,
+      action: 'created',
+      id: data.id,
+      name,
+      flowId: flowId || undefined,
+    });
 
     return this.mapToIntentTestCase(data);
   }
@@ -648,6 +658,22 @@ export class IntentTestCaseService {
         await cache.delByPattern(`qait:cache:ptree:flow:${data.flow_id}:*`);
       }
 
+      // Live cache invalidation for other open editors (best-effort). Only emit
+      // when a field the editor's cached lists display changed (name / flow /
+      // status) — NOT for pure steps_json persistence from auto-heal / run,
+      // which would spam the room without changing any list-visible data.
+      const listVisibleChanged =
+        name !== undefined || flowId !== undefined || status !== undefined;
+      if (listVisibleChanged && data.project_id) {
+        emitTestCaseMutated({
+          projectId: data.project_id,
+          action: 'updated',
+          id,
+          name: data.name,
+          flowId: data.flow_id || undefined,
+        });
+      }
+
       // Mark related negative test cases as stale when steps change
       if (steps !== undefined) {
         this.markNegativesStale(id).catch((err) => {
@@ -695,6 +721,16 @@ export class IntentTestCaseService {
     // Invalidate plans cache — deleting a test case removes its regression_plan_items as side-effect
     if (tc?.project_id) {
       await cache.delByPattern(`qait:cache:plans:proj:${tc.project_id}:*`);
+    }
+
+    // Live cache invalidation for other open editors (best-effort).
+    if (tc?.project_id) {
+      emitTestCaseMutated({
+        projectId: tc.project_id,
+        action: 'deleted',
+        id,
+        flowId: tc.flow_id || undefined,
+      });
     }
 
     return true;

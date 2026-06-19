@@ -14,6 +14,7 @@ import {
 import { NotFoundError, ValidationError } from '@/types';
 import type { PlatformKey } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+import { emitModuleMutated } from '@/websocket/helpers/project-mutation-emit';
 import { Request, Response } from 'express';
 
 interface AuthenticatedRequest extends Request {
@@ -69,6 +70,8 @@ export async function createModule(req: AuthenticatedRequest, res: Response): Pr
     });
 
     res.json({ success: true, data: module, timestamp: new Date() });
+
+    emitModuleMutated({ projectId, action: 'created', id: module.id, name: module.name });
 
     void WorkspaceAuditService.logForProject({
       projectId,
@@ -168,6 +171,13 @@ export async function updateModule(req: AuthenticatedRequest, res: Response): Pr
     res.json({ success: true, data: module, timestamp: new Date() });
 
     if (module.projectId) {
+      emitModuleMutated({
+        projectId: module.projectId,
+        action: 'updated',
+        id,
+        name: module.name,
+      });
+
       const changedFields = Object.entries({ name, description, tags, priority })
         .filter(([, v]) => v !== undefined)
         .map(([k]) => k);
@@ -208,6 +218,8 @@ export async function deleteModule(req: AuthenticatedRequest, res: Response): Pr
     res.json({ success: true, message: 'Module deleted', timestamp: new Date() });
 
     if (snapshot?.project_id) {
+      emitModuleMutated({ projectId: snapshot.project_id, action: 'deleted', id });
+
       void WorkspaceAuditService.logForProject({
         projectId: snapshot.project_id,
         actorUserId: userId,
