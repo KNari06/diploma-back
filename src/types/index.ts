@@ -301,15 +301,30 @@ export type WorkspaceRole =
 // Workspace account type enum
 export type WorkspaceAccountType = 'company' | 'individual';
 
+export type WorkspaceProjectType = 'web' | 'mobile';
+export type MobileOnboardingPlatform = 'android' | 'ios' | 'flutter';
+
 export interface WorkspaceOnboardingRequest {
   name: string; // Project/Workspace name
-  baseUrls: string[]; // Array of base URLs
-  environments: {
+  // projectType drives which fields are required:
+  //  - 'web' (default): baseUrls + environments + browserType required
+  //  - 'mobile': baseUrls/environments NOT required; mobilePlatform required.
+  //    The APK/IPA is uploaded separately (mobileService.uploadApp) once the
+  //    workspace/project exists, so it's not part of this payload.
+  projectType?: WorkspaceProjectType; // Default: 'web'
+  // When true the user chose "skip for now" — no web/mobile config is required;
+  // onboarding completes and they configure the target later on the dashboard.
+  skipped?: boolean;
+  baseUrls?: string[]; // Array of base URLs (required for web)
+  environments?: {
     dev?: string;
     predprod?: string;
     prod?: string;
   };
-  browserType: BrowserTypeEnum; // Default: 'chrome'
+  browserType?: BrowserTypeEnum; // Default: 'chrome' (web)
+  // Mobile fields — required/used only when projectType === 'mobile'
+  mobilePlatform?: MobileOnboardingPlatform; // 'android' | 'ios' | 'flutter'
+  mobilePackageName?: string; // package name / bundle id (optional)
   // NEW FIELDS (all optional)
   role?: WorkspaceRole; // User's role (optional)
   position?: string; // User's position (optional, max 255 chars)
@@ -320,6 +335,8 @@ export interface WorkspaceOnboardingRequest {
 export interface WorkspaceOnboardingResponse {
   workspace_id?: string; // Workspace ID returned in response (only when completed)
   name?: string;
+  projectType?: WorkspaceProjectType;
+  skipped?: boolean;
   baseUrls?: string[];
   environments?: {
     dev?: string;
@@ -327,6 +344,8 @@ export interface WorkspaceOnboardingResponse {
     prod?: string;
   };
   browserType?: BrowserTypeEnum;
+  mobilePlatform?: MobileOnboardingPlatform;
+  mobilePackageName?: string;
   completed: boolean; // Whether onboarding was completed
   // NEW FIELDS
   role?: WorkspaceRole;
