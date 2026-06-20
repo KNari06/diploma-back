@@ -309,8 +309,9 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
       onboarding_skipped: skipped,
       baseUrls: normalizedBaseUrls,
       environments: normalizedEnvironments,
-      browserType: isMobile ? (existingSettings.browserType ?? 'chrome') : body.browserType,
-      defaultBrowser: isMobile ? (existingSettings.defaultBrowser ?? 'chrome') : body.browserType,
+      // Mobile / skip have no browser choice → keep existing or default to chrome.
+      browserType: (isMobile || skipped) ? (existingSettings.browserType ?? 'chrome') : body.browserType,
+      defaultBrowser: (isMobile || skipped) ? (existingSettings.defaultBrowser ?? 'chrome') : body.browserType,
       mobilePlatform: isMobile ? body.mobilePlatform : null,
       mobilePackageName: isMobile ? (body.mobilePackageName?.trim() || null) : null,
       // NEW FIELDS
@@ -354,7 +355,7 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
       skipped,
       baseUrls: normalizedBaseUrls,
       environments: normalizedEnvironments,
-      browserType: body.browserType,
+      browserType: (isMobile || skipped) ? 'chrome' : body.browserType,
       mobilePlatform: isMobile ? body.mobilePlatform : undefined,
       mobilePackageName: isMobile ? (body.mobilePackageName?.trim() || undefined) : undefined,
       completed: true,
