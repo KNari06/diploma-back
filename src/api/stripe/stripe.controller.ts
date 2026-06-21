@@ -569,29 +569,6 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     return;
   }
 
-  const { data: existingTransaction, error: existingTransactionError } = await supabaseAdmin
-    .from('stripe_transactions')
-    .select('id')
-    .or(`stripe_invoice_id.eq.${invoice.id},stripe_event_id.eq.${event.id}`)
-    .maybeSingle();
-
-  if (existingTransactionError) {
-    logger.error('[STRIPE_WEBHOOK] Failed to check transaction duplicate', {
-      invoiceId: invoice.id,
-      eventId: event.id,
-      error: existingTransactionError.message,
-    });
-  }
-
-  if (existingTransaction) {
-    logger.info('[STRIPE_WEBHOOK] Duplicate transaction ignored', {
-      invoiceId: invoice.id,
-      eventId: event.id,
-      userId: user.id,
-    });
-    return;
-  }
-
   if (user.last_credits_invoice_id === invoice.id) {
     logger.info('[STRIPE_WEBHOOK] Invoice already processed', {
       userId: user.id,
@@ -652,6 +629,11 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
   const planCode = plan?.code || 'unknown';
   const subscriptionPlanLabel = plan?.name || plan?.code || 'pro';
 
+  // A recurring renewal must RESET credits to the period allotment, not stack
+  // them. The first charge / upgrade adds; every `subscription_cycle` resets.
+  const billingReason = (invoice as Stripe.Invoice).billing_reason;
+  const isRenewalCycle = billingReason === 'subscription_cycle';
+
   const transactionData: Record<string, any> = {
     user_id: user.id,
     stripe_customer_id: customerId,
@@ -673,24 +655,42 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
       : new Date().toISOString(),
   };
 
+  // Idempotency lock: INSERT (not upsert) the transaction row BEFORE granting
+  // any credits. The unique constraint on stripe_invoice_id makes this the
+  // atomic barrier — only the FIRST delivery of an invoice inserts a row; a
+  // concurrent retry hits a 23505 unique violation and bows out WITHOUT
+  // granting. (The old code did a separate SELECT-then-act check and granted
+  // before the upsert, so two concurrent retries could both pass the check and
+  // double-grant.)
   const { error: transactionError } = await supabaseAdmin
     .from('stripe_transactions')
-    .upsert(transactionData, { onConflict: 'stripe_invoice_id' });
+    .insert(transactionData);
 
   if (transactionError) {
-    logger.error('[STRIPE_WEBHOOK] Failed to save transaction', {
+    if (transactionError.code === '23505') {
+      logger.info('[STRIPE_WEBHOOK] Duplicate invoice ignored (already recorded)', {
+        invoiceId: invoice.id,
+        eventId: event.id,
+        userId: user.id,
+      });
+      return;
+    }
+    // Could not record the transaction — do NOT grant credits, so a Stripe
+    // retry can re-attempt the whole thing rather than granting un-recorded.
+    logger.error('[STRIPE_WEBHOOK] Failed to record transaction; skipping credit grant', {
       invoiceId: invoice.id,
       userId: user.id,
       error: transactionError.message,
     });
-  } else {
-    logger.info('[STRIPE_WEBHOOK] Transaction saved', {
-      invoiceId: invoice.id,
-      userId: user.id,
-      amount: transactionData.amount,
-      currency: transactionData.currency,
-    });
+    return;
   }
+
+  logger.info('[STRIPE_WEBHOOK] Transaction saved', {
+    invoiceId: invoice.id,
+    userId: user.id,
+    amount: transactionData.amount,
+    currency: transactionData.currency,
+  });
 
   if (creditsPerPeriod > 0) {
     logger.info('[STRIPE_WEBHOOK] Adding credits on invoice payment', {
@@ -753,13 +753,18 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
       if (ownerMembership) {
         const workspaceId = ownerMembership.workspace_id;
 
-        const result = await WorkspaceCreditsService.upgradeToPlan(workspaceId, workspacePlanSlug);
+        // First charge / upgrade ADDS the plan credits; a recurring cycle RESETS
+        // to the period allotment (otherwise the balance stacks every month).
+        const result = isRenewalCycle
+          ? await WorkspaceCreditsService.renewPlan(workspaceId, workspacePlanSlug)
+          : await WorkspaceCreditsService.upgradeToPlan(workspaceId, workspacePlanSlug);
 
         if (result) {
-          logger.info('[STRIPE_WEBHOOK] B2B workspace plan provisioned via upgradeToPlan', {
+          logger.info('[STRIPE_WEBHOOK] B2B workspace plan provisioned', {
             workspaceId,
             userId: user.id,
             plan: workspacePlanSlug,
+            mode: isRenewalCycle ? 'renew' : 'upgrade',
             credits: result.credits_balance,
             graceLimit: result.grace_limit,
             invoiceId: invoice.id,
@@ -818,7 +823,6 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
   // one-off (`manual`/`subscription_update`) — NOT on monthly renewals
   // (`subscription_cycle`), which would spam "Payment confirmed" every cycle.
   // Stripe still sends its own receipt for every charge.
-  const billingReason = (invoice as Stripe.Invoice).billing_reason;
   const isFirstOrOneOff =
     !billingReason || billingReason === 'subscription_create' || billingReason === 'manual' || billingReason === 'subscription_update';
   if (user.email && isFirstOrOneOff) {

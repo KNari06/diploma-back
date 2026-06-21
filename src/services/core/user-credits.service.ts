@@ -325,70 +325,50 @@ export class UserCreditsService {
         return { success: false, newBalance: 0 };
       }
 
+      // Ensure the row (and welcome bonus) exist before deducting. We read the
+      // pre-deduction balance only to flag grace transitions and to report the
+      // unchanged balance on an "insufficient" result — the actual deduction is
+      // atomic in the DB, NOT computed from this value.
       const credits = await this.getOrCreateUserCredits(userId);
 
       // Round amount to 2 decimal places to match NUMERIC(10,2) in DB
       const roundedAmount = Math.round(amount * 100) / 100;
+      const currentBalance = toNum(credits.credits_balance);
+      const wasAlreadyInGrace = currentBalance < 0;
 
-      const currentBalance = Number.isFinite(credits.credits_balance)
-        ? (credits.credits_balance || 0)
-        : 0;
+      // Atomic deduction with grace-floor enforcement. The DB applies the
+      // balance check and the write in one statement under a row lock, so
+      // concurrent deductions serialize and cannot double-spend (was a
+      // read-modify-write race). No row returned => the deduction would breach
+      // the grace floor => insufficient credits.
+      const { data: updatedRow, error: rpcError } = await supabaseAdmin.rpc('deduct_user_credits', {
+        p_user_id: userId,
+        p_amount: roundedAmount,
+      });
 
-      // V16: Grace period — allow negative balance up to grace_limit.
-      // grace_limit is set per plan (free=0, pro=100, ultra=200, business=1000).
-      const graceLimit = Number.isFinite(credits.grace_limit) ? (credits.grace_limit || 0) : 0;
-      const effectiveFloor = -graceLimit; // e.g., -100 for pro plan
-      const newBalance = Math.round((currentBalance - roundedAmount) * 100) / 100;
+      if (rpcError) {
+        logger.error('[USER_CREDITS] Error deducting credits (rpc)', {
+          error: rpcError.message,
+          code: rpcError.code,
+          userId,
+        });
+        return { success: false, newBalance: currentBalance };
+      }
 
-      if (newBalance < effectiveFloor) {
+      // supabase rpc returning a row type may surface as an array or single object.
+      const deducted = Array.isArray(updatedRow) ? updatedRow[0] : updatedRow;
+      if (!deducted) {
         logger.warn('[USER_CREDITS] Insufficient credits (grace limit exceeded)', {
           userId,
           required: roundedAmount,
           available: currentBalance,
-          graceLimit,
-          wouldBe: newBalance,
-          floor: effectiveFloor,
+          graceLimit: toNum(credits.grace_limit),
         });
         return { success: false, newBalance: currentBalance };
       }
 
+      const newBalance = toNum(deducted.credits_balance);
       const isGraceDeduction = newBalance < 0;
-      const wasAlreadyInGrace = currentBalance < 0;
-
-      // Update balance
-      const previousTotalUsed = Number.isFinite(credits.total_used)
-        ? (credits.total_used || 0)
-        : 0;
-
-      const updateFields: Record<string, any> = {
-        credits_balance: newBalance,
-        total_used: Math.round((previousTotalUsed + roundedAmount) * 100) / 100,
-        last_credit_usage: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
-
-      // V16: Track overage and grace start
-      if (isGraceDeduction) {
-        // overage_balance = how much user owes (positive number)
-        updateFields.overage_balance = Math.round(Math.abs(newBalance) * 100) / 100;
-        if (!wasAlreadyInGrace) {
-          updateFields.grace_started_at = new Date().toISOString();
-        }
-      }
-
-      const { error: updateError } = await supabaseAdmin
-        .from('user_credits')
-        .update(updateFields)
-        .eq('user_id', userId);
-
-      if (updateError) {
-        logger.error('[USER_CREDITS] Error updating credits', {
-          error: updateError.message,
-          code: updateError.code,
-          userId,
-        });
-        return { success: false, newBalance: currentBalance };
-      }
 
       // Record transaction (with grace flag)
       await this.recordTransaction(userId, -roundedAmount, newBalance, 'usage', description, {
@@ -400,7 +380,7 @@ export class UserCreditsService {
         logger.info('[USER_CREDITS] Grace period started', {
           userId,
           balance: newBalance,
-          graceLimit,
+          graceLimit: toNum(credits.grace_limit),
           overageBalance: Math.abs(newBalance),
         });
       }

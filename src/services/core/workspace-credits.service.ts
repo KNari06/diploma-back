@@ -943,4 +943,84 @@ export class WorkspaceCreditsService {
       return null;
     }
   }
+
+  /**
+   * V16: Renew a workspace's B2B plan on a recurring billing cycle.
+   *
+   * Unlike upgradeToPlan (which ADDS the plan's credits — correct for a first
+   * purchase / upgrade), renewal SETS the balance to exactly the plan allotment
+   * for the new period. Calling upgradeToPlan on every `subscription_cycle`
+   * stacked credits forever (29K → 58K → 87K …); this resets to the period
+   * limit with no rollover, the standard subscription-credit model.
+   */
+  static async renewPlan(
+    workspaceId: string,
+    planSlug: 'small_business' | 'middle_business' | 'enterprise',
+  ): Promise<WorkspaceCredits | null> {
+    try {
+      const { WORKSPACE_PLANS } = await import('./token-calculator.service');
+      const planConfig = WORKSPACE_PLANS[planSlug];
+      if (!planConfig) {
+        logger.error('[WORKSPACE_CREDITS] Unknown B2B plan slug (renew)', { workspaceId, planSlug });
+        return null;
+      }
+
+      const credits = await this.getOrCreateWorkspaceCredits(workspaceId);
+      const newBalance = planConfig.credits; // SET, not add — fresh period allotment
+
+      const { data, error } = await supabaseAdmin
+        .from('workspace_credits')
+        .update({
+          credits_balance: newBalance,
+          total_purchased: toNum(credits.total_purchased) + planConfig.credits,
+          subscription_plan: planSlug,
+          subscription_status: 'active',
+          grace_limit: planConfig.graceLimit,
+          monthly_credit_limit: planConfig.credits,
+          credits_used_this_period: 0,
+          period_start_date: new Date().toISOString().split('T')[0],
+          warning_80_sent: false,
+          warning_95_sent: false,
+          overage_balance: 0,
+          grace_started_at: null,
+          credits_purchased_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('workspace_id', workspaceId)
+        .select()
+        .single();
+
+      if (error) {
+        logger.error('[WORKSPACE_CREDITS] Error renewing plan', {
+          error: error.message, workspaceId, planSlug,
+        });
+        return null;
+      }
+
+      try {
+        await supabaseAdmin.from('workspace_credit_transactions').insert({
+          workspace_id: workspaceId,
+          amount: planConfig.credits,
+          balance_after: newBalance,
+          transaction_type: 'purchase',
+          description: `Renewed ${planSlug} plan — ${planConfig.credits.toLocaleString()} credits for the new period`,
+          metadata: { plan: planSlug, price: planConfig.price, renewal: true },
+        });
+      } catch { /* non-fatal */ }
+
+      logger.info('[WORKSPACE_CREDITS] Workspace plan renewed', {
+        workspaceId, plan: planSlug, credits: planConfig.credits, newBalance,
+      });
+
+      await invalidateWorkspaceCreditsCache(workspaceId);
+      return data;
+    } catch (error) {
+      logger.error('[WORKSPACE_CREDITS] Exception renewing plan', {
+        error: error instanceof Error ? error.message : String(error),
+        workspaceId,
+        planSlug,
+      });
+      return null;
+    }
+  }
 }

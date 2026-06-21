@@ -37,7 +37,19 @@ jest.mock('@/db/supabase', () => {
     };
     return builder;
   };
-  return { supabaseAdmin: { from: jest.fn((t: string) => makeBuilder(t)) } };
+  return {
+    supabaseAdmin: {
+      from: jest.fn((t: string) => makeBuilder(t)),
+      // Atomic deduction RPC: subtract from the (coerced) balance, enforce floor.
+      rpc: jest.fn(async (_fn: string, params: any) => {
+        const bal = Number(state.row?.credits_balance);
+        const grace = Number(state.row?.grace_limit) || 0;
+        const next = Math.round((bal - params.p_amount) * 100) / 100;
+        if (next < -grace) return { data: [], error: null }; // insufficient
+        return { data: [{ ...state.row, credits_balance: next }], error: null };
+      }),
+    },
+  };
 });
 
 function stringRow(overrides: Record<string, any> = {}) {
@@ -85,12 +97,11 @@ describe('UserCreditsService NUMERIC-as-string coercion', () => {
     await expect(UserCreditsService.hasCredits('user-1', 30)).resolves.toBe(true);
   });
 
-  it('deductCredits computes from the real balance, not a phantom 0', async () => {
+  it('deductCredits computes from the real balance via the atomic RPC, not a phantom 0', async () => {
     state.row = stringRow({ credits_balance: '50.00' });
     const res = await UserCreditsService.deductCredits('user-1', 1, 'test deduction');
     expect(res.success).toBe(true);
-    expect(res.newBalance).toBe(49); // not -1
-    expect(Number(state.lastUpdate?.credits_balance)).toBe(49); // written value is correct
+    expect(res.newBalance).toBe(49); // not -1 — RPC subtracted from the real 50
   });
 
   it('addCredits adds to the real balance, not overwriting it with just the delta', async () => {
