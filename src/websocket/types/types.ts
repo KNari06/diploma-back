@@ -1649,7 +1649,7 @@ export interface PreviewDialogPayload {
 
 /**
  * Video frame payload for preview stream (CDP screencast)
- * ~10 fps, 1280x720, JPEG quality 60
+ * 1280x720, JPEG. The client decodes via createImageBitmap (byte-sniffed).
  */
 export interface PreviewVideoFramePayload {
   previewSessionId: string;
@@ -1658,7 +1658,7 @@ export interface PreviewVideoFramePayload {
   /**
    * Frame bytes — base64 string only when binary transport is unavailable.
    * When binary transport is used (preferred), this is an empty string and
-   * the actual JPEG bytes are passed as the second `emit()` argument.
+   * the actual image bytes are passed as the second `emit()` argument.
    */
   data: string;
   width: number;             // 1280
