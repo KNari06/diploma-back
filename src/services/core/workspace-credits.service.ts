@@ -259,64 +259,43 @@ export class WorkspaceCreditsService {
         return null;
       }
 
-      // Get current credits
+      // Ensure the row exists (and read the pre-deduction monthly limit for the
+      // threshold notification below). The deduction itself is atomic via RPC.
       const credits = await this.getOrCreateWorkspaceCredits(workspaceId);
-      const currentBalance = Number.isFinite(credits.credits_balance) ? credits.credits_balance : 0;
-
-      // V16: Grace period — allow negative balance up to grace_limit
-      const graceLimit = Number.isFinite(credits.grace_limit) ? (credits.grace_limit || 0) : 0;
-      const effectiveFloor = -graceLimit;
-
-      if (currentBalance - amount < effectiveFloor) {
-        logger.warn('[WORKSPACE_CREDITS] Insufficient credits (grace limit exceeded)', {
-          workspaceId,
-          currentBalance,
-          requiredAmount: amount,
-          graceLimit,
-        });
-        return null;
-      }
-
-      // Check monthly credit limit (Business plan cap)
+      const currentBalance = toNum(credits.credits_balance);
       const monthlyLimit = credits.monthly_credit_limit;
-      const usedThisPeriod = credits.credits_used_this_period || 0;
 
-      if (monthlyLimit != null && usedThisPeriod + amount > monthlyLimit) {
-        logger.warn('[WORKSPACE_CREDITS] Monthly credit limit exceeded', {
-          workspaceId,
-          monthlyLimit,
-          usedThisPeriod,
-          requestedAmount: amount,
-        });
-        return null;
-      }
+      // Atomic deduction: folds the grace-floor check AND the monthly-cap check
+      // into one statement under a row lock, so concurrent deductions can't lose
+      // updates or both pass the cap. Empty result = rejected (floor or cap).
+      const { data: deductedRows, error: rpcError } = await supabaseAdmin.rpc('deduct_workspace_credits', {
+        p_workspace_id: workspaceId,
+        p_amount: amount,
+      });
 
-      const newBalance = currentBalance - amount;
-      const newTotalUsed = (credits.total_used || 0) + amount;
-      const newUsedThisPeriod = usedThisPeriod + amount;
-
-      // Update credits (including period usage tracking)
-      const { data: updatedCredits, error: updateError } = await supabaseAdmin
-        .from('workspace_credits')
-        .update({
-          credits_balance: newBalance,
-          total_used: newTotalUsed,
-          credits_used_this_period: newUsedThisPeriod,
-          last_credit_usage: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq('workspace_id', workspaceId)
-        .select()
-        .single();
-
-      if (updateError) {
-        logger.error('[WORKSPACE_CREDITS] Error deducting credits', {
-          error: updateError.message,
+      if (rpcError) {
+        logger.error('[WORKSPACE_CREDITS] Error deducting credits (rpc)', {
+          error: rpcError.message,
           workspaceId,
           amount,
         });
         return null;
       }
+
+      const updatedCredits = Array.isArray(deductedRows) ? deductedRows[0] : deductedRows;
+      if (!updatedCredits || updatedCredits.workspace_id == null) {
+        // Grace floor breached or monthly cap exceeded.
+        logger.warn('[WORKSPACE_CREDITS] Deduction rejected (grace floor or monthly cap)', {
+          workspaceId,
+          currentBalance,
+          requiredAmount: amount,
+          monthlyLimit,
+        });
+        return null;
+      }
+
+      const newBalance = toNum(updatedCredits.credits_balance);
+      const newUsedThisPeriod = toNum(updatedCredits.credits_used_this_period);
 
       // Record transaction
       const { error: txError } = await supabaseAdmin.from('workspace_credit_transactions').insert({
@@ -375,7 +354,7 @@ export class WorkspaceCreditsService {
       }
 
       await invalidateWorkspaceCreditsCache(workspaceId);
-      return updatedCredits;
+      return normalizeWorkspaceCredits(updatedCredits) as WorkspaceCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception deducting credits', {
         error: error instanceof Error ? error.message : String(error),
@@ -555,7 +534,7 @@ export class WorkspaceCreditsService {
       });
 
       await invalidateWorkspaceCreditsCache(workspaceId);
-      return updatedCredits;
+      return normalizeWorkspaceCredits(updatedCredits) as WorkspaceCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception adding credits', {
         error: error instanceof Error ? error.message : String(error),
@@ -787,7 +766,7 @@ export class WorkspaceCreditsService {
       });
 
       await invalidateWorkspaceCreditsCache(workspaceId);
-      return updatedCredits;
+      return normalizeWorkspaceCredits(updatedCredits) as WorkspaceCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception resetting monthly usage', {
         error: error instanceof Error ? error.message : String(error),
@@ -852,7 +831,7 @@ export class WorkspaceCreditsService {
       });
 
       await invalidateWorkspaceCreditsCache(workspaceId);
-      return data;
+      return normalizeWorkspaceCredits(data) as WorkspaceCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception assigning pilot', {
         error: error instanceof Error ? error.message : String(error),
@@ -933,7 +912,7 @@ export class WorkspaceCreditsService {
       });
 
       await invalidateWorkspaceCreditsCache(workspaceId);
-      return data;
+      return normalizeWorkspaceCredits(data) as WorkspaceCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception upgrading plan', {
         error: error instanceof Error ? error.message : String(error),
@@ -1013,7 +992,7 @@ export class WorkspaceCreditsService {
       });
 
       await invalidateWorkspaceCreditsCache(workspaceId);
-      return data;
+      return normalizeWorkspaceCredits(data) as WorkspaceCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception renewing plan', {
         error: error instanceof Error ? error.message : String(error),

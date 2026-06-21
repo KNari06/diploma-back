@@ -1,5 +1,6 @@
 import { verifyToken } from '@/services/auth/auth.service';
 import { supabaseAdmin } from '@/db/supabase';
+import { isPaidUser } from '@/services/core/plan-access.service';
 import { AuthUser } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { NextFunction, Request, Response } from 'express';
@@ -550,3 +551,54 @@ async function checkWorkspaceCredits(
 
   return 'next';
 }
+
+/**
+ * Gate a route to paid plans only. Mobile testing (emulator sessions, APK
+ * upload, mobile exploration/runs) is a Pro feature — free users get 403 with
+ * an upgrade code the frontend turns into an upgrade prompt. Must run after
+ * requireAuth. Fail-closed: any resolution error denies access.
+ */
+export const requirePaidPlan = (featureLabel: string = 'This feature') => {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      if (!req.user) {
+        res.status(401).json({
+          success: false,
+          error: 'Unauthorized: Authentication required',
+          message: 'Please authenticate first',
+        });
+        return;
+      }
+
+      const paid = await isPaidUser(req.user.id);
+      if (!paid) {
+        logger.debug('[AUTH] Paid-plan feature blocked for free user', {
+          userId: req.user.id,
+          path: req.path,
+        });
+        res.status(403).json({
+          success: false,
+          error: 'Upgrade required',
+          code: 'UPGRADE_REQUIRED',
+          message: `${featureLabel} is available on the Pro plan. Upgrade to unlock it.`,
+        });
+        return;
+      }
+
+      next();
+    } catch (error) {
+      // Fail-closed: if we can't confirm a paid plan, deny rather than leak.
+      logger.error('[AUTH] Paid-plan check error', {
+        error: error instanceof Error ? error.message : String(error),
+        userId: req.user?.id,
+        path: req.path,
+      });
+      res.status(403).json({
+        success: false,
+        error: 'Upgrade required',
+        code: 'UPGRADE_REQUIRED',
+        message: 'Could not verify your plan. Please try again.',
+      });
+    }
+  };
+};

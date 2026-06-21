@@ -12,6 +12,7 @@ import { env } from '@/config/environment/env';
 import { QueueManager, redisConnection } from '@/config/infrastructure/queues';
 import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { isPaidUser } from '@/services/core/plan-access.service';
 import type { MobileIntentStep, MobilePlatform, MobileTestJobData, MobileTestMetadata } from '@/services/mobile/mobile-runner.types';
 import {
   MobileAppStorageService,
@@ -45,6 +46,18 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
   const userId = req.ciUserId!;
   const projectId = project.id;
   const workspaceId = project.workspace_id;
+
+  // Plan gate — mobile testing is a Pro feature. The CI path queues the runner
+  // job directly (bypassing dispatchMobileTest), so it needs its own check.
+  if (!(await isPaidUser(userId))) {
+    res.status(403).json({
+      success: false,
+      error: 'Upgrade required',
+      code: 'UPGRADE_REQUIRED',
+      message: 'Mobile testing is available on the Pro plan. Upgrade to run mobile tests via CI.',
+    });
+    return;
+  }
 
   const {
     savedTestCaseIds,

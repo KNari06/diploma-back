@@ -40,9 +40,14 @@ jest.mock('@/db/supabase', () => {
   return {
     supabaseAdmin: {
       from: jest.fn((t: string) => makeBuilder(t)),
-      // Atomic deduction RPC: subtract from the (coerced) balance, enforce floor.
-      rpc: jest.fn(async (_fn: string, params: any) => {
+      // Atomic credit RPCs (SETOF → array; empty array == no-op/insufficient).
+      rpc: jest.fn(async (fn: string, params: any) => {
         const bal = Number(state.row?.credits_balance);
+        if (fn === 'add_user_credits') {
+          const next = Math.round((bal + params.p_amount) * 100) / 100;
+          return { data: [{ ...state.row, credits_balance: next }], error: null };
+        }
+        // deduct_user_credits: subtract, enforce grace floor.
         const grace = Number(state.row?.grace_limit) || 0;
         const next = Math.round((bal - params.p_amount) * 100) / 100;
         if (next < -grace) return { data: [], error: null }; // insufficient
@@ -104,11 +109,29 @@ describe('UserCreditsService NUMERIC-as-string coercion', () => {
     expect(res.newBalance).toBe(49); // not -1 — RPC subtracted from the real 50
   });
 
-  it('addCredits adds to the real balance, not overwriting it with just the delta', async () => {
+  it('deductCredits reports insufficient when the SETOF RPC returns an EMPTY set (grace floor breached)', async () => {
+    // Free user, balance 0, grace 0 → deducting 1 breaches the floor → RPC empty set.
+    // Regression guard for the all-NULL-row bug: an empty array must be treated
+    // as failure, NOT as a successful free deduction.
+    state.row = stringRow({ credits_balance: '0.00', grace_limit: '0.00' });
+    const res = await UserCreditsService.deductCredits('user-1', 1, 'over-limit');
+    expect(res.success).toBe(false);
+    expect(res.newBalance).toBe(0);
+  });
+
+  it('addCredits adds to the real balance via the atomic RPC, not overwriting it with just the delta', async () => {
     state.row = stringRow({ credits_balance: '50.00' });
     const res = await UserCreditsService.addCredits('user-1', 10, 'bonus', 'top up');
     expect(res.success).toBe(true);
-    expect(res.newBalance).toBe(60); // not 10 — the existing 50 is preserved
-    expect(Number(state.lastUpdate?.credits_balance)).toBe(60);
+    expect(res.newBalance).toBe(60); // not 10 — RPC added to the real 50
+  });
+
+  it('resetToPlanCredits SETs the balance to the allotment, it does NOT stack (B2C renewal)', async () => {
+    // User still has 300 from last period; a renewal must reset to 500, not 800.
+    state.row = stringRow({ credits_balance: '300.00', grace_limit: '0.00' });
+    const res = await UserCreditsService.resetToPlanCredits('user-1', 500, 'renewal');
+    expect(res.success).toBe(true);
+    expect(res.newBalance).toBe(500); // exact allotment, no rollover
+    expect(Number(state.lastUpdate?.credits_balance)).toBe(500);
   });
 });

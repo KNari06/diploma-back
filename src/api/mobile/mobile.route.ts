@@ -9,7 +9,7 @@
  * Mounted at: /api/v1/mobile
  */
 
-import { requireAuth } from '@/middleware/auth.middleware';
+import { requireAuth, requirePaidPlan } from '@/middleware/auth.middleware';
 import { requireCiApiKey } from '@/middleware/api-key.middleware';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { Router } from 'express';
@@ -37,6 +37,12 @@ import { warmupSession, destroySession, tapSession, swipeSession, goHomeSession,
 
 const router = Router();
 
+// Mobile testing is a Pro feature — gate the expensive entry points (APK
+// upload, emulator warmup, exploration, test runs) so free users can't consume
+// mobile capacity. Read-only GETs and in-session gestures (tap/swipe/type) are
+// implicitly gated: without a warmed session they're unreachable.
+const requireMobilePlan = requirePaidPlan('Mobile testing');
+
 /**
  * POST /api/v1/mobile/projects/:projectId/app/upload-url
  * Step 1 of the signed-URL upload flow. Body: { filename, platform?, contentLength? }.
@@ -45,6 +51,7 @@ const router = Router();
 router.post(
   '/projects/:projectId/app/upload-url',
   requireAuth,
+  requireMobilePlan,
   asyncHandler(createMobileAppUploadUrl),
 );
 
@@ -59,6 +66,7 @@ router.post(
 router.post(
   '/projects/:projectId/app/finalize',
   requireAuth,
+  requireMobilePlan,
   asyncHandler(finalizeMobileAppUpload),
 );
 
@@ -103,6 +111,7 @@ router.delete(
 router.post(
   '/projects/:projectId/app/probe-driver-extension',
   requireAuth,
+  requireMobilePlan,
   asyncHandler(probeDriverExtension),
 );
 
@@ -163,6 +172,7 @@ router.get(
 router.post(
   '/projects/:projectId/exploration/start',
   requireAuth,
+  requireMobilePlan,
   asyncHandler(startMobileExploration),
 );
 
@@ -179,6 +189,7 @@ router.post(
 router.post(
   '/sessions/warmup',
   requireAuth,
+  requireMobilePlan,
   asyncHandler(warmupSession),
 );
 
@@ -307,6 +318,7 @@ router.post(
 router.post(
   '/sessions/:sessionId/run-test-case',
   requireAuth,
+  requireMobilePlan,
   asyncHandler(runTestCaseOnSession),
 );
 

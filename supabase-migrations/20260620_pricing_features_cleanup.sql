@@ -29,7 +29,15 @@ SET features = ARRAY[
   'AI-powered exploration & test runs',
   'Web UI + API testing · Chrome',
   'Email support'
-], updated_at = NOW()
+],
+-- Free is web-only — mobile testing is gated to paid plans (Pro+). State it in
+-- limitations so the pricing page is honest about the boundary.
+limitations = ARRAY[
+  'One-off trial credits (no monthly refill)',
+  'Web testing only — mobile is a Pro feature',
+  'Upgrade to a paid plan for more credits'
+],
+updated_at = NOW()
 WHERE slug = 'free';
 
 UPDATE public.pricing_plans
