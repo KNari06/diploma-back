@@ -32,6 +32,36 @@ export interface CreditTransaction {
 }
 
 /**
+ * Coerce one value to a finite number, defaulting to 0.
+ *
+ * Postgres NUMERIC columns are serialized by PostgREST/supabase-js as JSON
+ * STRINGS (e.g. "50.00"), even though our TS interfaces type them as `number`.
+ * Calling `Number.isFinite` on the raw value is therefore always false, and
+ * arithmetic concatenates strings. Normalize every NUMERIC field through this
+ * at the data-access boundary so the rest of the codebase can trust the types.
+ */
+function toNum(v: unknown): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * Normalize a raw user_credits row's NUMERIC columns to real numbers.
+ * Returns null untouched. Non-numeric columns pass through unchanged.
+ */
+function normalizeUserCredits(row: any): UserCredits | null {
+  if (!row) return null;
+  return {
+    ...row,
+    credits_balance: toNum(row.credits_balance),
+    total_purchased: toNum(row.total_purchased),
+    total_used: toNum(row.total_used),
+    grace_limit: toNum(row.grace_limit),
+    overage_balance: toNum(row.overage_balance),
+  };
+}
+
+/**
  * Service for managing user credits and subscriptions
  */
 export class UserCreditsService {
@@ -63,7 +93,7 @@ export class UserCreditsService {
         return null;
       }
 
-      return data;
+      return normalizeUserCredits(data);
     } catch (error) {
       logger.error('[USER_CREDITS] Exception in getUserCredits', {
         error: error instanceof Error ? error.message : String(error),
@@ -89,7 +119,13 @@ export class UserCreditsService {
     const existingCredits = await this.getUserCredits(userId);
 
     if (existingCredits) {
-      return existingCredits;
+      // The welcome bonus is idempotent and gated on a durable column, NOT on
+      // "the row was just created". An existing row may never have been granted
+      // the bonus (created at balance 0 by the /credits endpoint, the
+      // credit-check middleware, or a deduct/add path before provisioning ran;
+      // or a prior grant attempt failed). Re-evaluate every time so the grant
+      // self-heals instead of leaving the user stuck at 0 forever.
+      return await this.grantInitialBonusIfEligible(existingCredits);
     }
 
     // Create new credits record with 0 balance
@@ -124,23 +160,70 @@ export class UserCreditsService {
       // Try to fetch again in case of race condition
       const retryCredits = await this.getUserCredits(userId);
       if (retryCredits) {
-        return retryCredits;
+        return await this.grantInitialBonusIfEligible(retryCredits);
       }
       throw new Error('Failed to create user credits: no data returned');
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Give initial 50 credits to new free plan users
-    // ═══════════════════════════════════════════════════════════════════════
+    logger.info('[USER_CREDITS] Created new user credits', { userId });
+    return await this.grantInitialBonusIfEligible(normalizeUserCredits(data) as UserCredits);
+  }
+
+  /**
+   * Idempotently grant the one-time 50-credit welcome bonus to a free-plan user.
+   *
+   * Safe to call on every getOrCreateUserCredits path. Gated on a DURABLE marker
+   * — the presence of a `credit_transactions` row tagged metadata.is_initial_bonus
+   * — NOT on "the row was just created" or on balance. So a user whose row was
+   * materialized at 0 by some other caller (the /credits endpoint, the
+   * credit-check middleware, a deduct/add path) before provisioning ran still
+   * gets the bonus, and a prior attempt that failed before recording the
+   * transaction self-heals on the next call. No schema change required — it
+   * reuses the is_initial_bonus marker addCredits already writes.
+   *
+   * Concurrency note: two simultaneous first-time calls could both find no
+   * marker and both grant (a rare double-grant on signup races — the same
+   * exposure the previous non-idempotent code had). The common stuck-at-0 path
+   * this fixes is sequential (a later auth/credits call after a 0 row already
+   * exists), which the marker check resolves. A fully race-proof variant needs a
+   * uniqueness guard on the bonus transaction; deferred deliberately.
+   *
+   * @param credits - the user's current credits row
+   * @returns the (possibly updated) credits row — never throws; on any failure
+   *          it logs and returns the freshest row so callers are unaffected.
+   */
+  private static async grantInitialBonusIfEligible(credits: UserCredits): Promise<UserCredits> {
+    const userId = credits.user_id;
     try {
-      // Check user's plan
+      // Durable idempotency: if a welcome-bonus transaction already exists, the
+      // bonus was granted (now or in the past) — nothing to do.
+      const { data: existingBonus, error: bonusLookupError } = await supabaseAdmin
+        .from('credit_transactions')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('metadata->>is_initial_bonus', 'true')
+        .limit(1)
+        .maybeSingle();
+
+      if (bonusLookupError) {
+        // Can't confirm idempotency — do NOT grant (avoid accidental double-grant).
+        logger.warn('[USER_CREDITS] Could not check welcome-bonus marker; skipping grant', {
+          error: bonusLookupError.message,
+          userId,
+        });
+        return credits;
+      }
+      if (existingBonus) {
+        return credits;
+      }
+
+      // Only free / no-plan users get the welcome bonus.
       const { data: userData } = await supabaseAdmin
         .from('users')
         .select('plan_id, pricing_plans!plan_id(slug)')
         .eq('id', userId)
         .maybeSingle();
 
-      // Get plan slug (handle both array and object responses)
       let planSlug: string | null = null;
       if (userData?.pricing_plans) {
         const plan = Array.isArray(userData.pricing_plans)
@@ -148,35 +231,40 @@ export class UserCreditsService {
           : userData.pricing_plans;
         planSlug = plan?.slug || null;
       }
-
-      // If user has no plan or has free plan, give initial 50 credits
       const isFreePlan = !planSlug || planSlug === 'free';
-
-      if (isFreePlan && data.credits_balance === 0) {
-        logger.info('[USER_CREDITS] Giving initial 50 credits to new free plan user', { userId });
-        await this.addCredits(
-          userId,
-          50,
-          'bonus',
-          'Welcome bonus: Initial free credits for new user',
-          { is_initial_bonus: true }
-        );
-        // Return updated credits
-        const updatedCredits = await this.getUserCredits(userId);
-        if (updatedCredits) {
-          return updatedCredits;
-        }
+      if (!isFreePlan) {
+        return credits;
       }
-    } catch (initialCreditsError) {
-      // Log error but don't fail user creation if initial credits fail
-      logger.warn('[USER_CREDITS] Failed to give initial credits (non-critical)', {
-        error: initialCreditsError instanceof Error ? initialCreditsError.message : String(initialCreditsError),
-        userId,
-      });
-    }
 
-    logger.info('[USER_CREDITS] Created new user credits', { userId });
-    return data;
+      logger.info('[USER_CREDITS] Granting initial 50-credit welcome bonus', { userId });
+      const result = await this.addCredits(
+        userId,
+        50,
+        'bonus',
+        'Welcome bonus: Initial free credits for new user',
+        { is_initial_bonus: true }
+      );
+
+      // addCredits returns {success:false} instead of throwing on a transient
+      // failure. On failure the is_initial_bonus transaction is NOT written, so
+      // the marker check above will fail again next time and the grant retries —
+      // the user is never stuck at 0.
+      if (!result.success) {
+        logger.warn('[USER_CREDITS] Welcome bonus add failed; leaving eligible for retry', {
+          userId,
+        });
+        return (await this.getUserCredits(userId)) ?? credits;
+      }
+
+      return (await this.getUserCredits(userId)) ?? credits;
+    } catch (bonusError) {
+      // Best-effort: never break credit resolution because of the bonus.
+      logger.warn('[USER_CREDITS] Failed to grant welcome bonus (non-critical)', {
+        error: bonusError instanceof Error ? bonusError.message : String(bonusError),
+        userId: credits.user_id,
+      });
+      return credits;
+    }
   }
 
   /**
@@ -237,70 +325,50 @@ export class UserCreditsService {
         return { success: false, newBalance: 0 };
       }
 
+      // Ensure the row (and welcome bonus) exist before deducting. We read the
+      // pre-deduction balance only to flag grace transitions and to report the
+      // unchanged balance on an "insufficient" result — the actual deduction is
+      // atomic in the DB, NOT computed from this value.
       const credits = await this.getOrCreateUserCredits(userId);
 
       // Round amount to 2 decimal places to match NUMERIC(10,2) in DB
       const roundedAmount = Math.round(amount * 100) / 100;
+      const currentBalance = toNum(credits.credits_balance);
+      const wasAlreadyInGrace = currentBalance < 0;
 
-      const currentBalance = Number.isFinite(credits.credits_balance)
-        ? (credits.credits_balance || 0)
-        : 0;
+      // Atomic deduction with grace-floor enforcement. The DB applies the
+      // balance check and the write in one statement under a row lock, so
+      // concurrent deductions serialize and cannot double-spend (was a
+      // read-modify-write race). No row returned => the deduction would breach
+      // the grace floor => insufficient credits.
+      const { data: updatedRow, error: rpcError } = await supabaseAdmin.rpc('deduct_user_credits', {
+        p_user_id: userId,
+        p_amount: roundedAmount,
+      });
 
-      // V16: Grace period — allow negative balance up to grace_limit.
-      // grace_limit is set per plan (free=0, pro=100, ultra=200, business=1000).
-      const graceLimit = Number.isFinite(credits.grace_limit) ? (credits.grace_limit || 0) : 0;
-      const effectiveFloor = -graceLimit; // e.g., -100 for pro plan
-      const newBalance = Math.round((currentBalance - roundedAmount) * 100) / 100;
+      if (rpcError) {
+        logger.error('[USER_CREDITS] Error deducting credits (rpc)', {
+          error: rpcError.message,
+          code: rpcError.code,
+          userId,
+        });
+        return { success: false, newBalance: currentBalance };
+      }
 
-      if (newBalance < effectiveFloor) {
+      // supabase rpc returning a row type may surface as an array or single object.
+      const deducted = Array.isArray(updatedRow) ? updatedRow[0] : updatedRow;
+      if (!deducted) {
         logger.warn('[USER_CREDITS] Insufficient credits (grace limit exceeded)', {
           userId,
           required: roundedAmount,
           available: currentBalance,
-          graceLimit,
-          wouldBe: newBalance,
-          floor: effectiveFloor,
+          graceLimit: toNum(credits.grace_limit),
         });
         return { success: false, newBalance: currentBalance };
       }
 
+      const newBalance = toNum(deducted.credits_balance);
       const isGraceDeduction = newBalance < 0;
-      const wasAlreadyInGrace = currentBalance < 0;
-
-      // Update balance
-      const previousTotalUsed = Number.isFinite(credits.total_used)
-        ? (credits.total_used || 0)
-        : 0;
-
-      const updateFields: Record<string, any> = {
-        credits_balance: newBalance,
-        total_used: Math.round((previousTotalUsed + roundedAmount) * 100) / 100,
-        last_credit_usage: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
-
-      // V16: Track overage and grace start
-      if (isGraceDeduction) {
-        // overage_balance = how much user owes (positive number)
-        updateFields.overage_balance = Math.round(Math.abs(newBalance) * 100) / 100;
-        if (!wasAlreadyInGrace) {
-          updateFields.grace_started_at = new Date().toISOString();
-        }
-      }
-
-      const { error: updateError } = await supabaseAdmin
-        .from('user_credits')
-        .update(updateFields)
-        .eq('user_id', userId);
-
-      if (updateError) {
-        logger.error('[USER_CREDITS] Error updating credits', {
-          error: updateError.message,
-          code: updateError.code,
-          userId,
-        });
-        return { success: false, newBalance: currentBalance };
-      }
 
       // Record transaction (with grace flag)
       await this.recordTransaction(userId, -roundedAmount, newBalance, 'usage', description, {
@@ -312,7 +380,7 @@ export class UserCreditsService {
         logger.info('[USER_CREDITS] Grace period started', {
           userId,
           balance: newBalance,
-          graceLimit,
+          graceLimit: toNum(credits.grace_limit),
           overageBalance: Math.abs(newBalance),
         });
       }

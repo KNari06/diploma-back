@@ -8,6 +8,8 @@ import { Request, Response } from 'express';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const VALID_BROWSERS: string[] = ['chrome', 'firefox', 'safari', 'edge'];
+const VALID_PROJECT_TYPES: string[] = ['web', 'mobile'];
+const VALID_MOBILE_PLATFORMS: string[] = ['android', 'ios', 'flutter'];
 
 /**
  * POST /api/v1/workspaces/onboarding
@@ -59,93 +61,137 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    if (!body.baseUrls || !Array.isArray(body.baseUrls) || body.baseUrls.length === 0) {
+    // projectType drives which fields are required. Default 'web' for back-compat.
+    const projectType = body.projectType ?? 'web';
+    if (!VALID_PROJECT_TYPES.includes(projectType)) {
       res.status(400).json({
         success: false,
-        error: 'Missing required field: baseUrls',
-        message: 'Field baseUrls is required and must be a non-empty array',
+        error: 'Invalid field: projectType',
+        message: `projectType must be one of: ${VALID_PROJECT_TYPES.join(', ')}`,
         timestamp: new Date().toISOString(),
       });
       return;
     }
 
-    // Validate all URLs
-    for (const url of body.baseUrls) {
-      if (typeof url !== 'string' || url.trim().length === 0) {
-        res.status(400).json({
-          success: false,
-          error: 'Invalid field: baseUrls',
-          message: 'All baseUrls must be non-empty strings',
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      }
-
-      try {
-        // Add protocol if missing
-        const urlToValidate = url.includes('://') ? url : `https://${url}`;
-        new URL(urlToValidate);
-      } catch {
-        res.status(400).json({
-          success: false,
-          error: 'Invalid field: baseUrls',
-          message: `Invalid URL format: ${url}`,
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      }
-    }
-
-    // Validate environments
-    if (!body.environments || typeof body.environments !== 'object' || Array.isArray(body.environments)) {
-      res.status(400).json({
-        success: false,
-        error: 'Missing required field: environments',
-        message: 'Field environments is required and must be an object',
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
-
-    // Validate environment URLs if provided
     const envKeys = ['dev', 'predprod', 'prod'];
-    for (const key of envKeys) {
-      if (body.environments[key as keyof typeof body.environments]) {
-        const envUrl = body.environments[key as keyof typeof body.environments];
-        if (typeof envUrl !== 'string' || envUrl.trim().length === 0) {
+
+    // "Skip for now" — user deferred target config; no web/mobile fields are
+    // required. They'll set the URL / app up later from the dashboard.
+    const skipped = body.skipped === true;
+
+    if (!skipped && projectType === 'web') {
+      // ── WEB: baseUrls + environments + browserType required ──
+      if (!body.baseUrls || !Array.isArray(body.baseUrls) || body.baseUrls.length === 0) {
+        res.status(400).json({
+          success: false,
+          error: 'Missing required field: baseUrls',
+          message: 'Field baseUrls is required and must be a non-empty array',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Validate all URLs
+      for (const url of body.baseUrls) {
+        if (typeof url !== 'string' || url.trim().length === 0) {
           res.status(400).json({
             success: false,
-            error: 'Invalid field: environments',
-            message: `Environment ${key} URL must be a non-empty string`,
+            error: 'Invalid field: baseUrls',
+            message: 'All baseUrls must be non-empty strings',
             timestamp: new Date().toISOString(),
           });
           return;
         }
 
         try {
-          const urlToValidate = envUrl.includes('://') ? envUrl : `https://${envUrl}`;
+          // Add protocol if missing
+          const urlToValidate = url.includes('://') ? url : `https://${url}`;
           new URL(urlToValidate);
         } catch {
           res.status(400).json({
             success: false,
-            error: 'Invalid field: environments',
-            message: `Invalid URL format for ${key}: ${envUrl}`,
+            error: 'Invalid field: baseUrls',
+            message: `Invalid URL format: ${url}`,
             timestamp: new Date().toISOString(),
           });
           return;
         }
       }
-    }
 
-    // Validate browserType
-    if (!body.browserType || !VALID_BROWSERS.includes(body.browserType)) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid field: browserType',
-        message: `browserType must be one of: ${VALID_BROWSERS.join(', ')}`,
-        timestamp: new Date().toISOString(),
-      });
-      return;
+      // Validate environments
+      if (!body.environments || typeof body.environments !== 'object' || Array.isArray(body.environments)) {
+        res.status(400).json({
+          success: false,
+          error: 'Missing required field: environments',
+          message: 'Field environments is required and must be an object',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Validate environment URLs if provided
+      for (const key of envKeys) {
+        if (body.environments[key as keyof typeof body.environments]) {
+          const envUrl = body.environments[key as keyof typeof body.environments];
+          if (typeof envUrl !== 'string' || envUrl.trim().length === 0) {
+            res.status(400).json({
+              success: false,
+              error: 'Invalid field: environments',
+              message: `Environment ${key} URL must be a non-empty string`,
+              timestamp: new Date().toISOString(),
+            });
+            return;
+          }
+
+          try {
+            const urlToValidate = envUrl.includes('://') ? envUrl : `https://${envUrl}`;
+            new URL(urlToValidate);
+          } catch {
+            res.status(400).json({
+              success: false,
+              error: 'Invalid field: environments',
+              message: `Invalid URL format for ${key}: ${envUrl}`,
+              timestamp: new Date().toISOString(),
+            });
+            return;
+          }
+        }
+      }
+
+      // Validate browserType
+      if (!body.browserType || !VALID_BROWSERS.includes(body.browserType)) {
+        res.status(400).json({
+          success: false,
+          error: 'Invalid field: browserType',
+          message: `browserType must be one of: ${VALID_BROWSERS.join(', ')}`,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+    } else if (!skipped) {
+      // ── MOBILE: no baseUrls/browser; mobilePlatform required. The APK/IPA is
+      // uploaded separately once the project exists, so it's not in this payload.
+      if (!body.mobilePlatform || !VALID_MOBILE_PLATFORMS.includes(body.mobilePlatform)) {
+        res.status(400).json({
+          success: false,
+          error: 'Invalid field: mobilePlatform',
+          message: `mobilePlatform must be one of: ${VALID_MOBILE_PLATFORMS.join(', ')}`,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      if (
+        body.mobilePackageName !== undefined &&
+        (typeof body.mobilePackageName !== 'string' || body.mobilePackageName.length > 255)
+      ) {
+        res.status(400).json({
+          success: false,
+          error: 'Invalid field: mobilePackageName',
+          message: 'Field mobilePackageName must be a string with max 255 characters',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
     }
 
     // Validate role (optional)
@@ -205,11 +251,16 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
       }
     }
 
+    // When skipped, no target was configured — treat as neither web nor mobile.
+    const isMobile = !skipped && projectType === 'mobile';
+
     logger.info('[ONBOARDING] Saving onboarding data', {
       userId,
       projectName: body.name,
-      baseUrlsCount: body.baseUrls.length,
+      projectType,
+      baseUrlsCount: body.baseUrls?.length ?? 0,
       browserType: body.browserType,
+      mobilePlatform: body.mobilePlatform,
       role: body.role,
       accountType: body.accountType,
     });
@@ -217,14 +268,14 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
     // Get or create workspace for user
     const { workspace_id } = await WorkspaceService.checkOrCreateWorkspace(userId);
 
-    // Normalize URLs (add https:// if missing)
-    const normalizedBaseUrls = body.baseUrls.map(url =>
+    // Normalize URLs (add https:// if missing). Web-only — mobile has none.
+    const normalizedBaseUrls = (body.baseUrls ?? []).map(url =>
       url.includes('://') ? url : `https://${url}`
     );
 
     const normalizedEnvironments: Record<string, string> = {};
     for (const key of envKeys) {
-      const envUrl = body.environments[key as keyof typeof body.environments];
+      const envUrl = body.environments?.[key as keyof typeof body.environments];
       if (envUrl) {
         normalizedEnvironments[key] = envUrl.includes('://') ? envUrl : `https://${envUrl}`;
       }
@@ -247,16 +298,22 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
       throw fetchError;
     }
 
-    // Merge existing settings with new onboarding data
+    // Merge existing settings with new onboarding data. For mobile we persist
+    // platform + package instead of URLs/browser; the APK is uploaded later.
     const existingSettings = existingWorkspace?.settings || {};
     const newSettings = {
       ...existingSettings, // Preserve existing settings
       onboarding_completed: true,
       onboarding_completed_at: new Date().toISOString(),
+      projectType,
+      onboarding_skipped: skipped,
       baseUrls: normalizedBaseUrls,
       environments: normalizedEnvironments,
-      browserType: body.browserType,
-      defaultBrowser: body.browserType, // For backward compatibility
+      // Mobile / skip have no browser choice → keep existing or default to chrome.
+      browserType: (isMobile || skipped) ? (existingSettings.browserType ?? 'chrome') : body.browserType,
+      defaultBrowser: (isMobile || skipped) ? (existingSettings.defaultBrowser ?? 'chrome') : body.browserType,
+      mobilePlatform: isMobile ? body.mobilePlatform : null,
+      mobilePackageName: isMobile ? (body.mobilePackageName?.trim() || null) : null,
       // NEW FIELDS
       role: body.role,
       position: body.position || null,
@@ -264,9 +321,9 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
       companyName: body.companyName || null,
     };
 
-    // Extract dev and prod URLs for backward compatibility
-    const devUrl = normalizedEnvironments.dev || normalizedBaseUrls[0];
-    const prodUrl = normalizedEnvironments.prod || normalizedBaseUrls[normalizedBaseUrls.length - 1];
+    // Extract dev and prod URLs for backward compatibility (web only).
+    const devUrl = normalizedEnvironments.dev || normalizedBaseUrls[0] || null;
+    const prodUrl = normalizedEnvironments.prod || normalizedBaseUrls[normalizedBaseUrls.length - 1] || null;
 
     // Update workspace with onboarding data
     const { data: updatedWorkspace, error: updateError } = await supabaseAdmin
@@ -294,9 +351,13 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
     const response: WorkspaceOnboardingResponse = {
       workspace_id: workspace_id, // Return workspace_id in response
       name: updatedWorkspace.name,
+      projectType,
+      skipped,
       baseUrls: normalizedBaseUrls,
       environments: normalizedEnvironments,
-      browserType: body.browserType,
+      browserType: (isMobile || skipped) ? 'chrome' : body.browserType,
+      mobilePlatform: isMobile ? body.mobilePlatform : undefined,
+      mobilePackageName: isMobile ? (body.mobilePackageName?.trim() || undefined) : undefined,
       completed: true,
       // NEW FIELDS
       role: body.role,
@@ -440,9 +501,12 @@ export const getOnboarding = async (req: Request, res: Response): Promise<void> 
     const response: WorkspaceOnboardingResponse = {
       workspace_id: workspace.id, // Return workspace_id
       name: workspace.name,
+      projectType: settings.projectType || 'web',
       baseUrls,
       environments,
       browserType: settings.browserType || settings.defaultBrowser || 'chrome',
+      mobilePlatform: settings.mobilePlatform || undefined,
+      mobilePackageName: settings.mobilePackageName || undefined,
       completed: true,
       // NEW FIELDS
       role: settings.role,

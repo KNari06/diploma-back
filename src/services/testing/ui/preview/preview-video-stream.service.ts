@@ -28,6 +28,11 @@ const PREVIEW_VIDEO_CONFIG = {
   maxWidth: PREVIEW_SESSION_CONFIG.viewport.width,
   maxHeight: PREVIEW_SESSION_CONFIG.viewport.height,
   quality: PREVIEW_SESSION_CONFIG.screenshot.quality,
+  // NOTE: WebP would be ~25-35% smaller than JPEG, BUT Playwright's CDP binding
+  // types Page.startScreencast `format` as 'jpeg' | 'png' only (webp is allowed
+  // for captureScreenshot, not the screencast — see playwright-core protocol.d.ts
+  // startScreencastParameters). So the live screencast stays JPEG. Smaller frames
+  // would have to come from quality tuning or a different capture path.
   format: 'jpeg' as const,
 
   // Throttle settings.
@@ -721,7 +726,7 @@ export class PreviewVideoStreamService {
     const payload: PreviewVideoFramePayload = {
       previewSessionId: this.previewSessionId,
       seq: this.seq,
-      format: 'jpeg',
+      format: PREVIEW_VIDEO_CONFIG.format,
       data: '', // V20: empty — actual bytes sent as binary arg below
       width: Math.min(width, PREVIEW_VIDEO_CONFIG.maxWidth),
       height: Math.min(height, PREVIEW_VIDEO_CONFIG.maxHeight),
