@@ -237,23 +237,67 @@ export class UserCreditsService {
       }
 
       logger.info('[USER_CREDITS] Granting initial 50-credit welcome bonus', { userId });
-      const result = await this.addCredits(
-        userId,
-        50,
-        'bonus',
-        'Welcome bonus: Initial free credits for new user',
-        { is_initial_bonus: true }
-      );
 
-      // addCredits returns {success:false} instead of throwing on a transient
-      // failure. On failure the is_initial_bonus transaction is NOT written, so
-      // the marker check above will fail again next time and the grant retries —
-      // the user is never stuck at 0.
-      if (!result.success) {
-        logger.warn('[USER_CREDITS] Welcome bonus add failed; leaving eligible for retry', {
+      // IMPORTANT: apply the bonus DIRECTLY on the already-resolved row instead
+      // of calling addCredits(). addCredits() calls getOrCreateUserCredits()
+      // again, which re-enters grantInitialBonusIfEligible() — and because the
+      // is_initial_bonus marker is only written at the very end of addCredits,
+      // every nested call still sees "no marker" and grants again, recursing
+      // until the process runs out of memory. We have `credits` in hand, so we
+      // do the balance update + transaction insert here with no re-provisioning.
+      const BONUS = 50;
+      const currentBalance = toNum(credits.credits_balance);
+      const newBalance = Math.round((currentBalance + BONUS) * 100) / 100;
+
+      const updateData: Record<string, any> = {
+        credits_balance: newBalance,
+        updated_at: new Date().toISOString(),
+      };
+      // Mirror addCredits' grace-clearing: a bonus that lifts the balance to >=0
+      // clears any prior grace/overage state.
+      if (newBalance >= 0 && credits.grace_started_at) {
+        updateData.overage_balance = 0;
+        updateData.grace_started_at = null;
+      }
+
+      const { error: updateError } = await supabaseAdmin
+        .from('user_credits')
+        .update(updateData)
+        .eq('user_id', userId);
+
+      if (updateError) {
+        // Balance not changed and no marker written → eligible for retry next call.
+        logger.warn('[USER_CREDITS] Welcome bonus balance update failed; leaving eligible for retry', {
+          error: updateError.message,
           userId,
         });
         return (await this.getUserCredits(userId)) ?? credits;
+      }
+
+      // Write the durable idempotency marker. If this insert fails the balance
+      // is already credited but the marker is missing — a later call could
+      // double-grant. recordTransaction swallows its own errors, so insert the
+      // marker row directly here and react to failure.
+      const { error: markerError } = await supabaseAdmin
+        .from('credit_transactions')
+        .insert({
+          user_id: userId,
+          amount: BONUS,
+          balance_after: newBalance,
+          transaction_type: 'bonus',
+          description: 'Welcome bonus: Initial free credits for new user',
+          metadata: { is_initial_bonus: true },
+        });
+
+      if (markerError) {
+        logger.error('[USER_CREDITS] Welcome bonus marker insert failed AFTER crediting balance', {
+          error: markerError.message,
+          userId,
+          newBalance,
+        });
+        // Balance is credited but unmarked. Returning here avoids a crash; the
+        // next call's marker lookup will miss and could re-grant, but a failed
+        // append-only insert here is rare and preferable to losing the grant.
       }
 
       return (await this.getUserCredits(userId)) ?? credits;
@@ -355,9 +399,12 @@ export class UserCreditsService {
         return { success: false, newBalance: currentBalance };
       }
 
-      // supabase rpc returning a row type may surface as an array or single object.
+      // SETOF function → supabase-js returns an array; an empty array means the
+      // grace-floor WHERE matched no row (insufficient). Defensively also treat
+      // an all-NULL row as no-match, in case the function shape ever regresses
+      // to a scalar composite (which emits a single all-NULL row on no match).
       const deducted = Array.isArray(updatedRow) ? updatedRow[0] : updatedRow;
-      if (!deducted) {
+      if (!deducted || deducted.user_id == null || deducted.credits_balance == null) {
         logger.warn('[USER_CREDITS] Insufficient credits (grace limit exceeded)', {
           userId,
           required: roundedAmount,
@@ -441,56 +488,41 @@ export class UserCreditsService {
         return { success: false, newBalance: 0 };
       }
 
+      // Ensure the row (and welcome bonus) exist before adding.
       const credits = await this.getOrCreateUserCredits(userId);
-      logger.info('[USER_CREDITS] credits', { credits });
+      const currentBalance = toNum(credits.credits_balance);
       // Round amount to 2 decimal places to match NUMERIC(10,2) in DB
       const roundedAmount = Math.round(amount * 100) / 100;
-      logger.info('[USER_CREDITS] roundedAmount', { roundedAmount });
-      const currentBalance = Number.isFinite(credits.credits_balance)
-        ? (credits.credits_balance || 0)
-        : 0;
-      logger.info('[USER_CREDITS] currentBalance', { currentBalance });
-      const newBalance = Math.round((currentBalance + roundedAmount) * 100) / 100;
-      logger.info('[USER_CREDITS] newBalance', { newBalance });
-      // Update balance
-      const updateData: any = {
-        credits_balance: newBalance,
-        updated_at: new Date().toISOString(),
-      };
-      logger.info('[USER_CREDITS] updateData', { updateData });
-      if (type === 'purchase') {
-        const previousTotalPurchased = Number.isFinite(credits.total_purchased)
-          ? (credits.total_purchased || 0)
-          : 0;
-        updateData.total_purchased = Math.round((previousTotalPurchased + roundedAmount) * 100) / 100;
-        updateData.credits_purchased_at = new Date().toISOString();
-      }
 
-      // V16: Clear grace period state when credits are added (purchase/bonus/refund)
-      if (newBalance >= 0 && credits.grace_started_at) {
-        updateData.overage_balance = 0;
-        updateData.grace_started_at = null;
-        logger.info('[USER_CREDITS] Grace period cleared on credit addition', {
-          userId,
-          type,
-          newBalance,
-          previousOverage: credits.overage_balance,
-        });
-      }
-      logger.info('[USER_CREDITS] updateData', { updateData });
-      const { error: updateError } = await supabaseAdmin
-        .from('user_credits')
-        .update(updateData)
-        .eq('user_id', userId);
+      // Atomic increment. A plain read-modify-write here loses updates against a
+      // concurrent atomic deduction (the deduct RPC) — addCredits' write would
+      // clobber the deduction's result. The RPC folds the increment, purchase
+      // bookkeeping, and grace clearing into one statement under a row lock.
+      const { data: addedRow, error: rpcError } = await supabaseAdmin.rpc('add_user_credits', {
+        p_user_id: userId,
+        p_amount: roundedAmount,
+        p_is_purchase: type === 'purchase',
+      });
 
-      if (updateError) {
-        logger.error('[USER_CREDITS] Error adding credits', {
-          error: updateError.message,
-          code: updateError.code,
+      if (rpcError) {
+        logger.error('[USER_CREDITS] Error adding credits (rpc)', {
+          error: rpcError.message,
+          code: rpcError.code,
           userId,
         });
         return { success: false, newBalance: currentBalance };
       }
+
+      // SETOF → empty array means the row was missing (getOrCreate should have
+      // created it, so this is unexpected). Defensively treat an all-NULL row as
+      // failure too.
+      const added = Array.isArray(addedRow) ? addedRow[0] : addedRow;
+      if (!added || added.user_id == null || added.credits_balance == null) {
+        logger.error('[USER_CREDITS] add_user_credits returned no row', { userId });
+        return { success: false, newBalance: currentBalance };
+      }
+
+      const newBalance = toNum(added.credits_balance);
 
       // Record transaction
       await this.recordTransaction(userId, roundedAmount, newBalance, type, description, metadata);
@@ -506,6 +538,74 @@ export class UserCreditsService {
       return { success: true, newBalance };
     } catch (error) {
       logger.error('[USER_CREDITS] Exception in addCredits', { error, userId, amount });
+      return { success: false, newBalance: 0 };
+    }
+  }
+
+  /**
+   * Reset a user's balance to a subscription's per-period allotment.
+   *
+   * For a recurring subscription cycle the balance must be SET to the plan's
+   * monthly credits (no rollover), NOT added to — otherwise each renewal stacks
+   * the allotment on top of the unused balance and the user accrues credits
+   * forever. Mirrors WorkspaceCreditsService.renewPlan for the B2C path.
+   *
+   * @param userId
+   * @param periodCredits  exact balance the user should have for the new period
+   * @param description    transaction description
+   * @param metadata       extra transaction metadata (e.g. invoice id)
+   */
+  static async resetToPlanCredits(
+    userId: string,
+    periodCredits: number,
+    description: string,
+    metadata: Record<string, any> = {}
+  ): Promise<{ success: boolean; newBalance: number }> {
+    try {
+      if (!userId || typeof userId !== 'string') {
+        logger.error('[USER_CREDITS] Invalid userId in resetToPlanCredits', { userId });
+        return { success: false, newBalance: 0 };
+      }
+      if (!Number.isFinite(periodCredits) || periodCredits < 0) {
+        logger.error('[USER_CREDITS] Invalid periodCredits in resetToPlanCredits', { userId, periodCredits });
+        return { success: false, newBalance: 0 };
+      }
+
+      const newBalance = Math.round(periodCredits * 100) / 100;
+
+      const { error: updateError } = await supabaseAdmin
+        .from('user_credits')
+        .update({
+          credits_balance: newBalance,        // SET to the allotment, not add
+          overage_balance: 0,                 // a funded period clears any grace debt
+          grace_started_at: null,
+          credits_purchased_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('user_id', userId);
+
+      if (updateError) {
+        logger.error('[USER_CREDITS] Error resetting credits to plan allotment', {
+          error: updateError.message,
+          userId,
+        });
+        return { success: false, newBalance: 0 };
+      }
+
+      await this.recordTransaction(userId, newBalance, newBalance, 'purchase', description, {
+        ...metadata,
+        renewal_reset: true,
+      });
+
+      logger.info('[USER_CREDITS] Credits reset to plan allotment for new period', {
+        userId,
+        newBalance,
+        description,
+      });
+
+      return { success: true, newBalance };
+    } catch (error) {
+      logger.error('[USER_CREDITS] Exception in resetToPlanCredits', { error, userId });
       return { success: false, newBalance: 0 };
     }
   }

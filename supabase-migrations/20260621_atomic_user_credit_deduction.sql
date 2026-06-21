@@ -22,10 +22,18 @@
 -- Apply BEFORE deploying the backend that calls it.
 -- ============================================================================
 
-CREATE OR REPLACE FUNCTION public.deduct_user_credits(
+-- RETURNS SETOF (not a scalar composite): a scalar `RETURNS user_credits`
+-- function emits ONE all-NULL row when the UPDATE matches nothing, which the
+-- caller can't distinguish from a real row (it's a truthy object). SETOF emits
+-- a genuinely EMPTY result set on no match, so supabase-js receives `data: []`
+-- and the caller correctly treats it as "insufficient / floor breached".
+-- DROP first because CREATE OR REPLACE cannot change a function's return type.
+DROP FUNCTION IF EXISTS public.deduct_user_credits(text, numeric);
+
+CREATE FUNCTION public.deduct_user_credits(
   p_user_id text,
   p_amount  numeric
-) RETURNS public.user_credits
+) RETURNS SETOF public.user_credits
 LANGUAGE sql
 AS $$
   UPDATE public.user_credits
@@ -50,4 +58,4 @@ AS $$
 $$;
 
 COMMENT ON FUNCTION public.deduct_user_credits(text, numeric) IS
-  'Atomically deduct credits with grace-floor enforcement. Returns the updated user_credits row, or no row when the deduction would breach the grace floor (insufficient credits). Replaces the race-prone read-modify-write in UserCreditsService.deductCredits.';
+  'Atomically deduct credits with grace-floor enforcement. Returns the updated user_credits row, or an EMPTY set when the deduction would breach the grace floor (insufficient credits). Replaces the race-prone read-modify-write in UserCreditsService.deductCredits.';

@@ -629,6 +629,12 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
   const planCode = plan?.code || 'unknown';
   const subscriptionPlanLabel = plan?.name || plan?.code || 'pro';
 
+  // B2B plans are credited at the WORKSPACE level (renewPlan/upgradeToPlan below),
+  // not as personal user credits. Today B2B plans carry credits_per_period=0 so
+  // the personal-credit block is naturally skipped, but guard explicitly so a
+  // future B2B plan with credits_per_period>0 can't double-grant (personal + workspace).
+  const isBusinessPlanCode = ['business', 'Business', 'small_business', 'middle_business', 'enterprise'].includes(planCode);
+
   // A recurring renewal must RESET credits to the period allotment, not stack
   // them. The first charge / upgrade adds; every `subscription_cycle` resets.
   const billingReason = (invoice as Stripe.Invoice).billing_reason;
@@ -692,20 +698,30 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     currency: transactionData.currency,
   });
 
-  if (creditsPerPeriod > 0) {
+  if (creditsPerPeriod > 0 && !isBusinessPlanCode) {
     logger.info('[STRIPE_WEBHOOK] Adding credits on invoice payment', {
       userId: user.id,
       credits: creditsPerPeriod,
       invoiceId: invoice.id,
     });
 
-    const result = await UserCreditsService.addCredits(
-      user.id,
-      creditsPerPeriod,
-      'purchase',
-      `Subscription payment - ${planCode} plan`,
-      { invoice_id: invoice.id, event_type: event.type }
-    );
+    // First charge / one-off ADDS the allotment; a recurring cycle RESETS the
+    // balance to the allotment (no rollover) — otherwise B2C credits stack every
+    // month. Mirrors the B2B renewPlan vs upgradeToPlan branch above.
+    const result = isRenewalCycle
+      ? await UserCreditsService.resetToPlanCredits(
+          user.id,
+          creditsPerPeriod,
+          `Subscription renewal - ${planCode} plan`,
+          { invoice_id: invoice.id, event_type: event.type }
+        )
+      : await UserCreditsService.addCredits(
+          user.id,
+          creditsPerPeriod,
+          'purchase',
+          `Subscription payment - ${planCode} plan`,
+          { invoice_id: invoice.id, event_type: event.type }
+        );
 
     if (result.success) {
       logger.info('[STRIPE_WEBHOOK] Credits added after invoice payment', {
