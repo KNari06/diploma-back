@@ -7,6 +7,7 @@ import { QueueManager } from '@/config/infrastructure/queues';
 import { buildMetadataFromTestCase } from '@/services/mobile/mobile-runner.types';
 import type { MobileTestJobData, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { env } from '@/config/environment/env';
+import { isPaidUser } from '@/services/core/plan-access.service';
 import { ValidationError } from '@/types';
 import { v4 as uuidv4 } from 'uuid';
 import { applyParameters } from '@/utils/testing/parameter-substitution.utils';
@@ -53,6 +54,13 @@ export class MobileTestDispatcherService {
      */
     analyticsExecutionId?: string,
   ): Promise<{ testId: string; jobId: string; appBuildId: string | null }> {
+    // 0. Plan gate — mobile testing is a Pro feature. This is the single choke
+    // point for every mobile dispatch path (single-case run, plan/module
+    // orchestrator, CI), so free users can't queue mobile jobs from any route.
+    if (!(await isPaidUser(userId))) {
+      throw new ValidationError('Mobile testing is available on the Pro plan. Upgrade to run mobile tests.');
+    }
+
     // 1. Resolve platform and browser
     const PLATFORM_MAP: Record<string, MobilePlatform> = {
       mobile_ios: 'ios',
