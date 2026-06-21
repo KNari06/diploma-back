@@ -6,7 +6,6 @@ import {
   createPortalSession,
   getBillingTransactions,
   getBillingStatus,
-  handleWebhook,
 } from './stripe.controller';
 
 const router = Router();
@@ -143,27 +142,11 @@ router.get('/status', requireAuth, asyncHandler(getBillingStatus));
  */
 router.get('/transactions', requireAuth, asyncHandler(getBillingTransactions));
 
-/**
- * @swagger
- * /api/stripe/webhook:
- *   post:
- *     summary: Stripe Webhook Handler
- *     description: Handles Stripe webhook events (subscription updates, payments, etc.)
- *     tags: [Billing]
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *     responses:
- *       200:
- *         description: Webhook processed successfully
- *       400:
- *         description: Invalid signature
- *       500:
- *         description: Server error
- */
-router.post('/webhook', asyncHandler(handleWebhook));
+// NOTE: the Stripe webhook is intentionally NOT defined on this shared router.
+// This router is mounted at BOTH /billing and /stripe, but the raw-body parser
+// (required for signature verification) is scoped only to /stripe/webhook. A
+// webhook reachable via /billing/webhook would get a JSON-parsed body and fail
+// signature verification on every event. The webhook is mounted exactly once,
+// directly on the raw-body path, in index.ts.
 
 export default router;

@@ -54,6 +54,8 @@ import savedTestCasesRoutes from '@/api/saved-test-cases/saved-test-cases.route'
 import testsRoutes from '@/api/tests/tests.route';
 import schedulesRoutes from '@/api/schedules/schedules.route';
 import stripeRoutes from '@/api/stripe/stripe.routes';
+import { handleWebhook } from '@/api/stripe/stripe.controller';
+import { asyncHandler } from '@/utils/core/error-handler';
 import supportRoutes from '@/api/support/support.routes';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
@@ -247,6 +249,14 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
 
 // Raw body parser for Stripe webhook (must be before express.json())
 app.use(`/api/${env.API_VERSION}/stripe/webhook`, express.raw({ type: 'application/json' }));
+// Mount the Stripe webhook handler ONCE, directly on the raw-body path, so it
+// cannot be reached via a path lacking the raw parser (signature verification
+// needs the exact bytes). It is deliberately NOT on the shared stripeRoutes
+// router, which is mounted at both /billing and /stripe.
+app.post(
+  `/api/${env.API_VERSION}/stripe/webhook`,
+  asyncHandler(handleWebhook),
+);
 
 // Body parsing middleware
 // IMPORTANT: GitHub webhook signature requires raw body (Buffer)
