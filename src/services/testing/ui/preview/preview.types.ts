@@ -898,6 +898,19 @@ export interface LocatorEntry {
    * False also covers timeout / throw — not the same as proven-broken.
    */
   validated?: boolean;
+  /**
+   * V25 first-priority probe flag. Set ONLY on the stable-token `:has-text`
+   * chain (`<tag>:has-text("X"):has-text("Y")`). `sortAndCap` orders flagged
+   * entries ahead of ALL tiers so the cheap (~50ms) token chain is tried
+   * before role/testId/etc. — its whole reason for existing (a token match
+   * beats waiting on a full-text role/getByText timeout when the recorded
+   * string drifted). Ordering is intentionally decoupled from `tier`: the
+   * chain stays `TEXTUAL` for durability/legacy-confidence semantics, but
+   * runs first as a probe. Safe to rank first because the chain is generated
+   * ONLY when the node has no structural anchor (id/testId/href/…), so it
+   * never out-orders a real identity attribute on the same element.
+   */
+  firstPriorityProbe?: boolean;
 }
 
 /**

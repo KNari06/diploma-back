@@ -133,7 +133,10 @@ async function buildLocatorChain(node: InteractiveNode, config: LocatorConfig): 
       // Above bare text (0.7) and below testId (0.8). Chained :has-text
       // is strong identity but not as durable as an explicit attribute.
       confidence: 0.82,
+      // Durability class stays TEXTUAL (drifts on copy/i18n). Ordering is
+      // separate: `firstPriorityProbe` makes sortAndCap rank it first.
       tier: 'TEXTUAL',
+      firstPriorityProbe: true,
     });
   }
 
@@ -1377,6 +1380,10 @@ async function validateOnPage(
  * Etap 1A — Sort and cap.
  *
  * Order rules (most → least important):
+ *   0. firstPriorityProbe first — the V25 stable-token `:has-text` chain is a
+ *      cheap probe deliberately tried before any tier (decoupled from its
+ *      TEXTUAL durability class). Only ever present when the node has no
+ *      structural anchor, so it can't out-order a real testId/id.
  *   1. tier ASC (IDENTITY before SEMANTIC before STRUCTURAL …)
  *   2. matchCount === 1 first (unique matches), then ASC count, undefined last
  *   3. preserve original index on full tie (stable sort)
@@ -1418,6 +1425,11 @@ function sortAndCap(plan: LocatorEntry[], config: LocatorConfig): LocatorEntry[]
   // 2. Sort: tier, then unique-first, then count ASC, then original index
   const indexed = alive.map((l, i) => ({ l, i }));
   indexed.sort((a, b) => {
+    // 0. First-priority probe (V25 token chain) jumps ahead of all tiers.
+    const aProbe = a.l.firstPriorityProbe ? 0 : 1;
+    const bProbe = b.l.firstPriorityProbe ? 0 : 1;
+    if (aProbe !== bProbe) return aProbe - bProbe;
+
     const ta = TIER_ORDER[a.l.tier ?? 'POSITIONAL'];
     const tb = TIER_ORDER[b.l.tier ?? 'POSITIONAL'];
     if (ta !== tb) return ta - tb;
