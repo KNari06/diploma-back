@@ -13,6 +13,36 @@ async function invalidateWorkspaceCreditsCache(workspaceId: string): Promise<voi
   await cache.del(`qait:cache:workspace-credits:${workspaceId}`);
 }
 
+/**
+ * Coerce one value to a finite number, defaulting to 0.
+ * Postgres NUMERIC columns are serialized as JSON strings by PostgREST, so the
+ * raw row values are strings at runtime even though the TS type says `number`.
+ * Normalize at the data-access boundary so all callers can trust the types.
+ */
+function toNum(v: unknown): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * Normalize a raw workspace_credits row's NUMERIC columns to real numbers.
+ * `monthly_credit_limit` is nullable (null = no cap) and is preserved as null.
+ */
+function normalizeWorkspaceCredits(row: any): WorkspaceCredits | null {
+  if (!row) return null;
+  return {
+    ...row,
+    credits_balance: toNum(row.credits_balance),
+    total_purchased: toNum(row.total_purchased),
+    total_used: toNum(row.total_used),
+    grace_limit: toNum(row.grace_limit),
+    overage_balance: toNum(row.overage_balance),
+    credits_used_this_period: toNum(row.credits_used_this_period),
+    monthly_credit_limit:
+      row.monthly_credit_limit == null ? null : toNum(row.monthly_credit_limit),
+  };
+}
+
 // ============================================================================
 // WORKSPACE CREDITS INTERFACE
 // ============================================================================
@@ -89,7 +119,7 @@ export class WorkspaceCreditsService {
         return null;
       }
 
-      return data;
+      return normalizeWorkspaceCredits(data);
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception in getWorkspaceCredits', {
         error: error instanceof Error ? error.message : String(error),
@@ -158,7 +188,7 @@ export class WorkspaceCreditsService {
       balance: data.credits_balance,
     });
 
-    return data;
+    return normalizeWorkspaceCredits(data) as WorkspaceCredits;
   }
 
   /**

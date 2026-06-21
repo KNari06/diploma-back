@@ -47,24 +47,45 @@ export class SelfServeProvisioningService {
       // Don't provision a workspace/project for a user who is not approved
       // (e.g. a manually 'rejected' account hitting auth again).
       if (!approved) return false;
-
-      const workspaceId = await this.ensureWorkspace(userId);
-      if (workspaceId) {
-        await this.ensureDefaultProject(userId, workspaceId);
-      }
-
-      // Trial credits + plan: a self-serve user must see a usable balance the
-      // moment they land, not lazily on their first paid action (otherwise
-      // /auth/me reports 0 and the exploration credit-gate would reject them).
-      await this.ensureTrialCreditsAndPlan(userId);
     } catch (error) {
       // Best-effort: log and swallow. The next auth call retries. `approved`
       // keeps whatever the approval step returned before the failure.
-      logger.warn('[SELF_SERVE] Provisioning failed (non-critical)', {
+      logger.warn('[SELF_SERVE] Approval failed (non-critical)', {
+        error: error instanceof Error ? error.message : String(error),
+        userId,
+      });
+      return approved;
+    }
+
+    // Trial credits + plan come FIRST and in their own guard. An approved user
+    // lands on /home immediately; if the workspace/project steps below throw,
+    // the credit grant must already have happened — otherwise the user is
+    // approved with a 0 balance and the frontend walls them with a bogus
+    // "trial exhausted" screen despite never spending anything. Credits don't
+    // depend on a workspace, so there's no ordering reason to grant them last.
+    try {
+      await this.ensureTrialCreditsAndPlan(userId);
+    } catch (error) {
+      logger.warn('[SELF_SERVE] Trial credit provisioning failed (non-critical)', {
         error: error instanceof Error ? error.message : String(error),
         userId,
       });
     }
+
+    // Workspace + project provisioning, separately guarded so a failure here
+    // cannot roll back or skip the credit grant above.
+    try {
+      const workspaceId = await this.ensureWorkspace(userId);
+      if (workspaceId) {
+        await this.ensureDefaultProject(userId, workspaceId);
+      }
+    } catch (error) {
+      logger.warn('[SELF_SERVE] Workspace/project provisioning failed (non-critical)', {
+        error: error instanceof Error ? error.message : String(error),
+        userId,
+      });
+    }
+
     return approved;
   }
 
