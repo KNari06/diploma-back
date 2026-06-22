@@ -42,6 +42,52 @@ interface LintHighlightSession {
 
 const activeSessions = new Map<string, LintHighlightSession>();
 
+// Sessions where a step is currently executing (apply / run). A lint can be
+// emitted just before Apply, but its resolver round-trip finishes AFTER apply
+// already cleared the border — that late `showLintHighlight` would repaint a
+// stale border that never goes away (observed: border stuck on the "Name" input
+// after Run). While suppressed, showLintHighlight is a no-op that also clears
+// any existing border. Suppression is the lint-side half of the
+// recording/run/apply mutual-exclusion invariant (#1).
+const suppressedSessions = new Set<string>();
+const releaseTimers = new Map<string, NodeJS.Timeout>();
+
+// Grace window after a step finishes during which late lint results stay
+// suppressed. Sized to outlast a lint resolver round-trip (LLM ~hundreds of ms).
+const LINT_SUPPRESSION_GRACE_MS = 1500;
+
+/**
+ * Mark a session as executing a step — late lint highlights are suppressed (and
+ * any current border cleared) until `releaseLintHighlightSuppression`. Call on
+ * apply start / run:start.
+ */
+export function suppressLintHighlight(previewSessionId: string): void {
+  if (!previewSessionId) return;
+  // Cancel any pending graced release from a previous step — keep suppressed.
+  const pending = releaseTimers.get(previewSessionId);
+  if (pending) { clearTimeout(pending); releaseTimers.delete(previewSessionId); }
+  suppressedSessions.add(previewSessionId);
+  void clearLintHighlight(previewSessionId);
+}
+
+/**
+ * Lift suppression once the step / run finished — after a short grace so a lint
+ * that was emitted JUST BEFORE apply (its resolver round-trip lands AFTER apply
+ * completes — the exact race that wedged the border on the "Name" input) is
+ * still swallowed. The grace covers a typical lint resolver round-trip.
+ */
+export function releaseLintHighlightSuppression(previewSessionId: string): void {
+  if (!previewSessionId) return;
+  const existing = releaseTimers.get(previewSessionId);
+  if (existing) clearTimeout(existing);
+  const t = setTimeout(() => {
+    suppressedSessions.delete(previewSessionId);
+    releaseTimers.delete(previewSessionId);
+  }, LINT_SUPPRESSION_GRACE_MS);
+  t.unref?.();
+  releaseTimers.set(previewSessionId, t);
+}
+
 // In-page identifiers — stable so a teardown script works even after the JS
 // state is gone (e.g. after framenavigated wiped the document).
 const ROOT_ID = '__qai_lint_highlight_root';
@@ -61,6 +107,14 @@ export async function showLintHighlight(
   type: LintHighlightType = 'success',
 ): Promise<{ drawn: boolean }> {
   if (!ref || page.isClosed()) return { drawn: false };
+
+  // A step is executing — this lint result raced past Apply. Don't repaint a
+  // border the apply handler already cleared (it would stick forever). Clear
+  // any leftover and report not-drawn so the FE doesn't draw the fallback.
+  if (suppressedSessions.has(previewSessionId)) {
+    void clearLintHighlight(previewSessionId);
+    return { drawn: false };
+  }
 
   let session = activeSessions.get(previewSessionId);
   if (!session) {

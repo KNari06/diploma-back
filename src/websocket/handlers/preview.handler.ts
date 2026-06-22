@@ -2038,10 +2038,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const { previewSessionId, stepDraft, pageRef, intentTestCaseId } = data;
 
       // The "is this the element?" lint border is a pre-execution hint. Once Apply
-      // runs the step is executing, so clear the in-page highlight (best-effort).
+      // runs the step is executing, so clear the in-page highlight AND suppress
+      // any late lint result that raced past this point (it would otherwise
+      // repaint a border that never goes away). Released in the apply finally.
       if (previewSessionId) {
         import('@/services/testing/ui/preview/preview-lint-highlight.service')
-          .then(({ clearLintHighlight }) => clearLintHighlight(previewSessionId))
+          .then(({ suppressLintHighlight }) => suppressLintHighlight(previewSessionId))
           .catch(() => undefined);
       }
 
@@ -2452,6 +2454,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         error: error instanceof Error ? error.message : 'Apply failed',
         timestamp: new Date().toISOString(),
       });
+    } finally {
+      // Lift lint-highlight suppression now the step finished, so the NEXT
+      // lint can paint its border again. Border for THIS step is already gone.
+      const { previewSessionId } = data || {};
+      if (previewSessionId) {
+        import('@/services/testing/ui/preview/preview-lint-highlight.service')
+          .then(({ releaseLintHighlightSuppression }) => releaseLintHighlightSuppression(previewSessionId))
+          .catch(() => undefined);
+      }
     }
   });
 
@@ -5345,7 +5356,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     // preview:run:completed. Every early exit in this handler must emit a
     // completion-shaped terminator in addition to the diagnostic 'error' event,
     // otherwise the button spins forever even after the action succeeded.
+    // Lift lint-highlight suppression for this run (graced — see service). Called
+    // from every run terminus: early-exit terminators + the async run .finally.
+    const releaseRunLintSuppression = (): void => {
+      if (typeof guardKey === 'string' && guardKey.length > 0) {
+        import('@/services/testing/ui/preview/preview-lint-highlight.service')
+          .then(({ releaseLintHighlightSuppression }) => releaseLintHighlightSuppression(guardKey))
+          .catch(() => undefined);
+      }
+    };
     const emitRunTerminator = (errorMessage: string): void => {
+      releaseRunLintSuppression();
       socket.emit('preview:run:completed', {
         previewSessionId: typeof guardKey === 'string' ? guardKey : '',
         success: false,
@@ -5360,10 +5381,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
     };
     // The lint "is this the element?" border is a pre-execution hint — a run is
-    // executing steps, so clear the in-page highlight (best-effort).
+    // executing steps, so clear the in-page highlight AND suppress late lint
+    // results for the duration of the run (released when the run settles).
     if (typeof guardKey === 'string' && guardKey.length > 0) {
       import('@/services/testing/ui/preview/preview-lint-highlight.service')
-        .then(({ clearLintHighlight }) => clearLintHighlight(guardKey))
+        .then(({ suppressLintHighlight }) => suppressLintHighlight(guardKey))
         .catch(() => undefined);
     }
 
@@ -5687,6 +5709,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           if (typeof guardKey === 'string' && guardKey.length > 0) {
             previewRunStartInFlight.delete(guardKey);
           }
+          releaseRunLintSuppression();
         });
 
         return; // Mobile path done — skip web flow below
@@ -5795,6 +5818,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           if (typeof guardKey === 'string' && guardKey.length > 0) {
             previewRunStartInFlight.delete(guardKey);
           }
+          releaseRunLintSuppression();
         });
     } catch (error) {
       logger.error('[WebSocket] Error in preview:run:start', {
