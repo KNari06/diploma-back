@@ -161,6 +161,16 @@ export function hasIdle(userId: string): boolean {
  */
 async function onIdleFire(userId: string, io: SocketIOServer): Promise<void> {
   warmupExtendThrottle.delete(userId);
+
+  // Capture the warmed sessionIds BEFORE deleting the Redis keys — the
+  // teardown trace below needs them, and `deleteUserMobileKeys` removes the
+  // very keys `getUserWarmupSessionIds` reads. Best-effort: a Redis hiccup
+  // here must never stop the expiry from firing.
+  let sessionIds: string[] = [];
+  try {
+    sessionIds = await getUserWarmupSessionIds(userId);
+  } catch { /* proceed without trace context */ }
+
   try {
     const deletedKeys = await deleteUserMobileKeys(userId);
 
@@ -176,6 +186,72 @@ async function onIdleFire(userId: string, io: SocketIOServer): Promise<void> {
     logger.error('[MOBILE_IDLE] onIdleFire failed', {
       userId: userId.substring(0, 8) + '...',
       error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  // Record WHY the editor session ended into the per-session editor trace so
+  // prod can see idle teardowns in Supabase (Storage + trace_files). Done
+  // AFTER the emit so the FE notification is never delayed by the upload, and
+  // best-effort so it can never break the idle path. The runner emulator is
+  // intentionally preserved here — only the Redis binding was cleared above.
+  await uploadMobileTeardownTraces(sessionIds, userId, {
+    cause: 'idle',
+    idleTtlMs: IDLE_TTL_MS,
+    emulatorPreserved: true,
+  });
+}
+
+/**
+ * Write a `mobile_session_teardown` event into each warmed session's editor
+ * trace, then close + upload it to Supabase (Storage + `trace_files`). Lets
+ * prod answer "why did the mobile editor session expire?" from the durable
+ * trace instead of guessing.
+ *
+ * Best-effort end-to-end: a missing trace, a Redis/Storage error, or a module
+ * load failure is logged and swallowed — telemetry must never break a teardown
+ * path. Dynamic imports avoid a static cycle with the preview trace stack and
+ * mirror the lazy-require pattern that stack already uses.
+ *
+ * Only the idle path calls this (emulator preserved). The disconnect-grace
+ * cleanup in `connection.handler` writes the same event inline before its own
+ * existing close + upload (emulator destroyed), so it does NOT call this.
+ */
+async function uploadMobileTeardownTraces(
+  sessionIds: string[],
+  userId: string,
+  teardown: { cause: 'idle' | 'disconnect_grace'; idleTtlMs?: number; emulatorPreserved: boolean },
+): Promise<void> {
+  if (!userId || sessionIds.length === 0) return;
+  try {
+    const { EditorTraceService } = await import('@/services/testing/ui/preview/editor-trace.service');
+    const { uploadEditorTrace } = await import('@/services/testing/ui/preview/editor-trace-upload');
+    for (const sid of sessionIds) {
+      try {
+        EditorTraceService.getOrCreate(`mobile-${sid}`, userId).writeMobileSessionTeardown({
+          cause: teardown.cause,
+          sessionId: sid,
+          idleTtlMs: teardown.idleTtlMs,
+          emulatorPreserved: teardown.emulatorPreserved,
+        });
+        const meta = await EditorTraceService.close(`mobile-${sid}`);
+        if (meta) {
+          await uploadEditorTrace({
+            filePath: meta.filePath,
+            userId: meta.userId,
+            previewSessionId: `mobile-${sid}`,
+            traceType: 'editor',
+          });
+        }
+      } catch (err) {
+        logger.warn('[MOBILE_IDLE] teardown trace upload failed (non-fatal)', {
+          sessionId: sid,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  } catch (err) {
+    logger.warn('[MOBILE_IDLE] teardown trace module load failed (non-fatal)', {
+      error: err instanceof Error ? err.message : String(err),
     });
   }
 }

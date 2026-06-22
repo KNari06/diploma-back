@@ -76,6 +76,25 @@ export interface TraceSummary {
   latencyP50Ms: number | null;
   /** P95 of element_resolution.latencyMs (or null when no resolves). */
   latencyP95Ms: number | null;
+
+  // ── Mobile session teardown (surfaced for prod incident triage) ──────────
+  /**
+   * Why the mobile editor session ended, from the `mobile_session_teardown`
+   * event. Surfaced as a top-level field so prod can filter
+   * `trace_files.parsed_data->>'teardownCause'` without downloading the JSONL.
+   *   'idle'             — in-memory idle timer fired; emulator kept warm.
+   *   'disconnect_grace' — browser socket dropped past the grace window;
+   *                        the warmed session was destroyed.
+   * null when the session ended by explicit close or recorded no teardown.
+   */
+  teardownCause: string | null;
+  /**
+   * Socket disconnect reason behind a 'disconnect_grace' teardown
+   * (`ping timeout` / `transport close` / …). Distinguishes an ungraceful
+   * drop (wedged host / backgrounded tab) from a clean close. null for idle
+   * or when unknown.
+   */
+  teardownReason: string | null;
 }
 
 /**
@@ -98,6 +117,8 @@ export class TraceSummaryAggregator {
   private modalDetectionMisses = 0;
   private llmBugAOccurrences = 0;
   private resolveLatencies: number[] = [];
+  private teardownCause: string | null = null;
+  private teardownReason: string | null = null;
 
   /**
    * Consume a single parsed JSONL event. Safe to call with any shape —
@@ -142,6 +163,12 @@ export class TraceSummaryAggregator {
     if (evtType === 'run_end') {
       if (payload.totalSteps) this.totalSteps = payload.totalSteps;
       if (payload.failedSteps) this.failedSteps = payload.failedSteps;
+    }
+
+    if (evtType === 'mobile_session_teardown') {
+      // Last-writer-wins: a session records one teardown, but be defensive.
+      if (typeof payload.cause === 'string') this.teardownCause = payload.cause;
+      if (typeof payload.disconnectReason === 'string') this.teardownReason = payload.disconnectReason;
     }
 
     if (evtType === 'step_apply_result') {
@@ -224,6 +251,8 @@ export class TraceSummaryAggregator {
       resolveCount: this.resolveLatencies.length,
       latencyP50Ms: percentile(sorted, 0.5),
       latencyP95Ms: percentile(sorted, 0.95),
+      teardownCause: this.teardownCause,
+      teardownReason: this.teardownReason,
     };
   }
 }

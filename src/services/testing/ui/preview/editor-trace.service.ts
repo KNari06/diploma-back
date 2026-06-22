@@ -1618,4 +1618,36 @@ export class EditorTraceService {
       payload: data,
     });
   }
+
+  /**
+   * Mobile editor session teardown — records WHY the warmed session ended so
+   * the cause is visible on prod. Written right before the trace is closed +
+   * uploaded by:
+   *   - the idle timer (`mobile-idle.service` onIdleFire) — `cause:'idle'`,
+   *     `emulatorPreserved:true` (only the Redis binding is cleared);
+   *   - the FE↔BE disconnect-grace cleanup (`connection.handler`
+   *     performDisconnectCleanup) — `cause:'disconnect_grace'`,
+   *     `emulatorPreserved:false` (the session is destroyed).
+   * The aggregator lifts `cause`/`disconnectReason` into
+   * `trace_files.parsed_data` so prod can filter teardowns without reading the
+   * JSONL. Payload is bounded + carries no user content.
+   */
+  writeMobileSessionTeardown(data: {
+    cause: 'idle' | 'disconnect_grace';
+    sessionId: string;
+    /** Socket disconnect reason (grace path only): `ping timeout` / `transport close` / … */
+    disconnectReason?: string;
+    /** Grace window that elapsed before teardown, ms (grace path only). */
+    graceMs?: number;
+    /** Idle window that elapsed before teardown, ms (idle path only). */
+    idleTtlMs?: number;
+    /** true when the runner emulator was kept warm (idle), false when destroyed (grace). */
+    emulatorPreserved: boolean;
+  }): void {
+    this.writer.write({
+      stage: 'mobile_lifecycle',
+      eventType: 'mobile_session_teardown',
+      payload: { previewSessionId: this.previewSessionId, userId: this.userId, ...data },
+    });
+  }
 }
