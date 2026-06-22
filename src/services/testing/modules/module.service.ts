@@ -38,18 +38,9 @@ export class ModuleService {
       name,
     });
 
-    // Append new modules to the end of the platform's manual order (max+1),
-    // mirroring FlowService.create. Newest-created therefore sorts last under
-    // the order_index ASC tree — drag-reorder is what moves it.
-    const { data: maxOrder } = await supabaseAdmin
-      .from('test_modules')
-      .select('order_index')
-      .eq('platform_id', platformId)
-      .order('order_index', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    const orderIndex = maxOrder ? (maxOrder.order_index ?? 0) + 1 : 0;
-
+    // order_index stays NULL on create. NULL = "not manually ordered" → the
+    // module sorts by created_at DESC (newest-first). It only gets a value when
+    // the user drags to reorder (ModuleService.reorder).
     const { data, error } = await supabaseAdmin
       .from('test_modules')
       .insert({
@@ -60,7 +51,6 @@ export class ModuleService {
         description: description || null,
         tags: tags || [],
         priority: priority || null,
-        order_index: orderIndex,
       })
       .select('*, test_platforms!inner(platform_key)')
       .single();
@@ -145,7 +135,7 @@ export class ModuleService {
     // Execute count + data queries in parallel (independent reads)
     const [countResult, itemsResult] = await Promise.all([
       countQuery,
-      itemsQuery.order('order_index', { ascending: true }).order('created_at', { ascending: false }).range(offset, offset + limit - 1),
+      itemsQuery.order('order_index', { ascending: true, nullsFirst: false }).order('created_at', { ascending: false }).range(offset, offset + limit - 1),
     ]);
 
     const { count, error: countError } = countResult;
@@ -263,7 +253,7 @@ export class ModuleService {
       description: row.description || undefined,
       tags: row.tags || [],
       priority: row.priority || undefined,
-      orderIndex: typeof row.order_index === 'number' ? row.order_index : 0,
+      orderIndex: typeof row.order_index === 'number' ? row.order_index : null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };

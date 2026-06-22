@@ -42,27 +42,16 @@ export class FlowService {
       name,
     });
 
-    // Get max order_index if not provided
-    let finalOrderIndex = orderIndex;
-    if (finalOrderIndex === undefined) {
-      const { data: maxOrder } = await supabaseAdmin
-        .from('test_flows')
-        .select('order_index')
-        .eq('module_id', moduleId)
-        .order('order_index', { ascending: false })
-        .limit(1)
-        .single();
-
-      finalOrderIndex = maxOrder ? maxOrder.order_index + 1 : 0;
-    }
-
+    // order_index stays NULL unless the caller explicitly sets one. NULL means
+    // "not manually ordered" → the flow sorts by created_at DESC (newest-first).
+    // It only gets a value when the user drags to reorder (FlowService.reorder).
     const { data, error } = await supabaseAdmin
       .from('test_flows')
       .insert({
         module_id: moduleId,
         user_id: userId,
         name,
-        order_index: finalOrderIndex,
+        order_index: orderIndex ?? null,
         flow_type: flowType || 'ui',
         platform: platform || null,
         tags: tags || [],
@@ -119,12 +108,15 @@ export class FlowService {
     moduleId: string,
     userId: string
   ): Promise<TestFlow[]> {
+    // Manually-ordered flows (non-NULL order_index) first, ascending; the rest
+    // (NULL) newest-first by created_at. nullsFirst:false puts NULLs last.
     const { data, error } = await supabaseAdmin
       .from('test_flows')
       .select('*')
       .eq('module_id', moduleId)
       .eq('user_id', userId)
-      .order('order_index', { ascending: true });
+      .order('order_index', { ascending: true, nullsFirst: false })
+      .order('created_at', { ascending: false });
 
     if (error) {
       logger.error('[FLOW_SERVICE] Failed to list flows', { error, moduleId });

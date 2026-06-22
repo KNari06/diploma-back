@@ -215,8 +215,8 @@ export interface TestModule {
   description?: string;
   tags: string[];
   priority?: Priority;
-  /** Manual ordering within the platform (drag-and-drop). Lower = earlier. */
-  orderIndex: number;
+  /** Manual drag order within the platform. null = not manually ordered. */
+  orderIndex: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -261,7 +261,7 @@ export interface TestFlow {
   userId: string;
   name: string;
   description?: string;
-  orderIndex: number;
+  orderIndex: number | null;
   flowType: FlowType;
   platform?: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
   tags: string[];
