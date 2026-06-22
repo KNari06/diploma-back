@@ -383,7 +383,7 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
     }
 
     const { id } = req.params;
-    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings } = req.body;
+    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers } = req.body;
 
     logger.info('[PREVIEW_CONTROLLER] Updating intent test case', {
       intentTestCaseId: id,
@@ -402,8 +402,10 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
         // Included so PATCHes from the Run-as dropdown ("Login" / "No login")
         // are debuggable from logs alone.
         resourceBindings: resourceBindings !== undefined,
+        triggers: triggers !== undefined,
       },
       resourceBindingsCount: Array.isArray(resourceBindings) ? resourceBindings.length : undefined,
+      triggersCount: Array.isArray(triggers) ? triggers.length : undefined,
     });
 
     // Validate bindings shape upfront with a 400 (instead of letting it leak
@@ -551,12 +553,16 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       // Accept only arrays; `undefined` leaves the column untouched.
       // [] is valid and means "detach all resource bindings".
       resourceBindings: Array.isArray(resourceBindings) ? resourceBindings : undefined,
+      // Passed through raw — the service validates against the canonical
+      // Trigger contract and throws a ValidationError (→ 400) on a bad shape.
+      // `undefined` leaves the column untouched; `[]` clears all triggers.
+      triggers,
     });
 
     logger.info('[PREVIEW_CONTROLLER] Successfully updated intent test case', {
       intentTestCaseId: id,
       updatedFields: Object.keys({
-        name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings,
+        name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers,
       }).filter(k => (req.body as any)[k] !== undefined),
     });
 

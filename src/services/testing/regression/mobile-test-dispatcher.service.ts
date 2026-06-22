@@ -6,6 +6,7 @@ import { IntelligentTestStorageService } from '../results/intelligent-test-stora
 import { QueueManager } from '@/config/infrastructure/queues';
 import { buildMetadataFromTestCase } from '@/services/mobile/mobile-runner.types';
 import type { MobileTestJobData, MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { sanitizeTriggers } from '@/services/mobile/trigger-validation.util';
 import { env } from '@/config/environment/env';
 import { isPaidUser } from '@/services/core/plan-access.service';
 import { ValidationError } from '@/types';
@@ -204,6 +205,12 @@ export class MobileTestDispatcherService {
       }
     }
 
+    // 3c. User-defined triggers (event→action rules) — echoed from the test
+    // case verbatim into the job. Sanitize (not throw): a stale/legacy row
+    // shouldn't crash a run; only well-formed triggers are forwarded. The
+    // worker hands them to the runner in the run-steps body.
+    const triggers = sanitizeTriggers(intentCase.triggers);
+
     // 4. Create test record in DB (same pattern as ci.controller.ts)
     const testId = uuidv4();
     await dbAdminService.createTest({
@@ -300,6 +307,10 @@ export class MobileTestDispatcherService {
       // own — decrypts, prepends setup steps, builds the audit snapshot.
       // Secrets therefore never appear in BullMQ job data.
       ...(rawBindings.length > 0 ? { resourceBindings: rawBindings } : {}),
+      // User-defined triggers (no secrets — pure event→action rules). Only
+      // attached when non-empty so no-trigger jobs are byte-identical to
+      // pre-trigger dispatch.
+      ...(triggers.length > 0 ? { triggers } : {}),
     };
 
     await QueueManager.addMobileTestRunJob(jobData);
@@ -319,6 +330,7 @@ export class MobileTestDispatcherService {
       testCaseName: intentCase.name,
       stepsCount: intentSteps.length,
       resourceBindingsCount: rawBindings.length,
+      triggersCount: triggers.length,
       // Phase 5: which build ran, for operator debugging.
       appBuildId: resolvedBuild?.id,
       appBranch: resolvedBuild?.branch,

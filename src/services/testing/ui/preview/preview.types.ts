@@ -3,6 +3,10 @@
  * Types for realtime step editor and preview functionality
  */
 
+// Canonical cross-repo Trigger contract lives in the mobile runner types
+// (single source of truth, mirrored by qait-mobile-runner's zod schema).
+import type { Trigger } from '@/services/mobile/mobile-runner.types';
+
 // ═══════════════════════════════════════════════════════════════════════════
 // INTERACTIVE NODE (for dom_analysis storage)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1890,6 +1894,11 @@ export interface IntentTestCase {
     resource_id: string;
     required?: boolean;
   }>;
+
+  // User-defined event→action rules forwarded to the mobile runner per run.
+  // Surfaces intent_test_cases.triggers to the UI. CANONICAL cross-repo shape
+  // (`Trigger` in @/services/mobile/mobile-runner.types) — do not diverge.
+  triggers?: Trigger[];
 
   // Provenance (when saved from a completed test)
   sourceTestId?: string;

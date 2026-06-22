@@ -11,6 +11,7 @@ import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import type { CompiledStepPlan, IntentStep, IntentTestCase, StepEvidence } from './preview.types';
 import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 import { emitTestCaseMutated } from '@/websocket/helpers/project-mutation-emit';
+import { validateTriggers, sanitizeTriggers } from '@/services/mobile/trigger-validation.util';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Per-testCase in-memory mutex (prevents concurrent read-modify-write races)
@@ -454,6 +455,14 @@ export class IntentTestCaseService {
      * resources. Undefined leaves the column untouched.
      */
     resourceBindings?: Array<{ kind: string; resource_id: string; required?: boolean }>;
+    /**
+     * Optional replacement for the full triggers array (user-defined
+     * event→action rules forwarded to the mobile runner). Sending `[]`
+     * clears all triggers. Undefined leaves the column untouched. Validated
+     * against the canonical contract here (service layer), NOT the route —
+     * a malformed entry throws and surfaces as a 400.
+     */
+    triggers?: unknown;
   }): Promise<IntentTestCase> {
     // Serialize concurrent writes to the same test case via the same in-process
     // mutex used by updateStepFromPreviewApply / updateStepAfterHeal /
@@ -462,7 +471,7 @@ export class IntentTestCaseService {
     // that the runner just wrote. No reentrancy risk — none of the already-
     // mutex'd methods call update() internally.
     return withTestCaseMutex(params.id, async () => {
-      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings } = params;
+      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers } = params;
 
       const updates: Record<string, any> = {};
       if (name !== undefined) updates.name = name;
@@ -475,6 +484,12 @@ export class IntentTestCaseService {
           throw new Error('resourceBindings must be an array');
         }
         updates.resource_bindings = resourceBindings;
+      }
+      if (triggers !== undefined) {
+        // Validate against the canonical cross-repo contract. Throws a
+        // ValidationError on the first malformed entry — the controller maps
+        // that to a 400. `[]` is valid and clears all triggers.
+        updates.triggers = validateTriggers(triggers) ?? [];
       }
       if (steps !== undefined) {
         let mergedSteps = this.normalizeSteps(steps);
@@ -804,6 +819,12 @@ export class IntentTestCaseService {
       resourceBindings: Array.isArray(row.resource_bindings)
         ? row.resource_bindings
         : [],
+
+      // User-defined triggers (event→action rules forwarded to the mobile
+      // runner). Sanitized on read so a stale/legacy row never surfaces a
+      // malformed entry to the editor. Defaults to [] for rows predating the
+      // column (column default is already '[]', this guards null/legacy too).
+      triggers: sanitizeTriggers(row.triggers),
 
       // Provenance
       sourceTestId: row.source_test_id || undefined,

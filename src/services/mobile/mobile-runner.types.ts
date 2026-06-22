@@ -360,6 +360,36 @@ export function buildMetadataFromTestCase(tc: {
   return Object.keys(m).length > 0 ? m : undefined;
 }
 
+// ── Triggers ─────────────────────────────────────────────────────
+
+/**
+ * User-defined event→action rule forwarded VERBATIM to the mobile runner.
+ *
+ * CANONICAL CROSS-REPO CONTRACT — this shape is mirrored exactly by the runner
+ * (qait-mobile-runner src/api/schemas/run.schema.ts `triggerSchema`). The
+ * runner matches a trigger BEFORE its built-in permission policy. There is NO
+ * `source` field — that's runner-internal (defaults to 'user'). Do NOT add
+ * fields here without changing the runner schema in lockstep.
+ *
+ * Persisted per-test on `intent_test_cases.triggers`, echoed into the BullMQ
+ * mobile job, and sent in the run-steps body.
+ */
+export type TriggerCondition =
+  | { kind: 'permission_dialog' }
+  | { kind: 'any_dialog' }
+  | { kind: 'dialog_text'; contains: string };
+
+export type TriggerAction =
+  | { kind: 'permission'; decision: 'allow' | 'deny' }
+  | { kind: 'tap'; text: string }
+  | { kind: 'back' };
+
+export interface Trigger {
+  id: string;
+  condition: TriggerCondition;
+  action: TriggerAction;
+}
+
 // ── Run Steps ────────────────────────────────────────────────────
 
 export interface MobileRunStepsRequest {
@@ -371,6 +401,12 @@ export interface MobileRunStepsRequest {
   stopOnFailure?: boolean;
   /** Test-level metadata (goal, description, priority, tags, etc.) */
   metadata?: MobileTestMetadata;
+  /**
+   * User-defined triggers active for this run (matched before the built-in
+   * permission policy). Forwarded verbatim — see the `Trigger` contract above.
+   * Omitted when the test has none.
+   */
+  triggers?: Trigger[];
 }
 
 export interface MobileRunStepsResponse {
@@ -648,6 +684,12 @@ export interface MobileTestJobData {
     resource_id: string;
     required?: boolean;
   }>;
+  /**
+   * User-defined triggers echoed from `intent_test_cases.triggers`. Carried
+   * verbatim through Redis (no secrets — pure event→action rules) and forwarded
+   * to the runner in the run-steps body. Omitted when the test has none.
+   */
+  triggers?: Trigger[];
   /**
    * Job-level retry counter. Incremented by the worker before re-throwing
    * to BullMQ on retry-able errors (runner unreachable, transient 503,
