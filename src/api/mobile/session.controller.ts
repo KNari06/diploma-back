@@ -206,6 +206,11 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   const prelaunch = rawPrelaunch !== false; // default true
 
   if (!projectId) {
+    logger.warn('[MOBILE_SESSION] warmup rejected: projectId is required', {
+      userId,
+      reason: 'missing_projectId',
+      status: 400,
+    });
     res.status(400).json({ success: false, error: 'projectId is required' });
     return;
   }
@@ -219,6 +224,17 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   // pinned device.
   const accessibleProject = await ProjectService.getProject(projectId, userId);
   if (!accessibleProject) {
+    // 404 here means the project doesn't exist OR the user isn't a member of
+    // its workspace (getProject is access-scoped, no info leak). Either way the
+    // editor shows the generic "Failed to start session" — log so we can tell
+    // an IDOR/stale-project case apart from a runner failure without guessing.
+    logger.warn('[MOBILE_SESSION] warmup rejected: project not found or no access', {
+      userId,
+      projectId,
+      platform: rawPlatform,
+      reason: 'project_not_found_or_forbidden',
+      status: 404,
+    });
     res.status(404).json({ success: false, error: 'Project not found' });
     return;
   }
@@ -260,12 +276,27 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   let deviceSelector: { source?: 'local-emulator' | 'local-physical' | 'cloud'; serial?: string } | undefined;
   if (rawDeviceSelector !== undefined && rawDeviceSelector !== null) {
     if (typeof rawDeviceSelector !== 'object' || Array.isArray(rawDeviceSelector)) {
+      logger.warn('[MOBILE_SESSION] warmup rejected: malformed deviceSelector', {
+        userId,
+        projectId,
+        platform,
+        reason: 'deviceSelector_not_object',
+        status: 400,
+      });
       res.status(400).json({ success: false, error: 'deviceSelector must be an object' });
       return;
     }
     const sel = rawDeviceSelector as { source?: unknown; serial?: unknown };
     const validSources = ['local-emulator', 'local-physical', 'cloud'] as const;
     if (sel.source !== undefined && !validSources.includes(sel.source as typeof validSources[number])) {
+      logger.warn('[MOBILE_SESSION] warmup rejected: invalid deviceSelector.source', {
+        userId,
+        projectId,
+        platform,
+        source: sel.source,
+        reason: 'deviceSelector_bad_source',
+        status: 400,
+      });
       res.status(400).json({
         success: false,
         error: `deviceSelector.source must be one of ${validSources.join(', ')}`,
@@ -273,6 +304,13 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       return;
     }
     if (sel.serial !== undefined && (typeof sel.serial !== 'string' || sel.serial.trim() === '')) {
+      logger.warn('[MOBILE_SESSION] warmup rejected: invalid deviceSelector.serial', {
+        userId,
+        projectId,
+        platform,
+        reason: 'deviceSelector_bad_serial',
+        status: 400,
+      });
       res.status(400).json({
         success: false,
         error: 'deviceSelector.serial must be a non-empty string',
@@ -593,6 +631,19 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     const client = getMobileRunnerClient();
     const healthy = await time('runner_health_check', () => client.isHealthy());
     if (!healthy) {
+      // isHealthy() swallows the underlying cause (timeout / ECONNREFUSED /
+      // non-200), so this is the one place an operator can see that the editor's
+      // "Failed to start session" was the runner being down vs. unreachable.
+      // error level so it also lands in error.log, not just mobile-session.log.
+      logger.error('[MOBILE_SESSION] warmup aborted: mobile runner health check failed', {
+        userId,
+        projectId,
+        platform,
+        runnerUrl: env.MOBILE_RUNNER_URL,
+        healthCheckMs: timings.runner_health_check,
+        reason: 'runner_unhealthy',
+        status: 503,
+      });
       res.status(503).json({
         success: false,
         error: 'Mobile runner is unavailable',
@@ -760,6 +811,13 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     if (isFlutter) {
       const flutterPackage = appPackage || preppedPackage;
       if (!flutterPackage) {
+        logger.warn('[MOBILE_SESSION] warmup rejected: no APK to launch for Flutter session', {
+          userId,
+          projectId,
+          platform,
+          reason: 'flutter_no_app_package',
+          status: 400,
+        });
         await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`).catch(() => {});
         res.status(400).json({
           success: false,

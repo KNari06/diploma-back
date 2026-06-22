@@ -12,7 +12,8 @@
 import { requireAuth, requirePaidPlan } from '@/middleware/auth.middleware';
 import { requireCiApiKey } from '@/middleware/api-key.middleware';
 import { asyncHandler } from '@/utils/core/error-handler';
-import { Router } from 'express';
+import { logger } from '@/utils/core/logger';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import {
   createMobileAppUploadUrl,
   deleteMobileApp,
@@ -42,6 +43,55 @@ const router = Router();
 // mobile capacity. Read-only GETs and in-session gestures (tap/swipe/type) are
 // implicitly gated: without a warmed session they're unreachable.
 const requireMobilePlan = requirePaidPlan('Mobile testing');
+
+// Observability for the editor's "start session" (warmup) path. This is mounted
+// in index.ts BEFORE the app-level `requireAuth, requireApproved` gate (see the
+// `/mobile` mount) so it records the FINAL status of every warmup attempt —
+// including the 401 (auth/expired token), 403 (account not approved), and 403
+// UPGRADE_REQUIRED (paid-plan) rejections that all those middlewares log only at
+// `debug` and which therefore vanish in dev (no warn/combined file there;
+// error.log is error-only). Without this, an editor "Failed to start session"
+// can leave ZERO server-side trace. Tagged [MOBILE_SESSION] so it persists to
+// logs/mobile-session.log. Logging only — no business logic.
+//
+// It runs for ALL /mobile requests, so it self-filters to the warmup path:
+// gestures (tap/swipe/type) fire continuously and would drown the log.
+export const logWarmupOutcome = (req: Request, res: Response, next: NextFunction): void => {
+  if (req.method !== 'POST' || !req.path.endsWith('/sessions/warmup')) {
+    next();
+    return;
+  }
+  const startedAt = Date.now();
+  // Capture the response body's machine-readable `code` (e.g. UPGRADE_REQUIRED,
+  // PENDING_APPROVAL, FLUTTER_NOT_DETECTED) so a 403/4xx names WHICH gate
+  // rejected the warmup without cross-referencing middleware. Only the small
+  // `code`/`error` strings are read — never the full body.
+  let responseCode: string | undefined;
+  let responseError: string | undefined;
+  const originalJson = res.json.bind(res);
+  res.json = (payload: unknown) => {
+    const p = (payload ?? {}) as { code?: string; error?: string };
+    responseCode = p.code;
+    responseError = p.error;
+    return originalJson(payload);
+  };
+  res.on('finish', () => {
+    const body = (req.body ?? {}) as { projectId?: string; platform?: string };
+    const meta = {
+      status: res.statusCode,
+      code: responseCode,
+      error: responseError,
+      ms: Date.now() - startedAt,
+      userId: req.user?.id,
+      projectId: body.projectId,
+      platform: body.platform,
+    };
+    if (res.statusCode >= 500) logger.error('[MOBILE_SESSION] warmup outcome', meta);
+    else if (res.statusCode >= 400) logger.warn('[MOBILE_SESSION] warmup outcome', meta);
+    else logger.info('[MOBILE_SESSION] warmup outcome', meta);
+  });
+  next();
+};
 
 /**
  * POST /api/v1/mobile/projects/:projectId/app/upload-url
