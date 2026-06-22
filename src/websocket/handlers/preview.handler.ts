@@ -5579,6 +5579,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         const { getMobileRunnerClient } = await import('@/services/mobile');
         const mobileClient = getMobileRunnerClient();
         const { buildMetadataFromTestCase } = await import('@/services/mobile/mobile-runner.types');
+        const { sanitizeTriggers } = await import('@/services/mobile/trigger-validation.util');
 
         // Emit started AFTER session is validated
         webSocketService.emitToUser(userId, 'preview:run:started', {
@@ -5609,6 +5610,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           screenshotEachStep: true,
           stopOnFailure: true,
           metadata: buildMetadataFromTestCase(testCase),
+          // Forward the test's user-defined triggers (event→action rules) so the
+          // runner honours them mid-run. The editor "Run" path was missing this —
+          // only the regression job (mobile-test-run.job) had it — so triggers
+          // never reached the runner on a preview run.
+          triggers: sanitizeTriggers(testCase.triggers),
           userId,
         }).then((result) => {
           logger.info('[WebSocket] Mobile run completed', {

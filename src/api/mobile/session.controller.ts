@@ -1512,6 +1512,24 @@ export async function applySession(req: Request, res: Response): Promise<void> {
     return;
   }
 
+  // Set the run's user triggers ON THE SESSION so the runner's trigger engine +
+  // permission watcher honour them during this step. The editor "Run" applies
+  // steps one at a time, so triggers can't ride the batch run-steps body — they
+  // ride the session, set before each apply (like permissionPolicy). Best-effort:
+  // a trigger-setup hiccup must never fail the step.
+  const { triggers: applyTriggers } = req.body as { triggers?: unknown };
+  if (Array.isArray(applyTriggers)) {
+    try {
+      const { getMobileRunnerClient } = await import('@/services/mobile');
+      const { sanitizeTriggers } = await import('@/services/mobile/trigger-validation.util');
+      await getMobileRunnerClient().setTriggers(sessionId, sanitizeTriggers(applyTriggers), { userId: req.user!.id });
+    } catch (err) {
+      logger.warn('[applySession] failed to set triggers (non-fatal)', {
+        sessionId, error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   try {
     // Trace logging for mobile editor
     const traceSessionId = `mobile-${sessionId}`;

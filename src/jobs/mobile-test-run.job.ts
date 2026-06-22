@@ -129,6 +129,10 @@ export class MobileTestRunJobHandler {
       // Track 5 (shared resources): raw bindings only — the worker
       // compiles them on its own so plaintext secrets never land in Redis.
       resourceBindings,
+      // User-defined event→action rules — forwarded verbatim to the runner
+      // in the run-steps call below (matched before the built-in permission
+      // policy).
+      triggers,
       // `intent_test_cases.id`. Required for `persistCompiledPlansFromRun`
       // to find the test case row and merge per-step compiled plans back
       // into `intent_test_cases.steps_json`. Pre-fix the worker passed
@@ -648,6 +652,9 @@ export class MobileTestRunJobHandler {
         runResult = await client.runSteps(sessionId, intentSteps, {
           screenshotEachStep: true,
           metadata,
+          // Forward the test's user-defined triggers verbatim (no-op when
+          // undefined/empty — the client drops the field from the body).
+          triggers,
           signal: runStepsAbort.signal,
           userId,
         });
