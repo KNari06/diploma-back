@@ -3,6 +3,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { CONSTANTS } from '@/api/chat/shared/constants';
 import { logger } from '@/utils/core/logger';
+import { redactCredentials } from '@/utils/security/redact-credentials';
 
 /**
  * Chat Summarization Service — "Agent Memory"
@@ -101,9 +102,11 @@ export async function summarizeOldMessages(sessionId: string): Promise<void> {
       messagesToSummarize: oldMessages.length,
     });
 
-    // Build conversation text for GPT
+    // Build conversation text for GPT. Redact secrets (pasted bot tokens /
+    // webhook URLs) before they land in the long-lived summary — the verbatim
+    // value stays in chat_messages, but the summary must not carry it.
     const conversationText = oldMessages
-      .map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
+      .map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${redactCredentials(msg.content)}`)
       .join('\n\n');
 
     // Truncate if very long (cap at ~12K chars to stay within GPT context)

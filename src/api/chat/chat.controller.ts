@@ -26,6 +26,15 @@ import { parseMobileContext } from './mobile_agent/shared';
 import { incCounter } from '@/utils/core/mobile-chat-metrics';
 import { checkWorkspace, manageChatSession, validateInput } from './shared/validation';
 import { handlePendingExplorationConfirmation } from './shared/exploration-confirmation';
+import { handlePendingManageConfirmation } from './regression/shared/manage-confirmation';
+import {
+  beginCompound,
+  clearPendingCompound,
+  completeStep,
+  isCompoundCancel,
+  peekCurrentStep,
+  toCompoundSteps,
+} from './shared/compound-queue';
 import {
   TestCaseNotFoundError,
   assertCanAccessTestCase,
@@ -232,6 +241,15 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       }
       workspace_id = testCaseAccess.workspaceId;
       chatStore = TESTCASE_STORE;
+      // Test-case scope IS the editor surface — the user is looking at a live
+      // preview of this test case. Force editor mode so the general_chat
+      // executor prompt activates its editor flow (generate steps → confirm →
+      // run on preview → save). Backstop for older/mismatched clients that
+      // still send the lite/pro toggle value; the desktop client now sends
+      // mode='editor' itself, but the lite/pro toggle is a workspace-chat
+      // concept that must never leak into a test-case chat. Single source of
+      // truth: both parseIntent and routeToHandler read inputResult.mode.
+      inputResult.mode = 'editor';
     } else {
       const checkWorkspaceWithLogging = withFunctionLogging(checkWorkspace, 'checkWorkspace', functionLogger);
       workspace_id = await checkWorkspaceWithLogging(userId, sessionId);
@@ -310,9 +328,9 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       // `manageChatSession` does for the global path. Without this, the
       // frontend subscribed to `chat:tc:<tcid>` shows zero feedback
       // between sending the message and the first sub-agent step.
-      // Dual-broadcast via testCaseId — `chat:<sid>` reaches sockets
-      // already in the per-session room (returning users), `chat:tc:<tcid>`
-      // reaches first-time subscribers.
+      // In test-case scope the emit routes EXCLUSIVELY to `chat:tc:<tcid>`
+      // (passing testCaseId) — never to `chat:<sid>` — so an editor chat
+      // event cannot surface in the global chat sharing the socket.
       emitProcessingStep(
         chatSessionId,
         'enriching_context',
@@ -403,6 +421,54 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         await unregisterActiveRequestWithLogging(chatSessionId, userId);
         return;
       }
+
+      // Two-phase confirm for management ops: a bare "yes" replying to a
+      // manage_* preview would otherwise be classified as general_chat and the
+      // approval lost. Intercept it here and re-run the stored op.
+      const manageHandled = await handlePendingManageConfirmation(
+        req, res, message, chatSessionId!, userId,
+      );
+      if (manageHandled) {
+        const unregisterActiveRequestWithLogging = withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger);
+        await unregisterActiveRequestWithLogging(chatSessionId, userId);
+        return;
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 4.65 (Phase 3): COMPOUND CONTINUATION
+    // ═══════════════════════════════════════════════════════════════════════
+    // A compound request ("test A and B, then save as a plan") runs one step
+    // per turn. If a pending compound exists for this session, this turn drives
+    // the NEXT step: we replace the message with the queued step text and let
+    // the normal parse+route path below run it. The remainder is re-queued by
+    // advanceCompound. Global chat only (test-case scope never queues).
+    let effectiveMessage = message;
+    let isCompoundContinuation = false;
+    if (chatStore.kind === 'global' && chatSessionId) {
+      // Explicit abandon ("stop"/"отмена") clears the whole queue.
+      const pendingStep = await peekCurrentStep(chatSessionId);
+      if (pendingStep && isCompoundCancel(message)) {
+        await clearPendingCompound(chatSessionId);
+        res.json({
+          success: true,
+          message: 'Okay, stopped the multi-step request. What would you like to do?',
+          timestamp: new Date().toISOString(),
+          sessionId: chatSessionId,
+        });
+        await withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger)(chatSessionId, userId);
+        return;
+      }
+      if (pendingStep) {
+        // ADVANCE-AFTER-SUCCESS: run the CURRENT (peeked, not popped) step. The
+        // queue only advances once the step's handler reports success — see the
+        // res-wrapper + completeStep call after routeToHandler below.
+        logger.info('[COMPOUND] Continuing compound request', {
+          step: pendingStep.index, total: pendingStep.total, userId,
+        });
+        effectiveMessage = pendingStep.text;
+        isCompoundContinuation = true;
+      }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -459,7 +525,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       // from mid-flow.
       const parseIntentWithLogging = withFunctionLogging(parseIntent, 'parseIntent', functionLogger);
       parsedIntent = await parseIntentWithLogging(
-        message,
+        effectiveMessage,
         context,
         chatSessionId,
         userId,
@@ -528,30 +594,119 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // STEP 5.9 (Phase 3): COMPOUND BEGIN
+    // ═══════════════════════════════════════════════════════════════════════
+    // A freshly-classified compound request ("test A and B, then save a plan")
+    // runs its FIRST step now; the rest are queued for subsequent turns. Skip
+    // when we're already mid-compound (isCompoundContinuation) so a sub-step
+    // that itself parses as compound can't recurse. Global chat only.
+    if (chatStore.kind === 'global' && chatSessionId && !isCompoundContinuation) {
+      const steps = toCompoundSteps(parsedIntent?.metadata?.analysis);
+      if (steps.length >= 2) {
+        const first = await beginCompound(chatSessionId, steps);
+        if (first) {
+          logger.info('[COMPOUND] Detected compound request, running step 1', {
+            total: first.total, userId,
+          });
+          isCompoundContinuation = true; // step 1 is now a compound step too
+          // Re-parse step 1 in isolation so it routes as its own intent.
+          effectiveMessage = first.text;
+          const reparse = withFunctionLogging(parseIntent, 'parseIntent', functionLogger);
+          parsedIntent = await reparse(
+            effectiveMessage, context, chatSessionId, userId, workspace_id,
+            checkRequestTimeout, abortSignal, functionLogger,
+            inputResult.mode || 'lite', false /* global scope → not test-case */, testCaseId,
+          );
+        }
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // STEP 6: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
     // ═══════════════════════════════════════════════════════════════════════
+    // For a compound step, capture the handler's response payload so we can tell
+    // whether the step COMPLETED (advance the queue) or asked a clarification /
+    // confirm-preview (leave the queue so the next turn retries this step).
+    let stepResponsePayload: any;
+    if (isCompoundContinuation) {
+      const originalJson = res.json.bind(res);
+      res.json = (body: any) => {
+        stepResponsePayload = body;
+        return originalJson(body);
+      };
+    }
+
     const routeToHandlerWithLogging = withFunctionLogging(routeToHandler, 'routeToHandler', functionLogger);
-    await routeToHandlerWithLogging(req, res, {
-      message,
-      parsedIntent,
-      userId,
-      workspace_id,
-      chatSessionId,
-      conversationId,
-      answers,
-      context,
-      abortSignal, // Pass abort signal for cancellation checks
-      logger: functionLogger,
-      mode: inputResult.mode || 'lite', // Pass mode from request
-      executionStrategy: inputResult.executionStrategy, // Explicit exploration from frontend
-      attachments, // File attachments (images + documents)
-      // Persistence binding: GLOBAL_STORE for legacy, TESTCASE_STORE
-      // when this is a per-test-case chat. Migrated handlers
-      // (general_chat, editor_action) use this to route saves through
-      // ChatPersistence; legacy handlers receive but ignore it.
-      chatStore,
-      testCaseId,
+    // ACTIVE watchdog: race the handler against a real timer. The passive
+    // checkRequestTimeout() above only fires when something calls it between
+    // steps — a handler stalled inside an await (hung LLM/network) would never
+    // reach a checkpoint, so the request hangs and the frontend spinner spins
+    // forever. Racing guarantees we always settle: the loser's rejection drops
+    // into the catch below, which sends an honest 408 + REQUEST_TIMEOUT message
+    // instead of leaving the user on an infinite "Updating…". Covers EVERY
+    // handler, present and future.
+    let watchdog: NodeJS.Timeout | undefined;
+    const timeoutGuard = new Promise<never>((_, reject) => {
+      watchdog = setTimeout(() => {
+        // Signal the in-flight handler to stop work, then reject the race so the
+        // catch sends an honest timeout response.
+        abortController?.abort();
+        reject(new Error(`Request timeout after ${CONSTANTS.CHAT_REQUEST_TIMEOUT / 1000}s`));
+      }, CONSTANTS.CHAT_REQUEST_TIMEOUT);
+      if (typeof watchdog.unref === 'function') watchdog.unref();
     });
+    try {
+      await Promise.race([
+        routeToHandlerWithLogging(req, res, {
+          message: effectiveMessage,
+          parsedIntent,
+          userId,
+          workspace_id,
+          chatSessionId,
+          conversationId,
+          answers,
+          context,
+          abortSignal, // Pass abort signal for cancellation checks
+          logger: functionLogger,
+          mode: inputResult.mode || 'lite', // Pass mode from request
+          executionStrategy: inputResult.executionStrategy, // Explicit exploration from frontend
+          attachments, // File attachments (images + documents)
+          // Persistence binding: GLOBAL_STORE for legacy, TESTCASE_STORE
+          // when this is a per-test-case chat. Migrated handlers
+          // (general_chat, editor_action) use this to route saves through
+          // ChatPersistence; legacy handlers receive but ignore it.
+          chatStore,
+          testCaseId,
+        }),
+        timeoutGuard,
+      ]);
+    } finally {
+      if (watchdog) clearTimeout(watchdog);
+    }
+
+    // Advance the compound queue only if the step actually COMPLETED — not if it
+    // asked a clarification or a confirm-preview (those need the same step to be
+    // retried with the user's next reply). Best-effort; never throws.
+    if (isCompoundContinuation && chatSessionId) {
+      const data = stepResponsePayload?.data;
+      const stepIncomplete = data?.needsClarification === true || data?.needsConfirmation === true;
+      if (!stepIncomplete) {
+        try {
+          const next = await completeStep(chatSessionId);
+          if (next) {
+            emitProcessingStep(
+              chatSessionId, 'generating_plan',
+              `Done. Next (${next.index}/${next.total}): ${next.text}`,
+              100,
+            );
+          }
+        } catch (e) {
+          logger.warn('[COMPOUND] completeStep failed', {
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+    }
 
     // Unregister request on successful completion. Use the namespaced
     // registry for test-case requests so we don't drop a global-Map
@@ -588,8 +743,36 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       }
     }
 
+    // Abandon any pending compound on error — a mid-flow failure must not leave
+    // a stuck queue that hijacks the user's next message.
+    await clearPendingCompound(chatSessionId);
+
     // Flush logs before handling error
     await functionLogger.flushSync();
+
+    // Watchdog timeout MUST be classified before the cancellation branch below.
+    // The watchdog itself calls abortController.abort() (to stop the in-flight
+    // handler), which sets signal.aborted=true — so without this early check the
+    // cancellation branch would misclassify a timeout as a user-cancel (499)
+    // instead of the honest 408 + REQUEST_TIMEOUT. Keyed on the timeout error
+    // string the watchdog throws, not on signal.aborted.
+    const isTimeoutError =
+      error instanceof Error && error.message.toLowerCase().includes('timeout');
+    if (isTimeoutError) {
+      logger.warn('[CHAT] Request timed out (watchdog)', {
+        chatSessionId,
+        duration: Date.now() - requestStartTime,
+      });
+      if (!res.headersSent && !req.aborted && !req.socket?.destroyed) {
+        res.status(408).json({
+          success: false,
+          error: MESSAGES.REQUEST_TIMEOUT,
+          message: MESSAGES.REQUEST_TIMEOUT,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      return;
+    }
 
     // Check if request was cancelled
     if (error instanceof Error && (

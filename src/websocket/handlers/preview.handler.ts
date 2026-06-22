@@ -113,8 +113,8 @@ const RECORDING_MAX_TIME_MS = (() => {
  * Override via `WEB_RECORDING_MAX_STEPS`; set to 0 to disable.
  */
 const RECORDING_MAX_STEPS = (() => {
-  const raw = parseInt(process.env.WEB_RECORDING_MAX_STEPS || '50', 10);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 50;
+  const raw = parseInt(process.env.WEB_RECORDING_MAX_STEPS || '25', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 25;
 })();
 
 /**
@@ -141,6 +141,9 @@ const wheelCoalesceState = new Map<string, {
   lastX: number | undefined;
   lastY: number | undefined;
   flushScheduled: boolean;
+  /** Last time a forced preview:page snapshot was emitted for this scroll —
+   *  used to throttle the per-event force-snapshot (see WHEEL_SNAPSHOT_THROTTLE_MS). */
+  lastSnapshotAt: number;
 }>();
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -256,6 +259,14 @@ function emitRecordingStep(
     stepCount,
     timestamp: payload.timestamp || new Date().toISOString(),
   } as any);
+
+  // Background observer (Stage 2) — a step was just recorded; let the proactive
+  // watcher look at the page + step history. Fire-and-forget, flag-gated,
+  // debounced (so a burst of recorded steps collapses to one LLM call),
+  // fail-open. Dynamic import keeps it out of the module's hot init path.
+  void import('@/services/testing/ui/preview/observer.service')
+    .then(({ observe }) => observe(previewSessionId, 'step_added', userId))
+    .catch(() => { /* observer is advisory */ });
 
   // Max-steps auto-stop. Fires exactly once when the count reaches the cap so
   // the user is forced to "Apply All" before recording more. Non-blocking —
@@ -762,9 +773,26 @@ interface StreamContext {
 }
 const previewStreamContext = new Map<string, StreamContext>();
 
-// DOM update interval for preview:page (check every 500ms, emit only on change)
-const DOM_UPDATE_INTERVAL_MS = 500;
+// DOM update interval for preview:page (check every 1000ms, emit only on change).
+// NORMAL cadence, used when the event-driven dirty observer is off. 1000ms (was
+// 500ms) halves the always-on baseline; the frontend batches `ln` updates and gates
+// spinners on `ln:action:result` (not this cadence), and action/nav paths emit their
+// own forced snapshot — so only autonomous (non-action) DOM changes reflect up to ~1s
+// later instead of ~0.5s.
+const DOM_UPDATE_INTERVAL_MS = 1000;
+// Safety-net cadence used ONLY when the dirty observer is actively driving emits
+// (Phase 3). The observer catches real DOM changes within a frame; this slow tick
+// just backstops its blind spots (cross-origin iframes, missed signals after a
+// failed re-inject, pure text-only mutations).
+const DOM_UPDATE_SAFETY_NET_INTERVAL_MS = 3000;
 const activeDomUpdateIntervals = new Map<string, NodeJS.Timeout>();
+
+// Min interval between forced (throttle-bypassing) preview:page snapshots triggered
+// by wheel events. The wheel side-effect used to force a fresh page.evaluate() on
+// EVERY WS event (~8/s during a scroll), piling up heavy snapshots. The periodic
+// DOM tick (DOM_UPDATE_INTERVAL_MS, onlyIfChanged) still lands the final state after
+// the scroll settles, so the panel catches up within ≤1000ms regardless.
+const WHEEL_SNAPSHOT_THROTTLE_MS = 400;
 const activeDomUpdateTicks = new Set<string>();
 
 /**
@@ -1072,7 +1100,12 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
     } catch { /* non-critical */ }
 
     // Start DOM update interval (emit preview:page only on change)
-    const domInterval = setInterval(async () => {
+    // Collect a DOM snapshot and emit preview:page if it changed. Shared by the
+    // periodic tick AND (when enabled) the event-driven dirty observer, so both
+    // use identical guards (no-overlap via the tick guard, skip-during-run,
+    // shutdown-race tolerance) and the same signature dedup — no second copy of
+    // this delicate logic.
+    const collectAndEmitDomSnapshot = async (source: 'tick' | 'dirty-observer'): Promise<void> => {
       if (!acquireDomTickGuard(previewSessionId, activeDomUpdateTicks)) {
         return;
       }
@@ -1134,6 +1167,7 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
 
             logger.debug('[PREVIEW_STREAM] Emitted preview:page (DOM changed)', {
               previewSessionId,
+              source,
               domVersion: snapshot.domVersion,
               nodeCount: snapshot.domNodes?.length || 0,
             });
@@ -1165,7 +1199,64 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
       } finally {
         releaseDomTickGuard(previewSessionId, activeDomUpdateTicks);
       }
-    }, DOM_UPDATE_INTERVAL_MS);
+    };
+
+    // Phase 2/3: event-driven snapshot trigger (flag-gated, default OFF). An
+    // in-page MutationObserver signals real DOM changes so we collect+emit on
+    // the change instead of polling. When the observer is confirmed running and
+    // driving emits (real flag, not shadow), the periodic tick below is
+    // downshifted to a slow safety-net cadence; otherwise the tick keeps its
+    // normal cadence. When the flag is OFF this whole block is a no-op and the
+    // tick runs normally — behaviour is unchanged.
+    //
+    // Imported into the function scope (not the critical stream-setup import
+    // block) so an import hiccup can never break video/devtools/tick setup, and
+    // so the page-switch handler below can re-arm the observer on the new page.
+    let observerApi: typeof import('@/services/testing/ui/preview/preview-dirty-observer.service') | null = null;
+    try {
+      observerApi = await import('@/services/testing/ui/preview/preview-dirty-observer.service');
+    } catch (err) {
+      logger.debug('[DIRTY_OBSERVER] module import failed (non-fatal)', {
+        previewSessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Server-side handler for an in-page "DOM dirty" signal. Shadow mode logs
+    // only (the tick still drives); real mode collects + emits via the shared path.
+    const handleDirtySignal = (): void => {
+      if (!observerApi) return;
+      if (observerApi.isDirtyObserverShadowOnly()) {
+        logger.info('[DIRTY_OBSERVER] (shadow) DOM dirty — tick still drives emit', { previewSessionId });
+        return;
+      }
+      void collectAndEmitDomSnapshot('dirty-observer');
+    };
+
+    let tickIntervalMs = DOM_UPDATE_INTERVAL_MS;
+    if (observerApi && observerApi.isDirtyObserverActive()) {
+      try {
+        const started = await observerApi.startDirtyObserver({ previewSessionId, page, onDirty: handleDirtySignal });
+        if (started && !observerApi.isDirtyObserverShadowOnly()) {
+          // Observer confirmed running and driving emits — downshift the tick so
+          // it stops doing redundant full snapshots and becomes a pure backstop.
+          tickIntervalMs = DOM_UPDATE_SAFETY_NET_INTERVAL_MS;
+          logger.info('[DIRTY_OBSERVER] tick downshifted to safety-net cadence', {
+            previewSessionId,
+            intervalMs: tickIntervalMs,
+          });
+        }
+      } catch (err) {
+        logger.debug('[DIRTY_OBSERVER] start wiring failed (non-fatal)', {
+          previewSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    const domInterval = setInterval(() => {
+      void collectAndEmitDomSnapshot('tick');
+    }, tickIntervalMs);
 
     activeDomUpdateIntervals.set(previewSessionId, domInterval);
 
@@ -1186,6 +1277,23 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
           // Restart devtools collectors
           devtoolsRegistry.stop(previewSessionId);
           devtoolsRegistry.start(previewSessionId, room, newPage, nsp);
+
+          // Phase 3: re-arm the dirty observer on the NEW page — the previous
+          // observer was bound to the old page object and dies with it. Without
+          // this, after a page switch the popup's later autonomous DOM changes
+          // would only be caught by the (now slow) safety-net tick. No-op when
+          // the observer flag is OFF.
+          if (observerApi && observerApi.isDirtyObserverActive()) {
+            try {
+              await observerApi.cancelDirtyObserverForSession(previewSessionId);
+              await observerApi.startDirtyObserver({ previewSessionId, page: newPage, onDirty: handleDirtySignal });
+            } catch (err) {
+              logger.debug('[DIRTY_OBSERVER] re-arm after page switch failed (non-fatal)', {
+                previewSessionId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
 
           logger.info('[PREVIEW_STREAM] Streams restarted after page switch', { previewSessionId });
 
@@ -1302,6 +1410,19 @@ const stopPreviewStreams = async (previewSessionId: string): Promise<void> => {
     activeDomUpdateIntervals.delete(previewSessionId);
   }
   activeDomUpdateTicks.delete(previewSessionId);
+
+  // Phase 2: tear down the event-driven dirty observer (no-op if never started).
+  // The observer also self-cleans on page 'close', so this covers the explicit
+  // stream-stop path (last subscriber leaves / session stop).
+  try {
+    const { cancelDirtyObserverForSession } = await import('@/services/testing/ui/preview/preview-dirty-observer.service');
+    await cancelDirtyObserverForSession(previewSessionId);
+  } catch (err) {
+    logger.debug('[DIRTY_OBSERVER] stop cleanup failed (non-fatal)', {
+      previewSessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 
   // Stop video stream
   try {
@@ -1689,6 +1810,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           clarificationQuestion: result.clarificationQuestion,
           alternativesIncluded: !!includeAlternatives,
           applyDisabled: true, // V5: Apply should be disabled for needs_clarification
+          // Diagnostic parity with the resolved/not_found branch below (which
+          // spreads the whole result). Without these the FE cannot tell
+          // "LLM degraded — show retry hint" apart from "genuinely ambiguous".
+          degradedMode: result.degradedMode,
+          degradedReason: result.degradedReason,
+          aiFallbackReason: result.aiFallbackReason,
+          cacheHit: result.cacheHit,
+          resolverPath: result.resolverPath,
+          phaseTimings: result.phaseTimings,
           // V23: forward AMBIGUOUS coaching so the editor renders an
           // actionable hint alongside the alternatives picker.
           ...(result.suggestion ? { suggestion: result.suggestion } : {}),
@@ -1698,10 +1828,58 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      // For resolved/not_found/error, emit result as usual
+      // [HL-DIAG] Does the resolved result carry a usable highlight bbox? This is
+      // the single chokepoint for every lint result reaching the client. If the
+      // border doesn't draw, this tells us whether the BACKEND omitted the bbox
+      // (vs the frontend losing it). Remove with the other [HL-DIAG] logs.
+      try {
+        const hl = Array.isArray((result as any).highlight) ? (result as any).highlight : [];
+        const bb = hl[0]?.boundingBox;
+        logger.info('[HL-DIAG] lint emit', {
+          status: (result as any).status,
+          stepType: stepDraft.type,
+          resolverPath: (result as any).resolverPath,
+          highlightCount: hl.length,
+          firstHasBbox: !!bb,
+          firstBbox: bb ? { x: Math.round(bb.x), y: Math.round(bb.y), w: Math.round(bb.width), h: Math.round(bb.height) } : null,
+        });
+      } catch { /* diag only */ }
+
+      // Draw the "is this the element you meant?" border IN-PAGE (target
+      // architecture): the outline lives inside the browser, so coordinates are
+      // always correct and it scrolls with the page for free. We try the in-page
+      // highlight by data-agent-ref; `drawn` is false when the element isn't in
+      // the main frame (cross-origin iframe / not in DOM), in which case the FE
+      // falls back to its React-<div>-over-the-video overlay (works regardless of
+      // frame origin). Fire the call but await the `drawn` flag so the FE knows
+      // whether to render the fallback — avoids a double border. Best-effort.
+      let inPageHighlightDrawn = false;
+      try {
+        const firstRef = Array.isArray((result as any).highlight) && (result as any).highlight[0]?.ref
+          ? String((result as any).highlight[0].ref)
+          : null;
+        const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+        const liveSession = getPreviewSessionService().getSession(previewSessionId);
+        const { showLintHighlight, clearLintHighlight } =
+          await import('@/services/testing/ui/preview/preview-lint-highlight.service');
+        if (result.status === 'resolved' && firstRef && liveSession?.page) {
+          const hlType = (result as any).highlight[0]?.type === 'warning' ? 'warning'
+            : (result as any).highlight[0]?.type === 'error' ? 'error' : 'success';
+          const res = await showLintHighlight(previewSessionId, liveSession.page, firstRef, hlType);
+          inPageHighlightDrawn = res.drawn;
+        } else {
+          // not_found / error / no-ref → no element to outline; clear any prior.
+          await clearLintHighlight(previewSessionId);
+        }
+      } catch { /* highlight is advisory — never break lint */ }
+
+      // For resolved/not_found/error, emit result as usual. `inPageHighlightDrawn`
+      // tells the FE whether the border is already painted in-page (skip the React
+      // fallback) or whether it must draw the fallback overlay itself.
       socket.emit('preview:step:lint:result', {
         ...result,
         applyDisabled: result.status !== 'resolved', // V5: Apply only enabled for resolved
+        inPageHighlightDrawn,
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -1858,6 +2036,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       }
 
       const { previewSessionId, stepDraft, pageRef, intentTestCaseId } = data;
+
+      // The "is this the element?" lint border is a pre-execution hint. Once Apply
+      // runs the step is executing, so clear the in-page highlight AND suppress
+      // any late lint result that raced past this point (it would otherwise
+      // repaint a border that never goes away). Released in the apply finally.
+      if (previewSessionId) {
+        import('@/services/testing/ui/preview/preview-lint-highlight.service')
+          .then(({ suppressLintHighlight }) => suppressLintHighlight(previewSessionId))
+          .catch(() => undefined);
+      }
 
       // V9: Guard — cannot manually apply steps while a run is active
       {
@@ -2026,6 +2214,31 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         timestamp: new Date().toISOString(),
       });
 
+      // Background observer (Stage 2) — proactive editor hint. Fire-and-forget,
+      // flag-gated, debounced, fail-open. Skipped during a run (the run loop is
+      // not an authoring moment). NEVER awaited — must not delay apply:result.
+      try {
+        const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+        if (!PreviewRunService.isRunning(previewSessionId)) {
+          const { observe } = await import('@/services/testing/ui/preview/observer.service');
+          observe(previewSessionId, 'apply_done', ensuredUserId);
+        }
+      } catch { /* observer is advisory — never break apply */ }
+
+      // Invariant #12 — before persisting an applied step to the DB, rewind any
+      // interpolated value/assertionText back to the placeholder form the FE
+      // submitted. `stepDraft` still holds `{{secrets.X}}`/`{{key}}` (applyStep
+      // interpolated only a local copy of it), so without this a resolved secret
+      // gets baked into intent_test_cases.steps_json and every re-run then reads
+      // a stale literal. Mirrors PreviewRunService.preserveOriginalStep; the
+      // WS-emit redaction (redactObj above) is a separate sink.
+      const restoreInterpolatedForPersist = <T extends { value?: string; assertionText?: string }>(applied: T): T => {
+        const origValue = (stepDraft as { value?: string }).value;
+        const origAssertion = (stepDraft as { assertionText?: string }).assertionText;
+        if (applied.value === origValue && applied.assertionText === origAssertion) return applied;
+        return { ...applied, value: origValue, assertionText: origAssertion };
+      };
+
       // V8: Auto-persist to DB if intentTestCaseId provided and apply succeeded.
       // Skip if a run is active (the run will batch-persist at the end).
       // Awaited instead of setImmediate to prevent race with run:start.
@@ -2037,9 +2250,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             // Etap 1D.2 — clear stale failureEvidence on success. The
             // step that just succeeded is no longer "needs review"; the
             // bundle from the previous failed apply would be misleading.
-            const stepToPersist = result.appliedStep.failureEvidence
-              ? { ...result.appliedStep, failureEvidence: undefined }
-              : result.appliedStep;
+            const stepToPersist = restoreInterpolatedForPersist(
+              result.appliedStep.failureEvidence
+                ? { ...result.appliedStep, failureEvidence: undefined }
+                : result.appliedStep,
+            );
             const updated = await IntentTestCaseService.updateStepFromPreviewApply({
               intentTestCaseId,
               appliedStep: stepToPersist,
@@ -2086,7 +2301,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
             await IntentTestCaseService.updateStepFromPreviewApply({
               intentTestCaseId,
-              appliedStep: result.appliedStep,
+              appliedStep: restoreInterpolatedForPersist(result.appliedStep),
               userId: ensuredUserId,
             });
             logger.info('[WebSocket] Persisted proven-plan from failed apply', {
@@ -2124,7 +2339,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
             await IntentTestCaseService.updateStepFromPreviewApply({
               intentTestCaseId,
-              appliedStep: result.appliedStep,
+              appliedStep: restoreInterpolatedForPersist(result.appliedStep),
               userId: ensuredUserId,
             });
             logger.info('[WebSocket] Persisted failureEvidence', {
@@ -2239,6 +2454,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         error: error instanceof Error ? error.message : 'Apply failed',
         timestamp: new Date().toISOString(),
       });
+    } finally {
+      // Lift lint-highlight suppression now the step finished, so the NEXT
+      // lint can paint its border again. Border for THIS step is already gone.
+      const { previewSessionId } = data || {};
+      if (previewSessionId) {
+        import('@/services/testing/ui/preview/preview-lint-highlight.service')
+          .then(({ releaseLintHighlightSuppression }) => releaseLintHighlightSuppression(previewSessionId))
+          .catch(() => undefined);
+      }
     }
   });
 
@@ -3287,6 +3511,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           lastX: typeof data.x === 'number' ? data.x : undefined,
           lastY: typeof data.y === 'number' ? data.y : undefined,
           flushScheduled: false,
+          lastSnapshotAt: 0,
         };
         wheelCoalesceState.set(wheelKey, wState);
       } else {
@@ -3319,8 +3544,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       // wheel call lands in Playwright. Errors from the actual page.mouse.wheel() call
       // are logged at debug level inside executeMouseWheel and don't affect this path.
       {
-        // Scroll may reveal lazy-loaded content – always emit for visual feedback
-        setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+        // Scroll may reveal lazy-loaded content – emit a fresh snapshot for visual
+        // feedback, but THROTTLE it: forcing a throttle-bypassing page.evaluate() on
+        // every wheel event piled up heavy snapshots (~8/s) and was the dominant
+        // preview-lag source. Leading-edge throttle emits at most once per
+        // WHEEL_SNAPSHOT_THROTTLE_MS; the periodic DOM tick lands the trailing state.
+        const nowTs = Date.now();
+        if (nowTs - wState.lastSnapshotAt >= WHEEL_SNAPSHOT_THROTTLE_MS) {
+          wState.lastSnapshotAt = nowTs;
+          setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+        }
 
         // Editor trace: log scroll input
         const scrollTrace = EditorTraceService.get(previewSessionId);
@@ -4192,8 +4425,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'refresh', true);
-        // Snapshot is already kicked off inside refreshPage() via setImmediate —
-        // the DOM-update interval (500ms) will pick it up and emit preview:page.
+        // Emit the refreshed DOM explicitly instead of waiting for the periodic
+        // DOM tick to pick it up. After a same-page reload the tick sees
+        // changed:false (refreshPage's own collect already advanced the signature),
+        // so delivery used to depend on a progressive re-render happening to
+        // coincide with a tick. emitSnapshotForHandshake force-collects + emits with
+        // bypassDedup, so the node panel updates deterministically and independently
+        // of the poll cadence (prerequisite for event-driven snapshotting).
+        setImmediate(() => {
+          void emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId);
+        });
 
         // V13: Re-arm the first-frame guarantee instead of issuing a single
         // injectFrame. After page.reload() the existing CDP screencast may
@@ -4340,8 +4581,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'back', true);
-        // Snapshot is already kicked off inside goBack() via setImmediate —
-        // the DOM-update interval (500ms) will pick it up and emit preview:page.
+        // Emit the post-back DOM explicitly instead of relying on the periodic tick
+        // (see preview:page:refresh for the rationale — same-tab history nav doesn't
+        // trigger onPageSwitch, so the tick can't be counted on to deliver it).
+        // Decouples nav delivery from poll cadence.
+        setImmediate(() => {
+          void emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId);
+        });
 
         // V13: Re-arm first-frame guarantee instead of single injectFrame.
         try {
@@ -4424,8 +4670,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'forward', true);
-        // Snapshot is already kicked off inside goForward() via setImmediate —
-        // the DOM-update interval (500ms) will pick it up and emit preview:page.
+        // Emit the post-forward DOM explicitly instead of relying on the periodic
+        // tick (see preview:page:refresh for the rationale). Decouples nav delivery
+        // from poll cadence.
+        setImmediate(() => {
+          void emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId);
+        });
 
         // V13: Re-arm first-frame guarantee instead of single injectFrame.
         try {
@@ -5044,6 +5294,42 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
+  // Client video-render health → adaptive throttle. The client reports the FPS
+  // it actually painted; the server widens/narrows its send interval (fps-only,
+  // never restarts screencast / changes quality). Pure telemetry-driven hint:
+  // silent drop on any failure, no response event, never blocks the stream.
+  socket.on('preview:video:health', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      // Reports are low-frequency (every few seconds); reuse the mouse bucket
+      // as a cheap flood guard. A dropped report just means we adapt one tick
+      // later — never a correctness issue.
+      if (!checkRateLimit(socket.id, 'mouse')) {
+        return;
+      }
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) {
+        return;
+      }
+
+      const renderedFps = (data as { renderedFps?: unknown }).renderedFps;
+      if (typeof renderedFps !== 'number' || !Number.isFinite(renderedFps)) {
+        return; // ignore malformed report — applyHealthHint is also defensive
+      }
+
+      const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+      getPreviewVideoStreamRegistry().reportClientHealth(previewSessionId, renderedFps);
+    } catch (error) {
+      logger.debug('[WebSocket] Error in preview:video:health', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // ═══════════════════════════════════════════════════════════════════════════
   // V8: Preview Run Handlers ("Run from start" feature)
   // ═══════════════════════════════════════════════════════════════════════════
@@ -5070,7 +5356,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     // preview:run:completed. Every early exit in this handler must emit a
     // completion-shaped terminator in addition to the diagnostic 'error' event,
     // otherwise the button spins forever even after the action succeeded.
+    // Lift lint-highlight suppression for this run (graced — see service). Called
+    // from every run terminus: early-exit terminators + the async run .finally.
+    const releaseRunLintSuppression = (): void => {
+      if (typeof guardKey === 'string' && guardKey.length > 0) {
+        import('@/services/testing/ui/preview/preview-lint-highlight.service')
+          .then(({ releaseLintHighlightSuppression }) => releaseLintHighlightSuppression(guardKey))
+          .catch(() => undefined);
+      }
+    };
     const emitRunTerminator = (errorMessage: string): void => {
+      releaseRunLintSuppression();
       socket.emit('preview:run:completed', {
         previewSessionId: typeof guardKey === 'string' ? guardKey : '',
         success: false,
@@ -5084,6 +5380,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         timestamp: new Date().toISOString(),
       });
     };
+    // The lint "is this the element?" border is a pre-execution hint — a run is
+    // executing steps, so clear the in-page highlight AND suppress late lint
+    // results for the duration of the run (released when the run settles).
+    if (typeof guardKey === 'string' && guardKey.length > 0) {
+      import('@/services/testing/ui/preview/preview-lint-highlight.service')
+        .then(({ suppressLintHighlight }) => suppressLintHighlight(guardKey))
+        .catch(() => undefined);
+    }
+
     // Guard — pick mode is mutually exclusive with run. Source of truth is
     // the pick service's own active-session map. Done OUTSIDE the
     // `previewRunStartInFlight` synchronous window so the await doesn't
@@ -5296,6 +5601,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         const { getMobileRunnerClient } = await import('@/services/mobile');
         const mobileClient = getMobileRunnerClient();
         const { buildMetadataFromTestCase } = await import('@/services/mobile/mobile-runner.types');
+        const { sanitizeTriggers } = await import('@/services/mobile/trigger-validation.util');
 
         // Emit started AFTER session is validated
         webSocketService.emitToUser(userId, 'preview:run:started', {
@@ -5326,6 +5632,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           screenshotEachStep: true,
           stopOnFailure: true,
           metadata: buildMetadataFromTestCase(testCase),
+          // Forward the test's user-defined triggers (event→action rules) so the
+          // runner honours them mid-run. The editor "Run" path was missing this —
+          // only the regression job (mobile-test-run.job) had it — so triggers
+          // never reached the runner on a preview run.
+          triggers: sanitizeTriggers(testCase.triggers),
           userId,
         }).then((result) => {
           logger.info('[WebSocket] Mobile run completed', {
@@ -5398,6 +5709,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           if (typeof guardKey === 'string' && guardKey.length > 0) {
             previewRunStartInFlight.delete(guardKey);
           }
+          releaseRunLintSuppression();
         });
 
         return; // Mobile path done — skip web flow below
@@ -5506,6 +5818,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           if (typeof guardKey === 'string' && guardKey.length > 0) {
             previewRunStartInFlight.delete(guardKey);
           }
+          releaseRunLintSuppression();
         });
     } catch (error) {
       logger.error('[WebSocket] Error in preview:run:start', {
@@ -7221,6 +7534,18 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             await teardownHoverForSession(previewSessionId);
           } catch (err) {
             logger.debug('[HOVER_OVERLAY] disconnect cleanup failed (non-fatal)', {
+              previewSessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+
+          // Tear down the in-page lint highlight (scroll/resize listeners +
+          // outline div) so they don't outlive the socket on the orphaned page.
+          try {
+            const { clearLintHighlightForSession } = await import('@/services/testing/ui/preview/preview-lint-highlight.service');
+            await clearLintHighlightForSession(previewSessionId);
+          } catch (err) {
+            logger.debug('[LINT_HIGHLIGHT] disconnect cleanup failed (non-fatal)', {
               previewSessionId,
               error: err instanceof Error ? err.message : String(err),
             });

@@ -6,8 +6,10 @@ import {
   getChat,
   sendDocument,
   getMe,
+  isValidTelegramChatId,
 } from '@/services/api/telegram.service';
 import { IntegrationTokenService } from '@/services/api/integration-token.service';
+import { escTg } from '@/utils/notifications/telegram-notify';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 
@@ -282,6 +284,16 @@ export const TelegramSkill: SkillDefinition = {
         };
       }
 
+      // A 400 is a bad message/chat problem, NOT a token problem — give the
+      // user an accurate, actionable message instead of "token revoked".
+      if (!result.success && isTelegramBadRequestError(result.message)) {
+        return {
+          success: false,
+          message: telegramBadRequestMessage(result.message),
+          displayToUser: true,
+        };
+      }
+
       return result;
     } catch (error) {
       logger.error('[TELEGRAM_SKILL] Execution error', {
@@ -294,6 +306,15 @@ export const TelegramSkill: SkillDefinition = {
         return {
           success: false,
           message: 'The Telegram bot token has been revoked or is invalid. Please reconnect using telegram_connect with a new token from @BotFather.',
+          displayToUser: true,
+        };
+      }
+
+      // 400 Bad Request → bad chat/message, not a token issue.
+      if (isTelegramBadRequestError(error)) {
+        return {
+          success: false,
+          message: telegramBadRequestMessage(error),
           displayToUser: true,
         };
       }
@@ -329,6 +350,18 @@ async function handleConnect(
     return {
       success: false,
       message: 'chat_id is required for notifications to work. Ask user to send a message to the bot, then get their chat ID from @userinfobot or @getidsbot.',
+      displayToUser: true,
+    };
+  }
+
+  // Validate chat_id SHAPE — must be a numeric id or an @channel handle, never
+  // the bot's own username (a real incident stored "<bot>_bot" here, which made
+  // every send fail with a misleading "token invalid" error).
+  if (!isValidTelegramChatId(chat_id)) {
+    return {
+      success: false,
+      message:
+        'That does not look like a chat ID. A chat ID is a NUMBER (e.g. 8238452651, or a negative number for groups) or a public @channel handle — not the bot username. Ask the user to message their bot, then get the numeric chat ID from @userinfobot or @getidsbot.',
       displayToUser: true,
     };
   }
@@ -413,6 +446,31 @@ async function handleConnect(
 function isTelegramTokenRevokedError(error: unknown): boolean {
   const msg = error instanceof Error ? error.message : String(error);
   return /Telegram API error: (401|403)/i.test(msg) || /Unauthorized/i.test(msg);
+}
+
+/**
+ * Check if an error is a 400 Bad Request from Telegram — a BAD MESSAGE/CHAT
+ * problem (wrong chat_id, message too long, unparseable HTML), NOT a token
+ * problem. Surfacing this as "token revoked" (the old behaviour) misled users
+ * into reconnecting a perfectly valid bot. Distinguish the common chat_id case.
+ */
+function isTelegramBadRequestError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /Telegram API error: 400/i.test(msg);
+}
+
+function telegramBadRequestMessage(error: unknown): string {
+  const msg = error instanceof Error ? error.message : String(error);
+  // The most common 400 in practice: the stored chat_id is wrong (e.g. a bot
+  // username was saved instead of a numeric chat ID, or the bot was never
+  // messaged from that chat).
+  if (/chat not found|chat_id is empty|invalid.*chat|peer_id_invalid/i.test(msg)) {
+    return 'Could not deliver: the chat ID looks wrong or the bot was never started in that chat. Send your bot a message, get the numeric chat ID from @userinfobot, then reconnect with telegram_connect.';
+  }
+  if (/can't parse entities|message text is empty|message is too long/i.test(msg)) {
+    return 'Could not deliver: the message could not be formatted for Telegram. This is a formatting issue on our side, not your bot — please report it.';
+  }
+  return 'Could not deliver the Telegram message (bad request). Your bot token is fine — check the chat ID, or try again.';
 }
 
 /**
@@ -693,7 +751,11 @@ async function handleSendNotification(
   };
 
   const emoji = levelEmoji[level] || levelEmoji.info;
-  const formattedText = `${emoji} <b>${title}</b>\n\n${body}\n\n<i>Sent via QAIT</i>`;
+  // title/body are plain text the code wraps in <b>/<i> — escape them so a
+  // stray & or < doesn't make Telegram reject the message with a 400.
+  // (Note: handleSendMessage intentionally does NOT escape — that tool
+  // documents raw-HTML input; this one does not.)
+  const formattedText = `${emoji} <b>${escTg(title)}</b>\n\n${escTg(body)}\n\n<i>Sent via QAIT</i>`;
 
   try {
     const message = await sendMessage(botToken, chat_id, formattedText, 'HTML');

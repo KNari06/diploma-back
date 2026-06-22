@@ -1,23 +1,32 @@
-import { supabaseAdmin } from '@/db/supabase';
 import { ApiConfigService } from '@/services/api/api-config.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { logger } from '@/utils/core/logger';
 import { topologicalSort } from '@/utils/graph/topological-sort';
+import { collapseLevelsIfBarrierDisabled } from './level-dispatch.util';
+import { isRegressionLevelBarrierDisabled } from '@/config/features/regression-scheduling';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { executionCompletionEmitter } from '../executions/execution-completion-emitter';
 import { ExecutionService } from '../executions/execution.service';
 import { ManualTestService } from '../ui/manualTest.service';
-import { env } from '@/config/environment/env';
-import { QueueManager, mobileTestRunQueue, mobileTestRunQueueEvents } from '@/config/infrastructure/queues';
+import { IntentTestCaseService } from '../ui/preview/intent-test-case.service';
+import { mobileTestRunQueue, mobileTestRunQueueEvents } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import type { ExecutableTestCase } from '@/types/testing.types';
 import type { RegressionRunProgressPayload } from '@/websocket/types/types';
 import { getProjectWorkspaceMemberIds } from './regression-report-assembler.service';
+import { priorityRank } from './resolve-test-case-priority.util';
 import { MobileTestDispatcherService } from './mobile-test-dispatcher.service';
 import { WebTestRequestBuilderService } from './web-test-request-builder.service';
-import { RegressionTestQueryService } from './regression-test-query.service';
+import { RegressionTestQueryService } from './db/regression-test-query.db';
+import {
+  getRunRoutingInfo,
+  getExecutionRefsForRun,
+  getFastAuthByExecIds,
+  updateRunById,
+  updateRunByIdIfActive,
+} from './db/regression-run.db';
 import {
   decideMaxMobileInFlight,
   countMobileTests,
@@ -68,13 +77,9 @@ export class TestExecutionOrchestratorService {
     let projectIdForWs: string | null = null;
     let progressRecipients: string[] = [userId];
     try {
-      const { data: runRow } = await supabaseAdmin
-        .from('regression_runs')
-        .select('plan_id, project_id, user_id')
-        .eq('id', runId)
-        .maybeSingle();
-      planIdForWs = (runRow?.plan_id as string | null) ?? null;
-      projectIdForWs = (runRow?.project_id as string | null) ?? null;
+      const runRow = await getRunRoutingInfo(runId);
+      planIdForWs = runRow?.plan_id ?? null;
+      projectIdForWs = runRow?.project_id ?? null;
 
       if (projectIdForWs) {
         progressRecipients = await getProjectWorkspaceMemberIds(projectIdForWs, userId);
@@ -84,10 +89,7 @@ export class TestExecutionOrchestratorService {
     }
 
     // Preload executions to avoid per-test lookups
-    const { data: executions, error: execError } = await supabaseAdmin
-      .from('test_executions')
-      .select('id, test_case_id, test_type')
-      .eq('run_id', runId);
+    const { rows: executions, error: execError } = await getExecutionRefsForRun(runId);
 
     if (execError) {
       // Pre-fix this was a silent `return` — left the run row orphan in
@@ -97,19 +99,15 @@ export class TestExecutionOrchestratorService {
       // doesn't show a forever-running run.
       logger.error('[REGRESSION_RUN] Failed to preload executions', { error: execError, runId });
       try {
-        await supabaseAdmin
-          .from('regression_runs')
-          .update({
-            status: 'failed',
+        await updateRunByIdIfActive(runId, {
+          status: 'failed',
+          completed_at: new Date().toISOString(),
+          summary: {
+            total: testCases.length,
+            error: `Failed to preload executions: ${(execError as any)?.message ?? 'unknown'}`,
             completed_at: new Date().toISOString(),
-            summary: {
-              total: testCases.length,
-              error: `Failed to preload executions: ${execError.message ?? 'unknown'}`,
-              completed_at: new Date().toISOString(),
-            },
-          })
-          .eq('id', runId)
-          .in('status', ['pending', 'running']);
+          },
+        });
       } catch (finalizeErr) {
         logger.error('[REGRESSION_RUN] Failed to finalize run after preload failure', {
           runId,
@@ -120,29 +118,40 @@ export class TestExecutionOrchestratorService {
     }
 
     const execByKey = new Map<string, string>();
-    for (const e of executions || []) {
+    for (const e of executions) {
       execByKey.set(`${e.test_type}:${e.test_case_id}`, e.id);
     }
 
     // Topological sort by depends_on
-    const { levels, hasCycle, cycleNodes } = topologicalSort(testCases);
+    const { levels: topoLevels, hasCycle, cycleNodes, blockedByCycleNodes } = topologicalSort(testCases);
 
-    if (hasCycle) {
-      logger.error('[REGRESSION_RUN] Dependency cycle detected in run', { runId, cycleNodes });
-      // Mark cycle nodes as failed
-      for (const nodeId of cycleNodes || []) {
-        const tc = testCases.find((t) => t.testCaseId === nodeId);
-        if (tc) {
-          const execId = execByKey.get(`${tc.testType}:${tc.testCaseId}`);
-          if (execId) {
-            await ExecutionService.updateStatus({
-              id: execId,
-              status: 'failed',
-              errorMessage: 'Circular dependency detected. Cannot execute.',
-            });
-          }
-        }
-      }
+    // Level barrier (default ON): dependency levels run in order — a dependent
+    // waits for its dependency's standalone run. When REGRESSION_DISABLE_LEVEL_BARRIER
+    // is ON, collapse to a single level so every non-cyclic test dispatches together
+    // (bounded only by worker concurrency). Inlining of dependency steps and cycle
+    // detection are unaffected; cycle nodes are already excluded from `levels`.
+    const levels = collapseLevelsIfBarrierDisabled(topoLevels, isRegressionLevelBarrierDisabled());
+
+    // Dependencies pointing OUTSIDE this run (test case in depends_on but
+    // not in the plan/selection) are ignored for ordering — the dependent
+    // runs without waiting. That's the only sane default, but it must be
+    // VISIBLE: a server-side log alone leaves QA wondering why B ran
+    // without A. Collected here and persisted into every summary write
+    // below so the run report can render a warning.
+    const inRunIds = new Set(testCases.map((t) => t.testCaseId));
+    const missingDependencies = testCases
+      .map((tc) => ({
+        testCaseId: tc.testCaseId,
+        missingDependencyIds: (tc.dependsOn || []).filter((d) => !inRunIds.has(d)),
+      }))
+      .filter((e) => e.missingDependencyIds.length > 0);
+    const missingDepsSummary =
+      missingDependencies.length > 0 ? { missingDependencies } : {};
+    if (missingDependencies.length > 0) {
+      logger.warn('[REGRESSION_RUN] Test cases reference dependencies outside this run', {
+        runId,
+        missingDependencies,
+      });
     }
 
     // Level-based execution with dependency tracking
@@ -209,6 +218,71 @@ export class TestExecutionOrchestratorService {
     };
 
     emitProgress('started', `Regression run started: ${totalTests} tests in ${totalLevels} levels`);
+
+    if (missingDependencies.length > 0) {
+      emitProgress(
+        'started',
+        `${missingDependencies.length} test(s) reference dependencies outside this run and will run without waiting for them`,
+      );
+    }
+
+    if (hasCycle) {
+      logger.error('[REGRESSION_RUN] Dependency cycle detected in run', {
+        runId,
+        cycleNodes,
+        blockedByCycleNodes,
+      });
+      // True cycle members can never be ordered — fail them outright.
+      for (const nodeId of cycleNodes || []) {
+        const tc = testCases.find((t) => t.testCaseId === nodeId);
+        if (!tc) continue;
+        const execId = execByKey.get(`${tc.testType}:${tc.testCaseId}`);
+        if (execId) {
+          await ExecutionService.updateStatus({
+            id: execId,
+            status: 'failed',
+            errorMessage: 'Circular dependency detected. Cannot execute.',
+          });
+          emitProgress('test_completed', `Failed (circular dependency): ${tc.testCaseId}`, {
+            testExecution: {
+              testCaseId: tc.testCaseId,
+              testExecutionId: execId,
+              testType: tc.testType,
+              event: 'completed',
+              status: 'failed',
+              errorMessage: 'Circular dependency detected. Cannot execute.',
+            },
+          });
+        }
+      }
+      // Nodes that merely depend on the cycle are not broken themselves —
+      // skip them with an honest reason instead of the misleading
+      // "circular dependency" label. Mirrors the failed-prerequisite skip.
+      for (const nodeId of blockedByCycleNodes || []) {
+        const tc = testCases.find((t) => t.testCaseId === nodeId);
+        if (!tc) continue;
+        skippedCount++;
+        const execId = execByKey.get(`${tc.testType}:${tc.testCaseId}`);
+        if (execId) {
+          const blockedReason = 'Skipped: depends on test(s) inside a circular dependency chain';
+          await ExecutionService.updateStatus({
+            id: execId,
+            status: 'skipped',
+            errorMessage: blockedReason,
+          });
+          emitProgress('test_completed', `Skipped (blocked by circular dependency): ${tc.testCaseId}`, {
+            testExecution: {
+              testCaseId: tc.testCaseId,
+              testExecutionId: execId,
+              testType: tc.testType,
+              event: 'completed',
+              status: 'skipped',
+              errorMessage: blockedReason,
+            },
+          });
+        }
+      }
+    }
 
     // Mobile regression concurrency cap.
     //
@@ -313,7 +387,14 @@ export class TestExecutionOrchestratorService {
     let failFastTriggerTestCaseId: string | null = null;
 
     for (let levelIdx = 0; levelIdx < levels.length && !creditExhausted && !failFastTriggered; levelIdx++) {
-      const level = levels[levelIdx];
+      // Dispatch critical tests first within the level. Order between
+      // levels is owned by the topological sort; within a level it used
+      // to be arbitrary (input order), so a critical smoke test could
+      // queue behind twenty low-priority ones. Stable sort keeps the
+      // curator's relative order inside each priority bucket.
+      const level = [...levels[levelIdx]].sort(
+        (a, b) => priorityRank(a.priority) - priorityRank(b.priority),
+      );
       // `platform` captured at dispatch so we can forward it with the
       // per-test completion event below (post-level), which is how the
       // UI discriminates mobile vs web cards.
@@ -455,6 +536,24 @@ export class TestExecutionOrchestratorService {
           if (testCase.testType === 'ui') {
             // Run UI test without creating nested regression_runs
             const savedCase = await RegressionTestQueryService.getSavedTestCase(testCase.testCaseId, userId);
+
+            // Inline transitive dependency (precondition) steps so they run
+            // in-session BEFORE this case's own steps (shared browser → shared
+            // login/cookies/data) — same behavior as the editor / single run.
+            // Borrowed steps carry namespaced ids + `_preconditionSource`, so
+            // compiled-plan writeback never pollutes this case's steps_json.
+            if (savedCase.depends_on?.length) {
+              const preconditionSteps = await IntentTestCaseService.collectPreconditionSteps(testCase.testCaseId);
+              if (preconditionSteps.length > 0) {
+                savedCase.steps_json = [...preconditionSteps, ...(savedCase.steps_json || [])];
+                logger.info('[REGRESSION_RUN] Inlined precondition steps', {
+                  runId,
+                  testCaseId: testCase.testCaseId,
+                  preconditionSteps: preconditionSteps.length,
+                  totalSteps: savedCase.steps_json.length,
+                });
+              }
+            }
 
             // Route: mobile tests → mobile runner queue, web tests → Playwright queue
             const isMobile = savedCase.platform?.startsWith('mobile_');
@@ -803,24 +902,15 @@ export class TestExecutionOrchestratorService {
           const execIdsForFastAuth = results
             .map((r) => r.execId)
             .filter((id): id is string => typeof id === 'string' && id.length > 0);
-          if (execIdsForFastAuth.length > 0) {
-            const { data: faRows } = await supabaseAdmin
-              .from('test_executions')
-              .select('id, fast_auth_used, fast_auth_restore_ms')
-              .in('id', execIdsForFastAuth);
-            for (const row of (faRows ?? []) as Array<{
-              id: string;
-              fast_auth_used: boolean | null;
-              fast_auth_restore_ms: number | null;
-            }>) {
-              if (row.fast_auth_used === null) continue;
-              fastAuthByExecId.set(row.id, {
-                used: row.fast_auth_used,
-                ...(typeof row.fast_auth_restore_ms === 'number'
-                  ? { restoreMs: row.fast_auth_restore_ms }
-                  : {}),
-              });
-            }
+          const faRows = await getFastAuthByExecIds(execIdsForFastAuth);
+          for (const row of faRows) {
+            if (row.fast_auth_used === null) continue;
+            fastAuthByExecId.set(row.id, {
+              used: row.fast_auth_used,
+              ...(typeof row.fast_auth_restore_ms === 'number'
+                ? { restoreMs: row.fast_auth_restore_ms }
+                : {}),
+            });
           }
         } catch (err) {
           logger.warn(
@@ -846,12 +936,12 @@ export class TestExecutionOrchestratorService {
             }
           }
           // Narrow the emitter status to the FE's union. `executionCompletionEmitter`
-          // returns strings that may include 'cancelled' / 'pending' — collapse
-          // everything non-pass/non-fail to 'skipped' so the FE state machine stays
-          // three-valued.
+          // returns strings that may include 'cancelled' / 'pending' / 'timeout' —
+          // collapse everything non-pass to 'failed' or 'skipped' so the FE state
+          // machine stays three-valued. 'timeout' counts as a failure.
           const mappedStatus: 'passed' | 'failed' | 'skipped' =
             result.status === 'passed' ? 'passed'
-            : result.status === 'failed' ? 'failed'
+            : result.status === 'failed' || result.status === 'timeout' ? 'failed'
             : 'skipped';
           const fa = result.execId ? fastAuthByExecId.get(result.execId) : undefined;
           emitProgress('test_completed', `UI test ${result.status} (${completedCount}/${totalTests})`, {
@@ -866,6 +956,55 @@ export class TestExecutionOrchestratorService {
               ...(fa ? { fastAuth: fa } : {}),
             },
           });
+        }
+
+        // Stamp timed-out executions in the DB so they are never left as 'running'.
+        // The emitter resolved with 'timeout' (not a real signal) — the DB row was
+        // never updated by the worker. Best-effort: a failure here is logged and
+        // swallowed; the 30-minute force-fail in recomputeRunStatus is the backstop.
+        // Persist as 'failed' (with a timeout error_message): the
+        // `test_executions.status` CHECK constraint has no 'timeout' value, and
+        // nothing downstream distinguishes timeout from failure. Writing 'timeout'
+        // here raised a 23514 constraint violation, leaving the row stuck 'running'.
+        const timedOutExecIds = results
+          .filter((r) => r.status === 'timeout' && r.execId)
+          .map((r) => r.execId as string);
+
+        await Promise.all(
+          timedOutExecIds.map((execId) =>
+            ExecutionService.updateStatus({
+              id: execId,
+              status: 'failed',
+              errorMessage: 'Mobile job not processed within 10 minutes (timeout)',
+            }).catch((err) =>
+              logger.warn('[REGRESSION_RUN] Failed to stamp timed-out execution in DB', {
+                runId,
+                execId,
+                error: err instanceof Error ? err.message : String(err),
+              }),
+            ),
+          ),
+        );
+
+        // A timed-out execution means the worker never signalled it, so no
+        // completion event will ever recompute the run — without this trigger
+        // the run stays 'running' until the 30-minute stale reaper. Recompute
+        // now that the rows are stamped; if later levels are still pending the
+        // recompute is a safe early-return, and its optimistic lock makes a
+        // redundant call a no-op. Dynamic import mirrors mobile-test-run.job.ts
+        // (avoids a static import cycle with the completion handler).
+        if (timedOutExecIds.length > 0) {
+          try {
+            const { TestCompletionHandlerService } = await import(
+              '../results/test-completion-handler.service'
+            );
+            await TestCompletionHandlerService.recomputeRunStatusById(runId);
+          } catch (err) {
+            logger.warn('[REGRESSION_RUN] Post-timeout run recompute failed', {
+              runId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
         }
       }
 
@@ -932,24 +1071,22 @@ export class TestExecutionOrchestratorService {
         }
       }
 
-      await supabaseAdmin
-        .from('regression_runs')
-        .update({
-          status: 'failed',
-          test_ids: uiTestIds.length > 0 ? uiTestIds : undefined,
-          summary: {
-            total: testCases.length,
-            api_passed: apiPassed,
-            api_failed: apiFailed,
-            skipped: skippedCount,
-            failFastTriggered: true,
-            failFastTriggerTestCaseId,
-            started_at: startedAt,
-            completed_at: new Date().toISOString(),
-          },
+      await updateRunById(runId, {
+        status: 'failed',
+        test_ids: uiTestIds.length > 0 ? uiTestIds : undefined,
+        summary: {
+          total: testCases.length,
+          api_passed: apiPassed,
+          api_failed: apiFailed,
+          skipped: skippedCount,
+          failFastTriggered: true,
+          failFastTriggerTestCaseId,
+          ...missingDepsSummary,
+          started_at: startedAt,
           completed_at: new Date().toISOString(),
-        })
-        .eq('id', runId);
+        },
+        completed_at: new Date().toISOString(),
+      });
 
       return;
     }
@@ -971,43 +1108,39 @@ export class TestExecutionOrchestratorService {
         }
       }
 
-      await supabaseAdmin
-        .from('regression_runs')
-        .update({
-          status: 'failed',
-          test_ids: uiTestIds.length > 0 ? uiTestIds : undefined,
-          summary: {
-            total: testCases.length,
-            api_passed: apiPassed,
-            api_failed: apiFailed,
-            skipped: skippedCount,
-            creditExhausted: true,
-            started_at: startedAt,
-            completed_at: new Date().toISOString(),
-          },
+      await updateRunById(runId, {
+        status: 'failed',
+        test_ids: uiTestIds.length > 0 ? uiTestIds : undefined,
+        summary: {
+          total: testCases.length,
+          api_passed: apiPassed,
+          api_failed: apiFailed,
+          skipped: skippedCount,
+          creditExhausted: true,
+          ...missingDepsSummary,
+          started_at: startedAt,
           completed_at: new Date().toISOString(),
-        })
-        .eq('id', runId);
+        },
+        completed_at: new Date().toISOString(),
+      });
 
       return;
     }
 
     // Link UI test IDs to regression_runs so existing completion pipeline can update the run
     if (uiTestIds.length > 0) {
-      const { error: updateError } = await supabaseAdmin
-        .from('regression_runs')
-        .update({
-          test_ids: uiTestIds,
-          summary: {
-            total: testCases.length,
-            ui_started: uiTestIds.length,
-            api_passed: apiPassed,
-            api_failed: apiFailed,
-            skipped: skippedCount,
-            started_at: startedAt,
-          },
-        })
-        .eq('id', runId);
+      const { error: updateError } = await updateRunById(runId, {
+        test_ids: uiTestIds,
+        summary: {
+          total: testCases.length,
+          ui_started: uiTestIds.length,
+          api_passed: apiPassed,
+          api_failed: apiFailed,
+          skipped: skippedCount,
+          ...missingDepsSummary,
+          started_at: startedAt,
+        },
+      });
 
       if (updateError) {
         logger.warn('[REGRESSION_RUN] Failed to update run with UI test_ids', {
@@ -1026,22 +1159,20 @@ export class TestExecutionOrchestratorService {
     // NOTE: regression_runs.status uses 'completed' (not 'passed') for success — match DB convention.
     const hasFails = apiFailed > 0;
     const persistedStatus = hasFails ? 'failed' : 'completed';
-    await supabaseAdmin
-      .from('regression_runs')
-      .update({
-        status: persistedStatus,
-        summary: {
-          total: testCases.length,
-          passed: apiPassed,
-          failed: apiFailed,
-          api_passed: apiPassed,
-          api_failed: apiFailed,
-          skipped: skippedCount,
-          completed_at: new Date().toISOString(),
-        },
+    await updateRunById(runId, {
+      status: persistedStatus,
+      summary: {
+        total: testCases.length,
+        passed: apiPassed,
+        failed: apiFailed,
+        api_passed: apiPassed,
+        api_failed: apiFailed,
+        skipped: skippedCount,
+        ...missingDepsSummary,
         completed_at: new Date().toISOString(),
-      })
-      .eq('id', runId);
+      },
+      completed_at: new Date().toISOString(),
+    });
 
     emitProgress(
       persistedStatus === 'completed' ? 'completed' : 'failed',

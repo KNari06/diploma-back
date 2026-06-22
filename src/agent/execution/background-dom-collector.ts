@@ -41,6 +41,16 @@ const DOM_STABILITY_CHECK_INTERVAL_MS = 200;
  * Build browser-side script to extract interactive elements
  * @param maxNodes - Maximum number of nodes to collect
  */
+/**
+ * Exported for the syntax-regression test only. The returned string is
+ * evaluated as RAW JS in the browser (page.evaluate), so it must parse as
+ * plain JavaScript — NO TypeScript syntax. The test compiles it with
+ * `new vm.Script(...)` to catch any TS leak before it reaches a browser.
+ */
+export function __buildExtractScriptForTest(maxNodes: number): string {
+  return buildExtractScript(maxNodes);
+}
+
 function buildExtractScript(maxNodes: number): string {
   return `
 (function extractInteractiveNodes() {
@@ -563,7 +573,12 @@ function buildExtractScript(maxNodes: number): string {
       // Radix/shadcn/Vaul data-state. Symmetric with snapshot-collector
       // and CDP-snapshot. Length-cap < 30 chars; trim only (preserve
       // camelCase 'forceMount'). undefined when attribute absent.
-      dataState: ((): string | undefined => {
+      // NOTE: this template string is evaluated as RAW JS in the browser via
+      // page.evaluate — it must NOT contain TypeScript syntax. A TS return-type
+      // annotation on this IIFE (string-pipe-undefined arrow) made the WHOLE
+      // script unparseable ("Unexpected token close-paren"), so the legacy
+      // evaluate path collected 0 nodes. Keep this IIFE annotation-free.
+      dataState: (() => {
         const raw = (el.getAttribute('data-state') || '').replace(/["']/g, '').trim();
         return raw.length > 0 && raw.length < 30 ? raw : undefined;
       })(),
@@ -715,7 +730,7 @@ export async function collectInteractiveNodes(page: Page, maxNodes?: number): Pr
  * keep their `eN` ref untouched — downstream consumers don't care
  * about the literal prefix.
  */
-function adaptLiteElementsToInteractiveNodes(elements: LiteElement[]): InteractiveNode[] {
+export function adaptLiteElementsToInteractiveNodes(elements: LiteElement[]): InteractiveNode[] {
   const out: InteractiveNode[] = [];
   // Per-iframe counter so the rewritten refs are unique within their
   // frame namespace and stable across the same snapshot. We keep

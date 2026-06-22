@@ -22,6 +22,39 @@ export function toMobilePlatformKey(platform: MobilePlatform): MobilePlatformKey
     : 'mobile_android';
 }
 
+/**
+ * The app framework detected at APK/IPA upload time
+ * (`mobile_app_builds.detectedFramework` / `projects.settings.mobileApp`).
+ */
+export type DetectedFramework = 'android' | 'ios' | 'flutter' | 'react-native';
+
+/**
+ * Derive the test-case storage platform from the app's detected framework.
+ *
+ * Why this exists: a Flutter app's UI is one opaque canvas, so the runner's
+ * live ui-state reports the HOST platform (`android`/`ios`), never `flutter`.
+ * If we save a test case using that host value it becomes `mobile_android`,
+ * and the regression/warmup paths then create a plain Android session and
+ * SKIP `attach-flutter` — so the Flutter VM is never connected and element
+ * resolution reads an empty native tree. Deriving the key from the upload-time
+ * `detectedFramework` keeps Flutter apps on the Flutter path.
+ *
+ * `hostPlatform` only disambiguates non-flutter cases (e.g. react-native on
+ * iOS → mobile_ios). Defaults to android when nothing is known.
+ */
+export function frameworkToMobilePlatformKey(
+  framework: DetectedFramework | undefined,
+  hostPlatform?: 'android' | 'ios',
+): MobilePlatformKey {
+  if (framework === 'flutter') return 'mobile_flutter';
+  if (framework === 'ios') return 'mobile_ios';
+  // React-Native runs on either host — respect hostPlatform so RN-on-iOS
+  // isn't mislabeled mobile_android. Falls through to the host check below.
+  if (hostPlatform === 'ios') return 'mobile_ios';
+  // 'android', 'react-native' on android, or unknown → native android stack.
+  return 'mobile_android';
+}
+
 // ── Session ──────────────────────────────────────────────────────
 
 export interface MobileSessionResponse {
@@ -63,6 +96,13 @@ export interface MobileSessionConfig {
    * or whatever `DEVICE_DEFAULT_SOURCE` says).
    */
   deviceSelector?: MobileDeviceSelector;
+  /**
+   * When true, the runner marks this session as DEDICATED: excluded from TTL
+   * cleanup + capacity eviction (so its persistent container survives) and
+   * guarded by a per-serial lock. Set ONLY on the dedicated-emulator routing
+   * path alongside a pinned `deviceSelector.serial`. See dedicated-device.service.
+   */
+  dedicated?: boolean;
 }
 
 // ── Action Types (mirror of runner's IntentActionType) ───────────
@@ -104,6 +144,13 @@ export interface MobileIntentStepOptions {
   timeout?: number;
   replaceContent?: boolean;
   pressEnter?: boolean;
+  /**
+   * Typing realism for a type step (editor "type like a human" toggle).
+   * 'human' = per-character, 'instant' = atomic, 'auto'/undefined = the runner's
+   * heuristic. Forwarded verbatim into the runner type_text command's typeMode.
+   * Flutter-only effect; native typing is always per-key.
+   */
+  typeMode?: 'auto' | 'human' | 'instant';
   scrollDirection?: 'up' | 'down' | 'left' | 'right';
   scrollAmount?: number;
   /** Swipe direction (mobile swipe step). Distinct from scrollDirection so
@@ -313,6 +360,36 @@ export function buildMetadataFromTestCase(tc: {
   return Object.keys(m).length > 0 ? m : undefined;
 }
 
+// ── Triggers ─────────────────────────────────────────────────────
+
+/**
+ * User-defined event→action rule forwarded VERBATIM to the mobile runner.
+ *
+ * CANONICAL CROSS-REPO CONTRACT — this shape is mirrored exactly by the runner
+ * (qait-mobile-runner src/api/schemas/run.schema.ts `triggerSchema`). The
+ * runner matches a trigger BEFORE its built-in permission policy. There is NO
+ * `source` field — that's runner-internal (defaults to 'user'). Do NOT add
+ * fields here without changing the runner schema in lockstep.
+ *
+ * Persisted per-test on `intent_test_cases.triggers`, echoed into the BullMQ
+ * mobile job, and sent in the run-steps body.
+ */
+export type TriggerCondition =
+  | { kind: 'permission_dialog' }
+  | { kind: 'any_dialog' }
+  | { kind: 'dialog_text'; contains: string };
+
+export type TriggerAction =
+  | { kind: 'permission'; decision: 'allow' | 'deny' }
+  | { kind: 'tap'; text: string }
+  | { kind: 'back' };
+
+export interface Trigger {
+  id: string;
+  condition: TriggerCondition;
+  action: TriggerAction;
+}
+
 // ── Run Steps ────────────────────────────────────────────────────
 
 export interface MobileRunStepsRequest {
@@ -324,6 +401,12 @@ export interface MobileRunStepsRequest {
   stopOnFailure?: boolean;
   /** Test-level metadata (goal, description, priority, tags, etc.) */
   metadata?: MobileTestMetadata;
+  /**
+   * User-defined triggers active for this run (matched before the built-in
+   * permission policy). Forwarded verbatim — see the `Trigger` contract above.
+   * Omitted when the test has none.
+   */
+  triggers?: Trigger[];
 }
 
 export interface MobileRunStepsResponse {
@@ -338,6 +421,11 @@ export interface MobileRunStepsResponse {
   status: 'passed' | 'failed' | 'partial';
   /** Test-level metadata echoed from the request */
   metadata?: MobileTestMetadata;
+  /**
+   * Screenshot of the starting screen, captured BEFORE any step ran ("step 0").
+   * Base64 from the runner; uploaded to a URL by the job before persisting.
+   */
+  initialScreenshot?: string;
   /** Aggregated errors from all failed steps */
   errors?: Array<{ type: string; message: string; stepId?: string; timestamp: number }>;
   /** Device log errors (logcat/syslog) collected during the run */
@@ -597,6 +685,12 @@ export interface MobileTestJobData {
     required?: boolean;
   }>;
   /**
+   * User-defined triggers echoed from `intent_test_cases.triggers`. Carried
+   * verbatim through Redis (no secrets — pure event→action rules) and forwarded
+   * to the runner in the run-steps body. Omitted when the test has none.
+   */
+  triggers?: Trigger[];
+  /**
    * Job-level retry counter. Incremented by the worker before re-throwing
    * to BullMQ on retry-able errors (runner unreachable, transient 503,
    * Redis hiccup). Mirrors the web TestJobData.retryCount field used by
@@ -606,6 +700,41 @@ export interface MobileTestJobData {
    * runner doesn't infinitely retry.
    */
   retryCount?: number;
+}
+
+// ── Exploration (autonomous app crawl) ─────────────────────────────
+// Shapes for the runner's /api/explorer/* API, brokered by the backend
+// so the runner API key never reaches the browser. Kept intentionally
+// loose for the snapshot — it's the runner's UI-contract object and the
+// backend only reads a handful of fields (status, stats, flows). The
+// relay/job slices narrow what they consume.
+
+/** Runner response to POST /api/explorer/sessions/:id/start (202). */
+export interface MobileExplorationStartResponse {
+  runId: string;
+  status: string; // ExplorationStatus on the runner: 'running' | 'awaiting_user' | …
+}
+
+/** Runner readiness probe — GET /api/explorer/readiness. */
+export interface MobileExplorationReadiness {
+  runner: { ok: boolean; version?: string };
+  llm: { openaiKeySet: boolean; geminiKeySet: boolean; explorerModel?: string };
+  defaults?: { budget?: Record<string, number> };
+}
+
+/**
+ * UI-contract snapshot returned by GET /runs/:id and /runs/:id/result.
+ * Loosely typed on purpose — the runner owns this shape. `status` and
+ * `stats` are the fields the backend job/relay rely on.
+ */
+export interface MobileExplorationSnapshot {
+  runId?: string;
+  status?: string;
+  entryUrl?: string;
+  stats?: Record<string, unknown>;
+  flows?: unknown[];
+  pages?: unknown[];
+  [key: string]: unknown;
 }
 
 // ── Error ─────────────────────────────────────────────────────────

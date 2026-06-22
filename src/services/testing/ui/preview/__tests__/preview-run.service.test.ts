@@ -3,11 +3,13 @@
  * Tests for "Run from start" feature
  */
 
-import { PreviewRunService } from '../preview-run.service';
+import { PreviewRunService, scheduleCatchUpFrame } from '../preview-run.service';
+import { getPreviewVideoStreamRegistry } from '../preview-video-stream.service';
 import { IntentTestCaseService } from '../intent-test-case.service';
 import { PreviewStepApplyService } from '../preview-step-apply.service';
 import { getPreviewSessionService } from '../preview-session.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
+import { waitForPageInteractive } from '../page-interactive.utils';
 
 // Mock dependencies
 jest.mock('../intent-test-case.service', () => ({
@@ -34,6 +36,20 @@ jest.mock('@/websocket/core/websocket.service', () => ({
   },
 }));
 
+jest.mock('../page-interactive.utils', () => ({
+  waitForPageInteractive: jest.fn().mockResolvedValue({
+    ready: true,
+    waited: 0,
+    elementCount: 5,
+    reason: undefined,
+  }),
+}));
+
+jest.mock('../step-blocker-diagnosis.service', () => ({
+  diagnoseStepBlocker: jest.fn().mockResolvedValue(null),
+  actOnDiagnosis: jest.fn().mockResolvedValue(false),
+}));
+
 describe('PreviewRunService', () => {
   const mockPreviewSessionId = 'session-123';
   const mockIntentTestCaseId = 'testcase-456';
@@ -42,6 +58,10 @@ describe('PreviewRunService', () => {
   const mockSessionService = {
     isSessionOwned: jest.fn(),
     getSession: jest.fn(),
+    setDialogMode: jest.fn(),
+    isRecording: jest.fn().mockReturnValue(false),
+    setContextData: jest.fn(),
+    getRecordingStartUrl: jest.fn().mockReturnValue(null),
   };
 
   const mockSteps = [
@@ -69,15 +89,38 @@ describe('PreviewRunService', () => {
     // Ensure no cross-test leakage from module-scoped activeRuns map
     PreviewRunService.__dangerousClearRunsForTests();
 
+    // Restore module-level mocks cleared by resetAllMocks
+    (waitForPageInteractive as jest.Mock).mockResolvedValue({
+      ready: true,
+      waited: 0,
+      elementCount: 5,
+      reason: undefined,
+    });
+
     // Setup default mocks
     (getPreviewSessionService as jest.Mock).mockReturnValue(mockSessionService);
     mockSessionService.isSessionOwned.mockReturnValue(true);
+    const mockPage = {
+      url: () => 'https://example.com',
+      goto: jest.fn().mockResolvedValue(undefined),
+      waitForLoadState: jest.fn().mockResolvedValue(undefined),
+      reload: jest.fn().mockResolvedValue(undefined),
+      evaluate: jest.fn().mockResolvedValue(null),
+      on: jest.fn(),
+      off: jest.fn(),
+      isClosed: jest.fn().mockReturnValue(false),
+      context: jest.fn().mockReturnValue({
+        cookies: jest.fn().mockResolvedValue([]),
+        clearCookies: jest.fn().mockResolvedValue(undefined),
+      }),
+    };
     mockSessionService.getSession.mockReturnValue({
-      page: {
-        url: () => 'https://example.com',
-        goto: jest.fn().mockResolvedValue(undefined),
-        waitForLoadState: jest.fn().mockResolvedValue(undefined),
-      },
+      page: mockPage,
+      pages: [mockPage],
+      activeTabIndex: 0,
+      lastSnapshotEmit: 0,
+      lastPageSignature: '',
+      lastScreenshotEmitAt: 0,
     });
 
     (IntentTestCaseService.getById as jest.Mock).mockResolvedValue({
@@ -142,11 +185,11 @@ describe('PreviewRunService', () => {
     });
 
     it('should stop on first failure and skip remaining steps', async () => {
-      // Make step 2 fail
+      // Make step 2 fail both initial attempt and retry (service retries non-ai_check steps)
       (PreviewStepApplyService.applyStep as jest.Mock)
         .mockResolvedValueOnce({ success: true, appliedStep: mockSteps[0] })
         .mockResolvedValueOnce({ success: false, error: 'Element not found' })
-        .mockResolvedValueOnce({ success: true, appliedStep: mockSteps[2] });
+        .mockResolvedValueOnce({ success: false, error: 'Element not found' }); // retry
 
       await PreviewRunService.runSavedSteps(
         mockPreviewSessionId,
@@ -154,8 +197,8 @@ describe('PreviewRunService', () => {
         mockUserId
       );
 
-      // Only first 2 steps should be executed
-      expect(PreviewStepApplyService.applyStep).toHaveBeenCalledTimes(2);
+      // step-1 + step-2 initial + step-2 retry = 3 total; step-3 skipped
+      expect(PreviewStepApplyService.applyStep).toHaveBeenCalledTimes(3);
 
       // Verify step 2 failed
       const failCalls = (webSocketService.emitToUser as jest.Mock).mock.calls.filter(
@@ -164,7 +207,7 @@ describe('PreviewRunService', () => {
       expect(failCalls).toHaveLength(1);
       expect(failCalls[0][2]).toMatchObject({
         stepId: 'step-2',
-        error: 'Element not found',
+        error: expect.stringContaining('Element not found'),
       });
 
       // Verify step 3 skipped
@@ -224,14 +267,15 @@ describe('PreviewRunService', () => {
 
       await runPromise;
 
-      // Only first step should be executed
+      // applyStep was called once for step-1 (even though the result was aborted)
       expect(PreviewStepApplyService.applyStep).toHaveBeenCalledTimes(1);
 
-      // Verify steps 2 and 3 skipped
+      // All 3 steps are skipped: step-1 was in-flight when abort fired,
+      // so the AbortError path emits step-1 as skipped too
       const skippedCalls = (webSocketService.emitToUser as jest.Mock).mock.calls.filter(
         (call) => call[1] === 'preview:run:step' && call[2].status === 'skipped'
       );
-      expect(skippedCalls).toHaveLength(2);
+      expect(skippedCalls).toHaveLength(3);
 
       // Verify completed with cancelled flag
       expect(webSocketService.emitToUser).toHaveBeenCalledWith(
@@ -240,8 +284,8 @@ describe('PreviewRunService', () => {
         expect.objectContaining({
           success: false,
           cancelled: true,
-          passedSteps: 1,
-          skippedSteps: 2,
+          passedSteps: 0,
+          skippedSteps: 3,
         })
       );
     });
@@ -342,7 +386,7 @@ describe('PreviewRunService', () => {
       (PreviewStepApplyService.applyStep as jest.Mock)
         .mockResolvedValueOnce({ success: true, appliedStep: enrichedStep1 })
         .mockResolvedValueOnce({ success: false, error: 'Element not found' })
-        .mockResolvedValueOnce({ success: true, appliedStep: mockSteps[2] });
+        .mockResolvedValueOnce({ success: false, error: 'Element not found' }); // retry
 
       await PreviewRunService.runSavedSteps(
         mockPreviewSessionId,
@@ -394,10 +438,10 @@ describe('PreviewRunService', () => {
       await runPromise;
     });
 
-    it('should throw error if no active run', () => {
-      expect(() => {
-        PreviewRunService.cancelRun(mockPreviewSessionId, mockUserId);
-      }).toThrow('No active run for this session');
+    it('returns false (idempotent no-op) if no active run', () => {
+      // Cancelling with nothing running is a normal close-time cleanup, not an
+      // error — it must not throw and should report "nothing cancelled".
+      expect(PreviewRunService.cancelRun(mockPreviewSessionId, mockUserId)).toBe(false);
     });
 
     it('should throw error if session not owned', async () => {
@@ -467,5 +511,51 @@ describe('PreviewRunService', () => {
 
       expect(PreviewRunService.isRunning(mockPreviewSessionId)).toBe(false);
     });
+  });
+});
+
+// Sibling describe (NOT nested) so the outer resetAllMocks/fake-timer-free
+// beforeEach does not run for these — the catch-up helper needs fake timers.
+describe('scheduleCatchUpFrame (Run picture-sync late-paint catch-up)', () => {
+  let injectSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    // Spy on the real registry singleton — injectSyncFrame is the guarded
+    // screenshot the helper must invoke (and only once, after the delay).
+    injectSpy = jest
+      .spyOn(getPreviewVideoStreamRegistry(), 'injectSyncFrame')
+      .mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    jest.clearAllTimers();
+    jest.useRealTimers();
+    injectSpy.mockRestore();
+  });
+
+  it('does not push a frame before the delay elapses', () => {
+    scheduleCatchUpFrame('sess-1', 600);
+    expect(injectSpy).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(599);
+    expect(injectSpy).not.toHaveBeenCalled();
+  });
+
+  it('pushes exactly one catch-up frame for the session once the delay elapses', () => {
+    scheduleCatchUpFrame('sess-2', 600);
+    jest.advanceTimersByTime(600);
+    expect(injectSpy).toHaveBeenCalledTimes(1);
+    expect(injectSpy).toHaveBeenCalledWith('sess-2');
+  });
+
+  it('swallows an injectSyncFrame rejection (fire-and-forget, no throw)', async () => {
+    injectSpy.mockRejectedValueOnce(new Error('stream gone'));
+    expect(() => {
+      scheduleCatchUpFrame('sess-3', 600);
+      jest.advanceTimersByTime(600);
+    }).not.toThrow();
+    // Flush the rejected promise's .catch so it never surfaces as unhandled.
+    await Promise.resolve();
+    expect(injectSpy).toHaveBeenCalledTimes(1);
   });
 });

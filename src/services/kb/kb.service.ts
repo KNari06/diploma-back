@@ -19,7 +19,7 @@ export interface KBChunk {
   content: string;
   source_file?: string;
   file_name?: string;
-  language?: string; // 'en', 'ru', 'neutral'
+  language?: string; // 'en', 'ru', 'kk', 'neutral'
   tags?: string[];
   /**
    * Parent section slug. Chunks sharing a parent_id belong to the same
@@ -468,7 +468,7 @@ export async function uploadProjectKB(
  * @param message - User message to detect language for
  * @returns Detected language: 'en', 'ru', or 'neutral'
  */
-export async function detectLanguage(message: string): Promise<'en' | 'ru' | 'neutral'> {
+export async function detectLanguage(message: string): Promise<'en' | 'ru' | 'kk' | 'neutral'> {
   // Validate input
   if (!message || typeof message !== 'string') {
     return 'neutral';
@@ -499,7 +499,7 @@ export async function detectLanguage(message: string): Promise<'en' | 'ru' | 'ne
  * @param message - Message to detect language for
  * @returns Detected language
  */
-async function detectLanguageWithAI(message: string): Promise<'en' | 'ru' | 'neutral'> {
+async function detectLanguageWithAI(message: string): Promise<'en' | 'ru' | 'kk' | 'neutral'> {
   // Validate input
   if (!message || typeof message !== 'string' || message.trim().length === 0) {
     return 'neutral';
@@ -513,19 +513,20 @@ async function detectLanguageWithAI(message: string): Promise<'en' | 'ru' | 'neu
 MESSAGE: "${truncatedMessage}"
 
 RULES:
-- If Russian text (Cyrillic) → return "ru"
+- If Kazakh text (Cyrillic with letters ә, ғ, қ, ң, ө, ұ, ү, һ, і) → return "kk"
+- If Russian text (Cyrillic, no Kazakh-specific letters) → return "ru"
 - If English text (Latin) → return "en"
 - If mixed languages → return primary language
 - If unclear/symbols/numbers only → return "neutral"
 
-RETURN ONLY: ru, en, or neutral`;
+RETURN ONLY: kk, ru, en, or neutral`;
 
   try {
     const response = await getChatCompletionWithMessages(
       [
         {
           role: 'system',
-          content: 'You are a language detection expert. Return only the language code: ru, en, or neutral.',
+          content: 'You are a language detection expert. Return only the language code: kk, ru, en, or neutral.',
         },
         {
           role: 'user',
@@ -546,7 +547,7 @@ RETURN ONLY: ru, en, or neutral`;
     const detected = response.content.trim().toLowerCase();
 
     // Validate response
-    if (detected === 'ru' || detected === 'en' || detected === 'neutral') {
+    if (detected === 'ru' || detected === 'en' || detected === 'kk' || detected === 'neutral') {
       return detected;
     }
 
@@ -569,11 +570,14 @@ RETURN ONLY: ru, en, or neutral`;
  * @param message - Message to detect language for
  * @returns Detected language
  */
-function detectLanguageFallback(message: string): 'en' | 'ru' | 'neutral' {
+function detectLanguageFallback(message: string): 'en' | 'ru' | 'kk' | 'neutral' {
   // Validate input
   if (!message || typeof message !== 'string' || message.trim().length === 0) {
     return 'neutral';
   }
+
+  // Kazakh-specific Cyrillic letters → unambiguous Kazakh signal (check first).
+  if (/[әғқңөұүһіӘҒҚҢӨҰҮҺІ]/.test(message)) return 'kk';
 
   // Simple heuristic: if message contains Cyrillic characters → ru
   const hasCyrillic = /[а-яА-ЯёЁ]/.test(message);
@@ -599,7 +603,7 @@ export async function searchKB(
   options: {
     matchThreshold?: number;
     matchCount?: number;
-    language?: 'en' | 'ru' | 'neutral'; // Filter by language
+    language?: 'en' | 'ru' | 'kk' | 'neutral'; // Filter by language
     /** Telemetry fields — optional, used to attribute retrievals to user/session/message. */
     telemetry?: {
       userId?: string | null;
@@ -632,6 +636,9 @@ export async function searchKB(
     // Validate and clamp options
     const matchThreshold = Math.max(0, Math.min(1, options.matchThreshold || 0.7));
     const matchCount = Math.max(1, Math.min(100, Math.floor(options.matchCount || 5)));
+    // KB content exists only in en/ru today. 'kk' (Kazakh) intentionally falls
+    // through to `undefined` → unfiltered search, so Kazakh users still get the
+    // closest relevant ru/en chunks instead of an empty result.
     const language = options.language && ['en', 'ru', 'neutral'].includes(options.language)
       ? options.language
       : undefined;

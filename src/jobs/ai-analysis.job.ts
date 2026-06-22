@@ -2,6 +2,8 @@ import { env } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
 import { aiService } from '@/services/ai/analysis/test-results.service';
+import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
+import { withAIContext } from '@/services/ai/tracking/ai-context';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
 import { JiraReportService } from '@/services/integrations/jira-report.service';
@@ -93,10 +95,52 @@ export class AIAnalysisJobHandler {
         }
       } catch { /* non-fatal */ }
 
+      // AI-usage tracking + run correlation. This is the most AI-heavy,
+      // hallucination-prone step (bug detection), so its LLM calls must land in
+      // ai_usage_log with a run_id — enabling "show every LLM decision for run X".
+      // All best-effort: tracking/runId resolution must never break analysis.
+      const trackWorkspaceId = (testResult?.tests?.projects as any)?.workspace_id as string | undefined;
+      const trackUserId = testResult?.tests?.user_id as string | undefined;
+      const runId = await this.resolveRunIdForTest(testId);
+      const trackingSessionId =
+        trackWorkspaceId ? `analysis-${testResultId}` : null;
+      if (trackingSessionId && trackWorkspaceId) {
+        AIUsageTracker.beginSession(trackingSessionId, {
+          workspaceId: trackWorkspaceId,
+          userId: trackUserId,
+          testId,
+          runId: runId ?? undefined,
+          operationType: 'analysis',
+        });
+      }
+
       // Perform AI analysis
-      const aiSummary = await aiService.analyzeTestResults(testResultData, {
-        integrationContext: integrationContext || undefined,
-      });
+      const aiSummary = trackingSessionId && trackWorkspaceId
+        ? await withAIContext(
+            {
+              workspaceId: trackWorkspaceId,
+              userId: trackUserId,
+              testId,
+              runId: runId ?? undefined,
+              operationType: 'analysis',
+            },
+            () => aiService.analyzeTestResults(testResultData, {
+              integrationContext: integrationContext || undefined,
+            }),
+          )
+        : await aiService.analyzeTestResults(testResultData, {
+            integrationContext: integrationContext || undefined,
+          });
+
+      if (trackingSessionId) {
+        try {
+          await AIUsageTracker.endSession(trackingSessionId);
+        } catch (e) {
+          logger.warn('[AI-ANALYSIS] usage endSession failed (non-fatal)', {
+            testResultId, error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
 
       // Idempotency guard: if a previous job run already charged for the bug
       // report, don't charge again on BullMQ retry. The flag lives inside
@@ -390,6 +434,27 @@ export class AIAnalysisJobHandler {
    * are returned via `*` and ignored by the analyzer if absent on the
    * web shape.
    */
+  /**
+   * Resolve the regression run id a test belongs to, via test_executions
+   * (the table that carries the run_id → testId relationship). Mirrors the
+   * lookup in TestCompletionHandlerService. Best-effort: returns null on any
+   * miss/error — analysis must run regardless. Standalone/preview tests have
+   * no run, so null is the normal case there.
+   */
+  private static async resolveRunIdForTest(testId: string): Promise<string | null> {
+    try {
+      const { data } = await dbAdminService.supabaseAdmin
+        .from('test_executions')
+        .select('run_id')
+        .eq('result->>testId', testId)
+        .limit(1)
+        .maybeSingle();
+      return (data as { run_id?: string } | null)?.run_id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   private static async getTestResult(testResultId: string) {
     const SELECT = `
       *,

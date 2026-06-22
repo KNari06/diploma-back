@@ -78,7 +78,7 @@
  *   self-heals on next run.
  */
 
-import { supabaseAdmin } from '@/db/supabase';
+import { fetchPriorityByTestId } from './db/regression.db';
 import { logger } from '@/utils/core/logger';
 
 export type TestCasePriority = 'critical' | 'high' | 'medium' | 'low';
@@ -89,6 +89,24 @@ const VALID_PRIORITIES: ReadonlySet<string> = new Set([
   'medium',
   'low',
 ]);
+
+/**
+ * Numeric rank for dispatch ordering: critical=0 … low=3. NULL / unknown /
+ * wrongly-cased values collapse to the medium bucket — same semantics the
+ * runByTag sorter has always used (legacy NULL rows must not jump ahead of
+ * or behind explicit 'medium').
+ */
+const PRIORITY_ORDER: Record<string, number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+};
+
+export function priorityRank(priority: string | null | undefined): number {
+  const key = typeof priority === 'string' ? priority.toLowerCase() : '';
+  return PRIORITY_ORDER[key] ?? PRIORITY_ORDER.medium;
+}
 
 // ────────────────────────────────────────────────────────────────────
 // Cache + singleflight (see "PERFORMANCE" in module JSDoc)
@@ -145,29 +163,9 @@ function evictIfFull(): void {
 
 async function fetchFromDb(testId: string): Promise<TestCasePriority | undefined> {
   try {
-    // Hop 1: tests → test_executions (most recent execution for this test).
-    const { data: exec } = await supabaseAdmin
-      .from('test_executions')
-      .select('test_case_id')
-      .eq('test_id', testId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (!exec?.test_case_id) return undefined;
-
-    // Hop 2: test_executions.test_case_id → intent_test_cases.priority.
-    // NB: test_case_id can point to api_test_configs for API tests, but
-    // api_test_configs has no priority column. The query returns NULL
-    // for that row and we skip via the VALID_PRIORITIES guard below.
-    const { data: tc } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('priority')
-      .eq('id', exec.test_case_id)
-      .maybeSingle();
-
-    if (tc?.priority && VALID_PRIORITIES.has(tc.priority)) {
-      return tc.priority as TestCasePriority;
+    const priority = await fetchPriorityByTestId(testId);
+    if (priority && VALID_PRIORITIES.has(priority)) {
+      return priority as TestCasePriority;
     }
     return undefined;
   } catch (err) {

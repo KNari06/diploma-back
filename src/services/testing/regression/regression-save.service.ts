@@ -1,4 +1,4 @@
-import { supabaseAdmin } from '@/db/supabase';
+import * as regressionDb from './db/regression.db';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 
@@ -132,35 +132,27 @@ export class RegressionSaveService {
 
       // 7. Create intent test case (unified table) with status='published'
       // Saving from a completed test means it's ready for regression runs.
-      const { data: savedCase, error } = await supabaseAdmin
-        .from('intent_test_cases')
-        .insert({
-          project_id: test.project_id,
-          user_id: userId,
-          source_test_id: sourceTestId,
-          source_intelligent_session_id: session?.id || null,
-          name,
-          description: description || null,
-          // Lifecycle: saved from test = published
-          status: 'published',
-          kind,
-          // Replay data
-          replay_strategy: replayData.strategy,
-          commands: replayData.commands || null,
-          graph_ref: replayData.graphRef || null,
-          parameters_schema: replayData.parametersSchema || null,
-          // URL fields
-          url: test.url || null,
-          start_url: test.url || null,
-          // Human-readable steps (commands remain source of truth for replay)
-          steps_json: stepsJson,
-        })
-        .select('id')
-        .single();
-
-      if (error || !savedCase) {
-        throw new Error(`Failed to save test case: ${error?.message}`);
-      }
+      const savedCase = await regressionDb.insertIntentTestCase({
+        project_id: test.project_id,
+        user_id: userId,
+        source_test_id: sourceTestId,
+        source_intelligent_session_id: session?.id || null,
+        name,
+        description: description || null,
+        // Lifecycle: saved from test = published
+        status: 'published',
+        kind,
+        // Replay data
+        replay_strategy: replayData.strategy,
+        commands: replayData.commands || null,
+        graph_ref: replayData.graphRef || null,
+        parameters_schema: replayData.parametersSchema || null,
+        // URL fields
+        url: test.url || null,
+        start_url: test.url || null,
+        // Human-readable steps (commands remain source of truth for replay)
+        steps_json: stepsJson,
+      });
 
       logger.info('[REGRESSION_SAVE] Intent test case saved successfully', {
         intentTestCaseId: savedCase.id,
@@ -248,12 +240,8 @@ export class RegressionSaveService {
     }
 
     // Verify project ownership
-    const { data: project, error: projectError } = await supabaseAdmin
-      .from('projects')
-      .select('id, user_id')
-      .eq('id', projectId)
-      .single();
-    if (projectError || !project) {
+    const project = await regressionDb.getProjectForSave(projectId);
+    if (!project) {
       throw new NotFoundError('Project', projectId);
     }
     if (project.user_id !== userId) {
@@ -294,40 +282,32 @@ export class RegressionSaveService {
       kind,
     });
 
-    const { data: savedCase, error } = await supabaseAdmin
-      .from('intent_test_cases')
-      .insert({
-        project_id: projectId,
-        user_id: userId,
-        name,
-        description: description || null,
-        status: 'published',
-        kind,
-        platform,
-        replay_strategy: replayStrategy,
-        commands: null,
-        graph_ref: null,
-        steps_json: normalizedSteps,
-        parameters_schema: null,
-        url: effectiveUrl,
-        start_url: effectiveUrl,
-        tags: tags || null,
-        // Mobile app metadata carried inline until we add a dedicated column.
-        ...(isMobile && (appPackage || startActivity)
-          ? {
-              goal: JSON.stringify({
-                appPackage: appPackage || null,
-                startActivity: startActivity || null,
-              }),
-            }
-          : {}),
-      })
-      .select('id')
-      .single();
-
-    if (error || !savedCase) {
-      throw new Error(`Failed to save test case from recording: ${error?.message}`);
-    }
+    const savedCase = await regressionDb.insertIntentTestCase({
+      project_id: projectId,
+      user_id: userId,
+      name,
+      description: description || null,
+      status: 'published',
+      kind,
+      platform,
+      replay_strategy: replayStrategy,
+      commands: null,
+      graph_ref: null,
+      steps_json: normalizedSteps,
+      parameters_schema: null,
+      url: effectiveUrl,
+      start_url: effectiveUrl,
+      tags: tags || null,
+      // Mobile app metadata carried inline until we add a dedicated column.
+      ...(isMobile && (appPackage || startActivity)
+        ? {
+            goal: JSON.stringify({
+              appPackage: appPackage || null,
+              startActivity: startActivity || null,
+            }),
+          }
+        : {}),
+    });
 
     logger.info('[REGRESSION_SAVE] Test case saved from recording', {
       intentTestCaseId: savedCase.id,
@@ -352,13 +332,13 @@ export class RegressionSaveService {
    * @throws {ValidationError} If access denied or test not completed
    */
   private static async getSourceTest(testId: string, userId: string): Promise<any> {
-    const { data: test, error } = await supabaseAdmin
-      .from('tests')
-      .select('*, projects!inner(user_id)')
-      .eq('id', testId)
-      .single();
-
-    if (error || !test) {
+    let test: any;
+    try {
+      test = await regressionDb.getSourceTestForSave(testId);
+    } catch {
+      throw new NotFoundError('Test', testId);
+    }
+    if (!test) {
       throw new NotFoundError('Test', testId);
     }
 
@@ -384,21 +364,15 @@ export class RegressionSaveService {
    * @returns Intelligent session or null if not found
    */
   private static async getIntelligentSession(testId: string): Promise<any | null> {
-    const { data: session, error } = await supabaseAdmin
-      .from('intelligent_test_sessions')
-      .select('*')
-      .eq('test_id', testId)
-      .maybeSingle();
-
-    if (error) {
+    try {
+      return await regressionDb.getIntelligentSessionForTest(testId);
+    } catch (error) {
       logger.warn('[REGRESSION_SAVE] Failed to get intelligent session', {
         error,
         testId,
       });
       return null;
     }
-
-    return session;
   }
 
   /**

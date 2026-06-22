@@ -144,6 +144,7 @@ export class FlowService {
       id,
       userId,
       name,
+      moduleId,
       orderIndex,
       flowType,
       platform,
@@ -155,6 +156,7 @@ export class FlowService {
 
     const updates: Record<string, any> = {};
     if (name !== undefined) updates.name = name;
+    if (moduleId !== undefined) updates.module_id = moduleId;
     if (orderIndex !== undefined) updates.order_index = orderIndex;
     if (flowType !== undefined) updates.flow_type = flowType;
     if (platform !== undefined) updates.platform = platform;
@@ -165,6 +167,24 @@ export class FlowService {
 
     if (Object.keys(updates).length === 0) {
       throw new Error('No fields to update');
+    }
+
+    // When renaming, read the OLD flow name first so we can cascade the rename
+    // to the flow's intent_test_cases that were in lockstep with it (see below).
+    // When moving (moduleId changes), also capture the OLD module_id so we can
+    // bust its cached subtree too — otherwise the source folder keeps showing
+    // the moved flow until its cache expires.
+    let previousName: string | undefined;
+    let previousModuleId: string | undefined;
+    if (name !== undefined || moduleId !== undefined) {
+      const { data: prev } = await supabaseAdmin
+        .from('test_flows')
+        .select('name, module_id')
+        .eq('id', id)
+        .eq('user_id', userId)
+        .single();
+      previousName = prev?.name ?? undefined;
+      previousModuleId = prev?.module_id ?? undefined;
     }
 
     logger.info('[FLOW_SERVICE] Updating flow', {
@@ -185,8 +205,35 @@ export class FlowService {
       throw new Error(`Failed to update flow: ${error.message}`);
     }
 
-    // Invalidate module mode cache (flow metadata changed)
+    // Cascade the rename to the flow's intent_test_cases. A flow and its test
+    // case(s) are created with the SAME name, and the editor breadcrumb collapses
+    // to one segment while they match; renaming only the flow row left the test
+    // case on its old name (e.g. "Billz #2 > Billz"). We rename only the test
+    // cases whose current name still equals the flow's OLD name, so a test case
+    // the user deliberately renamed to something else is never clobbered.
+    // Best-effort: a failure here is logged, not thrown — the flow rename stands.
+    if (name !== undefined && previousName !== undefined && previousName !== name) {
+      const { error: tcErr } = await supabaseAdmin
+        .from('intent_test_cases')
+        .update({ name })
+        .eq('flow_id', id)
+        .eq('user_id', userId)
+        .eq('name', previousName);
+
+      if (tcErr) {
+        logger.warn('[FLOW_SERVICE] Flow renamed but test-case cascade failed', {
+          id,
+          error: tcErr.message,
+        });
+      }
+    }
+
+    // Invalidate module tree cache (flow metadata changed). On a move, bust the
+    // OLD module too so the source folder drops the flow immediately.
     await cache.delByPattern(`qait:cache:ptree:module:${data.module_id}:*`);
+    if (previousModuleId && previousModuleId !== data.module_id) {
+      await cache.delByPattern(`qait:cache:ptree:module:${previousModuleId}:*`);
+    }
 
     return this.mapToTestFlow(data);
   }
@@ -358,7 +405,13 @@ export class FlowService {
     if (sourceTestCases && sourceTestCases.length > 0) {
       const copies = sourceTestCases.map((tc) => {
         const { id, created_at, updated_at, flow_id, ...rest } = tc;
-        return { ...rest, flow_id: newFlow.id };
+        // Keep the test case name in lockstep with the duplicated flow name:
+        // a test case that matched the source flow name gets the same " (Copy)"
+        // suffix. Without this the flow becomes "X (Copy)" while its test case
+        // stays "X", which (a) breaks the breadcrumb's single-segment collapse
+        // and (b) defeats the rename cascade's lockstep guard in update().
+        const copiedTcName = tc.name === source.name ? copiedName : tc.name;
+        return { ...rest, name: copiedTcName, flow_id: newFlow.id };
       });
 
       const { error: tcInsErr } = await supabaseAdmin.from('intent_test_cases').insert(copies);

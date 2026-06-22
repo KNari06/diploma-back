@@ -12,6 +12,10 @@
 
 import { generateText } from '@/services/ai/core/ai-provider.service';
 import { logger } from '@/utils/core/logger';
+import { buildStopWordSet } from '@/config/testing/field-semantic-keywords';
+
+/** Built once at module load — multilingual (en+ru+kk) stop words. */
+const STOP_WORD_SET = buildStopWordSet();
 
 /** Cache: description hash → keywords */
 // const keywordCache = new Map<string, string[]>();
@@ -189,13 +193,11 @@ export function extractKeywordsSync(description: string): string[] {
     return [];
   }
 
-  // Simple stop words list (English only, for fallback)
-  const stopWords = new Set([
-    'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'with', 'and', 'or',
-    'enter', 'fill', 'type', 'click', 'press', 'select', 'input', 'field',
-    'button', 'link', 'into', 'please', 'should', 'want', 'need', 'put',
-    'this', 'value', 'box', 'form', 'element', 'of', 'is', 'are', 'from',
-  ]);
+  // Stop words now cover en+ru+kk (was English-only). A Russian/Kazakh intent
+  // like "нажми кнопку войти" previously kept the action verb + generic noun
+  // ("нажми", "кнопку") as keywords, diluting the real target token ("войти").
+  // Single source: KEYWORD_STOP_WORDS in field-semantic-keywords.ts.
+  const stopWords = STOP_WORD_SET;
 
   return description
     .toLowerCase()

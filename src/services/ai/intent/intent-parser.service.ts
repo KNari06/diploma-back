@@ -84,12 +84,22 @@ const MIN_API_URL_LENGTH = 7; // Minimum valid URL length ("http://x")
  * Detects Russian vs English based on Cyrillic characters
  * TODO: Re-enable AI-based detection when KB service is re-enabled
  */
-function detectLanguageSimple(message: string): 'en' | 'ru' | 'neutral' {
+function detectLanguageSimple(message: string): 'en' | 'ru' | 'kk' | 'neutral' {
   if (!message || typeof message !== 'string' || message.trim().length < 2) {
     return 'neutral';
   }
 
-  // Check for Cyrillic characters (Russian)
+  // Kazakh shares most of its alphabet with Russian Cyrillic but adds 9
+  // distinctive letters. Their presence is a strong, unambiguous signal for
+  // Kazakh — check it BEFORE the generic Cyrillic→Russian rule below.
+  const kazakhSpecific = /[әғқңөұүһіӘҒҚҢӨҰҮҺІ]/;
+  if (kazakhSpecific.test(message)) {
+    return 'kk';
+  }
+
+  // Check for Cyrillic characters (Russian — incl. Kazakh letters as a tail
+  // count so a mostly-Cyrillic message without the distinctive letters still
+  // reads as Russian rather than English).
   const cyrillicPattern = /[А-Яа-яЁё]/;
   const hasCyrillic = cyrillicPattern.test(message);
 
@@ -309,7 +319,7 @@ function validateAndPrepareMessage(message: string): string | null {
  */
 async function getKBRulesContext(
   trimmedMessage: string,
-  userLanguage: 'en' | 'ru' | 'neutral',
+  userLanguage: 'en' | 'ru' | 'kk' | 'neutral',
   context?: IntentParserContext,
   projectId?: string
 ): Promise<{
@@ -406,7 +416,7 @@ IMPORTANT: Follow these guidelines when parsing user intent and generating respo
 function handleHighConfidenceResult(
   intentResult: IntentResult,
   confidence: number,
-  userLanguage: 'en' | 'ru' | 'neutral'
+  userLanguage: 'en' | 'ru' | 'kk' | 'neutral'
 ): IntentResult | null {
     logger.info('[INTENT_PARSER] Initial parse confidence', {
       confidence,
@@ -442,7 +452,7 @@ function handleHighConfidenceResult(
 //   intentResult?: IntentResult,
 //   confidence?: number,
 //   cacheKey?: string,
-//   userLanguage?: 'en' | 'ru' | 'neutral'
+//   userLanguage?: 'en' | 'ru' | 'kk' | 'neutral'
 // ): Promise<IntentResult | null> {
 //   if (!intentResult || confidence === undefined || !cacheKey) {
 //     return null;
@@ -581,7 +591,7 @@ function isIntentCompleteness(intentResult: IntentResult): boolean {
 function createFallbackResult(
   intentResult: IntentResult,
   confidence: number,
-  userLanguage: 'en' | 'ru' | 'neutral' = 'neutral'
+  userLanguage: 'en' | 'ru' | 'kk' | 'neutral' = 'neutral'
 ): IntentResult {
   // If AI explicitly returned needs_clarification, respect its decision
   if (intentResult.intent === 'needs_clarification') {
@@ -777,7 +787,7 @@ function getPossibleIntents(intentResult: IntentResult): string[] {
 //   ragResults: any,
 //   cacheKey: string,
 //   trimmedMessage: string,
-//   userLanguage?: 'en' | 'ru' | 'neutral'
+//   userLanguage?: 'en' | 'ru' | 'kk' | 'neutral'
 // ): IntentResult {
 //       const enhancedConfidence = calculateConfidence(enhancedResult, trimmedMessage);
 //
@@ -1373,6 +1383,12 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
     });
   }
 
+  // Step 4b: Lift the request-understanding ANALYZE block (if the LLM returned
+  // one) into typed fields + metadata. Purely additive — never throws, and a
+  // missing/malformed analysis object is simply ignored so the 19 existing
+  // intents are unaffected.
+  liftAnalysisBlock(parsed, parsedAny);
+
   // Step 5: Normalize and clean fields based on intent type
   if (parsed.intent === 'api_test') {
     // Tokenize on Unicode word boundaries via splitting on
@@ -1686,6 +1702,143 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
   });
 
   return parsed;
+}
+
+/**
+ * Canonical `manage.action` values per management intent, plus the synonym map
+ * that collapses LLM variants onto them. This is the SINGLE validation gate for
+ * management actions: handlers downstream match these exact tokens, never raw
+ * LLM strings, so a typo/synonym ("converts", "convert_to_mobile", "reassign",
+ * "rename") can't slip past a handler's enum check. Unknown actions return null
+ * → the manage block is dropped and the handler falls back to a clarification.
+ *
+ * For modules, `move` and `convert` are RECOGNIZED but unsupported by
+ * qa_manage_module — surfaced so manage-module.handler can answer honestly. Keep
+ * in sync with request-understanding-prompts.ts (the action enum it documents).
+ */
+const MANAGE_ACTIONS: Record<string, Record<string, string>> = {
+  // Each value maps a normalized synonym → canonical action.
+  manage_schedule: {
+    create: 'create', schedule: 'create', add: 'create',
+    update: 'update', edit: 'update', change: 'update', reschedule: 'update',
+    activate: 'activate', enable: 'activate', resume: 'activate',
+    deactivate: 'deactivate', disable: 'deactivate', pause: 'deactivate',
+    delete: 'delete', remove: 'delete', cancel: 'delete',
+  },
+  manage_module: {
+    create: 'create', add: 'create',
+    update: 'update', rename: 'update', edit: 'update',
+    // Recognized-but-unsupported (honest refusal in the handler):
+    move: 'move', relocate: 'move', reassign: 'move', transfer: 'move',
+    convert: 'convert', changeplatform: 'convert', switchplatform: 'convert', migrate: 'convert',
+  },
+  manage_plan: {
+    create: 'create', add: 'create',
+    update: 'update', edit: 'update', rename: 'update',
+    additem: 'add_item', additems: 'add_item', addtoplan: 'add_item',
+    removeitem: 'remove_item', removeitems: 'remove_item', removefromplan: 'remove_item',
+  },
+};
+
+/**
+ * Normalize a raw LLM `manage.action` to the canonical per-intent value, or null
+ * when unrecognized. Pure. Lowercases and strips non-alphanumerics so
+ * "add_item" / "add-item" / "Add Item" all match the "additem" synonym key.
+ */
+export function normalizeManageAction(intent: string, raw: string): string | null {
+  const map = MANAGE_ACTIONS[intent];
+  if (!map) return null;
+  const key = raw.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return map[key] ?? null;
+}
+
+/**
+ * Lift the request-understanding ANALYZE block from the raw LLM JSON into typed
+ * IntentResult fields. Defensive: validates each piece independently so a
+ * partial/garbage `analysis` never corrupts the result or throws.
+ */
+function liftAnalysisBlock(parsed: IntentResult, parsedAny: any): void {
+  const analysis = parsedAny?.analysis;
+  if (!analysis || typeof analysis !== 'object') return;
+
+  if (!parsed.metadata) parsed.metadata = {};
+
+  // Compound decomposition → metadata.analysis.
+  // STATUS (Phase 1): captured but NOT yet executed. The compound splitter that
+  // runs subRequests sequentially is Phase-3 work; today a compound message is
+  // still handled as its single primary intent. Captured now so the splitter is
+  // a consumer-only change. routeHint (IMPROVE) is likewise captured for the
+  // future management-intent router.
+  const subRequests = Array.isArray(analysis.subRequests)
+    ? analysis.subRequests
+        .filter((s: any) => s && typeof s.text === 'string' && s.text.trim().length > 0)
+        .map((s: any, i: number) => ({
+          text: String(s.text).trim(),
+          order: Number.isFinite(s.order) ? Number(s.order) : i + 1,
+          dependsOnPrevious: s.dependsOnPrevious === true,
+        }))
+    : [];
+  // Optional lookback window (history/analysis time range), positive int only.
+  const rawDays = Number(analysis.lookbackDays);
+  const lookbackDays = Number.isFinite(rawDays) && rawDays > 0 ? Math.floor(rawDays) : undefined;
+
+  parsed.metadata.analysis = {
+    isCompound: analysis.isCompound === true && subRequests.length > 1,
+    subRequests,
+    routeHint: analysis.routeHint === 'dedicated' || analysis.routeHint === 'tool'
+      ? analysis.routeHint
+      : undefined,
+    lookbackDays,
+  };
+
+  // Management params (IMPROVE) → metadata.manage. Consumed by the first-class
+  // management handlers (manage_schedule/module/plan). Shallow string-only copy
+  // so a malformed object can't smuggle structures into the tool args. The
+  // action is normalized to a canonical per-intent value so LLM synonyms/typos
+  // ("converts", "convert_to_mobile", "reassign") collapse to one token and
+  // unknown actions drop — handlers then match an exact enum, never raw strings.
+  const manage = analysis.manage;
+  if (manage && typeof manage === 'object' && typeof manage.action === 'string') {
+    const action = normalizeManageAction(parsed.intent, manage.action);
+    if (action) {
+      const clean: Record<string, string> = { action };
+      for (const [k, v] of Object.entries(manage)) {
+        if (k !== 'action' && typeof v === 'string' && v.trim().length > 0) clean[k] = v.trim();
+      }
+      parsed.metadata.manage = clean;
+    }
+  }
+
+  // Target selector → typed field.
+  const sel = analysis.targetSelector;
+  const VALID_SELECTOR_TYPES = new Set([
+    'test_case', 'module', 'plan', 'flow', 'tag', 'keyword', 'url', 'element', 'none',
+  ]);
+  if (
+    sel &&
+    typeof sel === 'object' &&
+    VALID_SELECTOR_TYPES.has(sel.type) &&
+    typeof sel.value === 'string' &&
+    sel.value.trim().length > 0 &&
+    sel.type !== 'none'
+  ) {
+    parsed.targetSelector = { type: sel.type, value: sel.value.trim() };
+  }
+
+  // Execution modifiers → typed field (only keep recognized, well-formed keys).
+  const mods = analysis.executionModifiers;
+  if (mods && typeof mods === 'object') {
+    const clean: NonNullable<IntentResult['executionModifiers']> = {};
+    if (mods.browser === 'chromium' || mods.browser === 'firefox' || mods.browser === 'webkit') {
+      clean.browser = mods.browser;
+    }
+    if (mods.env === 'local' || mods.env === 'staging' || mods.env === 'prod') {
+      clean.env = mods.env;
+    }
+    if (typeof mods.device === 'string' && mods.device.trim()) clean.device = mods.device.trim();
+    if (typeof mods.build === 'string' && mods.build.trim()) clean.build = mods.build.trim();
+    if (Object.keys(clean).length > 0) parsed.executionModifiers = clean;
+  }
 }
 
 /**
@@ -2049,16 +2202,19 @@ export function calculateConfidence(intentResult: IntentResult, message: string)
  * Tries exact language match first, then falls back to other languages.
  */
 function getCachedRulesWithFallback(
-  userLanguage: 'en' | 'ru' | 'neutral'
+  userLanguage: 'en' | 'ru' | 'kk' | 'neutral'
 ): { content: string; language: 'en' | 'ru'; fallbackUsed: boolean } | null {
   try {
-    // Step 1: Try exact language match (if not neutral)
-    if (userLanguage !== 'neutral') {
-      const exactRules = RulesCacheService.getRules(userLanguage as 'en' | 'ru');
+    // Step 1: Try exact language match. Rules only exist for 'en'/'ru' today;
+    // 'kk' (Kazakh) and 'neutral' have no dedicated rule set, so they skip
+    // straight to the fallbacks below (English, then Russian — Russian being
+    // the closest available to Kazakh).
+    if (userLanguage === 'en' || userLanguage === 'ru') {
+      const exactRules = RulesCacheService.getRules(userLanguage);
       if (exactRules) {
         return {
           content: exactRules,
-          language: userLanguage as 'en' | 'ru',
+          language: userLanguage,
           fallbackUsed: false,
         };
       }

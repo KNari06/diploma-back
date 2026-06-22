@@ -44,3 +44,35 @@ export interface ResolverConfig {
   maxPrefilledSources: number;
   timeoutMs: number;
 }
+
+// ============================================================================
+// TestQueryResolver — descriptor → candidate IDs
+// ============================================================================
+
+/**
+ * The kind of entity a natural-language descriptor refers to. Derived from the
+ * ANALYZE prompt's `targetSelector.type` (minus 'url'/'element', which are not
+ * test-collection selectors).
+ */
+export type QuerySelectorType = 'test_case' | 'module' | 'plan' | 'flow' | 'tag' | 'keyword';
+
+export interface QueryCandidate {
+  id: string;
+  name: string;
+  url?: string;
+  tags?: string[];
+  score: number;
+}
+
+/**
+ * resolution:
+ *  - 'unique'    → exactly one clear winner (`topId` set); safe to auto-use.
+ *  - 'ambiguous' → several plausible candidates; caller should disambiguate
+ *                  (via session context or a single ENRICH clarification).
+ *  - 'none'      → nothing matched the descriptor.
+ */
+export interface TestQueryResult {
+  candidates: QueryCandidate[];
+  resolution: 'unique' | 'ambiguous' | 'none';
+  topId?: string;
+}

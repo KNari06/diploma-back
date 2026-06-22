@@ -24,6 +24,7 @@ import {
   getAIContext,
 } from '../tracking/ai-context';
 import { aiLogBuffer, type AIActionEntry } from './ai-log-buffer';
+import { redactCredentials } from '@/utils/security/redact-credentials';
 
 /** Hard truncation cap for any string we store in `detail` to keep rows light. */
 const MAX_FIELD_CHARS = 4_000;
@@ -55,7 +56,11 @@ function sanitiseDetail(detail: Record<string, unknown> | undefined): Record<str
   if (!detail) return {};
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(detail)) {
-    out[k] = truncate(v);
+    // Redact credential-shaped assignments (password=, token:, api_key is …)
+    // BEFORE truncation — `prompt_excerpt`/`response_excerpt` carry interpolated
+    // LLM text that may include secrets. Pattern-based (no value list needed).
+    // Redact-then-truncate so a secret straddling the 4K cap is still masked.
+    out[k] = truncate(typeof v === 'string' ? redactCredentials(v) : v);
   }
   return out;
 }

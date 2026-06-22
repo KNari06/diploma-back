@@ -53,7 +53,7 @@ class ExecutionCompletionEmitter extends EventEmitter {
           executionId,
           timeoutMs,
         });
-        resolve('failed');
+        resolve('timeout');
       }, timeoutMs);
 
       // once() auto-removes after first signal — safe for duplicate Redis + local emit

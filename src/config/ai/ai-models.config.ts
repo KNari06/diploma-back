@@ -34,11 +34,16 @@ export const AI_MODELS = {
   vision: env.OPENAI_MODEL || 'gpt-5.4-mini',
 
   /**
-   * Classification model — balances quality and cost for bulk processing tasks.
-   * Used by the Allure import pipeline for file classification and KB preprocessing.
-   * Default: gpt-4.1-mini ($0.40/$1.60 per 1M tokens — 80% cheaper than gpt-5.4-mini).
+   * Classification / extraction model for the Allure import pipeline (file
+   * classification, KB preprocessing, step conversion, CSV/PDF parsing).
+   *
+   * Now gpt-5.4-mini, matching `smart`/`vision`: extraction tasks (step
+   * conversion, PDF parsing) get noticeably better action-type inference, which
+   * directly reduces degraded imports. Resolves via `OPENAI_MODEL` (NOT
+   * `OPENAI_MODEL_FAST`, whose env default is still gpt-4.1-mini and would
+   * silently pin this back to the old model).
    */
-  classify: 'gpt-4.1-mini' as const,
+  classify: env.OPENAI_MODEL || 'gpt-5.4-mini',
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -97,6 +102,15 @@ export const AI_TASK_MODELS = {
    * sacrificing determinism).
    */
   recordedDescription: 'gemini-2.5-flash-lite' as const,
+  /**
+   * Background editor Observer (observer.service.ts) — proactive hint
+   * classifier (login_required / step_missing / blocked / wrong_page / none).
+   * Same flash-lite tier as the other preview classifiers: it runs off the hot
+   * path on every meaningful editor event, so predictable sub-second latency +
+   * native JSON mode + multilingual matter more than raw quality. temp=0 for a
+   * stable verdict given the same page+steps signature (drives the verdict cache).
+   */
+  observer: 'gemini-2.5-flash-lite' as const,
   /** AI check assertion evaluation */
   aiCheck: AI_MODELS.fast,
   /** AI check with screenshot (needs vision) */

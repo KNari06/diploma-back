@@ -7,11 +7,14 @@ import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from 
 import { AllureImportJobHandler } from '@/jobs/allure-import.job';
 import { AutoLearnJobHandler } from '@/jobs/auto-learn.job';
 import { ExplorationRunJobHandler } from '@/jobs/exploration-run.job';
+import { MobileExplorationRunJobHandler } from '@/jobs/mobile-exploration-run.job';
 import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manual-test-run.job';
 import { MobileTestRunJobHandler } from '@/jobs/mobile-test-run.job';
 import { processNegativeGeneration } from '@/jobs/negative-generation.job';
 import { RegressionDoctorJobHandler } from '@/jobs/regression-doctor.job';
+import { StaleReaperService } from '@/services/testing/results/stale-reaper.service';
 import { logger } from '@/utils/core/logger';
+import { startLeaderElection, stopLeaderElection } from '@/scheduler/leader';
 import { Worker } from 'bullmq';
 import { queueMonitor } from './queue-monitor';
 
@@ -300,6 +303,51 @@ const explorationWorker = new Worker(
   }
 );
 
+// Mobile exploration worker — backend-brokered runner crawl (Stage 3).
+// Holds a relay for the run's lifetime, so concurrency is capped low and
+// the lock spans the whole crawl (mirrors the web exploration worker).
+const mobileExplorationWorker = new Worker(
+  QUEUE_NAMES.MOBILE_EXPLORATION,
+  async (job) => {
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+    const startTime = Date.now();
+    logger.info(`[MOBILE_EXPLORATION_WORKER] Processing job: ${job.id}`, {
+      explorationId: job.data?.explorationId,
+      appId: job.data?.appId,
+      platform: job.data?.platform,
+    });
+    try {
+      if (!MobileExplorationRunJobHandler || typeof MobileExplorationRunJobHandler.process !== 'function') {
+        throw new Error('MobileExplorationRunJobHandler.process is not a function');
+      }
+      await MobileExplorationRunJobHandler.process(job);
+      logger.info(`[MOBILE_EXPLORATION_WORKER] Job completed: ${job.id}`, {
+        explorationId: job.data?.explorationId,
+        duration: `${Date.now() - startTime}ms`,
+      });
+    } catch (error) {
+      logger.error(`[MOBILE_EXPLORATION_WORKER] Job failed: ${job.id}`, {
+        explorationId: job.data?.explorationId,
+        duration: `${Date.now() - startTime}ms`,
+        error: error instanceof Error ? { message: error.message, name: error.name, stack: error.stack } : String(error),
+      });
+      throw error;
+    }
+  },
+  {
+    ...workerOptions,
+    concurrency: 2,
+    lockDuration: 20 * 60 * 1000, // 20 min — crawl can run long
+    stalledInterval: 5 * 60 * 1000,
+    // No checkpoint/resume here (unlike web exploration): a stalled crawl
+    // is marked failed, not retried — a re-run would start a fresh runner
+    // session rather than resume.
+    maxStalledCount: 1,
+  },
+);
+
 // Mobile test run worker
 const mobileTestRunWorker = new Worker(
   QUEUE_NAMES.MOBILE_TEST_RUN,
@@ -475,6 +523,24 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
       attemptsMade: job.attemptsMade,
       jobData: job.data ? JSON.stringify(job.data).substring(0, 200) : 'N/A',
     });
+
+    // Root-cause finalization: if a test-owning job dies without writing a
+    // terminal status (process killed / stall-death), its own catch/finally
+    // never ran — so the `tests` row would stay 'running' forever. Finalize it
+    // here from the surviving worker. The guarded DB write makes this a no-op
+    // for jobs that already finalized gracefully. Never throw out of the listener.
+    const testId = (job.data as { testId?: string } | undefined)?.testId;
+    if ((workerName === 'TestRun' || workerName === 'MobileTestRun') && testId) {
+      StaleReaperService.handleAbandonedTest(
+        testId,
+        `Job failed: ${err instanceof Error ? err.message : 'worker died'}`,
+      ).catch((e) => {
+        logger.error(`❌ [${workerName}] handleAbandonedTest threw`, {
+          testId,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      });
+    }
   });
 
   worker.on('error', (err) => {
@@ -556,6 +622,7 @@ setupWorkerEvents(notificationWorker, 'Notification');
 setupWorkerEvents(webhookWorker, 'Webhook');
 setupWorkerEvents(gitWebhookWorker, 'GitWebhook');
 setupWorkerEvents(explorationWorker, 'Exploration');
+setupWorkerEvents(mobileExplorationWorker, 'MobileExploration');
 setupWorkerEvents(mobileTestRunWorker, 'MobileTestRun');
 setupWorkerEvents(negativeGenerationWorker, 'NegativeGeneration');
 setupWorkerEvents(allureImportWorker, 'AllureImport');
@@ -584,6 +651,13 @@ const gracefulShutdown = async (signal: string) => {
     // Stop dynamic scaling monitor first
     queueMonitor.stop();
 
+    // Release the scheduler leader lock + stop the sweep bundle (no-op if we
+    // never held it / SCHEDULER_IN_WORKER is off) so a surviving replica takes
+    // over immediately instead of waiting out the lock TTL.
+    if (env.SCHEDULER_IN_WORKER) {
+      await stopLeaderElection();
+    }
+
     // Use Promise.allSettled to ensure all workers close even if one fails
     const closeResults = await Promise.allSettled([
       testRunWorker.close(),
@@ -594,6 +668,7 @@ const gracefulShutdown = async (signal: string) => {
       webhookWorker.close(),
       gitWebhookWorker.close(),
       explorationWorker.close(),
+      mobileExplorationWorker.close(),
       mobileTestRunWorker.close(),
       negativeGenerationWorker.close(),
       allureImportWorker.close(),
@@ -701,6 +776,15 @@ logger.info(`📋 Listening to queues: ${Object.values(QUEUE_NAMES).join(', ')}`
     // Don't exit - workers will fail gracefully if Redis is unavailable
   }
 })();
+
+// Host the scheduler bundle in the worker when enabled (prod). A Redis leader
+// lock guarantees exactly one worker replica runs the sweeps even at N>1.
+// Default OFF, so local docker-compose's dedicated scheduler container is
+// unaffected. See src/scheduler/leader.ts.
+if (env.SCHEDULER_IN_WORKER) {
+  logger.info('[WORKER] SCHEDULER_IN_WORKER=true — hosting scheduler bundle (leader-locked)');
+  startLeaderElection();
+}
 
 export {
   aiAnalysisWorker,

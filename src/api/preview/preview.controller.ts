@@ -7,6 +7,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { dbAdminService } from '@/db/supabase';
 import { env } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
+import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { IntentStepConverterService } from '@/services/testing/ui/preview/intent-step-converter.service';
 import { injectAutoWaitForSteps } from '@/services/testing/ui/preview/auto-wait-for.utils';
@@ -17,6 +18,8 @@ import { buildMetadataFromTestCase } from '@/services/mobile/mobile-runner.types
 import { cancelTest } from '@/services/testing/ui/manual/test-cancellation';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
+import { refreshIdle as refreshPreviewIdle } from '@/services/testing/ui/preview/preview-idle.service';
+import { getIO } from '@/websocket/core/server';
 import { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -101,6 +104,15 @@ export async function startPreview(req: Request, res: Response): Promise<void> {
       startUrl: safeStartUrl,
       viewport: parsedViewport,
     });
+
+    // Opening the editor is a REST call, so it never passes through the socket
+    // `socket.use` middleware that refreshes the per-user idle timer. Arm it
+    // here so the user gets a full IDLE_TTL window from the moment the session
+    // exists — otherwise the timer keeps counting from the last live-preview
+    // socket event and can fire moments after reopening a test case. Mirrors
+    // the mobile editor (session.controller.ts). Subsequent preview interaction
+    // keeps refreshing it via the middleware.
+    try { refreshPreviewIdle(userId, getIO()); } catch { /* non-fatal */ }
 
     // Get viewport metadata for coordinate mapping
     const viewportMeta = sessionService.getViewportMetadata(result.previewSessionId, userId);
@@ -269,6 +281,45 @@ export async function getIntentTestCase(req: Request, res: Response): Promise<vo
 }
 
 /**
+ * Transitive precondition (dependency) steps for a test case, grouped by
+ * owning dependency in execution order. Read-only — backs the "Run Before"
+ * panel in the editor so the user sees exactly what runs before this test.
+ * GET /api/v1/preview/intent-test-cases/:id/preconditions
+ */
+export async function getPreconditions(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = (req as any).user?.id;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const { id } = req.params;
+
+    // Verify access to the root case before exposing its dependency chain.
+    const testCase = await IntentTestCaseService.getById(id, userId);
+    if (!testCase) {
+      res.status(404).json({ error: 'Test case not found' });
+      return;
+    }
+
+    const groups = await IntentTestCaseService.collectPreconditionGroups(id);
+
+    res.json({
+      success: true,
+      data: { groups },
+    });
+  } catch (error) {
+    logger.error('[PREVIEW_CONTROLLER] Failed to get preconditions', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to get preconditions',
+    });
+  }
+}
+
+/**
  * List intent test cases for a project
  * GET /api/v1/preview/intent-test-cases?projectId=...&flowId=...
  */
@@ -332,7 +383,7 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
     }
 
     const { id } = req.params;
-    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings } = req.body;
+    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers } = req.body;
 
     logger.info('[PREVIEW_CONTROLLER] Updating intent test case', {
       intentTestCaseId: id,
@@ -351,8 +402,10 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
         // Included so PATCHes from the Run-as dropdown ("Login" / "No login")
         // are debuggable from logs alone.
         resourceBindings: resourceBindings !== undefined,
+        triggers: triggers !== undefined,
       },
       resourceBindingsCount: Array.isArray(resourceBindings) ? resourceBindings.length : undefined,
+      triggersCount: Array.isArray(triggers) ? triggers.length : undefined,
     });
 
     // Validate bindings shape upfront with a 400 (instead of letting it leak
@@ -500,12 +553,16 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       // Accept only arrays; `undefined` leaves the column untouched.
       // [] is valid and means "detach all resource bindings".
       resourceBindings: Array.isArray(resourceBindings) ? resourceBindings : undefined,
+      // Passed through raw — the service validates against the canonical
+      // Trigger contract and throws a ValidationError (→ 400) on a bad shape.
+      // `undefined` leaves the column untouched; `[]` clears all triggers.
+      triggers,
     });
 
     logger.info('[PREVIEW_CONTROLLER] Successfully updated intent test case', {
       intentTestCaseId: id,
       updatedFields: Object.keys({
-        name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings,
+        name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers,
       }).filter(k => (req.body as any)[k] !== undefined),
     });
 
@@ -598,6 +655,19 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
       return;
     }
 
+    // 1a. Inline transitive dependency (precondition) steps so they run
+    // in-session BEFORE this test's own steps (shared browser → shared
+    // login/cookies/data). Borrowed steps carry `_preconditionSource`.
+    const preconditionSteps = await IntentTestCaseService.collectPreconditionSteps(id);
+    if (preconditionSteps.length > 0) {
+      testCase.stepsJson = [...preconditionSteps, ...(testCase.stepsJson || [])];
+      logger.info('[PREVIEW_CONTROLLER] Inlined precondition steps', {
+        intentTestCaseId: id,
+        preconditionSteps: preconditionSteps.length,
+        totalSteps: testCase.stepsJson.length,
+      });
+    }
+
     // 2. Validate project if override provided
     const projectId = overrideProjectId || testCase.projectId;
     if (overrideProjectId && overrideProjectId !== testCase.projectId) {
@@ -638,9 +708,24 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
         .eq('id', projectId)
         .single();
 
-      const mobileApp = project?.settings?.mobileApp;
+      // workspaceId is REQUIRED for a mobile job (billing, telemetry,
+      // dedicated-emulator routing). Persisting '' silently breaks
+      // workspace-scoped lookups, so fail loudly on a workspace-less project.
+      const workspaceId = project?.workspace_id;
+      if (!workspaceId) {
+        res.status(400).json({
+          error: `Project ${projectId} has no workspace assigned`,
+        });
+        return;
+      }
+
       const PLATFORM_MAP: Record<string, MobilePlatform> = { mobile_ios: 'ios', mobile_flutter: 'flutter' };
       const mobilePlatform: MobilePlatform = PLATFORM_MAP[platform ?? ''] ?? 'android';
+      // Read the platform-sharded slot, not the legacy singular one — for
+      // dual-platform projects the legacy slot mirrors the latest upload
+      // across platforms, so an iOS preview run could otherwise pick up
+      // an Android .apk and try to install it.
+      const mobileApp = getProjectMobileApp(project?.settings, mobilePlatform);
       const BROWSER_MAP: Record<string, string> = { mobile_ios: 'mobile-ios', mobile_flutter: 'mobile-flutter' };
       const browser = BROWSER_MAP[platform ?? ''] ?? 'mobile-android';
 
@@ -677,7 +762,7 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
       const jobData: MobileTestJobData = {
         testId,
         userId,
-        workspaceId: project?.workspace_id || '',
+        workspaceId,
         projectId,
         platform: mobilePlatform,
         browser: browser as 'mobile-android' | 'mobile-ios' | 'mobile-flutter',

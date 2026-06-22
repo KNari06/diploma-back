@@ -23,6 +23,7 @@ initLogBridge();
 startMobileChatMetricsLoop();
 import authRoutes from '@/api/auth/auth.route';
 import chatRoutes from '@/api/chat/chat.route';
+import publicChatRoutes from '@/api/chat/public/public-chat.route';
 import feedbackRoutes from '@/api/chat/feedback.route';
 import fixturesRoutes from '@/api/fixtures/fixtures.route';
 import flowsRoutes from '@/api/flows/flows.route';
@@ -42,7 +43,7 @@ import notificationsRoutes from '@/api/notifications/notifications.routes';
 import platformsRoutes from '@/api/platforms/platforms.route';
 import playwrightRoutes from '@/api/playwright/playwright.route';
 import previewRoutes from '@/api/preview/preview.route';
-import mobileRoutes from '@/api/mobile/mobile.route';
+import mobileRoutes, { logWarmupOutcome } from '@/api/mobile/mobile.route';
 import projectRoutes from '@/api/project/project.routes';
 import regressionPlansRoutes from '@/api/regression-plans/plans.route';
 import regressionRoutes from '@/api/regression/regression.route';
@@ -53,6 +54,8 @@ import savedTestCasesRoutes from '@/api/saved-test-cases/saved-test-cases.route'
 import testsRoutes from '@/api/tests/tests.route';
 import schedulesRoutes from '@/api/schedules/schedules.route';
 import stripeRoutes from '@/api/stripe/stripe.routes';
+import { handleWebhook } from '@/api/stripe/stripe.controller';
+import { asyncHandler } from '@/utils/core/error-handler';
 import supportRoutes from '@/api/support/support.routes';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
@@ -246,6 +249,14 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
 
 // Raw body parser for Stripe webhook (must be before express.json())
 app.use(`/api/${env.API_VERSION}/stripe/webhook`, express.raw({ type: 'application/json' }));
+// Mount the Stripe webhook handler ONCE, directly on the raw-body path, so it
+// cannot be reached via a path lacking the raw parser (signature verification
+// needs the exact bytes). It is deliberately NOT on the shared stripeRoutes
+// router, which is mounted at both /billing and /stripe.
+app.post(
+  `/api/${env.API_VERSION}/stripe/webhook`,
+  asyncHandler(handleWebhook),
+);
 
 // Body parsing middleware
 // IMPORTANT: GitHub webhook signature requires raw body (Buffer)
@@ -1346,11 +1357,17 @@ app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // User issue reports
 app.use(`/api/${env.API_VERSION}/analytics`, requireAuth, requireApproved, analyticsRoutes);
 app.use(`/api/${env.API_VERSION}/dashboard`, requireAuth, requireApproved, dashboardRoutes);
 app.use(`/api/${env.API_VERSION}/projects`, requireAuth, requireApproved, projectRoutes);
-app.use(`/api/${env.API_VERSION}/mobile`, requireAuth, requireApproved, mobileRoutes);
+// logWarmupOutcome runs BEFORE requireAuth/requireApproved so the editor's
+// "start session" outcome is recorded even when a gate rejects it (expired-token
+// 401, not-approved 403, paid-plan 403) — those middlewares only log at debug.
+app.use(`/api/${env.API_VERSION}/mobile`, logWarmupOutcome, requireAuth, requireApproved, mobileRoutes);
 app.use(`/api/${env.API_VERSION}/manual-test`, requireAuth, requireApproved, manualTestRoutes);
 app.use(`/api/${env.API_VERSION}/intelligent-test`, requireAuth, requireApproved, intelligentTestRoutes);
 app.use(`/api/${env.API_VERSION}/test-case`, requireAuth, requireApproved, testCaseRoutes);
 app.use(`/api/${env.API_VERSION}/test-resource`, requireAuth, requireApproved, testResourceRoutes);
+// Public B2C "Ask Me Anything" widget — product Q&A, NO auth. Must be mounted
+// BEFORE the auth-gated /chat mount below, or Express routes /chat/public/* into it.
+app.use(`/api/${env.API_VERSION}/chat/public`, publicChatRoutes);
 app.use(`/api/${env.API_VERSION}/chat`, requireAuth, requireApproved, chatRoutes);
 app.use(`/api/${env.API_VERSION}/chat/feedback`, requireAuth, requireApproved, feedbackRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, requireAuth, requireApproved, apiTestRoutes);
@@ -1369,7 +1386,30 @@ app.use(`/api/${env.API_VERSION}/admin`, adminRegressionMetricsRoutes);
 app.use(`/api/${env.API_VERSION}/playwright`, requireAuth, requireApproved, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, requireAuth, requireApproved, reportsRoutes);
 app.use(`/api/${env.API_VERSION}/test-visualization`, requireAuth, requireApproved, testVisualizationRoutes);
-// Shared report: public endpoint (no auth) — must be registered before auth-protected regression routes
+/**
+ * @swagger
+ * /api/v1/regression/shared/{shareToken}:
+ *   get:
+ *     summary: View a shared regression run report (public, no auth)
+ *     description: Returns the full run report for a publicly shared link
+ *     tags: [Regression]
+ *     parameters:
+ *       - in: path
+ *         name: shareToken
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Shared run report
+ *       404:
+ *         description: Shared report not found
+ */
+// Shared report is PUBLIC (no auth). It MUST stay registered BEFORE the auth-gated
+// `/regression` mount below: Express matches in registration order, so this handler
+// intercepts `/regression/shared/:shareToken` before `requireAuth` can run. Do not
+// move it below the mount, and do not re-add a `/shared` route inside regressionRoutes
+// (it would be auth-gated there).
 app.get(`/api/${env.API_VERSION}/regression/shared/:shareToken`, sharedReportRateLimiter, getSharedReport);
 app.use(`/api/${env.API_VERSION}/regression`, requireAuth, requireApproved, regressionRoutes);
 app.use(`/api/${env.API_VERSION}/platforms`, requireAuth, requireApproved, platformsRoutes);
@@ -1581,6 +1621,15 @@ const startServer = async () => {
     try {
       server = app.listen(env.PORT, async () => {
         logger.info(`QAIT Backend started | port=${env.PORT} env=${env.NODE_ENV}`);
+
+        // Verify SMTP at boot so a dead/missing credential is loud here instead
+        // of silently dropping every user-facing email. Non-fatal — fire and log.
+        try {
+          const { EmailService } = await import('@/services/core/email.service');
+          void EmailService.verifyConfig();
+        } catch (mailerError) {
+          logger.error('[SERVER] Failed to verify SMTP config', { error: formatError(mailerError) });
+        }
 
         // V21: Start system health monitor (polls Supabase, broadcasts maintenance
         // banner to all connected clients on outage). Independent from zombie cleanup

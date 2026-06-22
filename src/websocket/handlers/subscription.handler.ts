@@ -461,6 +461,184 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
     }
   });
 
+  // Subscribe to project resource mutation events (test-case / flow / module
+  // CRUD) for live cache invalidation in the test-suites editor. Access is
+  // verified fail-closed: only the project owner or an active workspace member
+  // may join `project:<projectId>` — this prevents cross-tenant event leakage.
+  socket.on('subscribe:project', async ({ projectId }, callback) => {
+    const ack = (response: { ok: boolean; error?: string }) => {
+      if (typeof callback === 'function') callback(response);
+    };
+
+    try {
+      if (!projectId || typeof projectId !== 'string' || projectId.trim().length === 0) {
+        socket.emit('error', {
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid projectId provided',
+          timestamp: new Date().toISOString(),
+        });
+        ack({ ok: false, error: 'Invalid projectId' });
+        return;
+      }
+
+      if (!socket.connected) {
+        ack({ ok: false, error: 'Socket disconnected' });
+        return;
+      }
+
+      if (!userId) {
+        socket.emit('error', {
+          code: 'AUTH_REQUIRED',
+          message: 'Authentication required',
+          timestamp: new Date().toISOString(),
+        });
+        ack({ ok: false, error: 'Authentication required' });
+        return;
+      }
+
+      const pid = projectId.trim();
+
+      // Fail-closed access check: owner OR active workspace member.
+      try {
+        const { data: project, error: projectError } = await supabaseAdmin
+          .from('projects')
+          .select('user_id, workspace_id')
+          .eq('id', pid)
+          .maybeSingle();
+
+        if (projectError || !project) {
+          logger.warn('[WebSocket] Project not found / lookup failed (denying subscription)', {
+            socketId: socket.id,
+            userId,
+            projectId: pid,
+            error: projectError?.message,
+          });
+          socket.emit('error', {
+            code: 'ACCESS_DENIED',
+            message: 'You do not have access to this project',
+            timestamp: new Date().toISOString(),
+          });
+          ack({ ok: false, error: 'Access denied' });
+          return;
+        }
+
+        let hasAccess = project.user_id === userId;
+
+        if (!hasAccess && project.workspace_id) {
+          const { data: member } = await supabaseAdmin
+            .from('workspace_members')
+            .select('user_id')
+            .eq('workspace_id', project.workspace_id)
+            .eq('user_id', userId)
+            .eq('status', 'active')
+            .maybeSingle();
+          hasAccess = !!member;
+        }
+
+        if (!hasAccess) {
+          logger.warn('[WebSocket] Subscription denied: no project access', {
+            socketId: socket.id,
+            requestingUserId: userId,
+            projectId: pid,
+          });
+          socket.emit('error', {
+            code: 'ACCESS_DENIED',
+            message: 'You do not have access to this project',
+            timestamp: new Date().toISOString(),
+          });
+          ack({ ok: false, error: 'Access denied' });
+          return;
+        }
+      } catch (verifyError) {
+        logger.warn('[WebSocket] Exception verifying project access (denying subscription)', {
+          socketId: socket.id,
+          userId,
+          projectId: pid,
+          error: verifyError instanceof Error ? verifyError.message : String(verifyError),
+        });
+        socket.emit('error', {
+          code: 'ACCESS_DENIED',
+          message: 'Authorization check failed',
+          timestamp: new Date().toISOString(),
+        });
+        ack({ ok: false, error: 'Authorization check failed' });
+        return;
+      }
+
+      const room = createRoomName('project', pid);
+      const rooms = getRoomSet(socket.id);
+
+      // Idempotent subscribe
+      if (rooms.has(room)) {
+        ack({ ok: true });
+        return;
+      }
+
+      if (!canSubscribe(socket.id)) {
+        socket.emit('error', {
+          code: 'SUBSCRIPTION_LIMIT',
+          message: 'Maximum subscription limit reached',
+          timestamp: new Date().toISOString(),
+        });
+        ack({ ok: false, error: 'Subscription limit reached' });
+        return;
+      }
+
+      socket.join(room);
+      rooms.add(room);
+      incrementSubscriptions(socket.id);
+
+      logger.info('[WebSocket] Subscribed to project', {
+        socketId: socket.id,
+        userId,
+        projectId: pid,
+        room,
+      });
+      ack({ ok: true });
+    } catch (error) {
+      logger.error('[WebSocket] Error in subscribe:project', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      socket.emit('error', {
+        code: 'SUBSCRIPTION_ERROR',
+        message: 'Failed to subscribe to project updates',
+        timestamp: new Date().toISOString(),
+      });
+      ack({ ok: false, error: 'Subscription error' });
+    }
+  });
+
+  socket.on('unsubscribe:project', ({ projectId }) => {
+    try {
+      if (!projectId || typeof projectId !== 'string' || projectId.trim().length === 0) {
+        return;
+      }
+
+      const room = createRoomName('project', projectId.trim());
+      socket.leave(room);
+      const rooms = getRoomSet(socket.id);
+      if (rooms.has(room)) {
+        rooms.delete(room);
+        decrementSubscriptions(socket.id);
+      }
+
+      logger.info('[WebSocket] Unsubscribed from project', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+        projectId,
+        room,
+      });
+    } catch (error) {
+      logger.error('[WebSocket] Error in unsubscribe:project', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // Subscribe to chat updates
   // ✅ FIX: Added async ownership verification to prevent cross-user event leakage
   socket.on('subscribe:chat', async ({ sessionId }, callback) => {
@@ -773,10 +951,8 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
       const rooms = getRoomSet(socket.id);
 
       // Idempotent — second subscribe for the same test case is a no-op.
-      // We still try to JOIN the per-session room below in case the
-      // session was created since the last subscribe (covers the rare
-      // case of a long-lived socket whose user just sent the first
-      // message in another tab).
+      // `chat:tc:<testCaseId>` is the ONLY room a test-case chat joins;
+      // all test-case chat emits route here exclusively.
       const alreadyInTcRoom = rooms.has(tcRoom);
       if (!alreadyInTcRoom) {
         socket.join(tcRoom);
@@ -784,14 +960,16 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         incrementSubscriptions(socket.id);
       }
 
-      // Look up the existing session (if any) and additionally join the
-      // per-session room. This covers two cases at once:
-      //   1. User reopens an existing test-case chat — they should
-      //      receive history-driven emits that target `chat:<sid>`.
-      //   2. User opens a fresh test case — no session yet, we only
-      //      hold the `chat:tc:<tcid>` membership; the dual-broadcast
-      //      in emitChatMessage will reach this socket via that room
-      //      until the session is created on first POST /chat.
+      // Look up the existing session (if any) only to resolve its id for
+      // the ack — we do NOT join the per-session room `chat:<sid>`.
+      //
+      // Leak fix: this socket may ALSO hold a global-chat subscription
+      // (`chat:<globalSid>`) on the same connection. All test-case chat
+      // emits now route EXCLUSIVELY to `chat:tc:<testCaseId>` (see
+      // emitChatMessage), so joining `chat:<tcSid>` here is unnecessary
+      // and previously caused editor messages to surface in the global
+      // chat. The `chat:tc:` membership joined above is the only room a
+      // test-case chat needs.
       let resolvedSessionId: string | undefined;
       try {
         const { TestCaseChatService } = await import(
@@ -800,18 +978,12 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         const session = await TestCaseChatService.findSession(userId, testCaseId.trim());
         if (session) {
           resolvedSessionId = session.id;
-          const sessionRoom = createRoomName('chat', session.id);
-          if (!rooms.has(sessionRoom)) {
-            socket.join(sessionRoom);
-            rooms.add(sessionRoom);
-            incrementSubscriptions(socket.id);
-          }
         }
       } catch (lookupErr) {
         // Non-fatal: subscription to chat:tc:<tcid> already succeeded
-        // above. The per-session room will be picked up on the next
-        // subscribe (e.g. on reconnect after the session is created).
-        logger.warn('[WebSocket] Optional session-room join failed', {
+        // above. The ack just won't carry a sessionId; the frontend can
+        // fetch it via REST when needed (cancel / feedback).
+        logger.warn('[WebSocket] Optional session lookup failed', {
           socketId: socket.id,
           userId,
           testCaseId,
@@ -838,10 +1010,10 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
     }
   });
 
-  // Unsubscribe — leave both the test-case room and (if joined) the
-  // per-session room. Idempotent: leaving a room we're not in is a
-  // no-op and the subscription counter only decrements when we
-  // actually had it.
+  // Unsubscribe — leave the test-case room. Idempotent: leaving a room
+  // we're not in is a no-op and the subscription counter only decrements
+  // when we actually held it. We no longer join a per-session room (see
+  // subscribe:chat:testcase), so there is nothing else to leave.
   socket.on('unsubscribe:chat:testcase', async ({ testCaseId }) => {
     try {
       if (!testCaseId || typeof testCaseId !== 'string' || testCaseId.trim().length === 0) {
@@ -855,27 +1027,6 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         socket.leave(tcRoom);
         rooms.delete(tcRoom);
         decrementSubscriptions(socket.id);
-      }
-
-      // Also leave the per-session room. Lookup is best-effort — if
-      // it fails the socket still gets cleaned up on disconnect.
-      if (userId) {
-        try {
-          const { TestCaseChatService } = await import(
-            '@/services/utils/test-case-chat.service'
-          );
-          const session = await TestCaseChatService.findSession(userId, trimmed);
-          if (session) {
-            const sessionRoom = createRoomName('chat', session.id);
-            if (rooms.has(sessionRoom)) {
-              socket.leave(sessionRoom);
-              rooms.delete(sessionRoom);
-              decrementSubscriptions(socket.id);
-            }
-          }
-        } catch {
-          // best-effort
-        }
       }
     } catch (error) {
       logger.error('[WebSocket] Error in unsubscribe:chat:testcase', {
@@ -915,6 +1066,17 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
       userId,
       questionId,
     });
+
+    // Reject malformed payloads: a missing/empty answer must NOT be written to
+    // Redis, otherwise the worker's poller resumes a flow with junk input.
+    if (typeof questionId !== 'string' || !questionId.trim()
+      || typeof answer !== 'string' || !answer.trim()) {
+      logger.warn('[SubscriptionHandler] Ignoring invalid exploration clarification response', {
+        questionId,
+        hasAnswer: typeof answer === 'string' && answer.trim().length > 0,
+      });
+      return;
+    }
 
     try {
       const { ClarificationService } = require('@/agent/utils/context/clarification.service');

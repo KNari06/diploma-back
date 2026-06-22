@@ -45,6 +45,7 @@
 import type { Page, Frame } from 'playwright';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
+import { isSameApp, originOf, hostnameOf } from './same-app.util';
 
 type PageState = {
   sessionId: string;
@@ -84,41 +85,6 @@ const INTENT_WINDOW_MS = 3000;
 /** Emit dedup — don't spam multiple notices for the same blocked URL within this window. */
 const NOTICE_DEDUP_MS = 1500;
 
-function originOf(url: string): string | null {
-  try {
-    return new URL(url).origin;
-  } catch {
-    return null;
-  }
-}
-
-function hostnameOf(url: string): string {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return '';
-  }
-}
-
-/**
- * Coarse "same app" check used for the origin baseline. Mirrors the logic in
- * `probeExternalAnchorAt` so the pre-click and post-nav paths agree on what
- * counts as cross-origin. Accepts any of:
- *   - identical origin
- *   - one hostname is a subdomain of the other (www/m/dev/staging)
- *   - last two DNS labels match (covers plain-TLD variants)
- * Multi-label ccTLDs (foo.co.uk ↔ bar.co.uk) can over-match, but allowing an
- * occasional benign external nav beats blocking the common subdomain case.
- */
-function isSameApp(navUrl: string, baselineUrl: string): boolean {
-  const a = hostnameOf(navUrl);
-  const b = hostnameOf(baselineUrl);
-  if (!a || !b) return false;
-  if (a === b) return true;
-  if (a.endsWith('.' + b) || b.endsWith('.' + a)) return true;
-  const last2 = (h: string) => h.split('.').slice(-2).join('.');
-  return last2(a) === last2(b);
-}
 
 function addPageToSession(sessionId: string, page: Page): void {
   let set = pagesOfSession.get(sessionId);

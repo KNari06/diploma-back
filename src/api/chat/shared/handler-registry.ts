@@ -8,6 +8,10 @@ import { handleAddToPlanIntent } from '../regression/add-to-plan.handler';
 import { handleAnalyzeFailureIntent } from '../regression/analyze-failure.handler';
 import { handleCoverageAnalysisIntent } from '../regression/coverage-analysis.handler';
 import { handleCreatePlanIntent } from '../regression/create-plan.handler';
+import { handleFlakyReportIntent } from '../regression/flaky-report.handler';
+import { handleManageModuleIntent } from '../regression/manage-module.handler';
+import { handleManagePlanIntent } from '../regression/manage-plan.handler';
+import { handleManageScheduleIntent } from '../regression/manage-schedule.handler';
 import { handleRunByTagIntent } from '../regression/run-by-tag.handler';
 import { handleRunModuleIntent } from '../regression/run-module.handler';
 import { handleRunPlanIntent } from '../regression/run-plan.handler';
@@ -211,6 +215,9 @@ const handleMobileAgent: IntentHandler = async (req, res, params) => {
     context: params.context,
     abortSignal: params.abortSignal,
     mode: params.mode,
+    // Forward the persistence backend so test-case-scoped mobile chats
+    // land in the test-case store instead of leaking to the global tables.
+    chatStore: params.chatStore,
   });
 };
 
@@ -229,6 +236,8 @@ const handleMobileAction: IntentHandler = async (req, res, params) => {
     context: params.context,
     abortSignal: params.abortSignal,
     mode: params.mode,
+    // Forward the persistence backend (see handleMobileAgent above).
+    chatStore: params.chatStore,
   });
 };
 
@@ -258,6 +267,12 @@ export const INTENT_HANDLERS: Record<string, IntentHandler> = {
   analyze_failure: handleAnalyzeFailureIntent,
   test_recommendations: handleTestRecommendationsIntent,
   coverage_analysis: handleCoverageAnalysisIntent,
+  flaky_report: handleFlakyReportIntent,
+
+  // Management intents (call qa_manage_* via the central tool pipeline)
+  manage_schedule: handleManageScheduleIntent,
+  manage_module: handleManageModuleIntent,
+  manage_plan: handleManagePlanIntent,
 
   // Editor mode intent
   editor_action: handleEditorAction,
@@ -330,6 +345,10 @@ export function getIntentDescriptions(): Record<string, string> {
     analyze_failure: 'User wants to understand why a test failed (root-cause analysis)',
     test_recommendations: 'User wants suggestions on what to test next',
     coverage_analysis: 'User wants to see test coverage gaps and what\'s not tested',
+    flaky_report: 'User wants to find flaky / unreliable tests (inconsistent pass-fail history)',
+    manage_schedule: 'User wants to create/update/activate/deactivate/delete a scheduled (cron) run',
+    manage_module: 'User wants to create or update/rename a test module',
+    manage_plan: 'User wants to create/update a regression plan or add/remove an item from it',
     editor_action: 'User wants to perform a direct action on the live page in editor mode',
     mobile_test: 'User wants to run a mobile (Android/iOS) test on recorded steps',
     mobile_action: 'User is in the mobile editor and wants ONE direct action on the current screen: tap, swipe, type, scroll, press key, back. Executed immediately, no planning.',

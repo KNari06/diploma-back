@@ -37,9 +37,18 @@ const CACHE_TTL_SECONDS = 60; // 1 minute — fresh enough for dashboard, elimin
  * cache keys stay stable (and so clients that don't pass platform don't
  * cause a fresh miss).
  */
-function cacheKey(workspaceId: string, userId: string, platform: AnalyticsPlatformFilter): string {
-  const suffix = platform === 'all' ? '' : `:p:${platform}`;
-  return `qait:cache:dashboard:summary:ws:${workspaceId}:u:${userId}${suffix}`;
+function cacheKey(
+  workspaceId: string,
+  userId: string,
+  platform: AnalyticsPlatformFilter,
+  projectId?: string,
+): string {
+  const platformSuffix = platform === 'all' ? '' : `:p:${platform}`;
+  // Project is a cache dimension too: the same user switching projects must
+  // not be served another project's cached response. Empty (workspace-wide)
+  // keeps the legacy keyspace so existing entries stay valid.
+  const projectSuffix = projectId ? `:proj:${projectId}` : '';
+  return `qait:cache:dashboard:summary:ws:${workspaceId}:u:${userId}${platformSuffix}${projectSuffix}`;
 }
 
 /**
@@ -48,6 +57,16 @@ function cacheKey(workspaceId: string, userId: string, platform: AnalyticsPlatfo
 export async function getDashboardSummary(req: Request, res: Response): Promise<void> {
   const userId = req.user?.id;
   const workspaceId = req.query.workspaceId as string;
+  // The client sends the project it has selected in the UI. We honour it for
+  // BOTH the analytics half (summary / results-overview) and the per-project
+  // lists. Empty / missing → workspace-wide aggregation for the metrics and a
+  // data-bearing fallback for the lists (see below) — never silently scoping
+  // the whole dashboard to projects[0], which is the *newest* project and is
+  // usually empty (it zeroed every metric the moment a fresh project existed).
+  const requestedProjectId =
+    typeof req.query.projectId === 'string' && req.query.projectId
+      ? req.query.projectId
+      : undefined;
   // Phase 7: dashboard now accepts the same platform filter as every other
   // analytics endpoint. Unknown / missing → 'all' (pre-Phase-7 default),
   // so clients that never heard of this param keep working unchanged.
@@ -87,7 +106,7 @@ export async function getDashboardSummary(req: Request, res: Response): Promise<
   }
 
   // ── Cache hit ─────────────────────────────────────────────────────────────
-  const key = cacheKey(workspaceId, userId, platform);
+  const key = cacheKey(workspaceId, userId, platform, requestedProjectId);
   const cached = await cache.get<object>(key);
   if (cached) {
     res.json({ success: true, data: cached, cached: true, timestamp: new Date().toISOString() });
@@ -96,33 +115,46 @@ export async function getDashboardSummary(req: Request, res: Response): Promise<
 
   // ── Parallel resolution ───────────────────────────────────────────────────
   try {
-    // Step 1: resolve projectId (ProjectService already caches this for 1h)
-    const projects = await ProjectService.getProjectsByWorkspace(workspaceId, userId);
-    const projectId: string | undefined = projects?.[0]?.id;
+    // Step 1: resolve which project drives the per-project LISTS (test nodes,
+    // recent runs, schedules). The analytics METRICS below ignore this and use
+    // `requestedProjectId` directly — undefined there means workspace-wide.
+    //
+    // When the client selected a project we use it. When it didn't, we must
+    // NOT default to projects[0] (the newest project — typically empty, which
+    // is the exact bug that zeroed the dashboard). Instead pick the project
+    // with the most recent regression run so the lists show real data.
+    const listProjectId: string | undefined =
+      requestedProjectId ??
+      (await ProjectService.getMostRecentlyActiveProjectId(workspaceId, userId));
 
     // Step 2: fire all project-independent and project-dependent queries in parallel.
     // Analytics services are platform-aware (Phase 7) — we forward the filter
     // so "Web" / "Mobile" / "API" dashboards actually differ.
+    //
+    // METRICS scope: `requestedProjectId` (undefined → whole workspace). The
+    // analytics services aggregate across every project in the workspace when
+    // no projectId is passed, which is the correct workspace-wide default.
+    //
     // The other services (overall builder, runs list, schedules) are
-    // intentionally NOT filtered: test nodes and upcoming schedules are
+    // intentionally NOT platform-filtered: test nodes and upcoming schedules are
     // structural/config-level, not execution-level — filtering them by
     // platform would hide a plan that contains mobile cases just because
     // the user is looking at "Web" metrics. Recent runs is kept unfiltered
     // for the same reason (a plan with mixed cases has one run row).
     const [summaryData, resultsOverviewData, testNodesData, recentRunsData, schedulesData] =
       await Promise.allSettled([
-        AnalyticsQueryService.getSummary({ workspaceId, projectId, platform }),
-        AnalyticsQueryService.getResultsOverview({ workspaceId, projectId, platform }),
+        AnalyticsQueryService.getSummary({ workspaceId, projectId: requestedProjectId, platform }),
+        AnalyticsQueryService.getResultsOverview({ workspaceId, projectId: requestedProjectId, platform }),
 
-        // Project-specific (skip gracefully if no projectId)
-        projectId
-          ? OverallBuilderService.buildProjectOverall(projectId, userId)
+        // Project-specific (skip gracefully if no project resolved)
+        listProjectId
+          ? OverallBuilderService.buildProjectOverall(listProjectId, userId)
           : Promise.resolve(null),
-        projectId
-          ? RegressionRunService.listRuns(projectId, userId)
+        listProjectId
+          ? RegressionRunService.listRuns(listProjectId, userId)
           : Promise.resolve([]),
-        projectId
-          ? ScheduleService.listByProject(projectId, userId)
+        listProjectId
+          ? ScheduleService.listByProject(listProjectId, userId)
           : Promise.resolve([]),
       ]);
 
@@ -144,14 +176,14 @@ export async function getDashboardSummary(req: Request, res: Response): Promise<
         logger.warn(`[DASHBOARD_API] Partial failure: ${names[i]}`, {
           error: r.reason instanceof Error ? r.reason.message : String(r.reason),
           workspaceId,
-          projectId,
+          projectId: listProjectId,
           userId,
         });
       }
     });
 
     const responseData = {
-      projectId: projectId ?? null,
+      projectId: listProjectId ?? null,
       summary,
       resultsOverview,
       testNodes,

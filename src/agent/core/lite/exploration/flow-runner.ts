@@ -21,7 +21,7 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { AI_MODELS } from '@/config/ai/ai-models.config';
 
 import { TestPipeline, type PipelineIntegrations } from '../pipeline/test-pipeline';
-import type { PipelineConfig, TestPipelineResult, ExecutedCommand } from '../pipeline/types';
+import type { PipelineConfig, TestPipelineResult } from '../pipeline/types';
 import { ActionExecutor } from '../execution/action-executor';
 import { NetworkTracker } from '../collectors/network-tracker';
 import { GoalDetector } from '../analysis/goal-detector';
@@ -30,21 +30,21 @@ import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.se
 import { OverlayDismisser } from './overlay-dismisser';
 import { VisualStability } from '../collectors/visual-stability';
 
-import type {
-  ExplorationConfig,
-  EntryPoint,
-  FlowExplorationTask,
-  FlowExplorationStatus,
-  FlowRunnerCheckpoint,
-  DiscoveredStep,
-  CapturedApiCall,
-  FlowError,
-  ErrorClassification,
-  BlockerType,
-  ExplorationProgressCallback,
+import {
+  type ExplorationConfig,
+  type EntryPoint,
+  type FlowExplorationTask,
+  type FlowExplorationStatus,
+  type FlowRunnerCheckpoint,
+  type DiscoveredStep,
+  type FlowError,
+  type ErrorClassification,
+  type BlockerType,
+  type ExplorationProgressCallback,
 } from './types';
 import type { NetworkSuccess } from '../lite-types';
 import { attributeCallsToSteps } from './network-assertions';
+import { extractDiscoveredSteps } from './pipeline-step-extractor';
 import { FlowQueue } from './flow-queue';
 import { BudgetTracker } from './budget-tracker';
 import { StateManager } from './state-manager';
@@ -56,8 +56,28 @@ import {
 import { ClarificationService } from '@/agent/utils/context/clarification.service';
 import type { ExplorationTraceService } from './exploration-trace.service';
 import { Scout } from './agents/scout';
-import type { ScoutInput, ScoutOutput, ExplorationBlackboard, CartographerInsight } from './agents/agent-types';
+import type { ScoutInput, ExplorationBlackboard, CartographerInsight } from './agents/agent-types';
 import { normalizeUrlWithPattern } from './url-pattern';
+
+/**
+ * Navigation timeout for flow execution (entry-point + login navigations).
+ * Single source of truth so the value can't drift across the four goto sites.
+ */
+const FLOW_NAV_TIMEOUT_MS = 15_000;
+
+/**
+ * Wait strategy for every navigation on the flow-execution (replay) path.
+ * MUST be 'load', never 'domcontentloaded' — see CLAUDE.md Hard Invariant #4.
+ * domcontentloaded fires before JS hydrates, so actions/login forms can fire
+ * against a non-interactive page and flake.
+ */
+const FLOW_NAV_WAIT_UNTIL = 'load' as const;
+
+// Step-extraction (rounds → DiscoveredStep + compiled plans) now lives in the
+// shared pipeline-step-extractor so the editor iterative-authoring service
+// builds steps identically. Re-export the gate constants for backward compat
+// (exploration-qa.test.ts imports them from here).
+export { PLAN_WORTHY_ACTIONS, VALUE_CARRYING_ACTIONS } from './pipeline-step-extractor';
 
 /** Semaphore for bounding concurrent flows */
 class Semaphore {
@@ -150,7 +170,7 @@ export class FlowRunner {
   }
 
   private emitProgress(
-    event: 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found' | 'flow_step',
+    event: 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found' | 'flow_step' | 'auth_started' | 'auth_completed',
     data: Record<string, any>,
   ): void {
     if (!this.onProgress) return;
@@ -347,6 +367,11 @@ export class FlowRunner {
         durationMs: task.durationMs,
         progressScore: task.progressScore,
         blockerType: task.blockerType || undefined,
+        // Human-readable blocker reason + whether the user can unblock it
+        // (CAPTCHA/2FA/login). The FE renders these live on a blocked flow;
+        // both are populated alongside blockerType when status==='blocked'.
+        blockerReason: task.blockedReason || undefined,
+        canUserHelp: task.canUserHelp ?? undefined,
         errorMessage: task.errors.length > 0 ? task.errors[0].message : undefined,
         failedAtStep: task.errors.length > 0 ? task.errors[0].stepNumber : undefined,
         errorsCount: task.errors.length,
@@ -504,8 +529,8 @@ export class FlowRunner {
       }
       try {
         await page.goto(targetUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: 15_000,
+          waitUntil: FLOW_NAV_WAIT_UNTIL,
+          timeout: FLOW_NAV_TIMEOUT_MS,
         });
         this.rateLimiter?.recordSuccess('target_site');
       } catch (navError) {
@@ -513,8 +538,8 @@ export class FlowRunner {
           const result = await this.rateLimiter.recordFailure('target_site', navError as Error);
           if (result.shouldRetry) {
             await page.goto(targetUrl, {
-              waitUntil: 'domcontentloaded',
-              timeout: 15_000,
+              waitUntil: FLOW_NAV_WAIT_UNTIL,
+              timeout: FLOW_NAV_TIMEOUT_MS,
             });
             this.rateLimiter.recordSuccess('target_site');
           } else {
@@ -597,7 +622,7 @@ export class FlowRunner {
       //    NetworkTracker has been running since `new NetworkTracker(page)`
       //    above, so everything captured since `pipelineStartTime` belongs
       //    to this flow.
-      const { steps: baseSteps, stepsByRound } = this.extractSteps(pipelineResult);
+      const { steps: baseSteps, stepsByRound } = await extractDiscoveredSteps(pipelineResult, page);
       const successfulCalls = this.collectSuccessfulCalls(networkTracker, pipelineStartTime);
       const discoveredSteps = attributeCallsToSteps({
         steps: baseSteps,
@@ -625,7 +650,10 @@ export class FlowRunner {
           count: discoveredSteps.length,
         });
 
-        // Emit flow_step events for real-time frontend updates
+        // Emit flow_step events for real-time frontend updates.
+        // `extractSteps` keeps ONLY successful commands (failed ones are
+        // filtered out above), so every emitted step is a success — the FE
+        // reads `data.success` to render the per-step ✓ indicator.
         for (const step of discoveredSteps) {
           this.emitProgress('flow_step', {
             entryPointId: entryPoint.id,
@@ -635,6 +663,7 @@ export class FlowRunner {
             description: step.description,
             value: step.value,
             pageUrl: step.pageUrl,
+            success: true,
           });
         }
       }
@@ -774,7 +803,7 @@ export class FlowRunner {
                   canUserHelp = undefined;
                   // Merge steps — reuse the same attribution pipeline so
                   // network calls captured during the retry get attached too.
-                  const { steps: retrySteps, stepsByRound: retryStepsByRound } = this.extractSteps(retryResult);
+                  const { steps: retrySteps, stepsByRound: retryStepsByRound } = await extractDiscoveredSteps(retryResult, page);
                   const retryCalls = this.collectSuccessfulCalls(retryNetworkTracker, retryStartTime);
                   const retryAttributed = attributeCallsToSteps({
                     steps: retrySteps,
@@ -804,7 +833,8 @@ export class FlowRunner {
         status = 'failed';
       }
 
-      // 11. Cleanup
+      // 11. Cleanup — capture the real final URL BEFORE tearing down the page.
+      const finalUrl = page.url();
       networkTracker.stopTracking();
       await page.close();
       await this.stateManager.closeContext(context);
@@ -823,6 +853,7 @@ export class FlowRunner {
         canUserHelp,
         progressScore: pipelineResult.progressScore,
         roundsUsed: pipelineResult.roundsExecuted,
+        finalUrl,
       };
     } catch (error) {
       // Cleanup on error
@@ -845,6 +876,9 @@ export class FlowRunner {
       'Find the email or username input field and fill it with credentials, then find the password field and fill it, then click the login or sign in button to submit the form',
     ];
 
+    // Surface login progress to the UI (frontend reads data.loginUrl / data.success).
+    this.emitProgress('auth_started', { loginUrl: this.config.entryUrl });
+
     for (let attempt = 0; attempt < goals.length; attempt++) {
       const loginStartTime = Date.now();
       try {
@@ -855,7 +889,10 @@ export class FlowRunner {
           success,
           durationMs: Date.now() - loginStartTime,
         });
-        if (success) return;
+        if (success) {
+          this.emitProgress('auth_completed', { success: true });
+          return;
+        }
         logger.warn('[FLOW_RUNNER] Login attempt failed', { attempt, goal: goals[attempt] });
       } catch (error) {
         this.trace?.writeFlowLoginAttempt({
@@ -869,6 +906,7 @@ export class FlowRunner {
       }
     }
 
+    this.emitProgress('auth_completed', { success: false });
     logger.warn('[FLOW_RUNNER] All login attempts failed');
   }
 
@@ -890,8 +928,8 @@ export class FlowRunner {
       }
       try {
         await page.goto(this.config.entryUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: 15_000,
+          waitUntil: FLOW_NAV_WAIT_UNTIL,
+          timeout: FLOW_NAV_TIMEOUT_MS,
         });
         this.rateLimiter?.recordSuccess('target_site');
       } catch (navError) {
@@ -899,8 +937,8 @@ export class FlowRunner {
           const result = await this.rateLimiter.recordFailure('target_site', navError as Error);
           if (result.shouldRetry) {
             await page.goto(this.config.entryUrl, {
-              waitUntil: 'domcontentloaded',
-              timeout: 15_000,
+              waitUntil: FLOW_NAV_WAIT_UNTIL,
+              timeout: FLOW_NAV_TIMEOUT_MS,
             });
             this.rateLimiter.recordSuccess('target_site');
           } else {
@@ -1017,47 +1055,6 @@ export class FlowRunner {
    * assertion pipeline to attribute captured API calls back to the action
    * that triggered them.
    */
-  private extractSteps(result: TestPipelineResult): {
-    steps: DiscoveredStep[];
-    stepsByRound: Array<number | null>;
-  } {
-    const steps: DiscoveredStep[] = [];
-    const stepsByRound: Array<number | null> = [];
-    let stepNumber = 0;
-
-    for (const round of result.rounds) {
-      // Use the page URL from the round's snapshot context
-      // The snapshot URL is captured before actions execute
-      const roundPageUrl = this.extractUrlFromSnapshot(round.pageSnapshotBefore);
-      let lastStepIdxInRound: number | null = null;
-
-      for (const executed of round.commands) {
-        // Skip failed commands — they produce noise in the final test case
-        if (!executed.result.success) continue;
-
-        const step = this.commandToStep(executed, stepNumber + 1, roundPageUrl);
-        if (step) {
-          step.stepNumber = ++stepNumber;
-          steps.push(step);
-          lastStepIdxInRound = steps.length - 1;
-        }
-      }
-
-      stepsByRound.push(lastStepIdxInRound);
-    }
-
-    return { steps, stepsByRound };
-  }
-
-  /**
-   * Extract URL from formatted snapshot text.
-   * Format is typically: "URL: https://... \n Title: ..."
-   */
-  private extractUrlFromSnapshot(snapshot: string): string {
-    const match = snapshot.match(/URL:\s*(\S+)/i);
-    return match?.[1] || '';
-  }
-
   /**
    * Pull the successful-responses list from NetworkTracker. Wrapped so a
    * tracker missing the getter (e.g. a partial test mock) degrades to an
@@ -1072,148 +1069,6 @@ export class FlowRunner {
       return tracker.getSuccessfulResponsesSince(sinceMs) ?? [];
     } catch {
       return [];
-    }
-  }
-
-  /**
-   * Convert a single executed command to a DiscoveredStep.
-   * Returns null for infrastructure commands.
-   */
-  private commandToStep(executed: ExecutedCommand, stepNumber: number, pageUrl: string): DiscoveredStep | null {
-    const cmd = executed.command;
-    // Use result.output for human-readable descriptions (e.g. 'Clicked "CONTACT" (a)')
-    // Strip [POST-ACTION: ...] suffix — it's internal context, not user-facing
-    const output = (executed.result.output || '').replace(/\s*\[POST-ACTION:.*$/s, '').trim();
-
-    switch (cmd.name) {
-      case 'fill_field':
-        return {
-          stepNumber,
-          description: output || `Fill "${cmd.args.ref}" with ${cmd.args.is_sensitive ? '[credential]' : `"${cmd.args.value}"`}`,
-          action: 'fill',
-          ref: cmd.args.ref,
-          value: cmd.args.is_sensitive ? undefined : cmd.args.value,
-          isSensitive: cmd.args.is_sensitive,
-          pageUrl,
-          expectedOutcome: 'Field is filled with the value',
-        };
-
-      case 'click_element':
-        return {
-          stepNumber,
-          description: output || `Click "${cmd.args.ref}"`,
-          action: 'click',
-          ref: cmd.args.ref,
-          pageUrl,
-          expectedOutcome: executed.result.success ? 'Element clicked successfully' : undefined,
-        };
-
-      case 'select_option':
-        return {
-          stepNumber,
-          description: output || `Select option "${cmd.args.value}" in "${cmd.args.ref}"`,
-          action: 'select',
-          ref: cmd.args.ref,
-          value: cmd.args.value,
-          pageUrl,
-        };
-
-      case 'press_key':
-        return {
-          stepNumber,
-          description: output || `Press key "${cmd.args.key}"`,
-          action: 'press',
-          value: cmd.args.key,
-          pageUrl,
-        };
-
-      case 'hover_element':
-        return {
-          stepNumber,
-          description: output || `Hover over "${cmd.args.ref}"`,
-          action: 'hover',
-          ref: cmd.args.ref,
-          pageUrl,
-        };
-
-      case 'scroll_page':
-      case 'scroll_to_element':
-        return {
-          stepNumber,
-          description: output || (cmd.name === 'scroll_to_element'
-            ? `Scroll to element "${cmd.args.ref}"`
-            : `Scroll ${cmd.args.direction || 'down'}`),
-          action: 'scroll',
-          ref: cmd.args.ref,
-          pageUrl,
-        };
-
-      case 'navigate_to':
-        return {
-          stepNumber,
-          description: output || `Navigate to ${cmd.args.url}`,
-          action: 'navigate',
-          value: cmd.args.url,
-          pageUrl,
-        };
-
-      case 'toggle_element':
-        return {
-          stepNumber,
-          description: output || `Toggle "${cmd.args.ref}"`,
-          action: 'toggle',
-          ref: cmd.args.ref,
-          pageUrl,
-          expectedOutcome: 'Element toggled successfully',
-        };
-
-      case 'set_range':
-        return {
-          stepNumber,
-          description: output || `Set range "${cmd.args.ref}" to "${cmd.args.value}"`,
-          action: 'setRange',
-          ref: cmd.args.ref,
-          value: cmd.args.value,
-          pageUrl,
-        };
-
-      case 'select_date':
-        return {
-          stepNumber,
-          description: output || `Set date "${cmd.args.ref}" to "${cmd.args.value}"`,
-          action: 'selectDate',
-          ref: cmd.args.ref,
-          value: cmd.args.value,
-          pageUrl,
-        };
-
-      case 'clear_field':
-        return {
-          stepNumber,
-          description: output || `Clear field "${cmd.args.ref}"`,
-          action: 'clear',
-          ref: cmd.args.ref,
-          pageUrl,
-        };
-
-      case 'mark_done':
-        return {
-          stepNumber,
-          description: `Verify: ${cmd.args.evidence || 'Goal achieved'}`,
-          action: 'verify',
-          pageUrl,
-          expectedOutcome: cmd.args.evidence,
-        };
-
-      // Skip infrastructure commands
-      case 'observe_page':
-      case 'wait_for_page':
-      case 'report_blocked':
-        return null;
-
-      default:
-        logger.debug('[FLOW_RUNNER] Unmapped command, skipping', { command: cmd.name });
-        return null;
     }
   }
 
@@ -1403,6 +1258,15 @@ export class FlowRunner {
       };
 
       const scoutResult = await this.scout.detect(scoutInput);
+
+      // Record the discovery on the blackboard so the Strategist's re-evaluation
+      // can see what Scout surfaced (insight + new pages/flows). Without this the
+      // recentDiscoveries channel stays empty and re-strategy is blind to Scout.
+      if (this.blackboard && (scoutResult.newEntryPoints.length > 0 || scoutResult.newPages.length > 0)) {
+        this.blackboard.discoveredBranches.push(
+          Scout.toDiscovery(completedEntry.id, completedEntry.name, scoutResult),
+        );
+      }
 
       // Filter out branches discovered on external domains
       const currentOrigin = new URL(page.url()).origin;

@@ -11,12 +11,18 @@
  * TTL: 15 minutes (session reclaimed if no test starts)
  */
 
+import { randomUUID } from 'crypto';
 import { env } from '@/config/environment/env';
-import { redisConnection } from '@/config/infrastructure/queues';
+import { redisConnection, QueueManager } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { resolveDedicatedDevice } from '@/services/mobile/dedicated-device.service';
+import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { ProjectService } from '@/services/core/project.service';
+import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
+import { sendMobileRunnerError } from './mobile-error-mapper';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
+import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
 import { refreshIdle, cancelIdle } from '@/services/mobile/mobile-idle.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { getIO } from '@/websocket/core/server';
@@ -28,6 +34,7 @@ import { Request, Response } from 'express';
 // `WarmupData` interface remain exported from this file because the
 // service imports them.
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
+import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { applyProjectPolicyToSession } from '@/services/mobile/permission-policy.service';
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -118,19 +125,28 @@ export interface WarmupData {
  * the emulator warms up. Mirrors the event shape already used by the web
  * preview path. Non-fatal — a socket hiccup must never fail warmup.
  *
- * Stage strings recognised by the frontend (in order):
- *   launching_browser → stage 1 (emulator ready)
- *   loading_page      → stage 2 (APK install in progress)
- *   extracting_elements → stage 3 (launching app)
- *   ready             → stage 4 (complete)
+ * Mobile warmup stages (in order) — each maps to a real step so the
+ * editor's loading bar shows truthful copy instead of borrowed web names:
+ *   boot_emulator       → emulator/simulator is booting or being claimed
+ *   installing_app      → APK/IPA install in progress
+ *   launching_app       → cold-launching the app
+ *   waiting_first_frame → app launched; waiting for the first video frame
+ *                         (the frontend flips this to `ready` itself when
+ *                          the live stream delivers frame #1)
+ *   ready               → complete
  */
 function emitWarmupProgress(
   userId: string,
-  stage: 'launching_browser' | 'loading_page' | 'extracting_elements' | 'ready',
+  stage: 'boot_emulator' | 'installing_app' | 'launching_app' | 'waiting_first_frame' | 'ready',
   progress: number,
+  error?: string,
 ): void {
   try {
-    webSocketService.emitToUser(userId, 'preview:session:progress', { stage, progress });
+    webSocketService.emitToUser(userId, 'preview:session:progress', {
+      stage,
+      progress,
+      ...(error ? { error } : {}),
+    });
   } catch {
     // Best-effort — never let a socket error break warmup.
   }
@@ -190,12 +206,66 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   const prelaunch = rawPrelaunch !== false; // default true
 
   if (!projectId) {
+    logger.warn('[MOBILE_SESSION] warmup rejected: projectId is required', {
+      userId,
+      reason: 'missing_projectId',
+      status: 400,
+    });
     res.status(400).json({ success: false, error: 'projectId is required' });
     return;
   }
 
+  // IDOR guard: projectId comes from the request body, so a caller could pass
+  // any project's id. Verify the user actually has access BEFORE deriving any
+  // project-scoped state (workspace, app, dedicated device). getProject returns
+  // null when the user is not a member of the project's workspace (no info
+  // leak). Without this, a user could warm a session against another tenant's
+  // project — and, with dedicated-emulator routing, reach another workspace's
+  // pinned device.
+  const accessibleProject = await ProjectService.getProject(projectId, userId);
+  if (!accessibleProject) {
+    // 404 here means the project doesn't exist OR the user isn't a member of
+    // its workspace (getProject is access-scoped, no info leak). Either way the
+    // editor shows the generic "Failed to start session" — log so we can tell
+    // an IDOR/stale-project case apart from a runner failure without guessing.
+    logger.warn('[MOBILE_SESSION] warmup rejected: project not found or no access', {
+      userId,
+      projectId,
+      platform: rawPlatform,
+      reason: 'project_not_found_or_forbidden',
+      status: 404,
+    });
+    res.status(404).json({ success: false, error: 'Project not found' });
+    return;
+  }
+
   const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
-  const platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
+  let platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
+  // Self-correct: the editor may warm up with platform='android' for a project
+  // whose app is actually Flutter (e.g. opened from an old android-typed test
+  // case). Without upgrading here, the warmup creates a plain android session,
+  // skips attach-flutter below, and the preview/editor reads an empty native
+  // tree. Upgrade android→flutter from the detected framework; never downgrade.
+  if (platform === 'android') {
+    const framework = await MobileAppStorageService.getDetectedFramework(projectId).catch(
+      () => undefined,
+    );
+    if (framework === 'flutter') {
+      logger.info('[MOBILE_SESSION] warmup upgrading android→flutter from detectedFramework', {
+        projectId,
+      });
+      platform = 'flutter';
+    }
+  }
+  // Flutter sessions are created as a NATIVE android session first, then
+  // upgraded via `attachFlutter` (install → launch → VM Service detect).
+  // The runner's direct `createSession('flutter')` probes the VM Service
+  // before the app is installed (chicken-and-egg → always fails), and the
+  // pool never warms 'flutter' anyway. So we always ask the runner for
+  // 'android' and keep `platform` ('flutter') only as the logical label
+  // stored in Redis + returned to the frontend.
+  const isFlutter = platform === 'flutter';
+  const sessionCreatePlatform: MobilePlatform = isFlutter ? 'android' : platform;
 
   // Phase 2.6: validate `deviceSelector` if present. Inline validator to
   // match this file's existing style (no zod). Rejects malformed selectors
@@ -206,12 +276,27 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   let deviceSelector: { source?: 'local-emulator' | 'local-physical' | 'cloud'; serial?: string } | undefined;
   if (rawDeviceSelector !== undefined && rawDeviceSelector !== null) {
     if (typeof rawDeviceSelector !== 'object' || Array.isArray(rawDeviceSelector)) {
+      logger.warn('[MOBILE_SESSION] warmup rejected: malformed deviceSelector', {
+        userId,
+        projectId,
+        platform,
+        reason: 'deviceSelector_not_object',
+        status: 400,
+      });
       res.status(400).json({ success: false, error: 'deviceSelector must be an object' });
       return;
     }
     const sel = rawDeviceSelector as { source?: unknown; serial?: unknown };
     const validSources = ['local-emulator', 'local-physical', 'cloud'] as const;
     if (sel.source !== undefined && !validSources.includes(sel.source as typeof validSources[number])) {
+      logger.warn('[MOBILE_SESSION] warmup rejected: invalid deviceSelector.source', {
+        userId,
+        projectId,
+        platform,
+        source: sel.source,
+        reason: 'deviceSelector_bad_source',
+        status: 400,
+      });
       res.status(400).json({
         success: false,
         error: `deviceSelector.source must be one of ${validSources.join(', ')}`,
@@ -219,6 +304,13 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       return;
     }
     if (sel.serial !== undefined && (typeof sel.serial !== 'string' || sel.serial.trim() === '')) {
+      logger.warn('[MOBILE_SESSION] warmup rejected: invalid deviceSelector.serial', {
+        userId,
+        projectId,
+        platform,
+        reason: 'deviceSelector_bad_serial',
+        status: 400,
+      });
       res.status(400).json({
         success: false,
         error: 'deviceSelector.serial must be a non-empty string',
@@ -229,6 +321,41 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       source: sel.source as 'local-emulator' | 'local-physical' | 'cloud' | undefined,
       serial: typeof sel.serial === 'string' ? sel.serial : undefined,
     };
+  }
+
+  // iOS-specific default: when the frontend doesn't pin a deviceSelector,
+  // assume simulator. Why this is here and not at the runner: the runner's
+  // default-source policy can flip to 'local-physical' when an iPhone is
+  // hotplugged via USB (the iOS device watcher reports it). For a *create-
+  // test* warmup that's never what the user wants — they want a fresh
+  // simulator. Backend is the right layer to disambiguate because it's the
+  // first stop where we know "this is a warmup, not a debug-physical-device
+  // session". Android is left alone (the Android default already lands on
+  // an emulator). Physical-iOS callers must pin `source: 'local-physical'`
+  // explicitly; this default never overrides that.
+  if (platform === 'ios' && deviceSelector === undefined) {
+    deviceSelector = { source: 'local-emulator' };
+    logger.debug('[MOBILE_SESSION] defaulting iOS deviceSelector to local-emulator', {
+      userId,
+      projectId,
+    });
+  }
+
+  // Dedicated emulator: if this project's workspace has an active dedicated
+  // device, pin the warmed session to it and force ownerId=workspaceId. Setting
+  // a `serial` makes the create/claim block below take the pinned path (skips
+  // the shared pool). Inert (null) unless the feature flag is on AND a row
+  // exists. workspaceId is derived from the access-checked project above — never
+  // from the request body (tenancy invariant).
+  const dedicatedWorkspaceId: string | undefined = accessibleProject.workspace_id ?? undefined;
+  const dedicated = await resolveDedicatedDevice(dedicatedWorkspaceId, sessionCreatePlatform);
+  if (dedicated) {
+    deviceSelector = { serial: dedicated.serial };
+    logger.info('[MOBILE_SESSION] warmup pinned to dedicated device', {
+      projectId,
+      workspaceId: dedicatedWorkspaceId,
+      platform,
+    });
   }
 
   logger.info('[MOBILE_SESSION] warmup request', {
@@ -408,6 +535,35 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             });
           }
           // Fall through to create a new session below
+        } else if (existing.platform !== platform) {
+          // Platform mismatch — the cached session's platform must match the
+          // requested one, in BOTH directions:
+          //   - Flutter request, non-flutter cached: a plain android/ios
+          //     session has no Dart VM Service connection.
+          //   - Non-flutter request, flutter cached: a flutter session
+          //     (android host upgraded via attachFlutter) reports
+          //     platform='flutter' and must NOT be handed to an android/ios
+          //     run. (The earlier one-directional check missed this case and
+          //     reused a flutter session for an android request.)
+          // Invalidate and fall through to a fresh create. For flutter the
+          // create path does android → install → attachFlutter.
+          logger.info('[MOBILE_SESSION] Cached session platform mismatch — recreating', {
+            projectId,
+            userId,
+            staleSessionId: existing.sessionId,
+            cachedPlatform: existing.platform,
+            requestedPlatform: platform,
+          });
+          await redisConnection.del(redisKey);
+          try {
+            await client.destroySession(existing.sessionId, { userId });
+          } catch (err) {
+            logger.warn('[MOBILE_SESSION] destroySession during flutter-mismatch invalidation failed (non-fatal)', {
+              sessionId: existing.sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          // Fall through to create a new session below
         } else {
           logger.debug('[MOBILE_SESSION] Reusing existing warmed session', {
             projectId,
@@ -418,25 +574,35 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // Run install+launch_app BEFORE responding, so the preview stream shows
           // the app already open. On a reused session this usually hits the fast
           // path (Redis match or device check) and just issues launch_app.
-          emitWarmupProgress(userId, 'launching_browser', 15);
-          try {
-            await time('prep_app_reuse', () => MobileAppPrepService.prepApp({
-              client,
-              sessionId: existing.sessionId,
-              projectId,
-              userId,
-              appPackage,
-              skipLaunch: !prelaunch,
-              onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
-            }));
-          } catch (err) {
-            logger.warn('[MOBILE_SESSION] App install/launch on reused session failed (non-fatal)', {
-              sessionId: existing.sessionId,
-              projectId,
-              error: err instanceof Error ? err.message : String(err),
-            });
+          emitWarmupProgress(userId, 'boot_emulator', 15);
+          // Skip re-prep for a reused Flutter session: it's already a live,
+          // attached Flutter session (app installed + running + VM Service
+          // connected). Re-running install/launch here would reinstall over
+          // the running app and tear down the FlutterClient connection.
+          if (!isFlutter) {
+            try {
+              await time('prep_app_reuse', () => MobileAppPrepService.prepApp({
+                client,
+                sessionId: existing.sessionId,
+                projectId,
+                userId,
+                appPackage,
+                platform,
+                skipLaunch: !prelaunch,
+                onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
+              }));
+            } catch (err) {
+              logger.warn('[MOBILE_SESSION] App install/launch on reused session failed (non-fatal)', {
+                sessionId: existing.sessionId,
+                projectId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
           }
-          emitWarmupProgress(userId, 'ready', 100);
+          // App is launched; the response goes out next and the frontend
+          // subscribes to the video stream. It flips to `ready` (100%)
+          // itself on the first real frame, so we stop at 95% here.
+          emitWarmupProgress(userId, 'waiting_first_frame', 95);
 
           const runnerSocketUrl = currentRunnerSocketUrl();
           logger.info('[MOBILE_SESSION] warmup response (path=cached_reuse)', {
@@ -465,6 +631,19 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     const client = getMobileRunnerClient();
     const healthy = await time('runner_health_check', () => client.isHealthy());
     if (!healthy) {
+      // isHealthy() swallows the underlying cause (timeout / ECONNREFUSED /
+      // non-200), so this is the one place an operator can see that the editor's
+      // "Failed to start session" was the runner being down vs. unreachable.
+      // error level so it also lands in error.log, not just mobile-session.log.
+      logger.error('[MOBILE_SESSION] warmup aborted: mobile runner health check failed', {
+        userId,
+        projectId,
+        platform,
+        runnerUrl: env.MOBILE_RUNNER_URL,
+        healthCheckMs: timings.runner_health_check,
+        reason: 'runner_unhealthy',
+        status: 503,
+      });
       res.status(503).json({
         success: false,
         error: 'Mobile runner is unavailable',
@@ -495,22 +674,38 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     //      "show emulators in popover" UX without this gate would
     //      silently use whatever's pre-booted instead of the user's
     //      explicit pick. Default (no selector) keeps pool fast-path.
-    const effectiveOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
+    // ownerId: a dedicated session forces ownerId=workspaceId (per-workspace
+    // multi-user isolation on the dedicated container); otherwise the existing
+    // MOBILE_MULTI_USER_ISOLATION gate decides whether to pass the user's owner.
+    const effectiveOwnerId = dedicated
+      ? dedicatedWorkspaceId
+      : (env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined);
     let session: Awaited<ReturnType<typeof client.createSession>>;
     const skipPoolForPhysical = deviceSelector?.source === 'local-physical' || !!deviceSelector?.serial;
+
+    // Emit boot_emulator BEFORE the (blocking) create/claim call — not after.
+    // createSession can take ~60s and may crash-loop; emitting only after it
+    // returns meant the frontend never saw a real boot event during the boot
+    // window and fell back to its timer animation (the fake green stepper from
+    // the bug report). Firing it here makes the boot step truthful: the loader
+    // sits on "Booting device" for as long as the device is actually booting,
+    // and a crash surfaces as a real failure (catch block below) instead of a
+    // phantom-complete checklist.
+    emitWarmupProgress(userId, 'boot_emulator', 10);
     if (skipPoolForPhysical) {
       logger.info('[MOBILE_SESSION] Pinned selector — bypassing pool', {
         projectId,
         deviceSelector,
       });
-      session = await time('create_session_pinned', () => client.createSession(platform, {
+      session = await time('create_session_pinned', () => client.createSession(sessionCreatePlatform, {
         ownerId: effectiveOwnerId,
         deviceSelector,
         userId,
+        ...(dedicated ? { dedicated: true } : {}),
       }));
     } else {
       try {
-        session = await time('pool_claim', () => client.claimSession(platform, { ownerId: effectiveOwnerId, userId }));
+        session = await time('pool_claim', () => client.claimSession(sessionCreatePlatform, { ownerId: effectiveOwnerId, userId }));
         logger.info('[MOBILE_SESSION] Pool session claimed for warmup', {
           projectId,
           sessionId: session.sessionId,
@@ -523,7 +718,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           projectId,
           error: poolErr instanceof Error ? poolErr.message : String(poolErr),
         });
-        session = await time('create_session_cold', () => client.createSession(platform, {
+        session = await time('create_session_cold', () => client.createSession(sessionCreatePlatform, {
           ownerId: effectiveOwnerId,
           deviceSelector,
           userId,
@@ -531,8 +726,10 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       }
     }
 
-    // Emulator is up — nudge the loader past the "preparing env" stage.
-    emitWarmupProgress(userId, 'launching_browser', 15);
+    // Emulator/simulator is now actually up (createSession/claim returned) —
+    // advance the boot stage toward done. The next emit is `installing_app`
+    // from prepApp/MobileAppPrepService.
+    emitWarmupProgress(userId, 'boot_emulator', 30);
 
     // Propagate project-level permission policy to the runner. Delegates
     // to the shared service so warmup, regression worker, and CI runs
@@ -583,14 +780,19 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // Install the project's mobile app and run launch_app BEFORE returning, so the
     // preview stream shows the app already open when the frontend connects.
     // Non-fatal: on failure we still return the session so the user can retry.
+    // For Flutter we install but DON'T launch here — `attachFlutter` below
+    // clears logcat and launches so the one-time VM Service log line is
+    // inside the detection window.
+    let preppedPackage: string | undefined;
     try {
-      await time('prep_app_fresh', () => MobileAppPrepService.prepApp({
+      preppedPackage = await time('prep_app_fresh', () => MobileAppPrepService.prepApp({
         client,
         sessionId: session.sessionId,
         projectId,
         userId,
         appPackage,
-        skipLaunch: !prelaunch,
+        platform,
+        skipLaunch: isFlutter ? true : !prelaunch,
         onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
       }));
     } catch (err) {
@@ -600,7 +802,57 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         error: err instanceof Error ? err.message : String(err),
       });
     }
-    emitWarmupProgress(userId, 'ready', 100);
+
+    // Flutter: upgrade the native session into a Flutter session (launch →
+    // VM Service detect → connect). FATAL — a Flutter test can't run without
+    // the driver connection, and the runner destroys the native session on
+    // failure, so drop the Redis pointer and surface the runner's status
+    // (422 FLUTTER_NOT_DETECTED when the build isn't debug/profile).
+    if (isFlutter) {
+      const flutterPackage = appPackage || preppedPackage;
+      if (!flutterPackage) {
+        logger.warn('[MOBILE_SESSION] warmup rejected: no APK to launch for Flutter session', {
+          userId,
+          projectId,
+          platform,
+          reason: 'flutter_no_app_package',
+          status: 400,
+        });
+        await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`).catch(() => {});
+        res.status(400).json({
+          success: false,
+          error: 'No mobile app uploaded for this project — cannot start a Flutter session.',
+        });
+        return;
+      }
+      try {
+        await time('attach_flutter', () => client.attachFlutter(
+          session.sessionId,
+          { packageName: flutterPackage },
+          { userId },
+        ));
+      } catch (err) {
+        await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`).catch(() => {});
+        const status = (err instanceof MobileRunnerError && err.statusCode) ? err.statusCode : 500;
+        logger.warn('[MOBILE_SESSION] Flutter attach failed during warmup', {
+          sessionId: session.sessionId,
+          projectId,
+          userId,
+          status,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        res.status(status).json({
+          success: false,
+          error: err instanceof Error ? err.message : 'Flutter attach failed',
+          ...(err instanceof MobileRunnerError ? { code: err.code } : {}),
+        });
+        return;
+      }
+    }
+    // App launched on the fresh session; warmup is about to respond and the
+    // frontend will subscribe to the live stream. It promotes this to
+    // `ready` (100%) on the first decoded frame.
+    emitWarmupProgress(userId, 'waiting_first_frame', 95);
 
     logger.info('[MOBILE_SESSION] warmup response (path=fresh_create)', {
       userId, projectId,
@@ -620,17 +872,22 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       reused: false,
     });
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     logger.error('[MOBILE_SESSION] Warmup failed', {
       projectId,
       userId,
-      error: error instanceof Error ? error.message : String(error),
+      error: message,
     });
 
-    res.status(500).json({
-      success: false,
-      error: 'Failed to warm up emulator session',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    // Tell the loader the boot stage FAILED so it stops the spinner and shows
+    // the real reason (e.g. "Emulator crashed during startup") instead of the
+    // fallback timer optimistically completing the checklist. `boot_emulator`
+    // is the right stage label: this catch fires for createSession/claim
+    // failures (the boot window) — install/launch failures are swallowed as
+    // non-fatal above and never reach here.
+    emitWarmupProgress(userId, 'boot_emulator', 0, message);
+
+    sendMobileRunnerError(res, error, 'Failed to warm up emulator session');
   }
 }
 
@@ -676,8 +933,25 @@ export async function destroySession(req: Request, res: Response): Promise<void>
       await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`);
     }
 
-    // Close editor trace file for this session
-    await EditorTraceService.close(`mobile-${sessionId}`).catch(() => {});
+    // Close editor trace file for this session and upload it, mirroring the
+    // web editor's recording:stop path. uploadEditorTrace skips Supabase in
+    // development (keeps the local file) and is fire-and-forget so a slow
+    // upload never delays the destroy response.
+    await EditorTraceService.close(`mobile-${sessionId}`)
+      .then((meta) => {
+        if (meta) {
+          uploadEditorTrace({
+            filePath: meta.filePath,
+            userId: meta.userId,
+            previewSessionId: `mobile-${sessionId}`,
+            traceType: 'editor',
+          }).catch((err) => logger.error('[MOBILE_SESSION] Editor trace upload failed on destroy', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          }));
+        }
+      })
+      .catch(() => {});
 
     // User explicitly closed the editor → cancel any pending idle timer.
     try { cancelIdle(userId); } catch { /* non-fatal */ }
@@ -692,11 +966,7 @@ export async function destroySession(req: Request, res: Response): Promise<void>
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json({
-      success: false,
-      error: 'Failed to destroy session',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Failed to destroy session');
   }
 }
 
@@ -737,11 +1007,7 @@ export async function tapSession(req: Request, res: Response): Promise<void> {
       y,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Tap failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Tap failed');
   }
 }
 
@@ -801,11 +1067,7 @@ export async function swipeSession(req: Request, res: Response): Promise<void> {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Swipe failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Swipe failed');
   }
 }
 
@@ -837,11 +1099,7 @@ export async function goHomeSession(req: Request, res: Response): Promise<void> 
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Go home failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Go home failed');
   }
 }
 
@@ -873,11 +1131,7 @@ export async function goBackSession(req: Request, res: Response): Promise<void> 
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Go back failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Go back failed');
   }
 }
 
@@ -916,11 +1170,7 @@ export async function typeSession(req: Request, res: Response): Promise<void> {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Type text failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Type text failed');
   }
 }
 
@@ -960,11 +1210,7 @@ export async function keySession(req: Request, res: Response): Promise<void> {
       keycode,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Key press failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Key press failed');
   }
 }
 
@@ -1004,11 +1250,7 @@ export async function commandSession(req: Request, res: Response): Promise<void>
       type,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Command failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Command failed');
   }
 }
 
@@ -1037,8 +1279,37 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
     return;
   }
 
+  // Hoisted so the catch block can emit a lint result/error trace event with the
+  // same correlation id — a timed-out / thrown lint must leave a row, not a hole
+  // (the missing "Order" results in the 2026-06-15 Flutter trace were this gap).
+  const requestId = randomUUID();
+  const trace = EditorTraceService.getOrCreate(`mobile-${sessionId}`, req.user.id);
+  let lintStart = 0;
+  let lintDescription = '';
+  let lintActionType = 'tap';
+
   try {
     const client = getMobileRunnerClient();
+
+    // Liveness guard. Unlike warmup/apply/run (which call sessionExists), lint
+    // used to forward straight to the runner with whatever sessionId the editor
+    // still held — so a session the runner had reclaimed (idle TTL ~25min, pool
+    // reset, runner redeploy) produced a bare runner 404 that the catch below
+    // flattened into a useless "Lint failed". Detect the dead session up front
+    // and return a TYPED 410 the editor recognizes (code SESSION_EXPIRED), so it
+    // can surface "session expired — reopen" instead of a generic error. Cheap
+    // (~one GET /api/sessions, 5s cap) and only on the lint path.
+    const alive = await client.sessionExists(sessionId);
+    if (!alive) {
+      logger.info('[MOBILE_SESSION] Lint on a session the runner no longer has', { sessionId });
+      res.status(410).json({
+        success: false,
+        code: 'SESSION_EXPIRED',
+        error: 'Session expired',
+        message: 'The device session is no longer available (it was reclaimed after inactivity or a restart). Reopen the test case to continue.',
+      });
+      return;
+    }
 
     const stepType = stepDraft.type || stepDraft.kind || 'click';
     const rawDescription = (stepDraft.elementDescription || stepDraft.description || '').trim();
@@ -1094,10 +1365,10 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
     const actionType = ACTION_TYPE_MAP[stepType] || 'tap';
 
     // Trace logging for mobile editor
-    const traceSessionId = `mobile-${sessionId}`;
-    const trace = EditorTraceService.getOrCreate(traceSessionId, req.user.id);
-    trace.writeMobileLintRequest({ description, actionType, sessionId });
-    const lintStart = Date.now();
+    lintDescription = description;
+    lintActionType = actionType;
+    trace.writeMobileLintRequest({ requestId, description, actionType, sessionId });
+    lintStart = Date.now();
 
     // Pull bindingHints off the draft — the frontend sends either the
     // authored-from-recording set nested under intentStep, or the
@@ -1123,10 +1394,12 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
 
     // Log the result for debugging element resolution issues
     trace.writeMobileLintResult({
+      requestId,
       description,
       actionType,
       sessionId,
       latencyMs: Date.now() - lintStart,
+      framework: lintResult.framework,
       result: {
         status: lintResult.status,
         confidence: lintResult.confidence,
@@ -1177,15 +1450,28 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
       ...(lintResult.compiledPlan ? { compiled: lintResult.compiledPlan } : {}),
     });
   } catch (error) {
-    logger.warn('[MOBILE_SESSION] Lint failed', {
-      sessionId,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    res.status(500).json({
-      success: false,
-      error: 'Lint failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    const message = error instanceof Error ? error.message : String(error);
+    logger.warn('[MOBILE_SESSION] Lint failed', { sessionId, error: message });
+    // Leave a trace row for a failed lint so a slow/errored search isn't an
+    // invisible hole in the JSONL (the missing "Order" results). Paired to the
+    // request by requestId. Guard on lintStart > 0: it's set immediately after
+    // writeMobileLintRequest, so a throw BEFORE the request (client init / module
+    // import) writes no result — avoids an orphan result with no paired request.
+    if (lintStart > 0) {
+      trace.writeMobileLintResult({
+        requestId,
+        description: lintDescription,
+        actionType: lintActionType,
+        sessionId,
+        latencyMs: Date.now() - lintStart,
+        result: { status: 'error', message },
+      });
+    }
+    // Forward the REAL cause (shared helper) instead of a blanket "Lint failed":
+    // carries the cause in `error`, passes the runner's typed code/status, and
+    // maps a session that died mid-lint (TOCTOU past the up-front guard) to a
+    // typed 410 SESSION_EXPIRED.
+    sendMobileRunnerError(res, error, 'Lint failed');
   }
 }
 
@@ -1224,6 +1510,24 @@ export async function applySession(req: Request, res: Response): Promise<void> {
   if (!sessionId || !stepDraft) {
     res.status(400).json({ success: false, error: 'sessionId and stepDraft are required' });
     return;
+  }
+
+  // Set the run's user triggers ON THE SESSION so the runner's trigger engine +
+  // permission watcher honour them during this step. The editor "Run" applies
+  // steps one at a time, so triggers can't ride the batch run-steps body — they
+  // ride the session, set before each apply (like permissionPolicy). Best-effort:
+  // a trigger-setup hiccup must never fail the step.
+  const { triggers: applyTriggers } = req.body as { triggers?: unknown };
+  if (Array.isArray(applyTriggers)) {
+    try {
+      const { getMobileRunnerClient } = await import('@/services/mobile');
+      const { sanitizeTriggers } = await import('@/services/mobile/trigger-validation.util');
+      await getMobileRunnerClient().setTriggers(sessionId, sanitizeTriggers(applyTriggers), { userId: req.user!.id });
+    } catch (err) {
+      logger.warn('[applySession] failed to set triggers (non-fatal)', {
+        sessionId, error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   try {
@@ -1349,11 +1653,7 @@ export async function applySession(req: Request, res: Response): Promise<void> {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(500).json({
-      success: false,
-      error: 'Apply failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendMobileRunnerError(res, error, 'Apply failed');
   }
 }
 
@@ -1392,9 +1692,24 @@ export async function autoBootAndInstall(
     const client = getMobileRunnerClient();
     const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
 
-    // Load app so we know which storagePath to pend if we fail early
+    // Load app so we know which storagePath to pend if we fail early.
+    // Reads the platform-sharded slot when available so an Android+iOS
+    // dual-platform project pends the correct binary instead of always
+    // the legacy singular one (which is whatever was uploaded last).
+    // getProject doubles as the IDOR guard: it returns null when `userId`
+    // has no access to `projectId` (the upload route is requireAuth only,
+    // NOT project-scoped). Bail out before booting/installing — without this
+    // a user could boot a session against another tenant's project, and with
+    // dedicated-emulator routing reach another workspace's pinned device.
     const project = await ProjectService.getProject(projectId, userId);
-    const appStoragePath = project?.settings?.mobileApp?.storagePath;
+    if (!project) {
+      logger.warn('[MOBILE_AUTO_BOOT] No project access — skipping auto-boot', { projectId, userId });
+      return;
+    }
+    const projectAppForPend = getProjectMobileApp(project?.settings, platform);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const legacyApp = (project?.settings as any)?.mobileApp;
+    const appStoragePath = projectAppForPend?.storagePath ?? legacyApp?.storagePath;
 
     // Check for existing session
     let sessionId: string | null = null;
@@ -1437,8 +1752,20 @@ export async function autoBootAndInstall(
       };
       await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
 
-      const autoBootOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
-      const session = await client.createSession(platform, { ownerId: autoBootOwnerId, userId });
+      // Dedicated emulator: pin auto-boot to the workspace's dedicated device
+      // when one exists. workspaceId comes from the access-checked project
+      // (never the request). Forces ownerId=workspaceId; inert unless the flag
+      // is on AND a row exists.
+      const autoBootWorkspaceId: string | undefined = project.workspace_id ?? undefined;
+      const dedicated = await resolveDedicatedDevice(autoBootWorkspaceId, platform);
+      const autoBootOwnerId = dedicated
+        ? autoBootWorkspaceId
+        : (env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined);
+      const session = await client.createSession(platform, {
+        ownerId: autoBootOwnerId,
+        userId,
+        ...(dedicated ? { deviceSelector: { serial: dedicated.serial }, dedicated: true } : {}),
+      });
       sessionId = session.sessionId;
 
       // Update Redis with the real session ID
@@ -1465,6 +1792,7 @@ export async function autoBootAndInstall(
       sessionId,
       projectId,
       userId,
+      platform,
       skipLaunch: true,
       onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
     });
@@ -1526,9 +1854,18 @@ export async function autoBootAndInstall(
     logger.error('[MOBILE_AUTO_BOOT] Failed', { projectId, userId, error: message });
 
     // Mark APK as pending so the next warmup re-attempts the install.
+    // CRITICAL: read the platform-sharded slot, not the legacy singular
+    // one. The legacy slot mirrors the latest upload across all
+    // platforms, so on a dual-platform project this could point at the
+    // wrong-platform binary — pending-install would then force-install
+    // an .apk on an iOS session (or vice versa) on the next warmup.
     try {
       const project = await ProjectService.getProject(projectId, userId);
-      await setPendingInstall(project?.settings?.mobileApp?.storagePath);
+      const shardedApp = getProjectMobileApp(project?.settings, platform);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const legacyApp = (project?.settings as any)?.mobileApp;
+      const pendingPath = shardedApp?.storagePath ?? legacyApp?.storagePath;
+      await setPendingInstall(pendingPath);
     } catch { /* best-effort */ }
 
     // Clean up the _booting placeholder so warmup doesn't wait forever
@@ -1822,6 +2159,8 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
                     ...coordParams,
                     text: step.value,
                     clearFirst: !!(step.options?.replaceContent),
+                    // Editor "type like a human" toggle → runner typing realism.
+                    ...(step.options?.typeMode ? { typeMode: step.options.typeMode } : {}),
                   },
                 });
                 if (step.options?.pressEnter) {
@@ -1976,9 +2315,130 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
       intentTestCaseId,
       error: error instanceof Error ? error.message : String(error),
     });
+    sendMobileRunnerError(res, error, 'Failed to run test case');
+  }
+}
+
+/**
+ * GET /api/v1/mobile/exploration/readiness
+ *
+ * Backend-brokered readiness probe for mobile exploration. Replaces the
+ * browser's direct runner call: the runner API key stays server-side
+ * (injected by MobileRunnerClient), so the frontend launcher can show
+ * the "Runner / LLM keys / emulator slot" panel without ever holding
+ * the key. Returns the runner's readiness shape as-is.
+ */
+export async function explorationReadiness(req: Request, res: Response): Promise<void> {
+  if (!req.user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+  try {
+    const client = getMobileRunnerClient();
+    const readiness = await client.getExplorationReadiness({ userId: req.user.id });
+    res.json({ success: true, readiness });
+  } catch (error) {
+    logger.warn('[MOBILE_SESSION] Exploration readiness probe failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(502).json({
+      success: false,
+      error: 'Runner readiness check failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * POST /api/v1/mobile/projects/:projectId/exploration/start
+ *
+ * Backend-brokered mobile exploration kickoff (Stage 3, Slice 4). The
+ * frontend has already warmed a session (warmupSession) and holds its
+ * sessionId; it sends that here instead of calling the runner directly,
+ * so the runner API key stays server-side. We mint an explorationId,
+ * enqueue the brokered job (which starts the runner run + relays its
+ * events), and return immediately — progress arrives over the backend
+ * Socket.IO as web-style exploration:* events keyed by explorationId.
+ *
+ * Body: { platform, appId, runnerSessionId, runnerSocketUrl?, goal?, budget? }
+ */
+export async function startMobileExploration(req: Request, res: Response): Promise<void> {
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { projectId } = req.params;
+  const {
+    platform: rawPlatform,
+    appId,
+    runnerSessionId,
+    goal,
+    budget,
+    chatSessionId,
+  } = req.body as {
+    platform?: string;
+    appId?: string;
+    runnerSessionId?: string;
+    goal?: string;
+    budget?: Record<string, number>;
+    chatSessionId?: string;
+  };
+
+  const VALID: Record<string, 'android' | 'ios' | 'flutter'> = {
+    android: 'android', ios: 'ios', flutter: 'flutter',
+  };
+  const platform = VALID[rawPlatform ?? ''] ?? 'android';
+
+  if (!projectId || !appId || !runnerSessionId) {
+    res.status(400).json({
+      success: false,
+      error: 'projectId, appId and runnerSessionId are required',
+    });
+    return;
+  }
+
+  // Server-config ONLY — never accept a client-supplied runner URL (it
+  // would let a caller redirect the server-held key to an arbitrary host).
+  const runnerSocketUrl = currentRunnerSocketUrl();
+  if (!runnerSocketUrl) {
+    res.status(503).json({ success: false, error: 'Mobile runner is not configured' });
+    return;
+  }
+
+  // randomUUID, not Date.now() — two concurrent requests in the same ms
+  // would otherwise mint the same id, and since it's the BullMQ jobId the
+  // second enqueue would silently dedupe to the first (run never starts).
+  const explorationId = `mexpl-${randomUUID()}`;
+
+  try {
+    await QueueManager.addMobileExplorationJob({
+      explorationId,
+      runnerSessionId,
+      runnerSocketUrl,
+      appId,
+      platform,
+      projectId,
+      userId,
+      chatSessionId: chatSessionId || undefined,
+      budget,
+      goal: goal?.trim() || undefined,
+    });
+
+    logger.info('[MOBILE_SESSION] Mobile exploration queued', {
+      explorationId, projectId, platform, appId, userId,
+    });
+
+    res.json({ success: true, explorationId, mode: 'exploration', platform });
+  } catch (error) {
+    logger.error('[MOBILE_SESSION] Failed to queue mobile exploration', {
+      explorationId,
+      error: error instanceof Error ? error.message : String(error),
+    });
     res.status(500).json({
       success: false,
-      error: 'Failed to run test case',
+      error: 'Failed to start mobile exploration',
       message: error instanceof Error ? error.message : String(error),
     });
   }

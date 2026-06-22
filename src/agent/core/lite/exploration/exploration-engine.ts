@@ -465,9 +465,18 @@ export class ExplorationEngine {
             );
             bb.tree = updatedTree;
 
-            // Rebuild queue with newly discovered entry points
+            // Rebuild queue with newly discovered entry points. Exclude flows
+            // already executed in Phase 2 and pre-seed dedup memory with their
+            // names/goals so the extra round neither re-runs nor re-queues a
+            // near-duplicate of an already-explored flow.
             const updatedEntryPoints = bb.tree.getAllEntryPoints();
-            bb.queue = FlowQueue.fromStrategyOutput(updatedEntryPoints, focused);
+            bb.queue = FlowQueue.fromStrategyOutput(updatedEntryPoints, focused, {
+              excludeIds: flowTasks.map((t) => t.entryPoint.id),
+              seedDedup: {
+                names: flowTasks.map((t) => t.entryPoint.name),
+                goals: flowTasks.map((t) => t.entryPoint.goal),
+              },
+            });
             this.attachQueuePolicies(bb.queue, trace);
 
             logger.info('[EXPLORATION] Phase 2.5: Targeted survey complete', {
@@ -599,6 +608,15 @@ export class ExplorationEngine {
     const budget = BudgetTracker.fromCheckpoint(config.budget, checkpoint.budget);
     const rateLimiter = new RateLimiter(config.rateLimiting, budget);
 
+    // Rebuild a blackboard for the resumed FlowRunner so Scout keeps its
+    // known-pages dedup + Cartographer page-insight context (same as a fresh
+    // run). Without this, resumed runs degrade Scout branch discovery.
+    const bb = createBlackboard(config, budget, rateLimiter, trace, config.onProgress || (() => {}));
+    bb.tree = tree;
+    if (checkpoint.pageInsights) {
+      bb.pageInsights = new Map(checkpoint.pageInsights);
+    }
+
     // Check if budget is already exhausted (stale checkpoint)
     if (budget.isExhausted()) {
       logger.warn('[EXPLORATION] Budget exhausted from checkpoint, building result from partial data');
@@ -640,7 +658,7 @@ export class ExplorationEngine {
         queue.setPerPageBudget(new PerPageBudget(resumePerPageCap));
       }
       trace.writePhaseStart('flow');
-      const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter, trace);
+      const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter, trace, bb);
 
       let lastCheckpointFlows = 0;
       flowRunner.setCheckpointCallback(async (completedTasks) => {
@@ -699,7 +717,7 @@ export class ExplorationEngine {
 
     const previousTasks = checkpoint.flowRunner?.completedTasks || [];
     trace.writePhaseStart('flow');
-    const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter, trace);
+    const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter, trace, bb);
 
     // Restore FlowRunner state
     if (checkpoint.flowRunner) {

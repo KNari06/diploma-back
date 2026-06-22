@@ -13,6 +13,36 @@ async function invalidateWorkspaceCreditsCache(workspaceId: string): Promise<voi
   await cache.del(`qait:cache:workspace-credits:${workspaceId}`);
 }
 
+/**
+ * Coerce one value to a finite number, defaulting to 0.
+ * Postgres NUMERIC columns are serialized as JSON strings by PostgREST, so the
+ * raw row values are strings at runtime even though the TS type says `number`.
+ * Normalize at the data-access boundary so all callers can trust the types.
+ */
+function toNum(v: unknown): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * Normalize a raw workspace_credits row's NUMERIC columns to real numbers.
+ * `monthly_credit_limit` is nullable (null = no cap) and is preserved as null.
+ */
+function normalizeWorkspaceCredits(row: any): WorkspaceCredits | null {
+  if (!row) return null;
+  return {
+    ...row,
+    credits_balance: toNum(row.credits_balance),
+    total_purchased: toNum(row.total_purchased),
+    total_used: toNum(row.total_used),
+    grace_limit: toNum(row.grace_limit),
+    overage_balance: toNum(row.overage_balance),
+    credits_used_this_period: toNum(row.credits_used_this_period),
+    monthly_credit_limit:
+      row.monthly_credit_limit == null ? null : toNum(row.monthly_credit_limit),
+  };
+}
+
 // ============================================================================
 // WORKSPACE CREDITS INTERFACE
 // ============================================================================
@@ -89,7 +119,7 @@ export class WorkspaceCreditsService {
         return null;
       }
 
-      return data;
+      return normalizeWorkspaceCredits(data);
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception in getWorkspaceCredits', {
         error: error instanceof Error ? error.message : String(error),
@@ -158,7 +188,7 @@ export class WorkspaceCreditsService {
       balance: data.credits_balance,
     });
 
-    return data;
+    return normalizeWorkspaceCredits(data) as WorkspaceCredits;
   }
 
   /**
@@ -229,64 +259,43 @@ export class WorkspaceCreditsService {
         return null;
       }
 
-      // Get current credits
+      // Ensure the row exists (and read the pre-deduction monthly limit for the
+      // threshold notification below). The deduction itself is atomic via RPC.
       const credits = await this.getOrCreateWorkspaceCredits(workspaceId);
-      const currentBalance = Number.isFinite(credits.credits_balance) ? credits.credits_balance : 0;
-
-      // V16: Grace period — allow negative balance up to grace_limit
-      const graceLimit = Number.isFinite(credits.grace_limit) ? (credits.grace_limit || 0) : 0;
-      const effectiveFloor = -graceLimit;
-
-      if (currentBalance - amount < effectiveFloor) {
-        logger.warn('[WORKSPACE_CREDITS] Insufficient credits (grace limit exceeded)', {
-          workspaceId,
-          currentBalance,
-          requiredAmount: amount,
-          graceLimit,
-        });
-        return null;
-      }
-
-      // Check monthly credit limit (Business plan cap)
+      const currentBalance = toNum(credits.credits_balance);
       const monthlyLimit = credits.monthly_credit_limit;
-      const usedThisPeriod = credits.credits_used_this_period || 0;
 
-      if (monthlyLimit != null && usedThisPeriod + amount > monthlyLimit) {
-        logger.warn('[WORKSPACE_CREDITS] Monthly credit limit exceeded', {
-          workspaceId,
-          monthlyLimit,
-          usedThisPeriod,
-          requestedAmount: amount,
-        });
-        return null;
-      }
+      // Atomic deduction: folds the grace-floor check AND the monthly-cap check
+      // into one statement under a row lock, so concurrent deductions can't lose
+      // updates or both pass the cap. Empty result = rejected (floor or cap).
+      const { data: deductedRows, error: rpcError } = await supabaseAdmin.rpc('deduct_workspace_credits', {
+        p_workspace_id: workspaceId,
+        p_amount: amount,
+      });
 
-      const newBalance = currentBalance - amount;
-      const newTotalUsed = (credits.total_used || 0) + amount;
-      const newUsedThisPeriod = usedThisPeriod + amount;
-
-      // Update credits (including period usage tracking)
-      const { data: updatedCredits, error: updateError } = await supabaseAdmin
-        .from('workspace_credits')
-        .update({
-          credits_balance: newBalance,
-          total_used: newTotalUsed,
-          credits_used_this_period: newUsedThisPeriod,
-          last_credit_usage: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq('workspace_id', workspaceId)
-        .select()
-        .single();
-
-      if (updateError) {
-        logger.error('[WORKSPACE_CREDITS] Error deducting credits', {
-          error: updateError.message,
+      if (rpcError) {
+        logger.error('[WORKSPACE_CREDITS] Error deducting credits (rpc)', {
+          error: rpcError.message,
           workspaceId,
           amount,
         });
         return null;
       }
+
+      const updatedCredits = Array.isArray(deductedRows) ? deductedRows[0] : deductedRows;
+      if (!updatedCredits || updatedCredits.workspace_id == null) {
+        // Grace floor breached or monthly cap exceeded.
+        logger.warn('[WORKSPACE_CREDITS] Deduction rejected (grace floor or monthly cap)', {
+          workspaceId,
+          currentBalance,
+          requiredAmount: amount,
+          monthlyLimit,
+        });
+        return null;
+      }
+
+      const newBalance = toNum(updatedCredits.credits_balance);
+      const newUsedThisPeriod = toNum(updatedCredits.credits_used_this_period);
 
       // Record transaction
       const { error: txError } = await supabaseAdmin.from('workspace_credit_transactions').insert({
@@ -345,7 +354,7 @@ export class WorkspaceCreditsService {
       }
 
       await invalidateWorkspaceCreditsCache(workspaceId);
-      return updatedCredits;
+      return normalizeWorkspaceCredits(updatedCredits) as WorkspaceCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception deducting credits', {
         error: error instanceof Error ? error.message : String(error),
@@ -525,7 +534,7 @@ export class WorkspaceCreditsService {
       });
 
       await invalidateWorkspaceCreditsCache(workspaceId);
-      return updatedCredits;
+      return normalizeWorkspaceCredits(updatedCredits) as WorkspaceCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception adding credits', {
         error: error instanceof Error ? error.message : String(error),
@@ -757,7 +766,7 @@ export class WorkspaceCreditsService {
       });
 
       await invalidateWorkspaceCreditsCache(workspaceId);
-      return updatedCredits;
+      return normalizeWorkspaceCredits(updatedCredits) as WorkspaceCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception resetting monthly usage', {
         error: error instanceof Error ? error.message : String(error),
@@ -822,7 +831,7 @@ export class WorkspaceCreditsService {
       });
 
       await invalidateWorkspaceCreditsCache(workspaceId);
-      return data;
+      return normalizeWorkspaceCredits(data) as WorkspaceCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception assigning pilot', {
         error: error instanceof Error ? error.message : String(error),
@@ -903,9 +912,89 @@ export class WorkspaceCreditsService {
       });
 
       await invalidateWorkspaceCreditsCache(workspaceId);
-      return data;
+      return normalizeWorkspaceCredits(data) as WorkspaceCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception upgrading plan', {
+        error: error instanceof Error ? error.message : String(error),
+        workspaceId,
+        planSlug,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * V16: Renew a workspace's B2B plan on a recurring billing cycle.
+   *
+   * Unlike upgradeToPlan (which ADDS the plan's credits — correct for a first
+   * purchase / upgrade), renewal SETS the balance to exactly the plan allotment
+   * for the new period. Calling upgradeToPlan on every `subscription_cycle`
+   * stacked credits forever (29K → 58K → 87K …); this resets to the period
+   * limit with no rollover, the standard subscription-credit model.
+   */
+  static async renewPlan(
+    workspaceId: string,
+    planSlug: 'small_business' | 'middle_business' | 'enterprise',
+  ): Promise<WorkspaceCredits | null> {
+    try {
+      const { WORKSPACE_PLANS } = await import('./token-calculator.service');
+      const planConfig = WORKSPACE_PLANS[planSlug];
+      if (!planConfig) {
+        logger.error('[WORKSPACE_CREDITS] Unknown B2B plan slug (renew)', { workspaceId, planSlug });
+        return null;
+      }
+
+      const credits = await this.getOrCreateWorkspaceCredits(workspaceId);
+      const newBalance = planConfig.credits; // SET, not add — fresh period allotment
+
+      const { data, error } = await supabaseAdmin
+        .from('workspace_credits')
+        .update({
+          credits_balance: newBalance,
+          total_purchased: toNum(credits.total_purchased) + planConfig.credits,
+          subscription_plan: planSlug,
+          subscription_status: 'active',
+          grace_limit: planConfig.graceLimit,
+          monthly_credit_limit: planConfig.credits,
+          credits_used_this_period: 0,
+          period_start_date: new Date().toISOString().split('T')[0],
+          warning_80_sent: false,
+          warning_95_sent: false,
+          overage_balance: 0,
+          grace_started_at: null,
+          credits_purchased_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('workspace_id', workspaceId)
+        .select()
+        .single();
+
+      if (error) {
+        logger.error('[WORKSPACE_CREDITS] Error renewing plan', {
+          error: error.message, workspaceId, planSlug,
+        });
+        return null;
+      }
+
+      try {
+        await supabaseAdmin.from('workspace_credit_transactions').insert({
+          workspace_id: workspaceId,
+          amount: planConfig.credits,
+          balance_after: newBalance,
+          transaction_type: 'purchase',
+          description: `Renewed ${planSlug} plan — ${planConfig.credits.toLocaleString()} credits for the new period`,
+          metadata: { plan: planSlug, price: planConfig.price, renewal: true },
+        });
+      } catch { /* non-fatal */ }
+
+      logger.info('[WORKSPACE_CREDITS] Workspace plan renewed', {
+        workspaceId, plan: planSlug, credits: planConfig.credits, newBalance,
+      });
+
+      await invalidateWorkspaceCreditsCache(workspaceId);
+      return normalizeWorkspaceCredits(data) as WorkspaceCredits;
+    } catch (error) {
+      logger.error('[WORKSPACE_CREDITS] Exception renewing plan', {
         error: error instanceof Error ? error.message : String(error),
         workspaceId,
         planSlug,

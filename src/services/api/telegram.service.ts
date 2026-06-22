@@ -17,6 +17,21 @@ import { supabaseAdmin } from '@/db/supabase';
 
 const TELEGRAM_API_URL = 'https://api.telegram.org';
 
+/**
+ * A valid Telegram chat_id is either a numeric id (positive for users,
+ * negative for groups/supergroups, e.g. 8238452651 or -1001234567890) OR a
+ * public channel handle starting with '@' (e.g. @my_channel).
+ *
+ * It is NEVER a bare bot username like "Beknur_qa_bot" — a real connect-flow
+ * incident stored the bot username here, which made every send fail. Reject it.
+ */
+export function isValidTelegramChatId(chatId: string | number): boolean {
+  const s = String(chatId).trim();
+  if (/^-?\d+$/.test(s)) return true;            // numeric id (user/group/supergroup)
+  if (/^@[A-Za-z][A-Za-z0-9_]{4,}$/.test(s)) return true; // @public_channel handle
+  return false;
+}
+
 export interface TelegramTokenData {
   id: string;
   user_id: string;
@@ -73,10 +88,19 @@ export async function getTelegramToken(userId: string, workspaceId?: string): Pr
       .eq('enabled', true);
 
     if (workspaceId) {
-      query = query.eq('workspace_id', workspaceId);
+      // Match workspace-scoped tokens OR global tokens (workspace_id IS NULL),
+      // mirroring IntegrationTokenService.getToken — a globally-connected bot
+      // must still resolve when a caller passes a workspaceId.
+      query = query.or(`workspace_id.eq.${workspaceId},workspace_id.is.null`);
     }
 
+    // Precedence: a workspace-scoped token (workspace_id NOT NULL) MUST win over
+    // a global one even if older — otherwise a stale global row can shadow the
+    // bot the user just connected for this workspace, causing a 401 on send.
+    // nullsFirst:false puts the non-null workspace_id rows first; created_at
+    // only breaks ties within the same scope.
     const { data, error } = await query
+      .order('workspace_id', { ascending: false, nullsFirst: false })
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();

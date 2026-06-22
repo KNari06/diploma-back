@@ -17,7 +17,9 @@ export { getTelegramToken };
 // Telegram HTML mode only supports: <b>, <i>, <u>, <s>, <code>, <pre>, <a>.
 // ALL other text must have <, >, & escaped.
 
-function escTg(text: string): string {
+// Exported so other Telegram HTML senders (automation, skills) reuse ONE
+// escaper instead of interpolating raw values and tripping a 400.
+export function escTg(text: string): string {
   return text
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -67,7 +69,8 @@ const SEVERITY_ICON: Record<string, string> = {
 
 // ─── Builder ────────────────────────────────────────────────────────────
 
-function buildTelegramMessage(payload: TgNotificationPayload): string {
+// Exported for unit testing — pure function, no side effects.
+export function buildTelegramMessage(payload: TgNotificationPayload): string {
   const lines: string[] = [];
 
   // Header
@@ -111,8 +114,10 @@ function buildTelegramMessage(payload: TgNotificationPayload): string {
     lines.push('');
   }
 
-  // CTA
-  lines.push(`<a href="${payload.ctaUrl}">${escTg(payload.ctaLabel)}</a>`);
+  // CTA — the href value MUST be escaped too: a raw `&` (common in URLs with
+  // query params) makes Telegram's HTML parser reject the whole message with a
+  // 400 "can't parse entities", so the notification silently never arrives.
+  lines.push(`<a href="${escTg(payload.ctaUrl)}">${escTg(payload.ctaLabel)}</a>`);
 
   return lines.join('\n');
 }

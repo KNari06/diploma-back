@@ -33,9 +33,11 @@ import { env } from '@/config/environment/env';
 import { incCounter, observeMs } from '@/utils/core/mobile-chat-metrics';
 import {
   MobileRunnerError,
+  frameworkToMobilePlatformKey,
   type MobileIntentStep,
   type MobilePlatform,
 } from '@/services/mobile/mobile-runner.types';
+import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { logger } from '@/utils/core/logger';
 import type { MobileBlackboard } from './blackboard';
 import { generateFlowPlan } from './planner';
@@ -1700,13 +1702,16 @@ async function runMobileCreateTestCase(
   }
 
   // Resolve platform. Priority:
-  //   1. Explicit override from the LLM (`platform` arg) — needed for Flutter
-  //      / React-Native because the runner's ui-state reports the host
-  //      platform (android/ios), not the framework. The LLM has the user's
-  //      context and can flag "this is a Flutter app".
-  //   2. Cached draft platform (captured at run time).
-  //   3. Default 'mobile_android' as a safe fallback (the save will validate
-  //      via DB CHECK constraint anyway).
+  //   1. Explicit override from the LLM (`platform` arg) — the LLM has the
+  //      user's context and can flag "this is a Flutter app" directly.
+  //   2. The app's upload-time `detectedFramework` — the authoritative signal.
+  //      This is the load-bearing fix: the runner's live ui-state collapses
+  //      Flutter to its host platform (android/ios), so without this a Flutter
+  //      app's test case saves as `mobile_android`. That then makes the
+  //      regression/warmup paths create a plain android session and SKIP
+  //      attach-flutter, leaving element resolution blind (empty native tree).
+  //   3. Cached draft platform (captured at run time).
+  //   4. Default 'mobile_android' (the save validates via DB CHECK anyway).
   const overrideRaw = typeof args.platform === 'string' ? args.platform : null;
   const validOverrides = ['mobile_android', 'mobile_ios', 'mobile_flutter'] as const;
   type SavePlatform = typeof validOverrides[number];
@@ -1714,13 +1719,37 @@ async function runMobileCreateTestCase(
     overrideRaw && (validOverrides as readonly string[]).includes(overrideRaw)
       ? (overrideRaw as SavePlatform)
       : null;
+
+  // Derive from the detected framework when the LLM didn't override. Failure
+  // to read it is non-fatal — fall through to the cached/host value.
+  let frameworkPlatform: SavePlatform | null = null;
+  if (!override) {
+    const framework = await MobileAppStorageService.getDetectedFramework(projectId).catch(
+      () => undefined,
+    );
+    if (framework === 'flutter' || framework === 'ios') {
+      frameworkPlatform = frameworkToMobilePlatformKey(
+        framework,
+        draft.platform === 'ios' ? 'ios' : 'android',
+      );
+    }
+  }
+
   const cachedPlatform: SavePlatform =
     draft.platform === 'ios' ? 'mobile_ios'
     : draft.platform === 'android' ? 'mobile_android'
     // captureUiState collapses flutter/react-native to host platform, so
     // 'flutter' here is theoretical (cache typed loose); treat as android.
     : 'mobile_android';
-  const finalPlatform: SavePlatform = override ?? cachedPlatform;
+  const finalPlatform: SavePlatform = override ?? frameworkPlatform ?? cachedPlatform;
+
+  if (frameworkPlatform && frameworkPlatform !== cachedPlatform) {
+    logger.info('[mobile_create_test_case] platform derived from detectedFramework', {
+      projectId,
+      derived: frameworkPlatform,
+      cachedHost: cachedPlatform,
+    });
+  }
 
   try {
     const result = await RegressionSaveService.saveTestCase({

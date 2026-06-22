@@ -1,26 +1,14 @@
-import { supabaseAdmin } from '@/db/supabase';
-import { ApiConfigService } from '@/services/api/api-config.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
-import { UserCreditsService } from '@/services/core/user-credits.service';
 import { BUG_REPORT_CREDITS } from '@/jobs/ai-analysis.job';
 import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { NotFoundError, ValidationError, InsufficientCreditsError } from '@/types';
-import type { RegressionRunProgressPayload } from '@/websocket/types/types';
 import type {
   Priority,
   RunResult,
   RunReport,
-  RunReportExecution,
-  RunReportStep,
-  RunReportSummary,
-  RunReportArtifactsSummary,
-  EnrichedBug,
   ExecutableTestCase,
-  ExecutionHealthChecks,
-  NegativeSummary,
 } from '@/types/testing.types';
-import { HealthCheckAggregatorService } from './health-check-aggregator.service';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { logger, formatError } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
@@ -28,9 +16,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { ExecutionService } from '../executions/execution.service';
 import { RegressionPlanService } from '../plans/regression-plan.service';
 import { ManualTestService } from '../ui/manualTest.service';
-import { TestReportGeneratorService } from '../results/test-report-generator.service';
-import { env } from '@/config/environment/env';
-import { QueueManager } from '@/config/infrastructure/queues';
+import { IntentTestCaseService } from '../ui/preview/intent-test-case.service';
 import { deriveRunStatus } from '@/utils/testing/run-status.utils';
 import {
   RegressionReportAssemblerService,
@@ -38,7 +24,16 @@ import {
 } from './regression-report-assembler.service';
 import { MobileTestDispatcherService } from './mobile-test-dispatcher.service';
 import { WebTestRequestBuilderService } from './web-test-request-builder.service';
-import { RegressionTestQueryService } from './regression-test-query.service';
+import { RegressionTestQueryService } from './db/regression-test-query.db';
+import {
+  insertRun,
+  updateRunById,
+  failZombieRuns,
+  listRunsByProject,
+  getRunExecutionStatsRows,
+} from './db/regression-run.db';
+import { getProjectForAccess } from './db/regression.db';
+import { priorityRank } from './resolve-test-case-priority.util';
 import { TestExecutionOrchestratorService } from './test-execution-orchestrator.service';
 
 /**
@@ -75,15 +70,7 @@ export class RegressionRunService {
   static async cleanupZombieRuns(): Promise<void> {
     try {
       const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-      const { data: zombieRuns, error } = await supabaseAdmin
-        .from('regression_runs')
-        .update({
-          status: 'failed',
-          completed_at: new Date().toISOString(),
-        })
-        .in('status', ['running', 'pending'])
-        .lt('started_at', thirtyMinutesAgo)
-        .select('id');
+      const { ids: zombieRunIds, error } = await failZombieRuns(thirtyMinutesAgo);
 
       if (error) {
         // Use formatError so upstream HTML gateway responses (e.g. Cloudflare 520
@@ -92,10 +79,10 @@ export class RegressionRunService {
         return;
       }
 
-      if (zombieRuns && zombieRuns.length > 0) {
+      if (zombieRunIds.length > 0) {
         logger.warn('[REGRESSION_RUN] Cleaned up zombie runs', {
-          count: zombieRuns.length,
-          runIds: zombieRuns.map((r: any) => r.id),
+          count: zombieRunIds.length,
+          runIds: zombieRunIds,
         });
       }
     } catch (error) {
@@ -120,11 +107,13 @@ export class RegressionRunService {
     userId: string;
     trigger: 'manual' | 'chat' | 'scheduled' | 'webhook';
     parameters?: Record<string, any>;
+    /** Optional Playwright browser override (chromium | firefox | webkit). */
+    browserOverride?: string;
   }): Promise<{
     runId: string;
     testId: string;
   }> {
-    const { savedTestCaseId: intentTestCaseId, userId, trigger, parameters = {} } = params;
+    const { savedTestCaseId: intentTestCaseId, userId, trigger, parameters = {}, browserOverride } = params;
 
     try {
       logger.info('[REGRESSION_RUN] Running intent test case', {
@@ -136,6 +125,20 @@ export class RegressionRunService {
       // 1. Get intent test case
       const intentCase = await RegressionTestQueryService.getSavedTestCase(intentTestCaseId, userId);
 
+      // 1a. Inline transitive dependency (precondition) steps so they run
+      // in-session BEFORE this test's own steps (shared browser → shared
+      // login/cookies/data). Borrowed steps carry `_preconditionSource` and
+      // are excluded from this case's persisted steps_json at writeback time.
+      const preconditionSteps = await IntentTestCaseService.collectPreconditionSteps(intentTestCaseId);
+      if (preconditionSteps.length > 0) {
+        intentCase.steps_json = [...preconditionSteps, ...(intentCase.steps_json || [])];
+        logger.info('[REGRESSION_RUN] Inlined precondition steps', {
+          intentTestCaseId,
+          preconditionSteps: preconditionSteps.length,
+          totalSteps: intentCase.steps_json.length,
+        });
+      }
+
       // 1b. Credit check + deduction for single test case
       await this.checkCreditBalance(
         userId,
@@ -144,21 +147,17 @@ export class RegressionRunService {
       );
 
       // 2. Create regression run record (now uses intent_test_case_id)
-      const { data: run, error: runError } = await supabaseAdmin
-        .from('regression_runs')
-        .insert({
-          intent_test_case_id: intentTestCaseId,
-          project_id: intentCase.project_id,
-          user_id: userId,
-          trigger,
-          status: 'running',
-          started_at: new Date().toISOString(),
-        })
-        .select('id')
-        .single();
+      const { data: run, error: runError } = await insertRun({
+        intent_test_case_id: intentTestCaseId,
+        project_id: intentCase.project_id,
+        user_id: userId,
+        trigger,
+        status: 'running',
+        started_at: new Date().toISOString(),
+      });
 
       if (runError || !run) {
-        throw new Error(`Failed to create regression run: ${runError?.message}`);
+        throw new Error(`Failed to create regression run: ${(runError as any)?.message}`);
       }
 
       // 3. Route mobile vs web test
@@ -181,7 +180,7 @@ export class RegressionRunService {
           testId = mobileResult.testId;
         } else {
           // Web test → dispatch to Playwright queue
-          const testRequest = await WebTestRequestBuilderService.buildTestRequest(intentCase, userId, parameters, undefined, trigger);
+          const testRequest = await WebTestRequestBuilderService.buildTestRequest(intentCase, userId, parameters, browserOverride, trigger);
           const testResult = await ManualTestService.runTest(testRequest);
 
           if (!testResult.success || !testResult.data?.id) {
@@ -191,18 +190,12 @@ export class RegressionRunService {
         }
       } catch (execError) {
         // Mark run as failed — it was already created with 'running' status
-        await supabaseAdmin
-          .from('regression_runs')
-          .update({ status: 'failed', completed_at: new Date().toISOString() })
-          .eq('id', run.id);
+        await updateRunById(run.id, { status: 'failed', completed_at: new Date().toISOString() });
         throw execError;
       }
 
       // 5. Update regression run with test_id for status tracking
-      const { error: updateError } = await supabaseAdmin
-        .from('regression_runs')
-        .update({ test_id: testId })
-        .eq('id', run.id);
+      const { error: updateError } = await updateRunById(run.id, { test_id: testId });
 
       if (updateError) {
         logger.warn('[REGRESSION_RUN] Failed to update run with test_id', {
@@ -256,12 +249,9 @@ export class RegressionRunService {
     let uiStepCredits = 0;
     if (uiCases.length > 0) {
       const uiIds = uiCases.map((tc) => tc.testCaseId);
-      const { data: rows } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, commands, graph_ref, steps_json, setup_steps, teardown_steps, replay_strategy')
-        .in('id', uiIds);
+      const rows = await RegressionTestQueryService.getUiStepCountRows(uiIds);
 
-      for (const row of rows || []) {
+      for (const row of rows) {
         let stepCount = 0;
         if (row.replay_strategy === 'commands' && Array.isArray(row.commands)) {
           stepCount = row.commands.length;
@@ -314,17 +304,24 @@ export class RegressionRunService {
       apiCreditCost,
       bugReportBudget,
       available: creditCheck.available,
+      graceLimit: creditCheck.graceLimit,
+      effectiveAvailable: creditCheck.effectiveAvailable,
       uiTestCount: uiCases.length,
     });
-    if (creditCheck.available < totalRequired) {
+    // Gate on effectiveAvailable (balance + grace_limit), matching the runtime
+    // per-step gate in CreditCostTrackerService. Using raw `available` here made
+    // the pre-flight reject grace-eligible users (e.g. Pro/Ultra) that the
+    // runtime would have allowed — surfacing "insufficient credits" despite a
+    // positive balance + grace headroom.
+    if (creditCheck.effectiveAvailable < totalRequired) {
       // Use the dedicated error class so the controller can surface a stable
       // `code: 'INSUFFICIENT_CREDITS'` to the frontend (which then flips the
       // global "credits exhausted" banner instead of a generic toast).
       throw new InsufficientCreditsError(
-        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost} + ${bugReportBudget} bug-report budget), Available: ${creditCheck.available}`,
+        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost} + ${bugReportBudget} bug-report budget), Available: ${creditCheck.effectiveAvailable}`,
         {
           required: totalRequired,
-          available: creditCheck.available,
+          available: creditCheck.effectiveAvailable,
           breakdown: {
             uiStepCredits,
             apiCount,
@@ -362,17 +359,14 @@ export class RegressionRunService {
     const { runId, status, summary } = params;
 
     try {
-      const { error } = await supabaseAdmin
-        .from('regression_runs')
-        .update({
-          status,
-          summary: summary || null,
-          completed_at: new Date().toISOString(),
-        })
-        .eq('id', runId);
+      const { error } = await updateRunById(runId, {
+        status,
+        summary: summary || null,
+        completed_at: new Date().toISOString(),
+      });
 
       if (error) {
-        throw new Error(`Failed to update run status: ${error.message}`);
+        throw new Error(`Failed to update run status: ${(error as any)?.message}`);
       }
 
       logger.info('[REGRESSION_RUN] Run status updated', { runId, status });
@@ -403,21 +397,14 @@ export class RegressionRunService {
     const safeLimit = Math.min(Math.max(limit, 1), MAX_LIST_LIMIT);
 
     // Now fetches from intent_test_cases (unified table)
-    let query = supabaseAdmin
-      .from('intent_test_cases')
-      .select('*')
-      .eq('project_id', projectId);
-
-    if (platform) {
-      query = query.eq('platform', platform);
-    }
-
-    const { data: cases, error } = await query
-      .order('created_at', { ascending: false })
-      .limit(safeLimit);
+    const { data: cases, error } = await RegressionTestQueryService.listByProject(
+      projectId,
+      safeLimit,
+      platform,
+    );
 
     if (error) {
-      throw new Error(`Failed to list intent test cases: ${error.message}`);
+      throw new Error(`Failed to list intent test cases: ${(error as any)?.message}`);
     }
 
     return cases || [];
@@ -442,15 +429,10 @@ export class RegressionRunService {
     // Apply limit bounds
     const safeLimit = Math.min(Math.max(limit, 1), MAX_LIST_LIMIT);
 
-    const { data: runs, error } = await supabaseAdmin
-      .from('regression_runs')
-      .select('*, regression_plans(name)')
-      .eq('project_id', projectId)
-      .order('started_at', { ascending: false })
-      .limit(safeLimit);
+    const { data: runs, error } = await listRunsByProject(projectId, safeLimit);
 
     if (error) {
-      throw new Error(`Failed to list runs: ${error.message}`);
+      throw new Error(`Failed to list runs: ${(error as any)?.message}`);
     }
 
     if (!runs || runs.length === 0) return [];
@@ -461,10 +443,7 @@ export class RegressionRunService {
     // Same single-query pattern as the existing stats fetch — no new
     // round-trip, just two extra columns.
     const runIds = runs.map((r: any) => r.id);
-    const { data: allExecs } = await supabaseAdmin
-      .from('test_executions')
-      .select('run_id, status, duration_ms, platform, test_type')
-      .in('run_id', runIds);
+    const allExecs = await getRunExecutionStatsRows(runIds);
 
     // Bucket a raw `test_executions` row into web/mobile/api. Matches
     // PlanHealthReport's bucketing exactly (see healthBucketForPlatform
@@ -564,19 +543,15 @@ export class RegressionRunService {
     projectId: string,
     userId: string
   ): Promise<void> {
-    const { data: project, error } = await supabaseAdmin
-      .from('projects')
-      .select('user_id, workspace_id')
-      .eq('id', projectId)
-      .maybeSingle();
+    const project = await getProjectForAccess(projectId);
 
-    if (error || !project) {
+    if (!project) {
       throw new NotFoundError('Project', projectId);
     }
 
     if (project.user_id === userId) return;
 
-    const workspaceId = (project as any).workspace_id as string | undefined;
+    const workspaceId = project.workspace_id ?? undefined;
     if (workspaceId) {
       const role = await WorkspaceAccessService.getRole(userId, workspaceId);
       if (role != null) return;
@@ -690,61 +665,48 @@ export class RegressionRunService {
         );
       }
 
-      // 1b. Batch-fetch depends_on for UI test cases
+      // 1b. Batch-fetch depends_on + priority for UI test cases.
+      // Dependencies are passed RAW (not filtered to in-run ids): the
+      // orchestrator detects out-of-run references, surfaces them in the
+      // run summary as `missingDependencies`, and the topological sort
+      // ignores them for ordering — so the user sees the gap instead of
+      // it being silently swallowed here.
       const uiCaseIds = expandedCases.filter((tc) => tc.testType === 'ui').map((tc) => tc.testCaseId);
       const depMap = new Map<string, string[]>();
+      const priorityMap = new Map<string, string | null>();
       if (uiCaseIds.length > 0) {
-        const { data: depRows } = await supabaseAdmin
-          .from('intent_test_cases')
-          .select('id, depends_on')
-          .in('id', uiCaseIds);
-        for (const row of depRows || []) {
+        const depRows = await RegressionTestQueryService.getDependsOnRows(uiCaseIds);
+        for (const row of depRows) {
           depMap.set(row.id, row.depends_on || []);
+          priorityMap.set(row.id, row.priority ?? null);
         }
       }
 
-      // Filter depends_on to only include test cases that are part of this run
-      const runTestCaseIds = new Set(expandedCases.map((tc) => tc.testCaseId));
-
-      const executableCases: ExecutableTestCase[] = expandedCases.map((tc) => {
-        const rawDeps = depMap.get(tc.testCaseId) || [];
-        const validDeps = rawDeps.filter((depId) => runTestCaseIds.has(depId));
-        if (validDeps.length !== rawDeps.length) {
-          logger.warn('[REGRESSION_RUN] Filtered out-of-run dependencies', {
-            testCaseId: tc.testCaseId,
-            originalDeps: rawDeps,
-            filteredDeps: validDeps,
-          });
-        }
-        return {
-          testCaseId: tc.testCaseId,
-          testType: tc.testType,
-          moduleId: tc.moduleId,
-          flowId: tc.flowId,
-          dependsOn: validDeps,
-          ...(tc.isNegative && { isNegative: true }),
-          ...(tc.platform && { platform: tc.platform }),
-        };
-      });
+      const executableCases: ExecutableTestCase[] = expandedCases.map((tc) => ({
+        testCaseId: tc.testCaseId,
+        testType: tc.testType,
+        moduleId: tc.moduleId,
+        flowId: tc.flowId,
+        dependsOn: depMap.get(tc.testCaseId) || [],
+        priority: priorityMap.get(tc.testCaseId) ?? null,
+        ...(tc.isNegative && { isNegative: true }),
+        ...(tc.platform && { platform: tc.platform }),
+      }));
 
       // 1c. Credit check — verify user has enough credits for all test cases
       await this.checkCreditBalance(userId, executableCases, 'regression_plan');
 
       // 2. Create regression run record with plan_id (initially 'pending' until executions are created)
-      const { data: run, error: runError } = await supabaseAdmin
-        .from('regression_runs')
-        .insert({
-          plan_id: planId,
-          project_id: plan.projectId,
-          user_id: userId,
-          trigger,
-          status: 'pending',
-        })
-        .select('id')
-        .single();
+      const { data: run, error: runError } = await insertRun({
+        plan_id: planId,
+        project_id: plan.projectId,
+        user_id: userId,
+        trigger,
+        status: 'pending',
+      });
 
       if (runError || !run) {
-        throw new Error(`Failed to create plan run: ${runError?.message}`);
+        throw new Error(`Failed to create plan run: ${(runError as any)?.message}`);
       }
 
       // Invalidate plans list cache (new run affects lastRun display)
@@ -773,18 +735,12 @@ export class RegressionRunService {
           runId: run.id,
           error: batchError,
         });
-        await supabaseAdmin
-          .from('regression_runs')
-          .update({ status: 'failed', completed_at: new Date().toISOString() })
-          .eq('id', run.id);
+        await updateRunById(run.id, { status: 'failed', completed_at: new Date().toISOString() });
         throw batchError;
       }
 
       // Transition from 'pending' to 'running' now that executions exist
-      await supabaseAdmin
-        .from('regression_runs')
-        .update({ status: 'running', started_at: new Date().toISOString() })
-        .eq('id', run.id);
+      await updateRunById(run.id, { status: 'running', started_at: new Date().toISOString() });
 
       // Notify all workspace members immediately — closes the gap between run creation
       // and the first progress event from executeTestCasesAsync (which fires only
@@ -838,10 +794,7 @@ export class RegressionRunService {
         failOnFirstFailure,
       ).catch(async (error) => {
         logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
-        await supabaseAdmin
-          .from('regression_runs')
-          .update({ status: 'failed', completed_at: new Date().toISOString() })
-          .eq('id', run.id);
+        await updateRunById(run.id, { status: 'failed', completed_at: new Date().toISOString() });
       });
 
       logger.info('[REGRESSION_RUN] Plan execution started', {
@@ -885,11 +838,7 @@ export class RegressionRunService {
       logger.info('[REGRESSION_RUN] Running module', { moduleId, userId, trigger });
 
       // 1. Get module with platform info and verify access
-      const { data: mod, error: modError } = await supabaseAdmin
-        .from('test_modules')
-        .select('*, projects!inner(user_id), test_platforms!inner(platform_key)')
-        .eq('id', moduleId)
-        .single();
+      const { data: mod, error: modError } = await RegressionTestQueryService.getModuleWithAccess(moduleId);
 
       if (modError || !mod) {
         throw new NotFoundError('Module', moduleId);
@@ -907,12 +856,7 @@ export class RegressionRunService {
       });
 
       // 2. Get all flows in module
-      const { data: flows } = await supabaseAdmin
-        .from('test_flows')
-        .select('id')
-        .eq('module_id', moduleId);
-
-      const flowIds = (flows || []).map((f: any) => f.id);
+      const flowIds = await RegressionTestQueryService.getFlowIdsByModule(moduleId);
 
       // 3. Get all test cases in flows
       const testCases = await RegressionTestQueryService.getTestCasesInFlows(flowIds);
@@ -925,21 +869,17 @@ export class RegressionRunService {
       await this.checkCreditBalance(userId, testCases, 'regression_module');
 
       // 5. Create regression run record
-      const { data: run, error: runError } = await supabaseAdmin
-        .from('regression_runs')
-        .insert({
-          module_id: moduleId,
-          project_id: mod.project_id,
-          user_id: userId,
-          trigger,
-          status: 'running',
-          started_at: new Date().toISOString(),
-        })
-        .select('id')
-        .single();
+      const { data: run, error: runError } = await insertRun({
+        module_id: moduleId,
+        project_id: mod.project_id,
+        user_id: userId,
+        trigger,
+        status: 'running',
+        started_at: new Date().toISOString(),
+      });
 
       if (runError || !run) {
-        throw new Error(`Failed to create module run: ${runError?.message}`);
+        throw new Error(`Failed to create module run: ${(runError as any)?.message}`);
       }
       createdRunId = run.id;
 
@@ -955,10 +895,7 @@ export class RegressionRunService {
         parameters
       ).catch(async (error) => {
         logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
-        await supabaseAdmin
-          .from('regression_runs')
-          .update({ status: 'failed', completed_at: new Date().toISOString() })
-          .eq('id', run.id);
+        await updateRunById(run.id, { status: 'failed', completed_at: new Date().toISOString() });
       });
 
       return {
@@ -970,10 +907,7 @@ export class RegressionRunService {
       // Mark run as failed if it was already created
       if (createdRunId) {
         try {
-          await supabaseAdmin
-            .from('regression_runs')
-            .update({ status: 'failed', completed_at: new Date().toISOString() })
-            .eq('id', createdRunId);
+          await updateRunById(createdRunId, { status: 'failed', completed_at: new Date().toISOString() });
         } catch { /* non-fatal */ }
       }
       logger.error('[REGRESSION_RUN] Failed to run module', { error, moduleId });
@@ -1003,11 +937,7 @@ export class RegressionRunService {
       logger.info('[REGRESSION_RUN] Running flow', { flowId, userId, trigger });
 
       // 1. Get flow and verify access
-      const { data: flow, error: flowError } = await supabaseAdmin
-        .from('test_flows')
-        .select('*, test_modules!inner(project_id, projects!inner(user_id))')
-        .eq('id', flowId)
-        .single();
+      const { data: flow, error: flowError } = await RegressionTestQueryService.getFlowWithAccess(flowId);
 
       if (flowError || !flow) {
         throw new NotFoundError('Flow', flowId);
@@ -1029,22 +959,18 @@ export class RegressionRunService {
       await this.checkCreditBalance(userId, testCases, 'regression_flow');
 
       // 3. Create regression run record
-      const { data: run, error: runError } = await supabaseAdmin
-        .from('regression_runs')
-        .insert({
-          flow_id: flowId,
-          module_id: flow.module_id,
-          project_id: module.project_id,
-          user_id: userId,
-          trigger,
-          status: 'running',
-          started_at: new Date().toISOString(),
-        })
-        .select('id')
-        .single();
+      const { data: run, error: runError } = await insertRun({
+        flow_id: flowId,
+        module_id: flow.module_id,
+        project_id: module.project_id,
+        user_id: userId,
+        trigger,
+        status: 'running',
+        started_at: new Date().toISOString(),
+      });
 
       if (runError || !run) {
-        throw new Error(`Failed to create flow run: ${runError?.message}`);
+        throw new Error(`Failed to create flow run: ${(runError as any)?.message}`);
       }
       createdRunId = run.id;
 
@@ -1060,10 +986,7 @@ export class RegressionRunService {
         parameters
       ).catch(async (error) => {
         logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
-        await supabaseAdmin
-          .from('regression_runs')
-          .update({ status: 'failed', completed_at: new Date().toISOString() })
-          .eq('id', run.id);
+        await updateRunById(run.id, { status: 'failed', completed_at: new Date().toISOString() });
       });
 
       return {
@@ -1074,10 +997,7 @@ export class RegressionRunService {
     } catch (error) {
       if (createdRunId) {
         try {
-          await supabaseAdmin
-            .from('regression_runs')
-            .update({ status: 'failed', completed_at: new Date().toISOString() })
-            .eq('id', createdRunId);
+          await updateRunById(createdRunId, { status: 'failed', completed_at: new Date().toISOString() });
         } catch { /* non-fatal */ }
       }
       logger.error('[REGRESSION_RUN] Failed to run flow', { error, flowId });
@@ -1115,11 +1035,7 @@ export class RegressionRunService {
       // a plan which has explicit `position`, or a module/flow which
       // has `order_index`), so reordering here doesn't violate any
       // curator-set sequence. Sort is below.
-      const { data: uiCases } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, flow_id, depends_on, platform, priority')
-        .eq('project_id', projectId)
-        .contains('tags', [tag]);
+      const uiCases = await RegressionTestQueryService.getUiTestCasesByTag(projectId, tag);
 
       // Get API test cases with tag (scoped to project via environments/endpoints)
       const apiCases = await RegressionTestQueryService.getApiTestConfigsByProjectAndTag(projectId, userId, tag);
@@ -1131,30 +1047,9 @@ export class RegressionRunService {
       // priority column repo-wide (see analytics-query.service:838) — no
       // signal to sort on, so we don't pretend to.
       //
-      // NULL handling: legacy rows pre-default (before
-      // intent-test-case.service.ts started inserting 'medium' as the
-      // default) collapse into the medium bucket here. Without this,
-      // newly-created 'medium' tests would run BEFORE older NULL tests
-      // — a confusing ordering change for users who haven't backfilled.
-      // Sort treats unknown-priority as middle-of-the-road, which is
-      // also what every other downstream path (Jira fallback, Telegram
-      // omission) effectively does.
-      //
-      // Case-insensitive lookup: defends against schema drift where a
-      // row might have 'Critical' (capital C) bypassing the CHECK
-      // constraint (e.g. via raw SQL or migration mishap). Without
-      // this, such a row would sort to the medium bucket along with
-      // NULL — silently wrong. Lowercasing keys is cheap and safe.
-      const PRIORITY_ORDER: Record<string, number> = {
-        critical: 0,
-        high: 1,
-        medium: 2,
-        low: 3,
-      };
-      const priorityRank = (p: string | null | undefined): number => {
-        const key = typeof p === 'string' ? p.toLowerCase() : '';
-        return PRIORITY_ORDER[key] ?? PRIORITY_ORDER.medium;
-      };
+      // NULL / wrongly-cased handling lives in the shared priorityRank()
+      // (resolve-test-case-priority.util.ts): legacy NULL rows and schema
+      // drift like 'Critical' collapse into the medium bucket.
       const orderedUiCases = [...(uiCases || [])].sort(
         (a, b) => priorityRank(a.priority) - priorityRank(b.priority),
       );
@@ -1166,6 +1061,7 @@ export class RegressionRunService {
           flowId: tc.flow_id || undefined,
           dependsOn: tc.depends_on || [],
           platform: tc.platform || undefined,
+          priority: tc.priority ?? null,
         })),
         ...(apiCases || []).map((tc: any) => ({
           testCaseId: tc.id,
@@ -1183,20 +1079,16 @@ export class RegressionRunService {
       await this.checkCreditBalance(userId, testCases, 'regression_tag');
 
       // Create regression run
-      const { data: run, error: runError } = await supabaseAdmin
-        .from('regression_runs')
-        .insert({
-          project_id: projectId,
-          user_id: userId,
-          trigger,
-          status: 'running',
-          started_at: new Date().toISOString(),
-        })
-        .select('id')
-        .single();
+      const { data: run, error: runError } = await insertRun({
+        project_id: projectId,
+        user_id: userId,
+        trigger,
+        status: 'running',
+        started_at: new Date().toISOString(),
+      });
 
       if (runError || !run) {
-        throw new Error(`Failed to create tag run: ${runError?.message}`);
+        throw new Error(`Failed to create tag run: ${(runError as any)?.message}`);
       }
       createdRunId = run.id;
 
@@ -1212,10 +1104,7 @@ export class RegressionRunService {
         {}
       ).catch(async (error) => {
         logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
-        await supabaseAdmin
-          .from('regression_runs')
-          .update({ status: 'failed', completed_at: new Date().toISOString() })
-          .eq('id', run.id);
+        await updateRunById(run.id, { status: 'failed', completed_at: new Date().toISOString() });
       });
 
       return {
@@ -1226,10 +1115,7 @@ export class RegressionRunService {
     } catch (error) {
       if (createdRunId) {
         try {
-          await supabaseAdmin
-            .from('regression_runs')
-            .update({ status: 'failed', completed_at: new Date().toISOString() })
-            .eq('id', createdRunId);
+          await updateRunById(createdRunId, { status: 'failed', completed_at: new Date().toISOString() });
         } catch { /* non-fatal */ }
       }
       logger.error('[REGRESSION_RUN] Failed to run by tag', { error, projectId, tag });
@@ -1262,11 +1148,7 @@ export class RegressionRunService {
       await this.verifyProjectAccess(projectId, userId);
 
       // Get UI test cases with priority from intent_test_cases (unified table)
-      const { data: uiCases } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, flow_id, depends_on, platform')
-        .eq('project_id', projectId)
-        .eq('priority', priority);
+      const uiCases = await RegressionTestQueryService.getUiTestCasesByPriority(projectId, priority);
 
       // Get API test cases with priority (scoped to project via environments/endpoints)
       const apiCases = await RegressionTestQueryService.getApiTestConfigsByProjectAndPriority(projectId, userId, priority);
@@ -1278,6 +1160,7 @@ export class RegressionRunService {
           flowId: tc.flow_id || undefined,
           dependsOn: tc.depends_on || [],
           platform: tc.platform || undefined,
+          priority: tc.priority ?? null,
         })),
         ...(apiCases || []).map((tc: any) => ({
           testCaseId: tc.id,
@@ -1295,20 +1178,16 @@ export class RegressionRunService {
       await this.checkCreditBalance(userId, testCases, 'regression_priority');
 
       // Create regression run
-      const { data: run, error: runError } = await supabaseAdmin
-        .from('regression_runs')
-        .insert({
-          project_id: projectId,
-          user_id: userId,
-          trigger,
-          status: 'running',
-          started_at: new Date().toISOString(),
-        })
-        .select('id')
-        .single();
+      const { data: run, error: runError } = await insertRun({
+        project_id: projectId,
+        user_id: userId,
+        trigger,
+        status: 'running',
+        started_at: new Date().toISOString(),
+      });
 
       if (runError || !run) {
-        throw new Error(`Failed to create priority run: ${runError?.message}`);
+        throw new Error(`Failed to create priority run: ${(runError as any)?.message}`);
       }
       createdRunId = run.id;
 
@@ -1324,10 +1203,7 @@ export class RegressionRunService {
         {}
       ).catch(async (error) => {
         logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
-        await supabaseAdmin
-          .from('regression_runs')
-          .update({ status: 'failed', completed_at: new Date().toISOString() })
-          .eq('id', run.id);
+        await updateRunById(run.id, { status: 'failed', completed_at: new Date().toISOString() });
       });
 
       return {
@@ -1338,10 +1214,7 @@ export class RegressionRunService {
     } catch (error) {
       if (createdRunId) {
         try {
-          await supabaseAdmin
-            .from('regression_runs')
-            .update({ status: 'failed', completed_at: new Date().toISOString() })
-            .eq('id', createdRunId);
+          await updateRunById(createdRunId, { status: 'failed', completed_at: new Date().toISOString() });
         } catch { /* non-fatal */ }
       }
       logger.error('[REGRESSION_RUN] Failed to run by priority', { error, projectId, priority });

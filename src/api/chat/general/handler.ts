@@ -6,6 +6,7 @@ import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { getSummariesForContext, summarizeOldMessages } from '@/services/ai/summarization/chat-summarization.service';
 import { formatPageContextForChat, getPageContext, type PageContext } from '@/services/chat/editor-context.service';
+import { ChatTestTraceService } from '@/services/chat/chat-test-trace.service';
 import { getProjectFiles, searchKB } from '@/services/kb/kb.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { ChatPersistence } from '@/services/utils/chat-persistence';
@@ -27,6 +28,7 @@ import { SUB_AGENT_CONFIG } from './sub-agents/config';
 import { executeTool } from '@/services/skills/tool-executor';
 import { ToolCallTracker } from '@/services/skills/hooks/loop-detection.hook';
 import { humanizeToolName, computeToolProgress } from './sub-agents/agents/executor-agent';
+import { getLocalizedMessages } from '../regression/localization';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPER: Resolve project ID (Tier 1: session → Tier 2: workspace default)
@@ -180,6 +182,53 @@ async function resolveEditorPageContext(
   }
 }
 
+/** Plain-language labels for the frontend's blocker keys (no internal jargon). */
+const EXPLORE_BLOCKER_LABELS: Record<string, string> = {
+  backend: "can't reach QAIT (connection)",
+  project: 'no project selected',
+  app: 'no app build uploaded',
+  runner: 'mobile testing service is offline',
+  llm: 'testing service AI is not configured',
+  capacity: 'no test device available right now',
+};
+
+/**
+ * Render the frontend's facts-only Explore snapshot into a system message so
+ * the agent can SEE the current screen. Returns null when there's nothing
+ * useful (no state, or a plain web surface with no run). Never includes
+ * secrets — the frontend only sends surface/platform/appId/ready/blockers.
+ */
+export function formatExploreStateForChat(state: unknown): string | null {
+  if (!state || typeof state !== 'object') return null;
+  const s = state as {
+    surface?: string; platform?: string; appId?: string;
+    ready?: boolean; blockers?: string[];
+  };
+  if (s.surface !== 'mobile') {
+    // Web surface carries no extra live state worth a message (yet).
+    return null;
+  }
+  const lines: string[] = [
+    '--- CURRENT EXPLORE SCREEN (the user is looking at this right now) ---',
+    'Surface: Mobile app exploration.',
+  ];
+  if (s.platform) lines.push(`Platform: ${s.platform}.`);
+  if (s.appId) lines.push(`App: ${s.appId}.`);
+  if (s.ready) {
+    lines.push('Status: READY — the user can start the run from the chat input (empty goal = whole app).');
+  } else {
+    const blockers = Array.isArray(s.blockers) ? s.blockers : [];
+    const labels = blockers.map((b) => EXPLORE_BLOCKER_LABELS[b] || b);
+    lines.push(
+      blockers.length
+        ? `Status: NOT READY — blocked by: ${labels.join('; ')}.`
+        : 'Status: NOT READY (preparing).',
+    );
+    lines.push('If asked why it won\'t start, explain the blocker(s) above in plain language and the fix (try again later / contact support / upload an .apk-.ipa / use a Flutter debug build).');
+  }
+  return lines.join('\n');
+}
+
 /**
  * ═══════════════════════════════════════════════════════════════════════════
  * HANDLER: GENERAL CHAT
@@ -194,7 +243,7 @@ export async function handleGeneralChat(
     chatSessionId?: string;
     context?: any;
     workspace_id?: string; // Workspace ID from validated route params (primary source)
-    userLanguage?: 'en' | 'ru' | 'neutral'; // Language from intent parser (avoid re-detection)
+    userLanguage?: 'en' | 'ru' | 'kk' | 'neutral'; // Language from intent parser (avoid re-detection)
     abortSignal?: AbortSignal;
     logger?: FunctionLogger;
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode
@@ -218,6 +267,14 @@ export async function handleGeneralChat(
   // mid-handler refactor mistake from sending some messages to one table
   // and some to the other.
   const store: ChatStore = params.chatStore ?? GLOBAL_STORE;
+
+  // Per-test-case chat trace (test_logs/chat_test/). Captures the full
+  // request → intent → context → tools → response cycle for analysis. Only
+  // active in test-case scope; every write is best-effort and never throws.
+  const chatTrace =
+    store.kind === 'testcase' && chatSessionId
+      ? ChatTestTraceService.getOrCreate(chatSessionId, userId, testCaseId)
+      : null;
 
   // Normalize context: parse JSON string into object if needed (frontend may send stringified JSON)
   let context: any = rawContext;
@@ -683,6 +740,29 @@ export async function handleGeneralChat(
     projectName = projectResult.value.name;
   }
 
+  if (chatTrace) {
+    chatTrace.writeRequest({
+      message,
+      mode,
+      previewSessionId: resolvedPreviewSessionId,
+      mobileSessionId: parsedContext?.mobileSessionId,
+      projectId,
+      projectName,
+    });
+    chatTrace.writePageContext(
+      editorPageContext
+        ? {
+            available: true,
+            url: editorPageContext.url,
+            elementCount: editorPageContext.testSteps?.length,
+            pageTextChars: editorPageContext.pageText?.length,
+            hasConsole: !!editorPageContext.consoleErrors,
+            hasNetwork: !!editorPageContext.networkSummary,
+          }
+        : { available: false, reason: mode === 'editor' ? 'no_active_preview_session' : 'not_editor_mode' },
+    );
+  }
+
   let integrationContext = '';
   if (integrationResult.status === 'fulfilled' && integrationResult.value) {
     integrationContext = integrationResult.value;
@@ -734,6 +814,12 @@ export async function handleGeneralChat(
       logger.info('[GENERAL_CHAT] Tools collected', {
         totalTools: availableTools.length,
       });
+
+      chatTrace?.writeToolsAvailable(
+        availableTools
+          .map((t) => t?.function?.name)
+          .filter((n): n is string => typeof n === 'string'),
+      );
     } catch (toolsError) {
       logger.warn('[GENERAL_CHAT] Failed to load tools, continuing without them', {
         error: toolsError instanceof Error ? toolsError.message : String(toolsError),
@@ -802,7 +888,10 @@ EDITOR WORKFLOW:
 IMPORTANT RULES:
 - Do NOT call qa_create_test_case unless user explicitly says "save" / "сохрани" / "persist"
 - For SINGLE actions (one click, one type) → this is editor_action, handled automatically
-- For MULTI-STEP flows (login, checkout, search+filter) → generate IntentSteps, ask to run, then qa_run_draft_steps
+- For MULTI-STEP flows (login, checkout, search+filter):
+  • If the user just names a GOAL on the current page and you do NOT already have concrete steps ("test the login flow", "протестируй оформление заказа") → PREFER qa_author_test_iteratively(goal, confirm). It builds the test by doing it live on the page — each step is grounded in the real DOM and already verified, no guessing. Describe the goal, get "yes", then call with confirm=true.
+  • If YOU already produced explicit IntentSteps (the user gave exact steps, or you're re-running a known list) → use qa_run_draft_steps as before.
+  • After either tool returns, the steps are cached — when the user says "save", call qa_create_test_case (the authored steps already passed; no re-run needed).
 
 POST-RUN BEHAVIOR (CRITICAL):
 - qa_run_draft_steps and qa_run_test (run_type="preview") AWAIT the full run. When the tool returns, the run is FINISHED.
@@ -836,6 +925,29 @@ Suggest the user to:
 3. Try sending the message again after the page loads
 
 You can still help with general questions, saved test cases, and test management even without live page context.`;
+  }
+
+  // Per-test-case scope reinforcement. Layered ON TOP of the editor-mode
+  // block above: the chat lives inside ONE existing test case's editor, so the
+  // agent must (a) treat save/update as editing THIS test case, and (b) use the
+  // live page context confidently to build and immediately run the right test.
+  if (testCaseId && mode === 'editor') {
+    systemPrompt += `\n\n--- TEST-CASE SCOPE (you are editing ONE existing test case) ---
+You are inside the editor for the test case currently open in the preview. The
+"CURRENT PAGE CONTEXT" above is the live page this test targets. Act with that context:
+- BUILD CONFIDENTLY: when the user asks to create/extend a flow, read the page
+  context (URL, interactive elements with ref IDs, page text, console/network
+  signals) and generate concrete IntentSteps yourself. Do NOT ask the user for
+  element names or selectors you can already see in the context.
+- CREATE + RUN IN ONE GO: for a clear request ("проверь логин", "test the search"),
+  generate the steps and run them on the preview in the same turn via
+  qa_run_draft_steps(confirm=true) — you do not need a separate confirmation round
+  in editor mode. Only pause to ask when the request is genuinely ambiguous.
+- SAVE = UPDATE THIS TEST CASE: when the user says "save"/"сохрани"/"обнови", call
+  qa_update_test_case_steps for THIS test case. Use qa_create_test_case ONLY when
+  the user explicitly wants a NEW/separate test case.
+- After a run, report the real outcome (passed/failed counts, first error) in past
+  tense — the user already saw the live progress.`;
   }
 
   // Enhance system prompt with old context summary from vector search
@@ -877,6 +989,16 @@ You can still help with general questions, saved test cases, and test management
       role: 'system',
       content: formatPageContextForChat(editorPageContext),
     });
+  }
+
+  // Live Explore-screen state (Slice B): the frontend sends a facts-only
+  // snapshot so the agent can SEE the current surface + mobile readiness and
+  // answer "why won't it start / what do I do" about THIS screen. Pushed as a
+  // system message so it reaches BOTH the monolithic and sub-agent paths
+  // (the appended systemPrompt blocks above do NOT flow into the pipeline).
+  const exploreStateMessage = formatExploreStateForChat(parsedContext?.exploreState);
+  if (exploreStateMessage) {
+    messages.push({ role: 'system', content: exploreStateMessage });
   }
 
   // Inject cached draft steps for cross-turn persistence (editor mode only)
@@ -1019,6 +1141,25 @@ You can still help with general questions, saved test cases, and test management
       });
     }
 
+    // Resolve the name of the test case in scope so the executor prompt can
+    // address it by name ("you are editing \"Login Flow\""). Best-effort and
+    // tc-scope-only — never blocks or fails the chat path.
+    let testCaseName: string | undefined;
+    if (testCaseId) {
+      try {
+        const { IntentTestCaseService } = await import(
+          '@/services/testing/ui/preview/intent-test-case.service'
+        );
+        const tc = await IntentTestCaseService.getById(testCaseId, userId);
+        testCaseName = tc?.name;
+      } catch (nameErr) {
+        logger.debug('[GENERAL_CHAT] Could not resolve test case name (non-critical)', {
+          testCaseId,
+          error: nameErr instanceof Error ? nameErr.message : String(nameErr),
+        });
+      }
+    }
+
     try {
       // ═══════════════════════════════════════════════════════════════════════
       // SUB-AGENT PIPELINE (preferred path — cheaper, faster, more focused)
@@ -1041,6 +1182,7 @@ You can still help with general questions, saved test cases, and test management
             // to `chat:tc:<tcid>` — without this, the test-case chat
             // sees zero progress events while sub-agents work.
             testCaseId,
+            testCaseName,
           });
 
           // Extract the user content from the last message (may be multimodal array with images)
@@ -1352,15 +1494,30 @@ You can still help with general questions, saved test cases, and test management
       userId,
     });
 
-    // Provide helpful fallback message based on error type
-    let fallbackMessage = 'I apologize, but I\'m currently experiencing technical difficulties. Please try again in a few moments.';
+    // Classify the failure and surface a SPECIFIC, localized message per class
+    // (not one catch-all). Language comes from the intent parser (userLanguage),
+    // so the user reads the hint in their own language.
+    const chatErrors = getLocalizedMessages(params.userLanguage).chatError;
+    const status = openaiError?.status;
+    const code = openaiError?.code;
+    const msg = String(openaiError?.message || '').toLowerCase();
 
-    if (openaiError?.status === 401 || openaiError?.code === 'invalid_api_key') {
-      fallbackMessage = 'I\'m temporarily unavailable due to a configuration issue. Our team has been notified.';
-    } else if (openaiError?.status === 429 || openaiError?.code === 'insufficient_quota') {
-      fallbackMessage = 'I\'m temporarily unavailable due to high demand. Please try again in a few minutes.';
-    } else if (openaiError?.message?.includes('timeout') || openaiError?.message?.includes('took too long')) {
-      fallbackMessage = 'The request took too long to process. Please try again with a shorter message.';
+    let fallbackMessage: string;
+    if (status === 401 || status === 403 || code === 'invalid_api_key') {
+      // Auth/config — user can't fix it; team is notified.
+      fallbackMessage = chatErrors.config;
+    } else if (status === 429 || code === 'insufficient_quota' || code === 'rate_limit_exceeded') {
+      fallbackMessage = chatErrors.rateLimit;
+    } else if (
+      code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'ECONNREFUSED'
+      || msg.includes('fetch failed') || msg.includes('network') || msg.includes('socket hang up')
+    ) {
+      fallbackMessage = chatErrors.network;
+    } else if (msg.includes('timeout') || msg.includes('timed out') || msg.includes('took too long')) {
+      fallbackMessage = chatErrors.timeout;
+    } else {
+      // 500/502/503 or anything unclassified.
+      fallbackMessage = chatErrors.generic;
     }
 
       gptResponse = {
@@ -1425,6 +1582,18 @@ You can still help with general questions, saved test cases, and test management
     testCaseId,
   );
 
+  // Honor cancellation BEFORE deducting credits. If the user aborted after the
+  // response was generated, this throws and the reply is neither saved nor
+  // delivered — so charging for it would lose the user a credit for nothing.
+  // Checking here (not after deduction) keeps "no charge" and "no save"
+  // consistent on the cancel path.
+  if (abortSignal) {
+    const checkRequestAbortedWithLogging = functionLogger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(abortSignal);
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3.5: DEDUCT CREDITS AFTER SUCCESSFUL RESPONSE
   // ═══════════════════════════════════════════════════════════════════════
@@ -1447,13 +1616,6 @@ You can still help with general questions, saved test cases, and test management
         chatSessionId,
       });
     }
-  }
-
-  if (abortSignal) {
-    const checkRequestAbortedWithLogging = functionLogger
-      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
-      : checkRequestAborted;
-    checkRequestAbortedWithLogging(abortSignal);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -1663,6 +1825,12 @@ You can still help with general questions, saved test cases, and test management
       logger.warn('[GENERAL_CHAT] Failed to get credits info', { error, userId });
     }
   }
+
+  chatTrace?.writeResponse({
+    content: gptResponse.content,
+    intent: 'general_chat',
+    toolsUsed: availableTools.length,
+  });
 
   res.json(response);
 }

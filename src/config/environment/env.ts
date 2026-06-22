@@ -115,10 +115,27 @@ const envSchema = z.object({
   SCALE_CHECK_INTERVAL_MS: z.string().transform(Number).default('15000'),
   SCALE_MAX_MEMORY_PERCENT: z.string().transform(Number).default('80'),
 
+  // When true, the worker process hosts the scheduler bundle (schedule sweeps +
+  // retention jobs) behind a Redis leader lock — exactly one worker replica
+  // runs them. Default OFF: local docker-compose runs a dedicated `scheduler`
+  // container, so the worker stays out of scheduling there. Set true on the
+  // prod worker (which is the only deployed long-lived process).
+  SCHEDULER_IN_WORKER: z.string().transform(v => v === 'true').default('false'),
+
   // Agent
   AGENT_TIMEOUT: z.string().transform(Number).default('300000'),
   AGENT_MAX_RETRIES: z.string().transform(Number).default('3'),
   AGENT_BASE_URL: z.string().default('http://localhost:3001'),
+  // Replay readiness recollect (default OFF). Background/regression replay
+  // snapshots the DOM right before LLM element resolution. On redirect-heavy
+  // flows (SSO/OAuth) that snapshot can land on a half-loaded / mid-redirect
+  // page with only a handful of interactive nodes — the resolver then picks a
+  // stray element and drifts the run onto the wrong page. When ON, a sparse
+  // fresh snapshot triggers one `waitForPageInteractive` gate + recollect (the
+  // same gate the editor/lite paths already use). Only fires on the first
+  // attempt and only when the snapshot is sparse, so healthy pages pay no extra
+  // wait. Validate before enabling broadly. See agent/execution/replay-readiness.ts.
+  REPLAY_READINESS_RECOLLECT_ENABLED: z.string().transform(v => v === 'true').default('false'),
   EXPLORATION_TIMEOUT_MS: z.string().transform(Number).default('300000'),
 
   // Logging
@@ -149,7 +166,7 @@ const envSchema = z.object({
   BACKEND_URL: z.string().optional(),
 
   // Email / SMTP
-  SMTP_PASSWORD: z.string().optional(), // Gmail app password for noreply@qait.dev
+  SMTP_PASSWORD: z.string().optional(), // Gmail app password for yera@qait.dev
 
   // Email Inbox (IMAP for test email reception — catch-all inbox)
   IMAP_HOST: z.string().default('imap.gmail.com'),
@@ -185,6 +202,19 @@ const envSchema = z.object({
   // Staged rollout: enable reads first, then writes, then credits cutover
   FEATURE_ORG_MEMBERS_ENABLED: z.string().transform(v => v === 'true').default('true'),
   FEATURE_ORG_CREDITS_ENABLED: z.string().transform(v => v === 'true').default('true'),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Self-serve PLG signup. Default false keeps the B2B flow intact
+  // (manual admin approval + business-email gate). When true:
+  //   - new users are provisioned approved on first auth (status set to
+  //     'approved', overriding the users.status column default), with a
+  //     default workspace + project so they skip the onboarding wizard
+  //   - the business-email gate accepts personal domains (Gmail etc.);
+  //     the disposable-domain block stays on as anti-abuse
+  // The requireApproved middleware is left in place — flipping this off
+  // restores gated behaviour with no code change.
+  // ──────────────────────────────────────────────────────────────────
+  AUTO_APPROVE_SIGNUP: z.string().transform(v => v === 'true').default('false'),
 
   // ──────────────────────────────────────────────────────────────────
   // Per-test-case chat (Phase 1-8 backend, frontend integration TBD).
@@ -227,6 +257,13 @@ const envSchema = z.object({
   // for tenants that require strict isolation between backend users.
   MOBILE_MULTI_USER_ISOLATION: z.string().transform(v => v === 'true').default('false'),
 
+  // Dedicated-emulator-per-workspace master switch. When ON, a mobile session
+  // for a workspace that has an active `workspace_dedicated_device` row is
+  // pinned to that runner_serial (skips the shared pool entirely). Default OFF
+  // — the resolver short-circuits to null, so behaviour is unchanged until a
+  // deploy flips this AND ops provisions a dedicated container + DB row.
+  DEDICATED_MOBILE_EMULATOR_ENABLED: z.string().transform(v => v === 'true').default('false'),
+
   // Intent classifier fast-path — set to 'true' to disable the deterministic
   // whitelist that short-circuits trivial messages (greetings, cancels, yes/no
   // after pending confirmation). Kill-switch for the rare case the whitelist
@@ -237,6 +274,28 @@ const envSchema = z.object({
   // instant retries by caching the full (message + context) pair for 60s.
   // Set to 'true' to disable.
   INTENT_CACHE_DISABLED: z.string().transform(v => v === 'true').default('false'),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Per-step screenshot capture (web + mobile regression replay).
+  // Captures a lightweight screenshot after EVERY step so passing/flaky
+  // runs have visual evidence even when video/trace are disabled (video
+  // only records on infra-retry attempts). Screenshots are uploaded to
+  // the artifacts bucket as URLs — never stored as base64 in the DB.
+  // ON by default; pair with the artifact-retention job (prunes old
+  // screenshots) so storage doesn't grow unbounded.
+  // ──────────────────────────────────────────────────────────────────
+  SCREENSHOT_EACH_STEP_ENABLED: z.string().transform(v => v === 'true').default('true'),
+  // Encoding format: 'webp' (smaller, via sharp) or 'jpeg' (Playwright-native).
+  SCREENSHOT_FORMAT: z.enum(['webp', 'jpeg']).default('webp'),
+  // Quality 1-100. Applies to both webp and jpeg. Clamped in ScreenshotCaptureFeature.
+  SCREENSHOT_QUALITY: z.string().transform(Number).default('75'),
+  // Screenshots older than this (days) are pruned by the artifact-retention job.
+  SCREENSHOT_RETENTION_DAYS: z.string().transform(Number).default('30'),
+  // Local editor / forensic logs in test_logs/editor/ older than this (days) are
+  // pruned by the artifact-retention job's local sweep. These are debug artifacts
+  // (editor traces + per-apply forensic jsonl/ds/html triplets) that otherwise
+  // grow without bound — ~16 files per editor session, no upstream cleanup.
+  EDITOR_LOG_RETENTION_DAYS: z.string().transform(Number).default('3'),
 
   // Phase B1: mobile-editor force-route. When `true` (default), chat
   // requests carrying `context.mobileEditorMode=true` with a non-empty
@@ -292,6 +351,14 @@ const envSchema = z.object({
   // WebSocket streaming is unaffected by this flag.
   MOBILE_AGENT_PERSIST_REASONING: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
 
+  // Full LLM prompt+completion persistence to ai_call_logs (for hallucination
+  // debugging). OPT-IN and OFF by default — unlike the reasoning flag above —
+  // because it stores the richest, most sensitive data (even after redaction)
+  // and adds DB volume. Enable in dev/staging or per-incident to debug AI
+  // failures. Text is always passed through redactForPersist first; rows carry
+  // a 30-day TTL. Set to 'true' to enable.
+  LLM_IO_PERSIST_ENABLED: z.string().transform(v => v.trim().toLowerCase() === 'true').default('false'),
+
   // ──────────────────────────────────────────────────────────────────
   // Phase 4 (May 2026): mobile regression concurrency cap.
   //
@@ -338,6 +405,18 @@ const envSchema = z.object({
   // Desired cap for large batches (testCount > SMALL_BATCH_THRESHOLD).
   // Final cap = min(MAX_CONCURRENCY, poolIdle, LARGE_CAP).
   REGRESSION_MOBILE_LARGE_CAP: z.string().optional().default('3'),
+
+  // Disable the dependency LEVEL BARRIER in a regression run (default OFF).
+  // By default the orchestrator runs depends_on levels in order — a dependent
+  // waits for its dependency's standalone run. But a dependent already INLINES
+  // its dependency's steps as preconditions (collectPreconditionSteps), so that
+  // wait is redundant for setup-style deps and just caps parallelism. When ON,
+  // all (non-cyclic) tests dispatch together, bounded only by worker concurrency.
+  // Inlining and cycle detection are unaffected. Trade-off: the fail-fast "skip a
+  // dependent when its dependency failed" no longer fires — the dependent runs and
+  // fails on its own inlined steps instead. Only yields parallelism when worker
+  // concurrency (TEST_RUN_CONCURRENCY_MIN/MAX) > 1.
+  REGRESSION_DISABLE_LEVEL_BARRIER: z.string().transform(v => v === 'true').default('false'),
 });
 
 // Parse and validate environment variables

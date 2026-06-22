@@ -28,6 +28,11 @@ const PREVIEW_VIDEO_CONFIG = {
   maxWidth: PREVIEW_SESSION_CONFIG.viewport.width,
   maxHeight: PREVIEW_SESSION_CONFIG.viewport.height,
   quality: PREVIEW_SESSION_CONFIG.screenshot.quality,
+  // NOTE: WebP would be ~25-35% smaller than JPEG, BUT Playwright's CDP binding
+  // types Page.startScreencast `format` as 'jpeg' | 'png' only (webp is allowed
+  // for captureScreenshot, not the screencast — see playwright-core protocol.d.ts
+  // startScreencastParameters). So the live screencast stays JPEG. Smaller frames
+  // would have to come from quality tuning or a different capture path.
   format: 'jpeg' as const,
 
   // Throttle settings.
@@ -49,6 +54,19 @@ const PREVIEW_VIDEO_CONFIG = {
   // Monitoring
   statsIntervalMs: 10000,
 
+  // Adaptive throttle ladder (client-health driven). The server NEVER restarts
+  // the screencast or changes JPEG quality (per the chosen strategy) — it only
+  // widens the inter-frame interval per session when the CLIENT reports it
+  // can't keep up. Cheap, fully reversible, loses no guaranteed frames.
+  // Index 0 is the default (45fps); the client report walks the ladder up
+  // (slower) on sustained low FPS and back down (faster) when it recovers.
+  adaptiveIntervalLadderMs: [22, 33, 66] as const, // ≈45 / 30 / 15 fps
+  // A client FPS at or below this fraction of the current target is "struggling".
+  adaptiveDegradeRatio: 0.6,
+  // A client FPS at or above this fraction of the NEXT-FASTER target means it
+  // has headroom — step back down. Hysteresis gap (0.6 vs 0.9) prevents flapping.
+  adaptiveRecoverRatio: 0.9,
+
   // CDP-idle watchdog (see PreviewVideoStreamService field comment).
   // Tick interval — keep small so detection is responsive.
   cdpIdleCheckIntervalMs: 1000,
@@ -59,6 +77,11 @@ const PREVIEW_VIDEO_CONFIG = {
   // in before they reach for the Refresh button. 2s would catch more cases
   // but at 5× the screenshot CPU cost on idle sessions.
   cdpIdleThresholdMs: 5000,
+  // Cap for the run-loop sync screenshot (injectSyncFrame). page.screenshot()
+  // defaults to a 30s timeout — far too long for a per-step poke that runs
+  // concurrently with apply/readiness. Bail fast and let the next step (or the
+  // idle watchdog) catch up instead of blocking on a contended renderer.
+  syncFrameTimeoutMs: 3000,
 };
 
 // ============================================================================
@@ -187,6 +210,11 @@ export class PreviewVideoStreamService {
   private cdpIdleWatchdog: NodeJS.Timeout | null = null;
   private lastCdpFrameAt = 0;
 
+  // Adaptive throttle state (client-health driven). Index into
+  // adaptiveIntervalLadderMs; 0 = full 45fps. Only moved by applyHealthHint().
+  private adaptiveLadderIdx = 0;
+  private currentMinFrameIntervalMs = PREVIEW_VIDEO_CONFIG.minFrameIntervalMs;
+
   constructor(previewSessionId: string, userId: string, room: string, initialSeq?: number) {
     this.previewSessionId = previewSessionId;
     this.userId = userId;
@@ -199,6 +227,60 @@ export class PreviewVideoStreamService {
   /** Get current seq value (for passing to replacement stream on page switch) */
   getSeq(): number {
     return this.seq;
+  }
+
+  /**
+   * Adaptive throttle — react to a client-reported render FPS. The client
+   * (which knows its real paint rate) periodically reports how many frames it
+   * actually rendered; if it's well below the rate we're sending, the client
+   * is the bottleneck (slow CPU, background tab, weak GPU) and pushing more
+   * frames only grows latency. We widen the inter-frame interval one ladder
+   * step; when the client recovers, we step back down.
+   *
+   * Strategy is INTENTIONALLY fps-only: we never restart the screencast or
+   * change JPEG quality here. Changing only `currentMinFrameIntervalMs` cannot
+   * lose a guaranteed frame, races nothing, and is instantly reversible.
+   *
+   * Idempotent and self-clamping — safe to call on every client report.
+   * Returns the (possibly unchanged) target interval for logging/telemetry.
+   */
+  applyHealthHint(clientFps: number): number {
+    const ladder = PREVIEW_VIDEO_CONFIG.adaptiveIntervalLadderMs;
+    const prevIdx = this.adaptiveLadderIdx;
+    const currentTargetFps = 1000 / ladder[prevIdx];
+
+    // Ignore obviously bogus reports (negative / absurd) — fail safe (no-op).
+    if (!Number.isFinite(clientFps) || clientFps < 0) {
+      return this.currentMinFrameIntervalMs;
+    }
+
+    // Struggling: client renders ≤ 60% of what we're sending → step slower.
+    if (
+      clientFps < currentTargetFps * PREVIEW_VIDEO_CONFIG.adaptiveDegradeRatio
+      && this.adaptiveLadderIdx < ladder.length - 1
+    ) {
+      this.adaptiveLadderIdx++;
+    } else if (this.adaptiveLadderIdx > 0) {
+      // Recovery: only step faster if the client comfortably clears the
+      // NEXT-faster target (hysteresis vs the degrade threshold → no flapping).
+      const fasterTargetFps = 1000 / ladder[this.adaptiveLadderIdx - 1];
+      if (clientFps >= fasterTargetFps * PREVIEW_VIDEO_CONFIG.adaptiveRecoverRatio) {
+        this.adaptiveLadderIdx--;
+      }
+    }
+
+    this.currentMinFrameIntervalMs = ladder[this.adaptiveLadderIdx];
+
+    if (this.adaptiveLadderIdx !== prevIdx) {
+      logger.info('[PREVIEW_VIDEO] Adaptive throttle adjusted', {
+        previewSessionId: this.previewSessionId,
+        clientFps: Math.round(clientFps),
+        fromTargetFps: Math.round(currentTargetFps),
+        toTargetFps: Math.round(1000 / this.currentMinFrameIntervalMs),
+        ladderIdx: this.adaptiveLadderIdx,
+      });
+    }
+    return this.currentMinFrameIntervalMs;
   }
 
   /**
@@ -483,8 +565,9 @@ export class PreviewVideoStreamService {
       }
     }
 
-    // Throttle to ~10 FPS
-    if (now - this.lastFrameTime < PREVIEW_VIDEO_CONFIG.minFrameIntervalMs) {
+    // Throttle to the current adaptive cap (default 22ms ≈ 45 FPS; widened by
+    // applyHealthHint when the client reports it can't keep up).
+    if (now - this.lastFrameTime < this.currentMinFrameIntervalMs) {
       return; // Skip frame (not counted as drop, just throttled)
     }
 
@@ -547,7 +630,14 @@ export class PreviewVideoStreamService {
     this.recordFrameTimestamp(now);
 
     try {
-      this.emitFrame(frameBuffer, params.metadata.deviceWidth, params.metadata.deviceHeight);
+      // Forward the per-frame scroll + zoom (CDP screencast metadata) so the
+      // editor can convert document-relative highlight bboxes to viewport space
+      // for THIS exact frame — see emitFrame / PreviewVideoFramePayload.
+      this.emitFrame(frameBuffer, params.metadata.deviceWidth, params.metadata.deviceHeight, {
+        scrollX: params.metadata.scrollOffsetX,
+        scrollY: params.metadata.scrollOffsetY,
+        pageScaleFactor: params.metadata.pageScaleFactor,
+      });
 
       // Success - reset circuit breaker
       this.consecutiveFailures = 0;
@@ -635,7 +725,12 @@ export class PreviewVideoStreamService {
    * at 45fps for a timeout that never actually bounded real work. `publishTimeoutMs`
    * is repurposed as a soft latency budget tracked via `pendingFrames` instead.
    */
-  private emitFrame(frame: Buffer, width: number, height: number): void {
+  private emitFrame(
+    frame: Buffer,
+    width: number,
+    height: number,
+    view?: { scrollX: number; scrollY: number; pageScaleFactor: number },
+  ): void {
     if (!this.nsp) {
       throw new Error('Socket.IO namespace not available');
     }
@@ -643,16 +738,32 @@ export class PreviewVideoStreamService {
     const payload: PreviewVideoFramePayload = {
       previewSessionId: this.previewSessionId,
       seq: this.seq,
-      format: 'jpeg',
+      format: PREVIEW_VIDEO_CONFIG.format,
       data: '', // V20: empty — actual bytes sent as binary arg below
       width: Math.min(width, PREVIEW_VIDEO_CONFIG.maxWidth),
       height: Math.min(height, PREVIEW_VIDEO_CONFIG.maxHeight),
       domVersion: this.currentDomVersion,
       timestamp: new Date().toISOString(),
       byteLength: frame.byteLength,
+      // Per-frame scroll + zoom (CDP screencast metadata). The editor subtracts
+      // scrollX/Y from document-relative highlight bboxes to place the border on
+      // THIS frame's viewport; absent on screenshot-injected frames (defaults to
+      // the last known scroll on the client — acceptable for a static page).
+      ...(view ? { scrollX: view.scrollX, scrollY: view.scrollY, pageScaleFactor: view.pageScaleFactor } : {}),
     };
 
-    this.nsp.to(this.room).emit('preview:video:frame', payload, frame);
+    // volatile: drop the frame for any client whose transport buffer hasn't
+    // drained yet instead of queueing it. Since V21 made this emit synchronous,
+    // the pendingFrames backpressure check above can never accumulate (inc and
+    // dec happen in the same tick) — the real queue moved into Socket.IO's
+    // per-client write buffer, where a slow consumer would otherwise build up
+    // unbounded latency ("rubber-band" video) and server memory. Frames are
+    // full JPEGs with no inter-frame dependency, so dropping any of them is
+    // safe; the next frame (≤22ms on an active page, ≤5s via the idle
+    // watchdog) repaints completely. Guaranteed deliveries (first-frame
+    // guarantee, idle watchdog) go through injectFrame()'s own NON-volatile
+    // emit and are unaffected.
+    this.nsp.to(this.room).volatile.emit('preview:video:frame', payload, frame);
   }
 
   /**
@@ -994,8 +1105,13 @@ export class PreviewVideoStreamService {
   /**
    * Inject a manual screenshot frame into the video stream.
    * Used after page reload/navigation when CDP screencast may lag behind.
+   *
+   * `timeoutMs` caps the underlying page.screenshot (defaults to Playwright's
+   * 30s). Callers on a contended path (the run-loop sync poke) pass a short cap
+   * so they fail fast instead of blocking; the watchdog/navigation callers omit
+   * it and keep the default.
    */
-  async injectFrame(): Promise<boolean> {
+  async injectFrame(opts?: { timeoutMs?: number }): Promise<boolean> {
     if (!this.isStreaming || this.isStopped || !this.page || !this.nsp) {
       return false;
     }
@@ -1004,6 +1120,7 @@ export class PreviewVideoStreamService {
       const buf = await this.page.screenshot({
         type: 'jpeg',
         quality: PREVIEW_VIDEO_CONFIG.quality,
+        ...(opts?.timeoutMs != null ? { timeout: opts.timeoutMs } : {}),
       });
 
       // V13: TOCTOU re-check — between the screenshot await and the emit
@@ -1056,6 +1173,32 @@ export class PreviewVideoStreamService {
       });
       return false;
     }
+  }
+
+  /**
+   * Guarded one-shot frame for run-loop step sync.
+   *
+   * Unlike the raw injectFrame() (used by post-navigation re-arm, where a forced
+   * frame is exactly what we want), this respects the SAME backpressure / zombie
+   * / circuit-breaker guards the idle watchdog applies, so a per-step poke can't
+   * pile screenshots onto a paused / zombie / contended stream:
+   *   - not streaming / stopped / CDP-closed → skip (dead session);
+   *   - circuit breaker open (isPaused) → skip (stream already failing);
+   *   - nobody in the room → skip (zombie session, no renderer);
+   *   - a frame already in flight (pendingFrames) → skip (don't pile up).
+   * It deliberately does NOT apply the watchdog's CDP-recency gate: the whole
+   * point of the run-loop poke is to land a frame in lockstep with each step
+   * even while the screencast lags under apply contention — the pendingFrames
+   * guard already bounds load to ≤1 screenshot per step. Screenshot is capped at
+   * syncFrameTimeoutMs so it fails fast on a stuck renderer.
+   */
+  async injectSyncFrame(): Promise<boolean> {
+    if (!this.isStreaming || this.isStopped || this.cdpSessionClosed) return false;
+    if (this.isPaused) return false;
+    if (this.pendingFrames > 0) return false;
+    const roomSize = this.nsp?.adapter.rooms.get(this.room)?.size ?? 0;
+    if (roomSize === 0) return false;
+    return this.injectFrame({ timeoutMs: PREVIEW_VIDEO_CONFIG.syncFrameTimeoutMs });
   }
 
   /**
@@ -1209,6 +1352,19 @@ export class PreviewVideoStreamRegistry {
   }
 
   /**
+   * Guarded run-loop sync frame (backpressure / zombie / circuit-breaker safe).
+   * Use this from the run loop instead of injectFrame — see
+   * PreviewVideoStreamService.injectSyncFrame.
+   */
+  async injectSyncFrame(previewSessionId: string): Promise<boolean> {
+    const stream = this.streams.get(previewSessionId);
+    if (stream) {
+      return stream.injectSyncFrame();
+    }
+    return false;
+  }
+
+  /**
    * V13: Re-arm the first-frame guarantee for an existing stream.
    * Use after page reload / refresh / SPA navigation when the existing CDP
    * screencast may emit no frames until something repaints. Idempotent and
@@ -1219,6 +1375,19 @@ export class PreviewVideoStreamRegistry {
     const stream = this.streams.get(previewSessionId);
     if (stream) {
       stream.armFirstFrameGuarantee();
+    }
+  }
+
+  /**
+   * Forward a client-reported render-FPS health hint to the session's stream
+   * so it can adapt its send rate. No-op if no active stream (client report
+   * raced a stop). Mirrors injectFrame/armFirstFrameGuarantee — the handler
+   * never touches the streams Map directly.
+   */
+  reportClientHealth(previewSessionId: string, clientFps: number): void {
+    const stream = this.streams.get(previewSessionId);
+    if (stream) {
+      stream.applyHealthHint(clientFps);
     }
   }
 

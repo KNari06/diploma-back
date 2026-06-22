@@ -104,6 +104,8 @@ RULES:
 - Each step should be a single atomic action
 - Include "targetRef" with the element ref from CURRENT PAGE STATE when a step targets a specific element (e.g. "e1", "e5")
 - Omit targetRef for non-element steps (observe_page, scroll_page, wait_for_page, mark_done, report_blocked)
+- TARGET ONLY REAL CONTROLS: a click_element / hover_element step MUST target an actual interactive element from CURRENT PAGE STATE — a link (<a href>), button, menuitem, tab, or input. NEVER target a heading, title, hero text, paragraph, image, or decorative element just because its visible text contains a goal word. Example: for "sign in", target the "Login" / "Sign in" link or button — do NOT target an <h1> like "Sign documents online" whose text merely starts with "Sign".
+- DESCRIBE BY PURPOSE, NOT BY A COPIED WORD: write the description as the user-facing intent ("Click the Login control to open the sign-in form"), not by quoting a single word you spotted on the page ("Click the link labeled 'Sign'"). If no element clearly serves the goal, plan report_blocked instead of inventing a label that does not exist.
 - For credential fields, mention "with credentials" in the description
 - If the page has obstacles (modals, cookie banners), plan to dismiss them first
 - If content is below the fold, plan to scroll_page or scroll_to_element first

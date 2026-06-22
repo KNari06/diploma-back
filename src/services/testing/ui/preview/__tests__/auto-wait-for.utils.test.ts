@@ -241,7 +241,8 @@ describe('injectAutoWaitForSteps', () => {
       expect(injected.type).toBe('wait_for');
       expect(injected.description).toBe('Auto: wait for URL change');
       expect(injected.options?.urlMatcher?.changedFrom).toBe('https://example.com/page1');
-      expect(injected.options?.urlMatcher?.timeoutMs).toBe(15000);
+      // 5000ms since the March 2026 navigation-handling change (commit 25bee1cc).
+      expect(injected.options?.urlMatcher?.timeoutMs).toBe(5000);
     });
   });
 });

@@ -10,8 +10,12 @@ import type { CompiledStepPlan, IntentStep, LocatorEntry, StepRuntimeMeta } from
 import { shouldSkipLookaheadAfter, waitForStepReadiness, type LookaheadResult } from '@/services/testing/ui/preview/step-readiness.service';
 import { runV1WithShadow } from '@/services/testing/ui/preview/step-readiness-v2.service';
 import { evaluateEvidenceShortcut } from '@/services/testing/ui/preview/evidence-shortcut.utils';
+import { waitForPageInteractive } from '@/services/testing/ui/preview/page-interactive.utils';
+import { shouldRecollectForReadiness, REPLAY_READINESS_MAX_WAIT_MS } from './replay-readiness';
+import { isReplayReadinessRecollectEnabled } from '@/config/features/replay-readiness';
 import { waitForHoverEffect } from '@/services/testing/ui/wait-phases/hover-effect-settle';
 import { smartStepWait } from '@/services/testing/ui/smart-step-wait.service';
+// eslint-disable-next-line no-duplicate-imports
 import type { IntentActionType } from '@/services/testing/ui/preview/preview.types';
 import { diagnoseStepBlocker, actOnDiagnosis } from '@/services/testing/ui/preview/step-blocker-diagnosis.service';
 import { COMMAND_EXECUTOR_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
@@ -24,6 +28,12 @@ import { SelectorStabilityScore, SmartWaitService } from '../utils/selectors/sma
 import type { ReplayTraceWriter } from '../playwright/core/replay-trace-writer';
 import { executeCoordinateDrag, parseDragCoordinates } from '../playwright/core/drag-helpers';
 import { buildRuntimeMeta, executeCompiledLocatorPlan, quickFingerprintCheck } from './compiled-locator-executor';
+// Step.options.* helpers (forwarded from intent-step-options-forwarder).
+// Field family: replaceContent, keyPressDelay, cssSelector,
+// disableStabilityChecks, disableCaching — see ./step-options/* for docs.
+import { typeWithOptionalClear } from './step-options/clear-before-type';
+import { fillWithOptionalAppend } from './step-options/append-fill';
+import { tryPinnedCssLocator } from './step-options/pinned-css-locator';
 import { tryOpenAnchorAsNewTab } from '@/services/testing/ui/preview/new-tab-opener';
 import {
   buildGlobWaitPayload,
@@ -254,6 +264,19 @@ function buildPostStep(
 export class CommandExecutor {
   private page: Page;
   private extractedData: Map<string, any> = new Map();
+  /** Per-run budget for the LLM tier of blocking-overlay clearing (tier3). */
+  private static readonly MAX_LLM_OVERLAY_CLEARS = 3;
+  private llmOverlayClears = 0;
+  /** Overall test goal — passed to the heal resolver as journey context. */
+  private testGoal?: string;
+  /**
+   * Sliding window of recent SUCCESSFUL step descriptions (descriptions only —
+   * never input values, which may carry secrets). Fed to the heal resolver so
+   * it has the "user's narrative" (what was done before this failing step) and
+   * can disambiguate drift. Capped at RECENT_STEPS_WINDOW.
+   */
+  private recentStepDescriptions: string[] = [];
+  private static readonly RECENT_STEPS_WINDOW = 3;
   private selfHealingEnabled: boolean = true;
   private metadata: { url: string; projectId?: string; userId?: string };
   private abortController: AbortController;
@@ -262,12 +285,21 @@ export class CommandExecutor {
   private externalAbortHandler?: () => void; // ✅ FIX 1: Store handler for cleanup
   private selfHealingConfidenceThreshold: number = COMMAND_EXECUTOR_CONFIG.selfHealingConfidenceThreshold;
   private maxHealAttempts: number = COMMAND_EXECUTOR_CONFIG.maxHealAttempts;
-  // Shared heal-credit budget across BOTH the intent-path heal (tryGetLocatorForIntentCommand)
-  // and the selector-path heal (executeWithSelfHealing). Each successful auto-applied heal
-  // charges 1 credit; when this counter reaches maxHealAttempts we stop charging even if
-  // subsequent heals happen. Without this, a failing step could be charged by both paths
-  // independently (2-3 credits per step instead of 1).
+  // Heal-credit accounting. We charge EXACTLY ONCE per step that auto-heals
+  // successfully — no more, no less:
+  //   - `currentStepHealCharged` is reset at the start of every executeCommand
+  //     and set true on the first successful auto-applied heal of THAT step.
+  //     Both heal paths (intent-path getLocatorForIntentCommand + selector-path
+  //     executeWithSelfHealing) consult it, so a single step is never charged
+  //     twice even when both paths fire (the bug the old run-level cap guarded).
+  //   - `instanceHealChargesSpent` is kept ONLY as an observability counter
+  //     (logged), no longer a billing gate. The previous run-level cap
+  //     (`< maxHealAttempts`) silently made every heal AFTER the Nth one FREE,
+  //     under-charging long tests; per-step dedup fixes that while preserving
+  //     the no-double-charge guarantee.
   private instanceHealChargesSpent: number = 0;
+  /** Reset per executeCommand; true once this step's heal has been billed. */
+  private currentStepHealCharged: boolean = false;
   private skipCompiledPlan: boolean = false; // Skip Stage 1 on retry attempts
   private maxDomNodes?: number; // Configurable DOM node limit (saves memory in replay mode)
   /** Runtime metadata for each step (keyed by stepId) */
@@ -303,6 +335,7 @@ export class CommandExecutor {
       maxDomNodes?: number; // Limit DOM nodes collected (saves memory in replay mode)
       replayTrace?: ReplayTraceWriter; // V14: JSONL trace writer for local debugging
       totalSteps?: number; // V14: Total steps for trace events
+      testGoal?: string; // Overall test goal — heal journey context
     } = {}
   ) {
     this.page = page;
@@ -314,6 +347,7 @@ export class CommandExecutor {
     this.maxDomNodes = options.maxDomNodes;
     this.replayTrace = options.replayTrace;
     this.totalSteps = options.totalSteps;
+    this.testGoal = options.testGoal;
 
     this.abortController = new AbortController();
 
@@ -331,6 +365,8 @@ export class CommandExecutor {
   resetRunState(): void {
     this.extractedData.clear();
     this.stepRuntimeMeta.clear();
+    this.recentStepDescriptions = [];
+    this.llmOverlayClears = 0;
     logger.debug('[COMMAND_EXECUTOR] Run state reset');
   }
 
@@ -457,6 +493,11 @@ export class CommandExecutor {
     runtimeMeta?: StepRuntimeMeta;
   }> {
     this.checkAborted();
+
+    // Per-step heal-billing dedup: fresh for each command. The first successful
+    // auto-applied heal of THIS step charges 1 credit and flips this true; any
+    // second heal path on the same step then sees it and does not re-charge.
+    this.currentStepHealCharged = false;
 
     const { action, value, url, timeout, continueOnError, description } = command;
 
@@ -768,8 +809,15 @@ export class CommandExecutor {
               const mod = process.platform === 'darwin' ? 'Meta' : 'Control';
               await this.page.keyboard.press(`${mod}+v`);
             } else {
-              // Use type() to simulate real keyboard events character by character
-              await intentTypeLocator.pressSequentially(String(value), { timeout: timeout || 30000 });
+              await typeWithOptionalClear(
+                intentTypeLocator,
+                String(value),
+                timeout || 30000,
+                {
+                  replaceContent: intentCommand.intentMeta.replaceContent,
+                  keyPressDelay: intentCommand.intentMeta.keyPressDelay,
+                },
+              );
             }
 
             // V10: Smart Enter decision
@@ -1245,12 +1293,7 @@ export class CommandExecutor {
           await tapLocator.tap({ timeout: timeout || 30000 });
           break;
 
-        case 'swipe':
-          if (!selector) throw new Error('Selector is required for swipe action');
-          const swipeLocator = this.getLocatorInternal(selector);
-          logger.warn('[COMMAND_EXECUTOR] Swipe action not fully supported, using tap');
-          await swipeLocator.tap({ timeout: timeout || 30000 });
-          break;
+        // V18: real swipe handling lives below (mouse-drag simulation from {start,end} coords)
 
         case 'goBack':
           await this.page.goBack({ timeout: timeout || 30000 });
@@ -1629,8 +1672,12 @@ export class CommandExecutor {
               'type',
               timeout || 30000
             );
-            // V15.5: noWaitAfter skips post-action stability wait (see clickOpts comment above)
-            await intentFillLocator.fill(String(value), { timeout: timeout || 30000, noWaitAfter: true });
+            await fillWithOptionalAppend(
+              intentFillLocator,
+              String(value),
+              timeout || 30000,
+              intentCommand.intentMeta.replaceContent,
+            );
             break;
           }
 
@@ -2511,29 +2558,101 @@ export class CommandExecutor {
           break;
         }
 
-        // V18: Multi-tab switch — switch to target tab by index
+        // V18: Multi-tab switch. Identity-first, index-fallback.
+        //
+        // The recorded step carries BOTH the tab index (`value`) and the URL of
+        // the tab it switched to (`evidence.pageUrl`, stamped when the recorder
+        // auto-emits switch_tab — see preview.handler.ts). Replaying by raw index
+        // is fragile: if the runtime tab order/count diverges from record time
+        // (an ad/tracking popup opened an extra tab, or a tab didn't open) index
+        // N points at the WRONG page and every subsequent step runs in it.
+        //
+        // So we MATCH BY URL first (exact → origin+path → origin), and only fall
+        // back to the index when there's no recorded URL or no tab matches it.
+        // This makes multi-tab regression robust against unplanned popups while
+        // staying backward-compatible with legacy steps that only have an index.
         case 'switchTab': {
           const targetTabIndex = parseInt(String(value || '0'), 10);
-          const allPages = this.page.context().pages();
-          if (targetTabIndex < 0 || targetTabIndex >= allPages.length) {
-            // Wait up to 5s for tab to appear (popup may still be opening)
-            let found = false;
-            for (let w = 0; w < 10; w++) {
-              await new Promise(r => setTimeout(r, 500));
-              const current = this.page.context().pages();
-              if (targetTabIndex < current.length) { found = true; break; }
+          const recordedUrl = intentCommand.intentMeta?.evidence?.pageUrl;
+
+          // normalize for comparison — strip trailing slash + hash; lower-case host
+          const norm = (u: string): { origin: string; originPath: string; full: string } | null => {
+            try {
+              const p = new URL(u);
+              // Only real navigations count. about:blank / data: / chrome: all
+              // collapse to an EMPTY host, so without this every such tab would
+              // false-match any other on the bare-origin tier ("data://" ===
+              // "data://") and switchTab would silently pick the wrong page.
+              if (p.protocol !== 'http:' && p.protocol !== 'https:') return null;
+              const host = p.host.toLowerCase();
+              const path = p.pathname.replace(/\/$/, '') || '/';
+              return { origin: `${p.protocol}//${host}`, originPath: `${p.protocol}//${host}${path}`, full: `${p.protocol}//${host}${path}${p.search}` };
+            } catch { return null; }
+          };
+
+          // Wait up to 5s for the expected tab to exist (popup may still open).
+          // The wait condition is "a URL match exists" when we have a recorded
+          // URL, otherwise "the index is in range" (legacy behaviour).
+          const want = recordedUrl ? norm(recordedUrl) : null;
+          const findByUrl = (): Page | null => {
+            if (!want) return null;
+            const pages = this.page.context().pages();
+            // exact full → origin+path, first match wins. Bare-origin is
+            // intentionally NOT a tier: two tabs of the same app share an origin
+            // but differ by path, so an origin-only match would grab the wrong
+            // same-origin tab. If neither path-bearing tier matches we fall back
+            // to index rather than guess. (Contrast hrefMatchesUrl in the newtab
+            // path, which DOES allow origin — there a same-origin redirect is
+            // still the clicked link's own destination.)
+            for (const tier of ['full', 'originPath'] as const) {
+              const hit = pages.find((pg) => { const n = norm(pg.url()); return n && n[tier] === want[tier]; });
+              if (hit) return hit;
             }
-            if (!found) {
-              throw new Error(`Tab ${targetTabIndex} not available (${this.page.context().pages().length} tabs open)`);
+            return null;
+          };
+
+          let targetPage: Page | null = findByUrl();
+          if (!targetPage) {
+            // No URL match yet (or no recorded URL) — wait for either a URL match
+            // or the index to come into range, then resolve.
+            for (let w = 0; w < 10 && !targetPage; w++) {
+              await new Promise(r => setTimeout(r, 500));
+              targetPage = findByUrl();
+              if (!targetPage) {
+                const current = this.page.context().pages();
+                if (!want && targetTabIndex >= 0 && targetTabIndex < current.length) {
+                  targetPage = current[targetTabIndex];
+                }
+              }
             }
           }
-          const targetPage = this.page.context().pages()[targetTabIndex];
+
+          // Final fallback: index (covers legacy/no-URL and "URL never appeared").
+          if (!targetPage) {
+            const pages = this.page.context().pages();
+            if (targetTabIndex >= 0 && targetTabIndex < pages.length) {
+              targetPage = pages[targetTabIndex];
+              if (want) {
+                logger.warn('[COMMAND_EXECUTOR] switchTab URL not found, fell back to index', {
+                  recordedUrl, targetTabIndex, totalPages: pages.length,
+                });
+              }
+            }
+          }
+
+          if (!targetPage) {
+            throw new Error(`Tab not available (index=${targetTabIndex}, recordedUrl=${recordedUrl || 'none'}, ${this.page.context().pages().length} tabs open)`);
+          }
+
           // Wait for page to be ready before switching
           try { await targetPage.waitForLoadState('load', { timeout: 10_000 }); } catch {
             try { await targetPage.waitForLoadState('domcontentloaded', { timeout: 3_000 }); } catch { /* proceed */ }
           }
           this.page = targetPage;
-          logger.info('[COMMAND_EXECUTOR] Switched to tab', { targetTabIndex, url: targetPage.url() });
+          logger.info('[COMMAND_EXECUTOR] Switched to tab', {
+            matchedBy: want && findByUrl() === targetPage ? 'url' : 'index',
+            targetTabIndex, recordedUrl: recordedUrl || undefined, url: targetPage.url(),
+          });
           break;
         }
 
@@ -2543,6 +2662,12 @@ export class CommandExecutor {
         // intent "this tab should not exist" is already true. We don't fail
         // the step. Hard-fail only when Playwright itself refuses to close
         // (e.g. attempting to close the very last page in the context).
+        //
+        // Deliberately index-based (NOT URL-matched like switchTab): closing
+        // the wrong tab is self-healing here (soft no-op when out of range),
+        // whereas URL-matching could close a legitimately-still-open tab that
+        // happens to share a URL. switchTab needs URL identity because picking
+        // the wrong tab silently redirects EVERY later step; closeTab doesn't.
         case 'closeTab': {
           const targetTabIndex = parseInt(String(value || '0'), 10);
           const pages = this.page.context().pages();
@@ -2572,6 +2697,31 @@ export class CommandExecutor {
             targetTabIndex,
             wasActive,
             remainingPages: this.page.context().pages().length,
+          });
+          break;
+        }
+
+        // Multi-tab open — create a new page in the context, navigate it to
+        // `value` (URL), and make it the active page so subsequent steps target
+        // it. Mirrors live-preview `open_tab` (PreviewSessionService.openTab).
+        case 'openTab': {
+          const url = String(value || '').trim();
+          if (!url) {
+            throw new Error('openTab requires a URL in value');
+          }
+          const ctx = this.page.context();
+          const newPage = await ctx.newPage();
+          try {
+            await newPage.goto(url, { waitUntil: 'load', timeout: timeout || 30000 });
+          } catch {
+            // Page is committed even if subresources stalled — fall back to a
+            // short domcontentloaded wait rather than failing the whole step.
+            try { await newPage.waitForLoadState('domcontentloaded', { timeout: 5_000 }); } catch { /* proceed */ }
+          }
+          this.page = newPage;
+          logger.info('[COMMAND_EXECUTOR] Opened new tab', {
+            url,
+            totalPages: ctx.pages().length,
           });
           break;
         }
@@ -2660,7 +2810,12 @@ export class CommandExecutor {
       // Only mutating actions go through it; read-only (assert/wait/getText)
       // skip the call entirely to stay fast.
       const intentType = playwrightActionToIntent(action);
-      if (intentType !== null) {
+      // Honour step.options.disableStabilityChecks (see
+      // ./step-options/* for the field family). Mirrors
+      // preview-step-apply.service.ts:2451.
+      const stabilityDisabled = isIntentCommand
+        && intentCommand.intentMeta?.disableStabilityChecks === true;
+      if (intentType !== null && !stabilityDisabled) {
         try {
           await smartStepWait({
             page: this.page,
@@ -2679,6 +2834,16 @@ export class CommandExecutor {
       const runtimeMeta = isIntentCommand
         ? this.stepRuntimeMeta.get(intentCommand.intentMeta?.stepId || '')
         : undefined;
+
+      // Record this successful step's DESCRIPTION (never its value/secrets) into
+      // the journey buffer so a LATER step's heal can see "what was done before".
+      const stepDesc = intentCommand.intentMeta?.intentDescription;
+      if (stepDesc) {
+        this.recentStepDescriptions.push(stepDesc.slice(0, 80));
+        if (this.recentStepDescriptions.length > CommandExecutor.RECENT_STEPS_WINDOW) {
+          this.recentStepDescriptions.shift();
+        }
+      }
 
       return { success: true, runtimeMeta };
     } catch (error) {
@@ -3442,6 +3607,20 @@ export class CommandExecutor {
     const stepId = intentMeta?.stepId || 'unknown';
     const iframeSelector = intentMeta?.iframeSelector;
 
+    // User-pinned CSS selector short-circuit (step.options.cssSelector).
+    // See ./step-options/pinned-css-locator.ts for details.
+    const pinnedCssResult = await tryPinnedCssLocator(
+      command,
+      this.page,
+      (iframeSel, t) => this.getFrameFromIframeSelector(iframeSel, t),
+      timeout,
+      startTime,
+    );
+    if (pinnedCssResult) {
+      this.stepRuntimeMeta.set(stepId, pinnedCssResult.runtimeMeta);
+      return pinnedCssResult;
+    }
+
     // V11: If no compiled plan exists, pre-mark compiled as deterministic fail so
     // allStagesDeterministicFail() can return true for intent-only steps (no compiled plan).
     // Without this, fail-fast is silently disabled for all intent-only steps.
@@ -3524,13 +3703,43 @@ export class CommandExecutor {
           !retryCtx.cachedDomNodes ||
           (Date.now() - retryCtx.lastDomCollectionTs > 1500);
 
-        const domNodes = shouldCollectFresh
+        let domNodes = shouldCollectFresh
           ? await collectInteractiveNodes(this.page, this.maxDomNodes)
           : retryCtx.cachedDomNodes!;
 
         if (shouldCollectFresh) {
           retryCtx.cachedDomNodes = domNodes;
           retryCtx.lastDomCollectionTs = Date.now();
+        }
+
+        // Replay readiness recollect (flag-gated, default OFF): a sparse fresh
+        // snapshot usually means the page is still mid-load / mid-redirect
+        // (SSO/OAuth chains), and resolving on it makes the LLM pick a stray
+        // element. Run the SAME page-interactive gate the editor/lite paths use,
+        // then recollect once. Never regress the node set on a worse recollect.
+        if (
+          shouldCollectFresh
+          && shouldRecollectForReadiness({
+            enabled: isReplayReadinessRecollectEnabled(),
+            domNodeCount: domNodes.length,
+            attempt: retryCtx.attempt,
+          })
+        ) {
+          const readiness = await waitForPageInteractive(this.page, { maxWaitMs: REPLAY_READINESS_MAX_WAIT_MS });
+          const recollected = await collectInteractiveNodes(this.page, this.maxDomNodes);
+          logger.info('[COMMAND_EXECUTOR] Replay readiness recollect', {
+            stepId,
+            before: domNodes.length,
+            after: recollected.length,
+            waited: readiness.waited,
+            ready: readiness.ready,
+            finalUrl: readiness.finalUrl,
+          });
+          if (recollected.length > domNodes.length) {
+            domNodes = recollected;
+            retryCtx.cachedDomNodes = domNodes;
+            retryCtx.lastDomCollectionTs = Date.now();
+          }
         }
 
         if (domNodes.length === 0) {
@@ -3543,7 +3752,13 @@ export class CommandExecutor {
           // result-shape differ (preview returns LintResult during lint phase,
           // background returns {locator, runtimeMeta} during execute phase).
           // Saves 1-2s LLM call when element hasn't changed between runs.
-          if (intentMeta.evidence?.lastSuccessRef && retryCtx.attempt === 0) {
+          if (
+            intentMeta.evidence?.lastSuccessRef
+            && retryCtx.attempt === 0
+            // step.options.disableCaching — see ./step-options/* for the
+            // field family. Mirrors intent-step-lint.service.ts:1227.
+            && !intentMeta.disableCaching
+          ) {
             const shortcut = evaluateEvidenceShortcut({
               evidence: intentMeta.evidence,
               domNodes,
@@ -3623,11 +3838,32 @@ export class CommandExecutor {
               description: intentMeta.intentDescription,
               bindingHints: intentMeta.bindingHints,
               evidence: intentMeta.evidence,
+              // Strong recorded identity for the heal resolver. Previously
+              // omitted — regression heals ran blind on description + soft
+              // hints only. With this, heal uses the same id/testId/name/text/
+              // ancestor fingerprint the editor captured (heal-context #2 fix).
+              recordedFingerprint: intentMeta.recordedFingerprint,
+              recordedDescription: intentMeta.recordedDescription,
             },
             domNodes,
             pageUrl: this.page.url(),
             includeAlternatives: false,
+            // V26 parity with the lint path: real viewport makes
+            // buildAllowedSets' modal-coverage ratio accurate on long
+            // scrollable pages. Null (no emulation) falls back to the
+            // bbox high-water-mark heuristic, same as before.
+            viewport: this.page.viewportSize() ?? undefined,
             screenshot: () => captureSmartScreenshot(pageForScreenshot),
+            // Journey context: the user's narrative (test goal + the steps
+            // completed before this failing one) so heal can disambiguate
+            // drift (e.g. "we just logged in → this is login submit, not
+            // settings submit"). Descriptions only — never input values.
+            healContext: {
+              testGoal: this.testGoal,
+              priorSteps: this.recentStepDescriptions.slice(-CommandExecutor.RECENT_STEPS_WINDOW),
+              stepIndex: intentMeta.stepIndex,
+              totalSteps: this.totalSteps,
+            },
           });
 
           if (resolveResult.status === 'resolved' && resolveResult.candidates.length > 0) {
@@ -3751,11 +3987,28 @@ export class CommandExecutor {
                       description: intentMeta.intentDescription,
                       bindingHints: intentMeta.bindingHints,
                       evidence: intentMeta.evidence,
+                      // Parity with the primary heal call above: below-the-fold
+                      // heals must NOT run blind. Forward the same strong recorded
+                      // identity so the resolver's identity fast-path can fire on
+                      // the freshly-revealed nodes (was missing — scroll heals
+                      // resolved on description + soft hints only).
+                      recordedFingerprint: intentMeta.recordedFingerprint,
+                      recordedDescription: intentMeta.recordedDescription,
                     },
                     domNodes: freshNodes,
                     pageUrl: this.page.url(),
                     includeAlternatives: false,
+                    // Same viewport parity as the primary heal call above.
+                    viewport: this.page.viewportSize() ?? undefined,
                     screenshot: () => captureSmartScreenshot(this.page),
+                    // Same journey context as the primary heal so a scroll-revealed
+                    // step is disambiguated with the test goal + prior steps too.
+                    healContext: {
+                      testGoal: this.testGoal,
+                      priorSteps: this.recentStepDescriptions.slice(-CommandExecutor.RECENT_STEPS_WINDOW),
+                      stepIndex: intentMeta.stepIndex,
+                      totalSteps: this.totalSteps,
+                    },
                   });
 
                   if (scrollResolve.status === 'resolved' && scrollResolve.candidates.length > 0) {
@@ -4019,9 +4272,11 @@ export class CommandExecutor {
             };
             this.stepRuntimeMeta.set(stepId, runtimeMeta);
 
-            // Deduct 1 credit for successful auto-applied heal — bounded by
-            // maxHealAttempts across BOTH paths via instanceHealChargesSpent.
-            if (this.metadata.userId && this.instanceHealChargesSpent < this.maxHealAttempts) {
+            // Deduct 1 credit per healed STEP. `currentStepHealCharged` makes
+            // it exactly-once per step across BOTH heal paths (no double-charge),
+            // while still charging every distinct step that heals (no free-after-N).
+            if (this.metadata.userId && !this.currentStepHealCharged) {
+              this.currentStepHealCharged = true;
               this.instanceHealChargesSpent++;
               await CreditCostTrackerService.deductStepCredit(
                 this.metadata.userId,
@@ -4384,10 +4639,11 @@ export class CommandExecutor {
       const meetsConfidenceThreshold = healConfidence >= this.selfHealingConfidenceThreshold;
 
       if (healingResult.autoApplied && meetsConfidenceThreshold) {
-        // Deduct 1 credit for self-heal retry — shared budget with intent-path heal
-        // (instanceHealChargesSpent) so a single failing step can't be charged by
-        // both paths independently.
-        if (this.metadata.userId && this.instanceHealChargesSpent < this.maxHealAttempts) {
+        // Deduct 1 credit per healed STEP. `currentStepHealCharged` ensures the
+        // same step isn't charged twice when the intent-path heal already
+        // charged it; each new step that heals is still charged once.
+        if (this.metadata.userId && !this.currentStepHealCharged) {
+          this.currentStepHealCharged = true;
           this.instanceHealChargesSpent++;
           await CreditCostTrackerService.deductStepCredit(
             this.metadata.userId,
@@ -5196,6 +5452,17 @@ export class CommandExecutor {
       return;
     }
 
+    // Deterministic obstacle-clear (regression path): we attempt to dismiss a
+    // BLOCKING overlay AT MOST ONCE per call, only when the target is actually
+    // covered. This unblocks unexpected modals/cookie banners/onboarding that
+    // would otherwise fail the step, WITHOUT disturbing steps that legitimately
+    // target a modal (if the step's own element is the modal, it IS topmost and
+    // we never enter the clear branch). `flow` mode is conservative — it never
+    // touches sticky headers/footers, chat widgets, tooltips, toasts or
+    // unclassified containers (see OverlayDismisser.filterDismissible). Fail-open:
+    // any error in the clear path leaves the original timeout/throw behaviour.
+    let obstacleClearTried = false;
+
     try {
       while (Date.now() - startTime < timeout) {
         try {
@@ -5225,6 +5492,16 @@ export class CommandExecutor {
             return;
           }
 
+          // Target is covered. Try clearing a blocking overlay once before we
+          // keep polling toward the timeout. This is the deterministic
+          // "clear-on-block" recovery — no LLM, conservative flow mode.
+          if (!obstacleClearTried) {
+            obstacleClearTried = true;
+            await this.tryClearBlockingOverlay();
+            // Loop continues → re-checks topmost on the next iteration.
+            continue;
+          }
+
           logger.debug('[COMMAND_EXECUTOR] Element not topmost, waiting...', {
             elapsed: Date.now() - startTime,
           });
@@ -5245,6 +5522,101 @@ export class CommandExecutor {
       // Always clean up the marker attribute
       await locator.evaluate((el, attr) => el.removeAttribute(attr), marker).catch(() => {});
     }
+  }
+
+  /**
+   * Best-effort, deterministic clearing of a BLOCKING overlay that is covering
+   * the current target. Reuses the LLM-free `OverlayDismisser` in `flow` mode
+   * (only modal / cookie_consent / loading_overlay / onboarding / paywall — never
+   * sticky chrome, chat widgets, tooltips, toasts, or unclassified containers).
+   * One pass, short budget. Fully fail-open: never throws, so the caller's
+   * timeout/throw contract is unchanged when nothing can be cleared.
+   */
+  private async tryClearBlockingOverlay(): Promise<void> {
+    // 2-tier escalation, both LANGUAGE-AGNOSTIC (no hardcoded close-word lists).
+    // Each tier is best-effort; the method is fully fail-open — a covered target
+    // that can't be cleared just falls back to the original timeout/throw in
+    // ensureTopMostAtCenter.
+    //
+    //   Tier 1 (deterministic): OverlayDismisser flow-mode — type-classified
+    //           recovery (Escape / click-away / type-specific) for genuinely-
+    //           blocking overlays only. Classification is geometry + ARIA based,
+    //           not word-matching.
+    //   Tier 2 (LLM, last resort, capped): ask the resolver to find a
+    //           "close the blocking popup" control and click it. Language- and
+    //           structure-agnostic; runs ONLY after tier 1 failed AND at most
+    //           `MAX_LLM_OVERLAY_CLEARS` times per run to bound cost/latency.
+    //
+    // NOTE: a previous text-pattern "generic close-button" tier was REMOVED —
+    // it hardcoded close-word lists (close/закрыть/жабу/…) which can never be
+    // complete across languages/sites. Structural (tier1) + LLM (tier2) cover
+    // the same ground without a brittle wordlist.
+    try {
+      const { OverlayDismisser } = await import('@/agent/core/lite/exploration/overlay-dismisser');
+      const result = await OverlayDismisser.dismissOverlays(this.page, {
+        mode: 'flow',
+        maxPasses: 1,
+        maxTimeMs: 2500,
+      });
+      const dismissed = result?.attempts?.filter((a) => a.dismissed).length ?? 0;
+      if (dismissed > 0) {
+        logger.warn('[COMMAND_EXECUTOR] Auto-dismissed a blocking overlay (tier1 deterministic)', {
+          dismissed,
+          overlaysDetected: result.overlaysDetected,
+        });
+        return;
+      }
+    } catch (err) {
+      logger.debug('[COMMAND_EXECUTOR] Tier1 overlay clear failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Tier 2 — LLM last resort, capped per run.
+    if (this.llmOverlayClears >= CommandExecutor.MAX_LLM_OVERLAY_CLEARS) {
+      logger.debug('[COMMAND_EXECUTOR] LLM overlay-clear budget exhausted, skipping tier2');
+      return;
+    }
+    try {
+      this.llmOverlayClears++;
+      const cleared = await this.clearOverlayWithLLM();
+      if (cleared) {
+        logger.warn('[COMMAND_EXECUTOR] Auto-dismissed a blocking overlay (tier2 LLM)', {
+          llmClearsUsed: this.llmOverlayClears,
+        });
+      }
+    } catch (err) {
+      logger.debug('[COMMAND_EXECUTOR] Tier2 LLM overlay clear failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Tier 2 — LLM last resort. Re-resolve a "close the blocking popup" control
+   * via the same resolver the self-heal path uses, then click it. Language- and
+   * structure-agnostic (no hardcoded close-word list). Capped by the caller.
+   * Returns true if it clicked a resolved element.
+   */
+  private async clearOverlayWithLLM(): Promise<boolean> {
+    const { resolveElement } = await import('@/services/testing/ui/preview/element-resolver.service');
+    const { collectInteractiveNodes } = await import('./background-dom-collector');
+    const nodes = await collectInteractiveNodes(this.page, this.maxDomNodes);
+    const res = await resolveElement({
+      previewSessionId: 'background',
+      mode: 'heal',
+      stepDraft: { id: 'overlay-clear', type: 'click', description: 'close or dismiss the blocking popup / modal / cookie banner' } as IntentStep,
+      domNodes: nodes,
+      pageUrl: this.page.url(),
+      includeAlternatives: false,
+      // Viewport parity with the heal calls: overlay-coverage math needs the
+      // real viewport, especially here where the target IS the overlay layer.
+      viewport: this.page.viewportSize() ?? undefined,
+    });
+    const ref = res.highlight?.find((h) => h.type === 'success')?.ref ?? res.candidates?.[0]?.ref;
+    if (res.status !== 'resolved' || !ref) return false;
+    await this.page.locator(`[data-agent-ref="${ref}"]`).first().click({ timeout: 2000 }).catch(() => {});
+    return true;
   }
 
   /**

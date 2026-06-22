@@ -85,6 +85,116 @@ describe('CdpSnapshotService — real Chromium integration', () => {
       expect(snapshot.transientState?.isTransient).toBe(false);
     }, PER_TEST_TIMEOUT_MS);
 
+    // ──────────────────────────────────────────────────────────────────
+    // Regression test for May 2026 bi.group "Астана" incident:
+    //   CDP DOMSnapshot.bounds is document-relative. The refAssign phase
+    //   calls `elementsFromPoint(cx, cy)` and `getBoundingClientRect()`
+    //   which are viewport-relative. Without subtracting scrollY, any
+    //   button below the fold gets dropped at refAssign with
+    //   `findElementReturnedNull / atPoint: null`.
+    //
+    //   Forensic evidence from production capture (preview_db408e1b…):
+    //     scrollY=500, 543/639 refAssign rejections had bbox.y > 720.
+    //     Target button "Астана" at doc-y=792.5 was one of them.
+    //
+    //   This test reproduces the scenario in isolation:
+    //   - Tall page (force scrollbar).
+    //   - Button placed well below the first viewport.
+    //   - Scroll the page so the button is INSIDE the viewport after scroll.
+    //   - Collect snapshot → assert the button survived with a ref.
+    //
+    // If the scroll fix regresses, the button gets `ref=''` and is
+    // filtered out by the post-refAssign defense — total ref count drops
+    // and this assertion fails.
+    it('preserves below-the-fold buttons after page scroll (refAssign coord-space fix)', async () => {
+      // 3000px tall page; target button at y≈1200 in DOCUMENT space.
+      // Viewport is 1280×720 by default. After scrollTo(0, 500) the
+      // button sits at y≈700 in viewport — visible — but document
+      // coordinates are still y=1200. The pre-fix code passed y=1200
+      // to elementsFromPoint, hitting empty space (> 720), and dropped.
+      await page.setViewportSize({ width: 1280, height: 720 });
+      await page.setContent(`
+        <div style="height: 1100px; background: linear-gradient(#eef,#fff);">
+          <p style="padding-top: 200px;">filler above</p>
+        </div>
+        <button id="target-astana" data-testid="city-astana"
+                style="display:block; width:300px; height:44px;">
+          Астана
+        </button>
+        <div style="height: 1500px;">filler below</div>
+      `);
+      await page.evaluate(() => (globalThis as unknown as { scrollTo: (x: number, y: number) => void }).scrollTo(0, 500));
+      // Settle layout + ensure scroll actually applied.
+      await page.waitForFunction(() => (globalThis as unknown as { scrollY: number }).scrollY === 500);
+
+      const snapshot = await CdpSnapshotService.collect(page);
+
+      // The button MUST appear with a ref (i.e. it survived refAssign).
+      const astana = snapshot.elements.find(
+        (e) => e.tag === 'button' && (e.htmlId === 'target-astana' || e.testIdAttr === 'city-astana'),
+      );
+      expect(astana).toBeDefined();
+      expect(astana?.ref).toMatch(/^e\d+$/);
+      // Bounds in the public LiteElement contract MUST stay
+      // document-relative (we subtract scroll only inside refAssign,
+      // not on the public field) — this is part of the API stability
+      // promise to downstream consumers like the resolver and traces.
+      expect(astana?.bounds?.y).toBeGreaterThanOrEqual(1000);
+    }, PER_TEST_TIMEOUT_MS);
+
+    // Race regression: scroll changes BETWEEN captureSnapshot (Node side,
+    // which records scrollOffset in the DS document) and the in-page
+    // refAssign evaluate. If we subtract snapshot-time scroll, the bbox
+    // we hand to elementsFromPoint is off by `(liveScroll - snapshotScroll)`
+    // px — when that delta exceeds TOL_EXACT (10px), bboxScore returns
+    // 'mismatch' and the element drops. Subtracting LIVE scroll inside
+    // the evaluate body (the only safe place) keeps both sides in sync.
+    //
+    // Repro: scroll to 500, kick off the collect (captureSnapshot reads
+    // scrollOffset=500), then immediately scroll to 600. By the time
+    // refAssign runs ~50ms later, win.scrollY=600 but DS bounds were
+    // captured at scroll=500. Pre-fix or with snapshot-scroll subtraction
+    // the button drops. With live-scroll subtraction it survives.
+    it('survives scroll-during-collect race (live scroll, not snapshot scroll)', async () => {
+      await page.setViewportSize({ width: 1280, height: 720 });
+      await page.setContent(`
+        <div style="height: 1100px; background:#eef;"></div>
+        <button id="race-target" style="display:block; width:300px; height:44px;">
+          Race Target
+        </button>
+        <div style="height: 1500px;"></div>
+      `);
+      await page.evaluate(() => (globalThis as unknown as { scrollTo: (x: number, y: number) => void }).scrollTo(0, 500));
+      await page.waitForFunction(() => (globalThis as unknown as { scrollY: number }).scrollY === 500);
+
+      // Kick off collect AND a scroll concurrently. The exact timing
+      // varies; what matters is that AT LEAST ONE run lands in the
+      // race window where snapshot scroll != live scroll. We do 3
+      // independent collects with mid-flight scrolls — at least one
+      // should hit the race.
+      let foundCount = 0;
+      for (const targetScroll of [600, 450, 550]) {
+        const collectPromise = CdpSnapshotService.collect(page);
+        // Best-effort race: fire the scroll immediately. May land
+        // before captureSnapshot starts (no race) or during refAssign
+        // (race we want to test).
+        page.evaluate((y) => (globalThis as unknown as { scrollTo: (x: number, y: number) => void }).scrollTo(0, y), targetScroll).catch(() => {});
+        const snap = await collectPromise;
+        const found = snap.elements.find((e) => e.htmlId === 'race-target');
+        if (found?.ref) foundCount++;
+        // restabilize
+        await page.evaluate(() => (globalThis as unknown as { scrollTo: (x: number, y: number) => void }).scrollTo(0, 500));
+        await page.waitForFunction(() => (globalThis as unknown as { scrollY: number }).scrollY === 500);
+      }
+
+      // Even in the worst case, the live-scroll fix should preserve
+      // the target on at least 2/3 collects. With the OLD bug (no
+      // scroll subtraction) we'd see 0/3 because target is always
+      // below the fold. With snapshot-scroll subtraction we'd see 1/3
+      // at best (only the non-racing run survives).
+      expect(foundCount).toBeGreaterThanOrEqual(2);
+    }, PER_TEST_TIMEOUT_MS);
+
     it('every interactive element has a ref starting with "e"', async () => {
       await page.setContent(`
         <button>A</button><button>B</button><button>C</button>
@@ -100,6 +210,92 @@ describe('CdpSnapshotService — real Chromium integration', () => {
       for (const ref of refs) {
         expect(ref).toMatch(/^e\d+$/);
       }
+    }, PER_TEST_TIMEOUT_MS);
+
+    // ──────────────────────────────────────────────────────────────────
+    // Regression: June 2026 codemify.com "Dropped duplicate-ref elements"
+    //   spam. findElement is a many-to-one map — an <input>, the SVG icon
+    //   group centred on it, and assorted pseudo/layout rows all resolve
+    //   to the SAME live DOM node. The first request set data-agent-ref;
+    //   every later request read the SAME attribute back and the collector
+    //   emitted N LiteElements sharing one ref (observed e34×4, e202 on a
+    //   form-with-icons page). dedupeElementsByRef then dropped 17/90 each
+    //   tick — quality-aware so the visible input usually survived, but it
+    //   was pure log spam + a signal of source-level collisions.
+    //
+    //   Fix: one-node-per-pass claim WeakSet in runRefAssignmentInFrame —
+    //   a node may back at most ONE ref per evaluate. These tests assert
+    //   the SOURCE invariant (no element shares a ref BEFORE dedup would
+    //   run), i.e. beforeDedup ≈ afterDedup.
+    it('never mints the same ref for two distinct elements (input + overlapping icon)', async () => {
+      // An input field overlaid by an absolutely-positioned SVG icon whose
+      // center sits on the input — the canonical many-to-one collapse:
+      // the input request and the icon-group request both center on the
+      // input's bbox and Stage B returns the same node for the loser.
+      await page.setContent(`
+        <div style="position:relative; width:320px;">
+          <input type="text" name="email" placeholder="Email"
+                 style="width:320px; height:44px; box-sizing:border-box;" />
+          <svg style="position:absolute; right:8px; top:10px; width:24px; height:24px;"
+               viewBox="0 0 24 24" aria-label="email icon">
+            <rect x="0" y="0" width="24" height="24"></rect>
+            <rect x="4" y="4" width="16" height="16"></rect>
+          </svg>
+        </div>
+        <button id="go">Go</button>
+      `);
+
+      const snapshot = await CdpSnapshotService.collect(page);
+
+      const refs = snapshot.elements.map((e) => e.ref).filter(Boolean) as string[];
+      const seen = new Set<string>();
+      const dups: string[] = [];
+      for (const r of refs) {
+        if (seen.has(r)) dups.push(r);
+        seen.add(r);
+      }
+      expect(dups).toEqual([]);
+      // Sanity: the input itself still made it through with a ref (the
+      // fix drops the COLLIDING twin, never the real field).
+      const input = snapshot.elements.find((e) => e.tag === 'input');
+      expect(input?.ref).toMatch(/^e\d+$/);
+    }, PER_TEST_TIMEOUT_MS);
+
+    it('keeps every emitted ref unique on a dense modal-style form (no dedup needed)', async () => {
+      // Modal with multiple labelled inputs + icon buttons — the shape
+      // that produced e34×4 in production. Assert the ref space is
+      // collision-free at the SOURCE so dedupeElementsByRef has nothing
+      // to drop.
+      await page.setContent(`
+        <div role="dialog" style="position:fixed; inset:80px; background:#fff;">
+          <h2>Get a free lesson</h2>
+          <label>Name
+            <span style="position:relative; display:inline-block;">
+              <input type="text" name="name" style="width:280px; height:40px;" />
+              <svg style="position:absolute; right:6px; top:8px; width:20px; height:20px;" viewBox="0 0 20 20">
+                <rect x="0" y="0" width="20" height="20"></rect>
+              </svg>
+            </span>
+          </label>
+          <label>Email
+            <span style="position:relative; display:inline-block;">
+              <input type="email" name="email" style="width:280px; height:40px;" />
+              <svg style="position:absolute; right:6px; top:8px; width:20px; height:20px;" viewBox="0 0 20 20">
+                <rect x="0" y="0" width="20" height="20"></rect>
+              </svg>
+            </span>
+          </label>
+          <button type="submit">Send</button>
+        </div>
+      `);
+
+      const snapshot = await CdpSnapshotService.collect(page);
+
+      const refs = snapshot.elements.map((e) => e.ref).filter(Boolean) as string[];
+      expect(refs.length).toBeGreaterThan(0);
+      expect(new Set(refs).size).toBe(refs.length);
+      // Both inputs survive (each backs its own ref).
+      expect(snapshot.elements.filter((e) => e.tag === 'input' && e.ref).length).toBe(2);
     }, PER_TEST_TIMEOUT_MS);
   });
 
@@ -610,6 +806,87 @@ describe('CdpSnapshotService — real Chromium integration', () => {
       } finally {
         await evalPage.close();
       }
+    }, PER_TEST_TIMEOUT_MS);
+  });
+
+  // ──────────────────────────────────────────────────────────────────
+  // Framework-clickable role-less wrapper — the documentolog "Login"
+  // regression. A role-LESS <div> with a JS-prop (React fiber) onClick whose
+  // label lives in a CHILD <p>. Three collector fixes must hold together:
+  //   (a) tagFrameworkClickable marks it → isInteractiveNodeTier1 → Tier-1, so
+  //       it survives the MAX_TIER2_ELEMENTS cap under cursor:pointer noise;
+  //   (b) text comes from the nodeValue descendant (the child <p>), NOT the
+  //       textarea-only `textValue` (which is empty) → the resolver has "Login";
+  //   (c) Chrome AX role=generic is promoted to button so the LLM candidate
+  //       pruner keeps it and the resolver's actionability guard accepts it.
+  // Drop any one and the live editor's "Find" returned "element not found" on
+  // documentolog.com/en while the evaluate path resolved it (a collector-
+  // symmetry break — preview/CLAUDE.md invariant #5).
+  // ──────────────────────────────────────────────────────────────────
+  describe('framework-clickable role-less wrapper (documentolog "Login")', () => {
+    // <div onClick><svg/><p>Login</p></div> — role-less, NO `onclick` attribute;
+    // the handler is a JS prop only, surfaced via a simulated React fiber props
+    // bag (the exact `__reactProps$*.onClick` signal the tag pass reads). The
+    // child <svg>/<p> are pinned to cursor:auto so they don't become their own
+    // Tier-2 candidates and add noise.
+    async function buildLoginPage(p: Page, decoyCount: number): Promise<void> {
+      const decoys = Array.from(
+        { length: decoyCount },
+        (_, i) => `<div class="decoy" data-i="${i}" style="cursor:pointer;width:30px;height:15px;display:inline-block;"></div>`,
+      ).join('');
+      await p.setContent(`
+        <header>
+          <div id="login-wrapper" style="cursor:pointer;width:62px;height:48px;display:inline-block;">
+            <svg width="16" height="16" viewBox="0 0 16 16" style="cursor:auto;"></svg>
+            <p style="cursor:auto;">Login</p>
+          </div>
+        </header>
+        <main>${decoys}</main>
+      `);
+      // Attach a React-style fiber props bag carrying onClick. role-less + no
+      // `onclick` attribute means this handler is invisible to the attribute-only
+      // DOMSnapshot; only the runtime tag pass (Object.keys → __reactProps$*) sees it.
+      await p.evaluate(() => {
+        const doc = (globalThis as unknown as {
+          document: { querySelector(s: string): Record<string, unknown> | null };
+        }).document;
+        const el = doc.querySelector('#login-wrapper');
+        if (el) el['__reactProps$qaittest'] = { onClick: () => { /* noop */ } };
+      });
+    }
+
+    it('promotes the role-less <div onClick> to a candidate with text + role=button', async () => {
+      await buildLoginPage(page, 0);
+
+      const snapshot = await CdpSnapshotService.collect(page);
+      const login = snapshot.elements.find((e) => e.htmlId === 'login-wrapper');
+
+      expect(login).toBeDefined();
+      expect(login?.tag).toBe('div');
+      // (c) Chrome AX reports role=generic; promotion lifts it to button.
+      expect(login?.role).toBe('button');
+      // (b) Label is in the child <p> — descendant text bubbles it to the wrapper.
+      expect(login?.text).toContain('Login');
+    }, PER_TEST_TIMEOUT_MS);
+
+    it('survives the Tier-2 cap under cursor:pointer pressure (promotion → Tier-1)', async () => {
+      // 350 textless cursor:pointer decoys > MAX_TIER2_ELEMENTS (300). They are
+      // smaller (area 450) than the target (2976), so the Tier-2 priority sort
+      // fills the cap with decoys first and would crowd the target out — UNLESS
+      // the framework-click marker promoted it to (uncapped) Tier-1.
+      await buildLoginPage(page, 350);
+
+      const snapshot = await CdpSnapshotService.collect(page);
+      const login = snapshot.elements.find((e) => e.htmlId === 'login-wrapper');
+
+      // (a) Present despite the cap pressure → it took the Tier-1 path.
+      expect(login).toBeDefined();
+      expect(login?.role).toBe('button');
+      expect(login?.text).toContain('Login');
+      // Sanity: the cap actually fired (not all 350 decoys survived) — otherwise
+      // the "pressure" is fake and the survival assertion proves nothing.
+      const keptDecoys = snapshot.elements.filter((e) => e.tag === 'div' && e.htmlId !== 'login-wrapper').length;
+      expect(keptDecoys).toBeLessThan(350);
     }, PER_TEST_TIMEOUT_MS);
   });
 });

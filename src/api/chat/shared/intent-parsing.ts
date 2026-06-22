@@ -9,6 +9,7 @@ import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
 import { isValidUUID } from '@/utils/validation/validation';
 import { CONSTANTS, FAST_PATH_COMMANDS, PROGRESS } from './constants';
 import { getAvailableIntents, hasHandler } from './handler-registry';
+import { attachResolvedTargets } from './intent-target-resolution';
 import { buildRegressionContext } from './regression-context';
 import { checkRequestAborted } from './request-cancellation';
 import { emitProcessingStep } from './utils';
@@ -34,9 +35,14 @@ export const BLOCKED_IN_TEST_CASE_SCOPE: ReadonlySet<string> = new Set([
   'platform_test',  // creates a brand-new test from a URL — pointless inside a test case
   'api_test',       // creates a new API test — same reason
   'api_flow_test',  // multi-step API integration tests; runs against workspace, not a single test case
-  'mobile_test',
-  'mobile_action',
-  'mobile_agent',
+  'mobile_test',     // creates a brand-new mobile test — pointless inside a test case
+  // mobile_action + mobile_agent are NOT blocked: they operate on the LIVE
+  // emulator attached to the test-case editor (parallel to web's
+  // editor_action), so they must work in test-case scope. Their chat turns
+  // route to the test-case store via the threaded ChatStore (see
+  // mobile_agent/shared.ts saveMobileChatTurn). Removing them lets the
+  // classifier-fallback path reach them too — the force-route path
+  // (chat.controller.ts decideForceRoute) already bypasses this guard.
   'run_regression',
   'run_plan',
   'run_module',
@@ -44,7 +50,78 @@ export const BLOCKED_IN_TEST_CASE_SCOPE: ReadonlySet<string> = new Set([
   'create_plan',
   'add_to_plan',
   'save_test',      // we ARE the test case — nowhere to save TO
+  // Management ops are workspace/project-level, not per-test-case.
+  'manage_schedule',
+  'manage_module',
+  'manage_plan',
 ]);
+
+// Full URLs first, then bare domains ("shop.example.com/checkout"). Mirrors
+// the frontend extractor (apps/web utils/exploreSurface) so both sides agree
+// on what counts as "this message targets a site".
+const URL_IN_TEXT_RE =
+  /https?:\/\/[^\s]+|(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/[^\s]*)?/i;
+
+// Reverse-DNS app ids ("com.acme.app") are domain-shaped and would trip the
+// URL regex; they mean MOBILE, not a website, so they must NOT trigger the
+// web-exploration bias. A real site URL has a path or a www/http prefix, or
+// its final label is a TLD — a package id's final label is the app name.
+const PACKAGE_ID_RE = /^(?:com|org|io|net|app|dev|co|kz|ru|me)\.[a-z0-9_.]+$/i;
+
+/**
+ * Verdicts the exploration-surface bias is allowed to overwrite. Anything
+ * else (api_test, save_test, run_*, mobile_*, editor_action, manage_*,
+ * needs_clarification, …) is an INTENTIONAL non-exploration request the
+ * user typed while inside the Exploration UI — we leave it untouched so
+ * "add a step to test X" or "run my regression" still work from here.
+ */
+const EXPLORATION_BIAS_OVERRIDABLE: ReadonlySet<string> = new Set([
+  'general_chat',
+  'platform_test',
+]);
+
+/**
+ * Soft, deterministic exploration bias for the Exploration UI surface.
+ *
+ * Mutates `parsedIntent` IN PLACE when ALL hold:
+ *   - surfaceContext === 'exploration'
+ *   - the classifier's verdict is overridable (general_chat, or a
+ *     platform_test that isn't already an exploration)
+ *   - the message contains a real site URL (not a reverse-DNS package id)
+ *
+ * Effect: intent → 'platform_test', executionStrategy → 'exploration'.
+ * No-op otherwise — explicit non-exploration intents are preserved, and a
+ * URL-less "what can you do?" stays general_chat (answered as normal chat).
+ *
+ * Exported for unit testing the decision in isolation.
+ */
+export function applyExplorationSurfaceBias(
+  parsedIntent: any,
+  surfaceContext: unknown,
+  message: string,
+): void {
+  if (surfaceContext !== 'exploration') return;
+  if (!parsedIntent || !EXPLORATION_BIAS_OVERRIDABLE.has(parsedIntent.intent)) return;
+
+  // Already an exploration — nothing to upgrade.
+  if (parsedIntent.intent === 'platform_test' && parsedIntent.executionStrategy === 'exploration') {
+    return;
+  }
+
+  const match = (message || '').match(URL_IN_TEXT_RE);
+  if (!match) return;
+  // A bare token that is actually an app id ("com.acme.app") is mobile,
+  // not a website — don't bias web exploration on it.
+  if (PACKAGE_ID_RE.test(match[0])) return;
+
+  const from = parsedIntent.intent;
+  parsedIntent.intent = 'platform_test';
+  parsedIntent.executionStrategy = 'exploration';
+  logger.info('[INTENT_PARSING] exploration-surface bias applied', {
+    from,
+    to: 'platform_test/exploration',
+  });
+}
 
 /**
  * Get chat history for intent parsing (extracted helper)
@@ -523,6 +600,7 @@ export async function parseIntent(
           mode,
           previewSessionId: contextObj?.previewSessionId,
           mobileSessionId: contextObj?.mobileSessionId,
+          surfaceContext: contextObj?.surfaceContext,
         },
         projectId ?? workspace_id, // Use project_id from session if available, fallback to workspace_id
         availableIntents // Pass dynamic intent list
@@ -588,14 +666,55 @@ export async function parseIntent(
       // way to recover from one mid-flow.
       // ═══════════════════════════════════════════════════════════════════
       if (isTestCaseScope) {
-        if (BLOCKED_IN_TEST_CASE_SCOPE.has(parsedIntent.intent)) {
+        const rawIntent = parsedIntent.intent;
+        const blocked = BLOCKED_IN_TEST_CASE_SCOPE.has(parsedIntent.intent);
+        if (blocked) {
           logger.warn('[CHAT] intent blocked in test-case scope, redirecting to general_chat', {
             userId,
             blockedIntent: parsedIntent.intent,
           });
           parsedIntent.intent = 'general_chat';
         }
+        // Trace the classification decision into test_logs/chat_test/.
+        if (chatSessionId) {
+          try {
+            const { ChatTestTraceService } = require('@/services/chat/chat-test-trace.service');
+            ChatTestTraceService.getOrCreate(chatSessionId, userId, testCaseId).writeIntent({
+              intent: parsedIntent.intent,
+              confidence: parsedIntent.confidence ?? parsedIntent.intent_confidence,
+              rawIntent,
+              blockedBy: blocked ? 'BLOCKED_IN_TEST_CASE_SCOPE' : undefined,
+              routingSource: parsedIntent.metadata?.routingSource,
+            });
+          } catch { /* trace must never break intent parsing */ }
+        }
       }
+
+      // Exploration-surface soft bias. When the message came from the
+      // Exploration UI (surfaceContext='exploration') and the classifier
+      // landed on an AMBIGUOUS verdict, nudge it toward a site exploration.
+      // Runs AFTER all guards so it can't resurrect a blocked intent, and
+      // is skipped in test-case scope (exploration is meaningless there).
+      if (!isTestCaseScope && mode !== 'editor') {
+        applyExplorationSurfaceBias(parsedIntent, contextObj?.surfaceContext, validMessage);
+      }
+
+      // Post-parse enrichment: resolve a descriptor-style targetSelector
+      // ("payment tests", "smoke-tagged", "Release v2 plan") to concrete IDs so
+      // descriptor-based requests are actionable. Best-effort, additive, scoped
+      // to the resolved project — runs AFTER the guards so it acts on the final
+      // intent and never resurrects a blocked one.
+      await attachResolvedTargets({
+        parsedIntent,
+        projectId: projectId ?? undefined,
+        message: validMessage,
+        session: {
+          lastTestId: regressionContext.lastTestId,
+          lastTestGoal: regressionContext.lastTestGoal,
+          lastFailedTestId: regressionContext.lastFailedTestId,
+          recentTestIds: regressionContext.recentTestIds,
+        },
+      });
     } catch (intentError) {
       logger.error('[CHAT] parseUserIntent failed', {
         error: intentError instanceof Error ? intentError.message : String(intentError),
@@ -716,6 +835,18 @@ export function buildIntentMessage(parsedIntent: IntentResult | null | undefined
 
     case 'coverage_analysis':
       return 'Got it! Calculating coverage...';
+
+    case 'flaky_report':
+      return 'Got it! Scanning for flaky tests...';
+
+    case 'manage_schedule':
+      return 'Got it! Updating the schedule...';
+
+    case 'manage_module':
+      return 'Got it! Updating the module...';
+
+    case 'manage_plan':
+      return 'Got it! Updating the regression plan...';
 
     case 'create_plan':
       return 'Got it! Creating regression plan...';

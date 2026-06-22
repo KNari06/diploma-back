@@ -70,11 +70,21 @@ EDGE CASES:
 - "Run tests and show results" → single_tool (qa category handles both run + results)
 - "Show my test cases" → single_tool (qa_read)
 - "Create a test and send notification" → multi_tool only if test + notification are different categories
+- "Run X and notify/ping the owner if it fails" / "запусти X и пни owner если упадёт" → multi_tool (qa + notify) — use the "notify" category (notify_owner reaches the owner across all their channels), NOT a specific channel, unless the user names one ("post to Slack" → qa + slack)
+- "Run X and let me know" when it implies acting after the result (not just a chat reply) → multi_tool (qa + notify)
+- "Run X, wait for the result, then do Y" / "запусти X, дождись результата и сделай Y" → multi_tool (qa + the category Y needs) — a run-then-act flow spans categories even when phrased as one sentence
 - If user asks to explain or summarize data already visible in conversation → simple_chat (re-fetch NOT needed)
 - Any request for QA data (test cases, results, bugs, analytics, coverage) in ANY language → single_tool (qa_read) — NEVER simple_chat
 - Quantitative questions about test metrics → single_tool (qa_read) — always requires tool call
 - Ambiguous request with no clear tool target → single_tool with best-guess category (confidence 0.6)
 - NEVER classify integration/setup requests as simple_chat — always use single_tool
+- Connect/setup, even when the service name is vague or implicit → single_tool with that service's category:
+  • "подключи телеграм" / "connect telegram" / "хочу интегрировать телеграм" → telegram
+  • "настрой вебхук slack" / "connect my slack webhook" / "подключи slack" → slack
+  • "authorize jira" / "подключи jira" / "интегрируй jira" → jira
+  • "connect github" / "привяжи гитхаб" → github
+  • "integrate notion" / "подключи notion" → notion
+- Mid-setup FOLLOW-UP — the previous turn asked for a credential/value and the user answers, pastes it, or asks how to get it ("вот токен ...", "открыл бот, как получить chat_id", "where do I find the webhook url") → single_tool with the SAME integration category from the recent conversation. NEVER simple_chat — the connect flow is still active.
 - "найди последний тест кейс" / "find the last test case" → single_tool (qa_read) — temporal queries ALWAYS need tools
 - "покажи все тесты" / "show all tests" → single_tool (qa_read)
 - "сколько у меня тестов?" / "how many tests?" → single_tool (qa_read)

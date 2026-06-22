@@ -237,7 +237,7 @@ export class JiraQaOrchestratorService {
 
         // 5. Integration status — which providers are connected
         import('@/services/api/integration-token.service')
-          .then(m => m.IntegrationTokenService.getIntegrationSummary(userId, workspaceId || ''))
+          .then(m => m.IntegrationTokenService.getIntegrationSummary(userId, workspaceId ?? undefined))
           .catch(() => ''),
       ]);
 
@@ -317,8 +317,12 @@ export class JiraQaOrchestratorService {
 
       // ── CAN_RUN_AUTO: platform test ───────────────────────────────────
       if (analysis.outcome === 'CAN_RUN_AUTO' && analysis.suggestedAction?.type === 'platform_test' && analysis.extractedUrl) {
-        const mode = (analysis.suggestedAction.mode === 'pro' ? 'pro' : 'lite') as 'lite' | 'pro';
-        const creditsRequired = mode === 'pro' ? TokenCalculatorService.getTestCreditCost('intelligent') : 15; // lite=15, pro=20
+        // Pro Mode is retired — the IntelligentTestOrchestrator path is no longer
+        // used; everything runs on the Lite engine. Force 'lite' regardless of
+        // what the analysis LLM suggested, so this stays the last reachable
+        // entry point that could have set 'pro'.
+        const mode = 'lite' as const;
+        const creditsRequired = 15;
         const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'intelligent');
         if (!creditCheck.hasEnough || (creditCheck.available ?? 0) < creditsRequired) {
           await addJiraComment(accessToken, cloudIdToUse, issueKey, `[QAI] Cannot run test: insufficient credits. Required: ${creditsRequired}, available: ${creditCheck.available ?? 0}.`);
@@ -362,7 +366,7 @@ export class JiraQaOrchestratorService {
           userId,
           testType: 'intelligent',
           credits: creditsRequired,
-          costUSD: mode === 'pro' ? 0.08 : 0.06,
+          costUSD: 0.06,
           testId: test.id,
           description: `Jira QA auto-test: ${issue.key} (${mode})`,
         });

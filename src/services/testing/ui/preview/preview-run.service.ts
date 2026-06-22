@@ -18,6 +18,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { IntentTestCaseService } from './intent-test-case.service';
 import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
+import { getPreviewVideoStreamRegistry } from './preview-video-stream.service';
 import { detectPageLoadError } from './page-load-error.util';
 import type { IntentActionType, IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, waitForApiIdle } from './step-readiness.service';
@@ -377,10 +378,47 @@ function detectInitialUrlMismatch(
 // ── Step-Level Retry ───────────────────────────────────────────────────────
 
 /** Step types that should NOT be retried on failure — either non-recoverable or LLM-evaluated */
-const NO_RETRY_STEP_TYPES = new Set(['ai_check', 'wait', 'wait_for_email', 'dialog', 'download', 'switch_tab']);
+const NO_RETRY_STEP_TYPES = new Set(['ai_check', 'wait', 'timeout', 'wait_for_email', 'dialog', 'download', 'switch_tab', 'close_tab', 'open_tab']);
 
 /** Wait time (ms) for DOM stability before retry attempt */
 const RETRY_SETTLE_MS = 1500;
+
+/**
+ * Delay (ms) for the guarded catch-up screenshot scheduled after a
+ * navigation-class step and at run completion. Long enough to land late async
+ * paint (lazy images, fonts, post-XHR content, slide-in overlays) that finishes
+ * AFTER the DOM-settle gate, short enough to feel immediate. During a run the
+ * live screencast is throttled and a now-static page emits no correcting
+ * compositor frame, so without this the picture sits on the pre-paint
+ * screenshot until the user interacts.
+ */
+const CATCH_UP_FRAME_DELAY_MS = 600;
+
+/** Final-frame DOM settle (run completion only): cap so it can't stall the
+ *  preview:run:completed event; stability window matches the navigation floor. */
+const FINAL_FRAME_SETTLE_MAX_MS = 1500;
+const FINAL_FRAME_SETTLE_STABLE_MS = 300;
+
+/**
+ * Fire-and-forget guarded catch-up screenshot, delayed by `delayMs`.
+ *
+ * The per-step / final `injectSyncFrame` is a single point-in-time screenshot.
+ * During a Run the live CDP screencast is throttled by apply/readiness
+ * contention and a static page emits no new compositor frame, so content that
+ * paints LATE (lazy images, fonts, post-XHR render, slide-in overlays) can be
+ * missing from that one screenshot and never corrected until the user
+ * interacts. This schedules ONE extra `injectSyncFrame` after the late paint
+ * should have landed. `injectSyncFrame` is itself guarded (skips when
+ * paused/zombie/empty-room, or when a frame is already in flight via
+ * pendingFrames), so this cannot pile screenshots onto the stream. The timer is
+ * unref'd so it never keeps the process alive past shutdown.
+ */
+export function scheduleCatchUpFrame(previewSessionId: string, delayMs: number): void {
+  const timer = setTimeout(() => {
+    getPreviewVideoStreamRegistry().injectSyncFrame(previewSessionId).catch(() => {});
+  }, delayMs);
+  if (typeof timer.unref === 'function') timer.unref();
+}
 
 /**
  * Internal state for active runs
@@ -492,6 +530,8 @@ export interface PreviewRunSummary {
   totalSteps: number;
   passedSteps: number;
   failedSteps: number;
+  /** Steps that failed but were marked optional (options.continueOnError) — do NOT fail the run */
+  failedOptionalSteps: number;
   skippedSteps: number;
   cancelled: boolean;
   timedOut: boolean;
@@ -584,6 +624,26 @@ export class PreviewRunService {
           throw new Error('Test case not found or has no saved steps');
         }
         savedSteps = testCase.stepsJson;
+
+        // Inline transitive dependency (precondition) steps so they execute
+        // in-session BEFORE this test's own steps (shared browser → shared
+        // login/cookies/data). Runtime-only: borrowed steps carry namespaced
+        // ids + `_preconditionSource`, so the per-step persistence in
+        // runStepsOnPreview never writes them back into this test's steps_json.
+        // Skipped for "Apply New Only" (startFromIndex) — those continue
+        // mid-session, so re-running preconditions (and shifting indices) is wrong.
+        if (testCase.dependsOn?.length && !options?.startFromIndex) {
+          const preconditionSteps = await IntentTestCaseService.collectPreconditionSteps(intentTestCaseId);
+          if (preconditionSteps.length > 0) {
+            savedSteps = [...preconditionSteps, ...savedSteps];
+            logger.info('[PreviewRun] Inlined precondition steps', {
+              previewSessionId,
+              intentTestCaseId,
+              preconditionSteps: preconditionSteps.length,
+              totalSteps: savedSteps.length,
+            });
+          }
+        }
       }
       if (!startUrl) {
         startUrl = testCase?.startUrl || testCase?.url || undefined;
@@ -742,6 +802,9 @@ export class PreviewRunService {
 
     let passedSteps = 0;
     let failedSteps = 0;
+    // Optional-step failures (options.continueOnError) — tallied apart from
+    // failedSteps so they don't flip the run verdict but are still surfaced.
+    let failedOptionalSteps = 0;
     let skippedSteps = 0;
 
     // Capture per-failure details for the returned summary (used by chat tools/AI)
@@ -1340,14 +1403,29 @@ export class PreviewRunService {
         if (['assert', 'ai_check'].includes(actionType)) return 'assertion';
         return 'default';
       };
+      // Category-aware lower floor. Navigation-class actions (click/open/toggle/
+      // select) can mount late overlays — a floating corner widget (chat bubble)
+      // typically slides in over ~300-500ms AFTER the click. The lookahead
+      // snapshot that feeds element resolution runs as soon as the page looks
+      // settled, so an over-eager adaptive floor (150ms) snapshots the widget
+      // mid-animation and its buttons pollute the candidate set (the Run-vs-Apply
+      // divergence: single Apply runs the full post-action settle). A 450ms floor
+      // for navigation gives the entry animation time to finish. Input/assertion
+      // stay at 150ms — they don't spawn corner widgets and shouldn't slow down.
+      const getSettleFloorMs = (category: string): number =>
+        category === 'navigation' ? 450 : 150;
       const getAdaptiveSettleMs = (prevActionType?: IntentActionType | string): number => {
         const category = prevActionType ? getActionCategory(prevActionType) : 'default';
+        const floor = getSettleFloorMs(category);
         const samples = adaptiveSettleByCategory.get(category);
-        if (!samples || samples.length < 2) return STEP_READINESS_CONFIG.defaults.settleMs; // Not enough data
-        // p75 × 1.5 safety margin, clamped to [150, 3000]
+        if (!samples || samples.length < 2) {
+          // Not enough data — use the configured default, but never below the floor.
+          return Math.max(floor, STEP_READINESS_CONFIG.defaults.settleMs);
+        }
+        // p75 × 1.5 safety margin, clamped to [floor, 3000]
         const sorted = [...samples].sort((a, b) => a - b);
         const p75 = sorted[Math.floor(sorted.length * 0.75)];
-        return Math.max(150, Math.min(3000, Math.round(p75 * 1.5)));
+        return Math.max(floor, Math.min(3000, Math.round(p75 * 1.5)));
       };
       const recordSettleTime = (prevActionType: IntentActionType | string, waitedMs: number): void => {
         const category = getActionCategory(prevActionType);
@@ -1715,6 +1793,32 @@ export class PreviewRunService {
           description: step.description,
           timestamp: new Date().toISOString(),
         });
+
+        // Keep the live preview picture in lockstep with the steps panel.
+        // During a run the periodic preview:page snapshot pipeline is gated off
+        // (see preview.handler.ts DOM tick) and the CDP screencast can lag or
+        // freeze under apply/readiness contention — so the panel races ahead
+        // while the picture sits on a stale frame (steps appear to "outrun" the
+        // preview). The previous step has fully settled by the time we mark this
+        // one 'running', so push ONE fresh frame reflecting the state this step
+        // is about to act on. Fire-and-forget: injectSyncFrame is a read-only,
+        // backpressure/zombie/circuit-breaker-guarded page.screenshot (NOT a
+        // CDP-session reuse — invariant #3 safe) that swallows its own errors and
+        // skips paused/zombie/contended streams. The trailing final frame is
+        // emitted after the loop so the last step's result is shown too.
+        getPreviewVideoStreamRegistry().injectSyncFrame(previewSessionId).catch(() => {});
+
+        // The frame above reflects the PREVIOUS step's result. Navigation-class
+        // steps (click/open/toggle/select) routinely paint late — lazy images,
+        // fonts, post-XHR content, slide-in overlays — AFTER the DOM-settle that
+        // gated it. The screencast is throttled during a run and a static page
+        // emits no correcting frame, so schedule ONE guarded catch-up screenshot.
+        // Gated to navigation-class so plain input/assertion steps add no
+        // screenshot load (injectSyncFrame's pendingFrames guard bounds the rest).
+        const prevExecutedStep = i > 0 ? stepsToExecute[i - 1] : undefined;
+        if (prevExecutedStep && getActionCategory(prevExecutedStep.type) === 'navigation') {
+          scheduleCatchUpFrame(previewSessionId, CATCH_UP_FRAME_DELAY_MS);
+        }
 
         // NOTE: We do NOT emit chat:processing:step here. The draft run is fire-and-forget
         // so clientRequestInFlightRef is already false on the frontend, and processing steps
@@ -2091,7 +2195,10 @@ export class PreviewRunService {
                 previewSessionId,
                 stepIndex: originalStepIndex,
                 stepId: step.id,
-                status: 'failed',
+                // FE DraftRunStep status union is 'fail' (not 'failed') — using
+                // 'failed' here rendered the page-load failure as a grey/pending
+                // step instead of red.
+                status: 'fail',
                 action: step.type,
                 description: step.description,
                 error: postApplyLoadErr.message,
@@ -2424,6 +2531,11 @@ export class PreviewRunService {
               },
             });
 
+            // Optional step (user flag options.continueOnError): a failure here
+            // does NOT abort the run — tally it apart and continue to the next
+            // step. Mirrors the mobile runner + background executor soft-fail.
+            const isOptionalStep = step.options?.continueOnError === true;
+
             // Emit fail (with augmented error + screenshot for better UX)
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
@@ -2435,47 +2547,60 @@ export class PreviewRunService {
               error: errorWithContext,
               timestamp: new Date().toISOString(),
               ...(retried ? { retried: true } : {}),
+              ...(isOptionalStep ? { optional: true } : {}),
               ...(failScreenshotBase64 ? { failScreenshot: failScreenshotBase64 } : {}),
             });
-            failedSteps++;
-            // Capture for summary (truncate to first 5 to bound payload size)
-            if (failedStepDetails.length < 5) {
-              failedStepDetails.push({
-                stepIndex: originalStepIndex,
-                description: step.description || '',
-                action: step.type,
-                error: errorWithContext,
-              });
-            }
 
-            // V14: Record step telemetry (fail)
+            // V14: Record step telemetry (fail) — same for optional + hard fails
             telemetryCollector?.markStepEnd('fail', session.page.url(), {
               error: result.error,
               retried,
               attempts: result.attempts,
             });
 
-            // Stop on first failure - emit remaining steps as skipped
-            logger.info('[PreviewRun] Stopping due to failure, skipping remaining steps', {
-              previewSessionId,
-              failedStep: i,
-              remainingSteps: stepsToExecute.length - i - 1,
-            });
-
-            for (let j = i + 1; j < stepsToExecute.length; j++) {
-              const remainingStep = stepsToExecute[j];
-              webSocketService.emitToUser(userId, 'preview:run:step', {
+            if (isOptionalStep) {
+              failedOptionalSteps++;
+              logger.info('[PreviewRun] Optional step failed — continuing run', {
                 previewSessionId,
-                stepIndex: startFromIndex + j,
-                stepId: remainingStep.id,
-                status: 'skipped',
-                action: remainingStep.type,
-                description: remainingStep.description,
-                timestamp: new Date().toISOString(),
+                stepIndex: originalStepIndex,
+                stepId: step.id,
+                error: result.error,
               });
-              skippedSteps++;
+              // No skip / no break — fall through to the next step.
+            } else {
+              failedSteps++;
+              // Capture for summary (truncate to first 5 to bound payload size)
+              if (failedStepDetails.length < 5) {
+                failedStepDetails.push({
+                  stepIndex: originalStepIndex,
+                  description: step.description || '',
+                  action: step.type,
+                  error: errorWithContext,
+                });
+              }
+
+              // Stop on first hard failure - emit remaining steps as skipped
+              logger.info('[PreviewRun] Stopping due to failure, skipping remaining steps', {
+                previewSessionId,
+                failedStep: i,
+                remainingSteps: stepsToExecute.length - i - 1,
+              });
+
+              for (let j = i + 1; j < stepsToExecute.length; j++) {
+                const remainingStep = stepsToExecute[j];
+                webSocketService.emitToUser(userId, 'preview:run:step', {
+                  previewSessionId,
+                  stepIndex: startFromIndex + j,
+                  stepId: remainingStep.id,
+                  status: 'skipped',
+                  action: remainingStep.type,
+                  description: remainingStep.description,
+                  timestamp: new Date().toISOString(),
+                });
+                skippedSteps++;
+              }
+              break; // Stop execution
             }
-            break; // Stop execution
           }
         } catch (stepError) {
           // AbortError from raceAbort — run was cancelled, skip remaining steps
@@ -2763,6 +2888,9 @@ export class PreviewRunService {
             },
           });
 
+          // Optional step: an exception here is soft — continue the run.
+          const isOptionalStepEx = step.options?.continueOnError === true;
+
           // Emit fail (with screenshot for visual debugging)
           webSocketService.emitToUser(userId, 'preview:run:step', {
             previewSessionId,
@@ -2774,18 +2902,9 @@ export class PreviewRunService {
             error: errorWithContext,
             timestamp: new Date().toISOString(),
             ...(exceptionRetried ? { retried: true } : {}),
+            ...(isOptionalStepEx ? { optional: true } : {}),
             ...(exFailScreenshot ? { failScreenshot: exFailScreenshot } : {}),
           });
-          failedSteps++;
-          // Capture for summary (truncate to first 5)
-          if (failedStepDetails.length < 5) {
-            failedStepDetails.push({
-              stepIndex: originalStepIndex,
-              description: step.description || '',
-              action: step.type,
-              error: errorWithContext,
-            });
-          }
 
           // V14: Record step telemetry (exception)
           try {
@@ -2795,21 +2914,43 @@ export class PreviewRunService {
             });
           } catch { /* page may be closed */ }
 
-          // Stop and skip remaining
-          for (let j = i + 1; j < stepsToExecute.length; j++) {
-            const remainingStep = stepsToExecute[j];
-            webSocketService.emitToUser(userId, 'preview:run:step', {
+          if (isOptionalStepEx) {
+            failedOptionalSteps++;
+            logger.info('[PreviewRun] Optional step threw — continuing run', {
               previewSessionId,
-              stepIndex: startFromIndex + j,
-              stepId: remainingStep.id,
-              status: 'skipped',
-              action: remainingStep.type,
-              description: remainingStep.description,
-              timestamp: new Date().toISOString(),
+              stepIndex: originalStepIndex,
+              stepId: step.id,
+              error: originalError,
             });
-            skippedSteps++;
+            // No skip / no break — fall through to the next step.
+          } else {
+            failedSteps++;
+            // Capture for summary (truncate to first 5)
+            if (failedStepDetails.length < 5) {
+              failedStepDetails.push({
+                stepIndex: originalStepIndex,
+                description: step.description || '',
+                action: step.type,
+                error: errorWithContext,
+              });
+            }
+
+            // Stop and skip remaining
+            for (let j = i + 1; j < stepsToExecute.length; j++) {
+              const remainingStep = stepsToExecute[j];
+              webSocketService.emitToUser(userId, 'preview:run:step', {
+                previewSessionId,
+                stepIndex: startFromIndex + j,
+                stepId: remainingStep.id,
+                status: 'skipped',
+                action: remainingStep.type,
+                description: remainingStep.description,
+                timestamp: new Date().toISOString(),
+              });
+              skippedSteps++;
+            }
+            break;
           }
-          break;
         }
       }
 
@@ -2860,6 +3001,7 @@ export class PreviewRunService {
         success: failedSteps === 0 && !cancelled && !timedOut,
         passedSteps,
         failedSteps,
+        failedOptionalSteps,
         skippedSteps,
         cancelled,
         timedOut,
@@ -2987,12 +3129,33 @@ export class PreviewRunService {
         }
       } catch { /* non-fatal */ }
 
+      // Final sync: the per-step inject above shows each step's result on the
+      // NEXT iteration's 'running' tick — the last step has no next iteration
+      // AND its lookahead settle is skipped (the loop only looks ahead while
+      // i < length-1), so without help the picture lands on a PRE-paint
+      // screenshot of the last step. Settle the DOM first (capped so it can't
+      // stall preview:run:completed), push the frame, then schedule ONE catch-up
+      // for very-late async paint — the static end page emits no screencast
+      // frame on its own, so otherwise the user sees missing blocks until the
+      // first manual interaction.
+      const finalSession = getPreviewSessionService().getSession(previewSessionId);
+      if (finalSession?.page && !finalSession.page.isClosed()) {
+        await waitForDOMStability(
+          finalSession.page,
+          FINAL_FRAME_SETTLE_MAX_MS,
+          FINAL_FRAME_SETTLE_STABLE_MS,
+        ).catch(() => {});
+      }
+      getPreviewVideoStreamRegistry().injectSyncFrame(previewSessionId).catch(() => {});
+      scheduleCatchUpFrame(previewSessionId, CATCH_UP_FRAME_DELAY_MS);
+
       webSocketService.emitToUser(userId, 'preview:run:completed', {
         previewSessionId,
         success: runSuccess,
         totalSteps: steps.length,
         passedSteps,
         failedSteps,
+        failedOptionalSteps,
         skippedSteps,
         cancelled,
         timedOut,
@@ -3013,6 +3176,7 @@ export class PreviewRunService {
         totalSteps: steps.length,
         passedSteps,
         failedSteps,
+        failedOptionalSteps,
         skippedSteps,
         cancelled,
         timedOut,
@@ -3081,6 +3245,7 @@ export class PreviewRunService {
         totalSteps: steps.length,
         passedSteps,
         failedSteps,
+        failedOptionalSteps,
         skippedSteps,
         cancelled: true,
         timedOut,
@@ -3093,15 +3258,23 @@ export class PreviewRunService {
   }
 
   /**
-   * Cancel active run for session
-   * Sets cancellation flag, main loop will handle skipping remaining steps
+   * Cancel active run for session.
+   * Sets cancellation flag, main loop will handle skipping remaining steps.
+   *
+   * Idempotent: cancelling when there is no active run is a no-op that returns
+   * `false` (NOT an error). The frontend fires this on editor/preview close as
+   * best-effort cleanup, by which point the run has usually already finished —
+   * treating "nothing to cancel" as an error produced noisy `error` logs and a
+   * spurious INTERNAL_ERROR on the socket for a perfectly normal close.
+   *
    * @param previewSessionId - Preview session ID
    * @param userId - User ID for ownership verification
+   * @returns true if an active run was cancelled, false if there was nothing to cancel
    */
-  static cancelRun(previewSessionId: string, userId: string): void {
+  static cancelRun(previewSessionId: string, userId: string): boolean {
     const runState = activeRuns.get(previewSessionId);
     if (!runState) {
-      throw new Error('No active run for this session');
+      return false;
     }
 
     const sessionService = getPreviewSessionService();
@@ -3116,6 +3289,7 @@ export class PreviewRunService {
       userId,
       currentStepIndex: runState.currentStepIndex,
     });
+    return true;
   }
 
   /**
@@ -3167,6 +3341,42 @@ export class PreviewRunService {
   static isRunning(previewSessionId: string): boolean {
     const runState = activeRuns.get(previewSessionId);
     return !!(runState?.running && !runState.cancelled);
+  }
+
+  /**
+   * Acquire the per-session run lock for a NON-runStepsOnPreview driver that
+   * still mutates the live preview (today: the iterative test-authoring service,
+   * which drives TestPipeline directly). Registers in the SAME `activeRuns` map
+   * so `isRunning()` reads true and recording / apply / Run-All correctly
+   * reject (preview invariant #1 — recording/run/pick are mutually exclusive).
+   *
+   * Returns the abort signal (so the driver can honour `cancelRun`) plus a
+   * `release()` that MUST be called in a finally. Returns null when a run is
+   * already in progress — caller must abort.
+   *
+   * PRECONDITION: the caller MUST have already verified session ownership
+   * (`isSessionOwned`) — this primitive takes no userId and does not check, so
+   * calling it unguarded is an IDOR/DoS (locking another user's session).
+   */
+  static acquireRunLock(previewSessionId: string): { signal: AbortSignal; release: () => void } | null {
+    if (activeRuns.has(previewSessionId)) return null;
+    const runState: RunState = {
+      running: true,
+      cancelled: false,
+      startTime: Date.now(),
+      currentStepIndex: 0,
+      abortController: new AbortController(),
+    };
+    activeRuns.set(previewSessionId, runState);
+    return {
+      signal: runState.abortController.signal,
+      release: () => {
+        // Only delete if it's still OUR state (a cancel may have replaced it).
+        if (activeRuns.get(previewSessionId) === runState) {
+          activeRuns.delete(previewSessionId);
+        }
+      },
+    };
   }
 
   /**

@@ -28,10 +28,13 @@ import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { isReasoningPersistEnabled } from './reasoning-trace';
 import { resolveMobileSessionContext } from '@/services/chat/mobile-context.service';
 import { incCounter, observeMs } from '@/utils/core/mobile-chat-metrics';
+import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
+import { withAIContext } from '@/services/ai/tracking/ai-context';
 import {
   assertMobileSessionOwnership,
   MobileSessionAuthzError,
 } from '@/services/mobile/mobile-session-authz';
+import { GLOBAL_STORE, type ChatStore } from '@/services/utils/chat-store';
 
 interface MobileAgentParams {
   message: string;
@@ -43,6 +46,13 @@ interface MobileAgentParams {
   context?: any;
   abortSignal?: AbortSignal;
   mode?: 'lite' | 'pro' | 'editor';
+  /**
+   * Persistence backend for this turn. TESTCASE_STORE when the mobile
+   * editor is scoped to a saved test case, GLOBAL_STORE otherwise. Threaded
+   * to `saveMobileChatTurn` so test-case turns don't leak into the global
+   * chat tables (parallel to web editor_action). Defaults to GLOBAL_STORE.
+   */
+  chatStore?: ChatStore;
 }
 
 export async function handleMobileAgent(
@@ -51,6 +61,8 @@ export async function handleMobileAgent(
   params: MobileAgentParams,
 ): Promise<void> {
   const { message, userId, chatSessionId, context, abortSignal } = params;
+  const workspaceId = params.workspace_id;
+  const chatStore: ChatStore = params.chatStore ?? GLOBAL_STORE;
   const startedAt = Date.now();
 
   const ctxObj = parseMobileContext(context);
@@ -64,6 +76,7 @@ export async function handleMobileAgent(
       NO_SESSION_REPLY,
       { noSession: true },
       'mobile_agent',
+      chatStore,
     );
     res.json({
       success: false,
@@ -103,6 +116,7 @@ export async function handleMobileAgent(
         NO_SESSION_REPLY,
         { noSession: true, authzRejected: true },
         'mobile_agent',
+        chatStore,
       );
       res.status(403).json({
         success: false,
@@ -190,10 +204,39 @@ export async function handleMobileAgent(
       incCounter('mobile_chat.eager_snapshot', 'disabled');
     }
 
-    const result = await runMobileAgentPipeline(blackboard, {
-      abortSignal,
-      snapshot,
-    });
+    // AI-usage tracking — parity with general_chat. mobile_agent is a real
+    // multi-step agent, so its decisions (tool calls, duration) must leave a
+    // trace in ai_usage_log for post-hoc analysis, not only Winston files.
+    // Best-effort: tracking must never break the agent turn.
+    const trackingSessionId = workspaceId && chatSessionId ? chatSessionId : null;
+    if (trackingSessionId && workspaceId) {
+      AIUsageTracker.beginSession(trackingSessionId, {
+        workspaceId,
+        userId,
+        operationType: 'chat',
+      });
+    }
+
+    const result = trackingSessionId && workspaceId
+      ? await withAIContext(
+          { workspaceId, userId, operationType: 'chat' },
+          () => runMobileAgentPipeline(blackboard, { abortSignal, snapshot }),
+        )
+      : await runMobileAgentPipeline(blackboard, { abortSignal, snapshot });
+
+    if (trackingSessionId) {
+      AIUsageTracker.recordPipelineMetrics(trackingSessionId, {
+        path: 'mobile_agent',
+        success: true,
+        toolCallsMade: result.toolCallsMade,
+        observed: result.observed,
+        durationMs: result.durationMs,
+      });
+      const usageStats = await AIUsageTracker.endSession(trackingSessionId);
+      if (usageStats) {
+        logger.info('[MOBILE_AGENT] AI usage stats', { chatSessionId: trackingSessionId, workspaceId, ...usageStats });
+      }
+    }
 
     logger.info('[MOBILE_AGENT] Pipeline finished', {
       userId,
@@ -250,6 +293,7 @@ export async function handleMobileAgent(
         ...(reasoningTrace.length > 0 ? { reasoningTrace } : {}),
       },
       'mobile_agent',
+      chatStore,
     );
 
     res.json({
@@ -300,6 +344,7 @@ export async function handleMobileAgent(
         ...(reasoningTrace.length > 0 ? { reasoningTrace } : {}),
       },
       'mobile_agent',
+      chatStore,
     );
 
     // Pipeline failures are user-visible text, not 5xx — the chat already

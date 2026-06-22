@@ -266,7 +266,7 @@ describe('SnapshotCollector - Shadow DOM Support', () => {
       `);
 
       const start = Date.now();
-      const snapshot = await SnapshotCollector.collect(page);
+      const snapshot = await SnapshotCollector.collect(page, { fullPage: true });
       const duration = Date.now() - start;
 
       expect(duration).toBeLessThan(3000); // Should be <3s (config timeout)

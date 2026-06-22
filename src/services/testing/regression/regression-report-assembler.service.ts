@@ -1,5 +1,15 @@
-import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/core/logger';
+import {
+  getRunWithOwnership,
+  getRunByShareToken,
+  getTestCaseNamesByIds,
+  getTestResultsByTestIds,
+  getMobileTestResultsByTestIds,
+  getExecutedStepsByTestIds,
+  getNegativeMetaByIds,
+  getTestCasePhaseInfoByIds,
+} from './db/regression-report.db';
+import { getProjectWorkspaceId, getActiveWorkspaceMemberIds } from './db/regression.db';
+import { describeDeviceError } from './device-error-catalog';
 import { ExecutionService } from '../executions/execution.service';
 import { HealthCheckAggregatorService } from './health-check-aggregator.service';
 import { TestReportGeneratorService } from '../results/test-report-generator.service';
@@ -8,12 +18,23 @@ import type {
   RunReport,
   RunReportExecution,
   RunReportStep,
+  RunReportScreenshot,
   RunReportSummary,
   RunReportArtifactsSummary,
+  RunReportFailureReason,
   EnrichedBug,
   ExecutionHealthChecks,
   NegativeSummary,
 } from '@/types/testing.types';
+
+/** Format a step event timestamp (ISO/epoch) to HH:MM:SS, or undefined if invalid. */
+function formatClock(ts: unknown): string | undefined {
+  if (typeof ts !== 'string' && typeof ts !== 'number') return undefined;
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return undefined;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 
 export class RegressionReportAssemblerService {
   // =========================================================================
@@ -27,35 +48,14 @@ export class RegressionReportAssemblerService {
     runId: string,
     userId: string,
   ): Promise<any | null> {
-    const { data, error } = await supabaseAdmin
-      .from('regression_runs')
-      .select('*, regression_plans(name)')
-      .eq('id', runId)
-      .eq('user_id', userId)
-      .maybeSingle();
-
-    if (error) {
-      logger.error('[REGRESSION_RUN] Failed to get run', { error, runId });
-      return null;
-    }
-    return data;
+    return getRunWithOwnership(runId, userId);
   }
 
   /**
    * Fetch a run by its public share token (no ownership check)
    */
   static async getRunByShareToken(shareToken: string): Promise<any | null> {
-    const { data, error } = await supabaseAdmin
-      .from('regression_runs')
-      .select('*, regression_plans(name)')
-      .eq('share_token', shareToken)
-      .maybeSingle();
-
-    if (error) {
-      logger.error('[REGRESSION_RUN] Failed to get run by share token', { error, shareToken });
-      return null;
-    }
-    return data;
+    return getRunByShareToken(shareToken);
   }
 
   /**
@@ -67,16 +67,8 @@ export class RegressionReportAssemblerService {
     const map = new Map<string, string>();
     if (!testCaseIds.length) return map;
 
-    const { data, error } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('id, name')
-      .in('id', testCaseIds);
-
-    if (error) {
-      logger.warn('[REGRESSION_RUN] Failed to fetch test case names', { error, count: testCaseIds.length });
-    }
-
-    for (const row of data || []) {
+    const rows = await getTestCaseNamesByIds(testCaseIds);
+    for (const row of rows) {
       map.set(row.id, row.name);
     }
     return map;
@@ -93,17 +85,14 @@ export class RegressionReportAssemblerService {
     const map = new Map<string, any>();
     if (!testIds.length) return map;
 
-    const { data, error } = await supabaseAdmin
-      .from('test_results')
-      .select('test_id, video_url, trace_url, screenshot, logs, network_logs, errors, ai_summary, quality_checks')
-      .in('test_id', testIds)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      logger.warn('[REGRESSION_RUN] Failed to fetch test results', { error, count: testIds.length });
-    }
-
-    for (const row of data || []) {
+    // Web results live in `test_results`, mobile in `mobile_test_results`. A
+    // given testId belongs to exactly one, so fetch both and merge — otherwise
+    // mobile execs surface with no artifacts/bugs.
+    const [webRows, mobileRows] = await Promise.all([
+      getTestResultsByTestIds(testIds),
+      getMobileTestResultsByTestIds(testIds),
+    ]);
+    for (const row of [...webRows, ...mobileRows]) {
       // Prefer the result that has ai_summary
       const existing = map.get(row.test_id);
       if (!existing || (!existing.ai_summary && row.ai_summary)) {
@@ -122,16 +111,8 @@ export class RegressionReportAssemblerService {
     const map = new Map<string, any[]>();
     if (!testIds.length) return map;
 
-    const { data, error } = await supabaseAdmin
-      .from('tests')
-      .select('id, executed_steps')
-      .in('id', testIds);
-
-    if (error) {
-      logger.warn('[REGRESSION_RUN] Failed to fetch executed steps', { error, count: testIds.length });
-    }
-
-    for (const row of data || []) {
+    const rows = await getExecutedStepsByTestIds(testIds);
+    for (const row of rows) {
       map.set(row.id, row.executed_steps || []);
     }
     return map;
@@ -156,6 +137,40 @@ export class RegressionReportAssemblerService {
     const run = await this.getRunByShareToken(shareToken);
     if (!run) return null;
     return RegressionReportAssemblerService.assembleReport(run);
+  }
+
+  /**
+   * Derive a case-level failure reason from a (mobile) test_result row when the
+   * run failed BEFORE any step executed — device attach / session setup / runner
+   * unreachable. The mobile job persists this on `mobile_test_results` (see
+   * `createFailedJobTestResult`): `metadata.failureLayer = 'job'` with an
+   * `errorCode`, plus a `{ type: 'job_failure', code, message }` entry in
+   * `errors`. Returns null for normal pass / step-failure rows so the banner
+   * only shows when the test genuinely never ran.
+   */
+  private static deriveFailureReason(testResult: any, platform?: string): RunReportFailureReason | null {
+    if (!testResult) return null;
+    // Job-failure markers only exist on the mobile path (createFailedJobTestResult).
+    // Guard on platform so a future web/API result that happens to carry a
+    // job_failure-typed error can't trip a false "couldn't start" banner.
+    if (!platform || !platform.startsWith('mobile')) return null;
+    const meta = testResult.metadata;
+    const jobErr = Array.isArray(testResult.errors)
+      ? testResult.errors.find((e: any) => e?.type === 'job_failure')
+      : null;
+    const isJobFailure = meta?.failureLayer === 'job' || !!jobErr;
+    if (!isJobFailure) return null;
+    const code: string = meta?.errorCode || jobErr?.code || 'UNKNOWN';
+    const message: string = meta?.errorMessage || jobErr?.message || '';
+    const info = describeDeviceError(code);
+    return {
+      code,
+      label: info.label,
+      message: message || info.label,
+      remediation: info.remediation,
+      layer: 'job',
+      category: info.category,
+    };
   }
 
   /**
@@ -188,11 +203,8 @@ export class RegressionReportAssemblerService {
     const negativeTestCaseIds = executions.filter((e) => e.isNegative).map((e) => e.testCaseId);
     const negativeMetaMap = new Map<string, import('@/types/testing.types').NegativeMeta>();
     if (negativeTestCaseIds.length > 0) {
-      const { data: negRows } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, negative_meta')
-        .in('id', negativeTestCaseIds);
-      for (const row of negRows || []) {
+      const negRows = await getNegativeMetaByIds(negativeTestCaseIds);
+      for (const row of negRows) {
         if (row.negative_meta) {
           negativeMetaMap.set(row.id, row.negative_meta as import('@/types/testing.types').NegativeMeta);
         }
@@ -225,11 +237,8 @@ export class RegressionReportAssemblerService {
     const priorityByTestCaseId = new Map<string, 'critical' | 'high' | 'medium' | 'low'>();
     const VALID_PRIORITY = new Set(['critical', 'high', 'medium', 'low']);
     if (testCaseIds.length > 0) {
-      const { data: caseRows } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, setup_steps, teardown_steps, steps_json, priority')
-        .in('id', testCaseIds);
-      for (const row of caseRows || []) {
+      const caseRows = await getTestCasePhaseInfoByIds(testCaseIds);
+      for (const row of caseRows) {
         if (row.priority && VALID_PRIORITY.has(row.priority)) {
           priorityByTestCaseId.set(row.id, row.priority as 'critical' | 'high' | 'medium' | 'low');
         }
@@ -280,12 +289,21 @@ export class RegressionReportAssemblerService {
       const testCaseName = namesMap.get(exec.testCaseId) || 'Unknown';
       const testId = exec.result?.testId;
 
+      // Case-level "couldn't start" reason (device attach / session setup / runner
+      // unreachable) — only present when the run failed before any step ran. When
+      // set, the test never executed, so health aggregation below is skipped: its
+      // "no console errors" findings would be misleadingly green.
+      const failureReason = RegressionReportAssemblerService.deriveFailureReason(
+        testId ? testResultsMap.get(testId) : null,
+        exec.platform,
+      );
+
       // Build steps from executed_steps
       const steps: RunReportStep[] = [];
       let execArtifacts: {
         videoUrl?: string;
         traceUrl?: string;
-        screenshots: string[];
+        screenshots: RunReportScreenshot[];
         bugScreenshots: string[];
         consoleLogs: string[];
         networkLogs: Array<{ method: string; url: string; status?: number; durationMs?: number }>;
@@ -304,13 +322,31 @@ export class RegressionReportAssemblerService {
       if (testId && exec.testType === 'ui') {
         // Build steps
         const rawSteps = executedStepsMap.get(testId) || [];
-        const completedSteps = rawSteps.filter((s: any) => s.type === 'step_completed');
+        const allCompletedSteps = rawSteps.filter((s: any) => s.type === 'step_completed');
+        // Collapse by step index, keeping the LAST event per index. The Redis
+        // buffer accumulates every attempt's steps in order (attempt 0, then
+        // attempt 1 on retry), and — during a worker/API mixed-version deploy —
+        // a step can be appended twice. Keeping the last occurrence per step
+        // index yields the final attempt's outcome and a single, un-doubled
+        // timeline. A Map preserves first-seen position, so steps stay ordered
+        // 0..n and the phase indexing below stays aligned. Events without a
+        // numeric step index keep a positional key so they are never merged.
+        const byStepIndex = new Map<string, any>();
+        allCompletedSteps.forEach((s: any, i: number) => {
+          const key = typeof s.data?.step === 'number' ? `step-${s.data.step}` : `pos-${i}`;
+          byStepIndex.set(key, s);
+        });
+        const completedSteps = [...byStepIndex.values()];
         // Reconstruct phase from the test case's setup_steps / steps_json /
         // teardown_steps counts. Indexed by executed-step position so as
         // long as the executor fires step_completed events in order (it does),
         // we can label setup / main / teardown without touching the
         // executor service. Undefined entries fall back to legacy (no phase).
         const phaseList = phaseMapByTestCaseId.get(exec.testCaseId);
+        // Per-step screenshots with display metadata for the Screenshots tab.
+        // Built here (in the step loop) so the label carries the step name,
+        // capture time, and outcome — not just a bare URL.
+        const stepScreenshots: RunReportScreenshot[] = [];
         for (let i = 0; i < completedSteps.length; i++) {
           const step = completedSteps[i];
           const meta = step.data?.runtimeMeta;
@@ -325,12 +361,29 @@ export class RegressionReportAssemblerService {
           // Phase 3: a failing teardown step is a warning, not a failure —
           // teardown runs best-effort and never flips the overall verdict.
           const isTeardownFailure = !success && phase === 'teardown';
+          const description = step.data?.stepDescription || step.data?.step || `Step ${i + 1}`;
+          // V16: Soft failures (e.g. auto-injected waitFor timeout) are warnings, not errors.
+          // Phase 3: teardown failures are also warnings by contract.
+          const stepStatus: RunReportStep['status'] = success
+            ? 'passed'
+            : (isSoftFailure || isTeardownFailure ? 'warning' : 'failed');
+          const stepScreenshotUrl =
+            typeof meta?.stepScreenshotUrl === 'string' && meta.stepScreenshotUrl
+              ? meta.stepScreenshotUrl
+              : undefined;
+          // Collect a labeled gallery entry: "Step N: <desc>" + HH:MM:SS + outcome.
+          if (stepScreenshotUrl && !stepScreenshotUrl.startsWith('data:')) {
+            stepScreenshots.push({
+              url: stepScreenshotUrl,
+              stepName: `Step ${i + 1}: ${description}`,
+              timestamp: formatClock(step.ts),
+              status: stepStatus,
+            });
+          }
           steps.push({
             index: i + 1,
-            description: step.data?.stepDescription || step.data?.step || `Step ${i + 1}`,
-            // V16: Soft failures (e.g. auto-injected waitFor timeout) are warnings, not errors
-            // Phase 3: teardown failures are also warnings by contract.
-            status: success ? 'passed' : (isSoftFailure || isTeardownFailure ? 'warning' : 'failed'),
+            description,
+            status: stepStatus,
             durationMs: meta?.executionMs,
             error: !success ? {
               message: meta?.failureExplanation || meta?.failedReason || 'Step failed',
@@ -339,6 +392,9 @@ export class RegressionReportAssemblerService {
               rootCause: meta?.rootCause,
               networkVerdict: meta?.networkVerdict,
             } : undefined,
+            // Per-step screenshot (every step, pass or fail) — surfaced inline
+            // in the timeline; the labeled copy lands in the Screenshots tab.
+            ...(stepScreenshotUrl ? { screenshot: stepScreenshotUrl } : {}),
             ...(healed ? { healed: true } : {}),
             ...(typeof meta?.healConfidence === 'number' ? { healConfidence: meta.healConfidence } : {}),
             // Forward self-heal before/after provenance. Only meaningful when
@@ -358,13 +414,20 @@ export class RegressionReportAssemblerService {
           execArtifacts.videoUrl = testResult.video_url || undefined;
           execArtifacts.traceUrl = testResult.trace_url || undefined;
           if (testResult.screenshot) {
-            const screenshots = Array.isArray(testResult.screenshot)
+            const finals = Array.isArray(testResult.screenshot)
               ? testResult.screenshot
               : [testResult.screenshot];
-            // Filter out base64 data — only include URLs
-            execArtifacts.screenshots = screenshots.filter(
-              (s: string) => typeof s === 'string' && !s.startsWith('data:'),
-            );
+            // URLs only (drop base64); label as the final/representative shot.
+            execArtifacts.screenshots = finals
+              .filter((s: string) => typeof s === 'string' && !s.startsWith('data:'))
+              .map((url: string): RunReportScreenshot => ({ url, stepName: 'Final screenshot' }));
+          }
+          // "Step 0": the starting screen captured before any step ran (mobile).
+          // Stored as a URL on mobile_test_results.metadata.initialScreenshot.
+          // Lead the gallery with it so the report reads start → steps → final.
+          const initialShot = testResult.metadata?.initialScreenshot;
+          if (typeof initialShot === 'string' && initialShot && !initialShot.startsWith('data:')) {
+            execArtifacts.screenshots.unshift({ url: initialShot, stepName: 'Step 0: Initial screen' });
           }
           if (testResult.logs) {
             execArtifacts.consoleLogs = Array.isArray(testResult.logs) ? testResult.logs : [];
@@ -389,8 +452,14 @@ export class RegressionReportAssemblerService {
             };
           }
 
-          // Aggregate health checks from existing test result data
-          execHealthChecks = HealthCheckAggregatorService.aggregateFromTestResult(testResult);
+          // Aggregate health checks from existing test result data — but NOT when
+          // the test never ran (job-level failure). A non-started test has no real
+          // console/network signal; emitting "no errors" here would render as a
+          // misleading green health badge next to a "couldn't start" failure.
+          const isMobileExec = typeof exec.platform === 'string' && exec.platform.startsWith('mobile');
+          execHealthChecks = failureReason
+            ? undefined
+            : HealthCheckAggregatorService.aggregateFromTestResult(testResult, { isMobile: isMobileExec });
 
           // Aggregate into run-level artifacts
           if (execArtifacts.videoUrl && !aggArtifacts.videoUrl) aggArtifacts.videoUrl = execArtifacts.videoUrl;
@@ -407,6 +476,20 @@ export class RegressionReportAssemblerService {
           }
         }
         aggArtifacts.bugScreenshots.push(...execArtifacts.bugScreenshots);
+
+        // Labeled per-step screenshots → Screenshots artifact tab. Works for
+        // web AND mobile (both append step_completed with stepScreenshotUrl).
+        // Deduped by URL against the final/test_results screenshot collected
+        // above; runs outside the testResult gate so it works even when
+        // test_results has no top-level screenshot.
+        const seenScreenshotUrls = new Set(execArtifacts.screenshots.map((s) => s.url));
+        for (const shot of stepScreenshots) {
+          if (!seenScreenshotUrls.has(shot.url)) {
+            seenScreenshotUrls.add(shot.url);
+            execArtifacts.screenshots.push(shot);
+            aggArtifacts.screenshots.push(shot);
+          }
+        }
 
         // Aggregate quality checks at run level
         if (execArtifacts.qualityChecks) {
@@ -488,8 +571,14 @@ export class RegressionReportAssemblerService {
 
       // V14: Extract failure classification from AI summary
       const execAiSummary = testId ? (testResultsMap.get(testId)?.ai_summary) : null;
-      const failureClassification = execAiSummary?.failureClassification || null;
+      const aiFailureClassification = execAiSummary?.failureClassification || null;
       const rootCauseStep = execAiSummary?.rootCauseStep ?? null;
+      // An environment failure means the test never ran, so the AI verdict (run
+      // on an artifact-less failed row) can't be trusted — the derived
+      // 'environment' category WINS over any AI classification. `failureReason`
+      // was computed at the top of the loop (also gates health aggregation).
+      const failureClassification =
+        failureReason?.category === 'environment' ? 'environment' : aiFailureClassification;
 
       reportExecutions.push({
         id: exec.id,
@@ -517,6 +606,7 @@ export class RegressionReportAssemblerService {
         ...(execAiSummary?.classificationEvidence?.length > 0 && {
           classificationEvidence: execAiSummary.classificationEvidence,
         }),
+        ...(failureReason && { failureReason }),
       });
     }
 
@@ -642,26 +732,15 @@ export class RegressionReportAssemblerService {
  */
 export async function getProjectWorkspaceMemberIds(projectId: string, ownerId: string): Promise<string[]> {
   try {
-    const { data: projRow } = await supabaseAdmin
-      .from('projects')
-      .select('workspace_id')
-      .eq('id', projectId)
-      .maybeSingle();
-
-    const workspaceId = (projRow as any)?.workspace_id as string | undefined;
+    const workspaceId = await getProjectWorkspaceId(projectId);
     if (!workspaceId) return [ownerId];
 
-    const { data: members } = await supabaseAdmin
-      .from('workspace_members')
-      .select('user_id')
-      .eq('workspace_id', workspaceId)
-      .eq('status', 'active');
+    const memberIds = await getActiveWorkspaceMemberIds(workspaceId);
 
     const ids = new Set<string>();
     ids.add(ownerId);
-    for (const m of members || []) {
-      const uid = (m as any)?.user_id as string | undefined;
-      if (uid) ids.add(uid);
+    for (const uid of memberIds) {
+      ids.add(uid);
     }
     return Array.from(ids);
   } catch {

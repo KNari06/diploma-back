@@ -12,13 +12,15 @@ import {
   signOut,
   signUpWithEmail,
   BusinessEmailError,
-  updatePassword,
+  recoverPassword,
   updateUserProfile,
   invalidateAuthCache,
   invalidateAuthCacheForUser,
 } from '@/services/auth/auth.service';
 import { notifyAdminsOfNewUser } from '@/services/auth/new-user-notification.service';
 import { EmailService } from '@/services/core/email.service';
+import { SelfServeProvisioningService } from '@/services/core/self-serve-provisioning.service';
+import { INDIVIDUAL_PLANS } from '@/services/core/token-calculator.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -42,6 +44,36 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
     const { email, password, name } = req.body;
 
     const result = await signUpWithEmail(email, password, name);
+
+    // Welcome email — fire-and-forget so a mail failure never breaks signup.
+    // Distinct from the Supabase verification email and the approval email.
+    // We don't read the live balance here: the trial grant is applied later
+    // (on first verify/login via SelfServeProvisioning), so at signup it's
+    // always absent. Instead we state the configured free-plan grant, which is
+    // what the user will receive — single-sourced from INDIVIDUAL_PLANS.free.
+    if (result.user?.email) {
+      const recipientEmail = result.user.email;
+      EmailService.sendWelcomeEmail({
+        recipientEmail,
+        recipientName: result.user.name || undefined,
+        frontendUrl: env.FRONTEND_URL,
+        freeCredits: INDIVIDUAL_PLANS.free.credits,
+      })
+        .then((emailResult) => {
+          if (!emailResult.success) {
+            logger.error('[AUTH] Welcome email not sent', {
+              email: recipientEmail,
+              error: emailResult.error,
+            });
+          }
+        })
+        .catch((err) =>
+          logger.error('[AUTH] Failed to send welcome email', {
+            error: err instanceof Error ? err.message : String(err),
+            email: recipientEmail,
+          })
+        );
+    }
 
     res.status(201).json({
       success: true,
@@ -79,10 +111,21 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
     const result = await signInWithEmail(email, password);
 
+    // Self-serve PLG: also provision on login, not just first signup/verify.
+    // Covers the case where a user signed up while AUTO_APPROVE_SIGNUP was off
+    // (left pending) and the flag was later turned on — their next email/
+    // password login then approves + provisions them. No-op when the flag is
+    // off; idempotent; best-effort (never throws).
+    const provisioned = await SelfServeProvisioningService.provision(result.user.id);
+    const effectiveStatus = provisioned ? 'approved' : result.user.status;
+
     res.json({
       success: true,
       message: 'Login successful',
-      data: result,
+      data: {
+        ...result,
+        user: { ...result.user, status: effectiveStatus },
+      },
     });
   } catch (error: any) {
     logger.error('Login error', error);
@@ -284,6 +327,13 @@ export const completeOAuthHandler = async (req: Request, res: Response): Promise
     // Exchange code for tokens
     const result = await exchangeCodeForSession(code, codeVerifier, redirectUri);
 
+    // Self-serve PLG: approve + provision workspace/project on first auth.
+    // No-op unless AUTO_APPROVE_SIGNUP is set. Best-effort, never throws.
+    // Returns true only when the user is genuinely approved, so the response
+    // never claims approval after a silent provisioning failure.
+    const provisioned = await SelfServeProvisioningService.provision(result.user.id);
+    const effectiveStatus = provisioned ? 'approved' : result.user.status;
+
     res.json({
       success: true,
       data: {
@@ -298,7 +348,7 @@ export const completeOAuthHandler = async (req: Request, res: Response): Promise
           name: result.user.name,
           avatar: result.user.avatar,
           role: result.user.role,
-          status: result.user.status,
+          status: effectiveStatus,
         },
       },
     });
@@ -471,42 +521,48 @@ export const resendVerification = async (req: Request, res: Response): Promise<v
 };
 
 /**
- * Update password
- * POST /auth/password/update
+ * Complete a password reset from a recovery email link.
+ * POST /auth/password/recover
+ * Body: { newPassword, and one of: code | tokenHash | accessToken }
+ *
+ * Tolerates every Supabase recovery link shape (PKCE ?code, ?token_hash, or
+ * implicit #access_token) so the reset works regardless of the project's auth
+ * flow config. Bearer header is also accepted as the accessToken fallback.
  */
-export const passwordUpdate = async (req: Request, res: Response): Promise<void> => {
+export const passwordRecover = async (req: Request, res: Response): Promise<void> => {
   try {
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.replace('Bearer ', '') || '';
-    const { newPassword } = req.body;
+    const { code, tokenHash, accessToken, newPassword } = req.body || {};
+    const bearer = req.headers.authorization?.replace('Bearer ', '') || undefined;
 
-    if (!token) {
-      res.status(401).json({
-        success: false,
-        error: 'Unauthorized: No token provided',
-      });
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 6) {
+      res.status(400).json({ success: false, error: 'Password must be at least 6 characters' });
       return;
     }
 
-    if (!newPassword || newPassword.length < 6) {
+    const resolvedAccessToken =
+      (typeof accessToken === 'string' && accessToken) || bearer || undefined;
+
+    if (!code && !tokenHash && !resolvedAccessToken) {
       res.status(400).json({
         success: false,
-        error: 'Password must be at least 6 characters',
+        error: 'Missing reset credential (code, tokenHash, or accessToken)',
       });
       return;
     }
 
-    await updatePassword(token, newPassword);
-
-    res.json({
-      success: true,
-      message: 'Password updated successfully',
+    await recoverPassword({
+      code: typeof code === 'string' ? code : undefined,
+      tokenHash: typeof tokenHash === 'string' ? tokenHash : undefined,
+      accessToken: resolvedAccessToken,
+      newPassword,
     });
+
+    res.json({ success: true, message: 'Password reset successfully' });
   } catch (error: any) {
-    logger.error('Password update error', error);
+    logger.error('Password recover error', { error: error?.message });
     res.status(400).json({
       success: false,
-      error: error.message || 'Failed to update password',
+      error: error.message || 'Failed to reset password',
     });
   }
 };
@@ -717,25 +773,48 @@ export const updateUserStatus = async (req: Request, res: Response): Promise<voi
           recipientEmail: updatedUser.email,
           recipientName: updatedUser.name || undefined,
           frontendUrl: env.FRONTEND_URL,
-        }).catch((err) =>
-          logger.error('[AUTH] Failed to send approval email on status change', {
-            error: err instanceof Error ? err.message : String(err),
-            userId,
-            email: updatedUser.email,
+        })
+          .then((result) => {
+            // A resolved {success:false} (e.g. SMTP misconfigured/rejected) is
+            // NOT a thrown error — surface it explicitly, otherwise a dead
+            // credential fails completely silently while the admin sees "approved".
+            if (!result.success) {
+              logger.error('[AUTH] Approval email not sent on status change', {
+                userId,
+                email: updatedUser.email,
+                error: result.error,
+              });
+            }
           })
-        );
+          .catch((err) =>
+            logger.error('[AUTH] Failed to send approval email on status change', {
+              error: err instanceof Error ? err.message : String(err),
+              userId,
+              email: updatedUser.email,
+            })
+          );
       } else if (status === 'rejected') {
         EmailService.sendRejectionEmail({
           recipientEmail: updatedUser.email,
           recipientName: updatedUser.name || undefined,
           frontendUrl: env.FRONTEND_URL,
-        }).catch((err) =>
-          logger.error('[AUTH] Failed to send rejection email on status change', {
-            error: err instanceof Error ? err.message : String(err),
-            userId,
-            email: updatedUser.email,
+        })
+          .then((result) => {
+            if (!result.success) {
+              logger.error('[AUTH] Rejection email not sent on status change', {
+                userId,
+                email: updatedUser.email,
+                error: result.error,
+              });
+            }
           })
-        );
+          .catch((err) =>
+            logger.error('[AUTH] Failed to send rejection email on status change', {
+              error: err instanceof Error ? err.message : String(err),
+              userId,
+              email: updatedUser.email,
+            })
+          );
       }
     }
 
@@ -797,12 +876,21 @@ export const sendApprovalEmailHandler = async (req: Request, res: Response): Pro
       recipientEmail: email,
       recipientName: name || undefined,
       frontendUrl: env.FRONTEND_URL,
-    }).catch((err) =>
-      logger.error('[AUTH] Failed to send approval email', {
-        error: err instanceof Error ? err.message : String(err),
-        email,
+    })
+      .then((result) => {
+        if (!result.success) {
+          logger.error('[AUTH] Approval email not sent', {
+            email,
+            error: result.error,
+          });
+        }
       })
-    );
+      .catch((err) =>
+        logger.error('[AUTH] Failed to send approval email', {
+          error: err instanceof Error ? err.message : String(err),
+          email,
+        })
+      );
 
     res.json({ success: true, message: 'Approval email queued' });
   } catch (error: any) {
@@ -874,12 +962,21 @@ export const verifyEmail = async (req: Request, res: Response): Promise<void> =>
       });
     }
 
+    // Self-serve PLG: approve + provision workspace/project on first auth.
+    // No-op unless AUTO_APPROVE_SIGNUP is set. Best-effort, never throws.
+    // Returns true only when the user is genuinely approved, so the response
+    // never claims approval after a silent provisioning failure.
+    const provisioned = await SelfServeProvisioningService.provision(data.user.id);
+    const effectiveStatus = provisioned
+      ? 'approved'
+      : userData?.status || 'pending_approval';
+
     const user = {
       id: data.user.id,
       email: data.user.email || '',
       name: userData?.name || data.user.user_metadata?.name,
       role: userData?.role || 'user',
-      status: userData?.status || 'pending_approval',
+      status: effectiveStatus,
       avatar: userData?.avatar_url || data.user.user_metadata?.avatar_url,
     };
 
@@ -901,5 +998,107 @@ export const verifyEmail = async (req: Request, res: Response): Promise<void> =>
   } catch (error: any) {
     logger.error('[AUTH] Email verification error', { error: error.message });
     res.status(500).json({ success: false, error: 'Verification failed' });
+  }
+};
+
+/**
+ * Send a general-info / announcement email to one or more users (admin only).
+ * POST /auth/admin/send-info-email
+ * Body: { userIds?: string[], emails?: string[], heading, body, subject?, cta? }
+ * Recipients resolve from userIds (looked up) and/or raw emails. Sends are
+ * sequential and best-effort; the response reports per-recipient success.
+ */
+export const sendInfoEmailHandler = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { userIds, emails, heading, body, subject, cta } = req.body as {
+      userIds?: string[];
+      emails?: string[];
+      heading?: string;
+      body?: string;
+      subject?: string;
+      cta?: { label: string; url: string };
+    };
+
+    if (!heading || typeof heading !== 'string' || !body || typeof body !== 'string') {
+      res.status(400).json({ success: false, error: 'heading and body are required' });
+      return;
+    }
+    if ((!Array.isArray(userIds) || userIds.length === 0) && (!Array.isArray(emails) || emails.length === 0)) {
+      res.status(400).json({ success: false, error: 'Provide userIds and/or emails' });
+      return;
+    }
+
+    // Validate the optional CTA up-front: both fields must be strings and the
+    // URL must be http(s)/mailto. The template also sanitizes (safeUrl), but
+    // reject obviously-bad input here so the admin gets a clear 400.
+    if (cta !== undefined) {
+      const okShape = cta && typeof cta.label === 'string' && typeof cta.url === 'string';
+      if (!okShape || !/^(https?:|mailto:)/i.test(cta.url.trim())) {
+        res.status(400).json({ success: false, error: 'cta must be { label, url } with an http(s)/mailto url' });
+        return;
+      }
+    }
+
+    // Cap total recipients per call so a fat-fingered broadcast can't hang the
+    // request (sends are sequential) or silently truncate a huge .in() lookup.
+    const MAX_RECIPIENTS = 500;
+    const idList = Array.isArray(userIds) ? userIds.slice(0, MAX_RECIPIENTS) : [];
+    const emailList = Array.isArray(emails) ? emails.slice(0, MAX_RECIPIENTS) : [];
+    if ((userIds?.length || 0) + (emails?.length || 0) > MAX_RECIPIENTS) {
+      res.status(400).json({ success: false, error: `Too many recipients (max ${MAX_RECIPIENTS} per call)` });
+      return;
+    }
+
+    // Resolve recipients: {email, name}. userIds are looked up; raw emails
+    // pass through with no name. De-dupe by email.
+    const recipients = new Map<string, { email: string; name?: string }>();
+
+    if (idList.length > 0) {
+      const { data: users } = await supabaseAdmin
+        .from('users')
+        .select('email, name')
+        .in('id', idList);
+      for (const u of users || []) {
+        if (u.email) recipients.set(u.email, { email: u.email, name: u.name || undefined });
+      }
+    }
+    for (const e of emailList) {
+      if (typeof e === 'string' && e.includes('@') && !recipients.has(e)) {
+        recipients.set(e, { email: e });
+      }
+    }
+
+    if (recipients.size === 0) {
+      res.status(400).json({ success: false, error: 'No valid recipients resolved' });
+      return;
+    }
+
+    let sent = 0;
+    const failed: string[] = [];
+    for (const r of recipients.values()) {
+      const result = await EmailService.sendGeneralInfoEmail({
+        recipientEmail: r.email,
+        recipientName: r.name,
+        heading,
+        body,
+        subject,
+        cta,
+      });
+      if (result.success) sent += 1;
+      else failed.push(r.email);
+    }
+
+    if (failed.length > 0) {
+      logger.error('[AUTH] Info email partially failed', { sent, failed: failed.length });
+    }
+
+    res.json({
+      success: true,
+      data: { total: recipients.size, sent, failed },
+      message: `Info email sent to ${sent}/${recipients.size} recipients`,
+    });
+  } catch (error: any) {
+    logger.error('[AUTH] Send info email error', { error: error.message });
+    res.status(500).json({ success: false, error: 'Failed to send info email' });
   }
 };

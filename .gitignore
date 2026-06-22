@@ -2,7 +2,10 @@
 temporary/
 
 # Dependencies
-node_modules/
+# No trailing slash so a git-worktree node_modules SYMLINK (a file, not a dir)
+# is ignored too — a `node_modules/` pattern matches only directories and let a
+# worktree symlink slip into a commit.
+node_modules
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -85,7 +88,9 @@ dist
 
 # Gatsby files
 .cache/
-public
+# Anchored to repo root so it doesn't swallow source dirs named "public"
+# (e.g. src/api/chat/public — the B2C public chat endpoint).
+/public
 
 # Storybook build outputs
 .out
@@ -169,7 +174,9 @@ dist
 
 # Gatsby files
 .cache/
-public
+# Anchored to repo root so it doesn't swallow source dirs named "public"
+# (e.g. src/api/chat/public — the B2C public chat endpoint).
+/public
 
 # Storybook build outputs
 .out
@@ -251,3 +258,17 @@ aws-*
 azure-*
 id_rsa*
 id_ed25519*
+
+# Local Claude config — launch.json holds machine-specific absolute paths;
+# worktrees/ are local git checkouts with their own gitdir (committing them
+# as gitlinks pointed at a machine-local path and broke `git status`).
+# scheduled_tasks.lock is a per-machine runtime lock (sessionId + pid) for the
+# scheduled-task runner — never share it.
+.claude/launch.json
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+
+# Always track the B2C public chat endpoint source (guards against any
+# broad "public" ignore rule above).
+!src/api/chat/public/
+!src/api/chat/public/**

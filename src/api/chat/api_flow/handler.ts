@@ -15,7 +15,7 @@ import { logger } from '@/utils/core/logger';
 import { ChatService } from '@/services/utils/chat.service';
 import { emitProcessingStep } from '../shared/utils';
 import { FlowBuilderService } from '@/services/testing/api/flow/flow-builder.service';
-import { SpecParserService } from '@/services/testing/api/flow/spec-parser.service';
+import { SpecParserService, isPythonScript } from '@/services/testing/api/flow/spec-parser.service';
 import type { ParseSpecRequest } from '@/services/testing/api/flow/flow.types';
 import type { ChatAttachment } from '../chat.types';
 
@@ -27,7 +27,7 @@ const SWAGGER_URL_PATTERNS = [
 ];
 
 // Patterns for Postman/HAR/etc from file attachments
-const API_SPEC_EXTENSIONS = ['.json', '.yaml', '.yml', '.har', '.raml'];
+const API_SPEC_EXTENSIONS = ['.json', '.yaml', '.yml', '.har', '.raml', '.py', '.zip', '.tar.gz', '.tgz'];
 
 /**
  * Extract swagger/spec URL from a message
@@ -64,6 +64,9 @@ export function isApiFlowRequest(message: string, attachments?: ChatAttachment[]
   // Check for curl commands
   const lower = message.toLowerCase();
   if (lower.includes('curl ') && lower.includes('http')) return true;
+
+  // Check for a pasted Python API script
+  if (isPythonScript(message)) return true;
 
   return false;
 }
@@ -124,13 +127,17 @@ export async function handleApiFlowTest(
       source = 'file';
       content = message;
       fileName = 'curl-commands.txt';
+    } else if (isPythonScript(message)) {
+      source = 'file';
+      content = message;
+      fileName = 'script.py';
     } else {
       url = extractSpecUrl(message);
       if (!url) {
         if (chatSessionId) {
           await ChatService.saveChatMessages(chatSessionId, [{
             role: 'ai',
-            content: `I'd like to test your API flow, but I couldn't find a Swagger/OpenAPI URL in your message. Please share:\n- A Swagger URL (e.g. \`https://api.example.com/swagger.json\`)\n- Or upload a Postman collection / OpenAPI file`,
+            content: `I'd like to test your API flow, but I couldn't find a Swagger/OpenAPI URL in your message. Please share:\n- A Swagger URL (e.g. \`https://api.example.com/swagger.json\`)\n- Or upload a Postman collection / OpenAPI file\n- Or paste a Python script (requests / httpx / pytest) or cURL commands`,
           }]);
         }
         res.json({ success: true, timestamp: new Date().toISOString() });
@@ -250,6 +257,8 @@ You can see the flow visualization in the sidebar. When ready, click **Run** to 
 - cURL commands (paste them directly)
 - HAR files (from Chrome DevTools)
 - Insomnia export files
+- Python scripts (requests / httpx / aiohttp / urllib / pytest)
+- A .zip / .tar.gz archive of a Python project
 
 Please check the URL or file and try again.`;
 

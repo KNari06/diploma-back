@@ -117,15 +117,17 @@
   - **Fake-success guard** lives in `PreviewStepApplyService`; `runStepsOnPreview` honours its FAIL.
   - **30s hard-purge** of `activeRuns` if finally crashes (prevents deadlock).
 
-### `cancelRun(previewSessionId, userId): void`
+### `cancelRun(previewSessionId, userId): boolean`
 
 - **Visibility:** `public static`.
 - **Callers:** WS `preview:run:cancel`; session cleanup.
-- **Side-effects:** sets `runState.cancelled = true`; calls `runState.abortController.abort()`.
-- **Throws:** `"No active run for this session"`, `"Session not owned by user"`.
+- **Returns:** `true` if an active run was cancelled, `false` if there was nothing to cancel.
+- **Side-effects:** when a run is active, sets `runState.cancelled = true` and calls `runState.abortController.abort()`.
+- **Throws:** `"Session not owned by user"` (only when a run IS active and owned by another user).
 - **Notes:**
-  - Owner-checked (no cross-user cancel).
-  - Safe to call when no run active? — **No**, it throws. Use `forceCancelOnSessionStop` for unconditional cleanup.
+  - Owner-checked (no cross-user cancel) — the owner check runs only after confirming a run exists.
+  - **Idempotent:** safe to call when no run is active — returns `false` (no throw). The frontend fires `preview:run:cancel` as best-effort cleanup on editor/preview close, by which point the run has usually already finished; treating "nothing to cancel" as an error previously produced noisy `error` logs + a spurious `INTERNAL_ERROR` on the socket for a normal close.
+  - For unconditional teardown (browser close, idle timeout) use `forceCancelOnSessionStop`, which additionally skips the owner check.
 
 ### `forceCancelOnSessionStop(previewSessionId): void`
 

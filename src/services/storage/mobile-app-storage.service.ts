@@ -11,6 +11,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { env } from '@/config/environment/env';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { detectBuildInfoFromBuffer } from '@/services/mobile/archive-platform-detect';
 import { logger } from '@/utils/core/logger';
 import path from 'path';
 
@@ -34,6 +35,36 @@ export interface MobileAppMetadata {
   versionName?: string;
   /** Integer build code (Android versionCode / iOS CFBundleVersion). */
   versionCode?: number;
+  /**
+   * Framework detected from the archive itself (`flutter` / `react-native` /
+   * `android` / `ios`). Stamped at upload time by the ZIP-CD inspector so
+   * the editor + runner can route accordingly even when `platform` was
+   * filled from the file-extension heuristic. `undefined` only when the
+   * archive predates this feature or detection failed.
+   */
+  detectedFramework?: 'android' | 'ios' | 'flutter' | 'react-native';
+  /**
+   * Flutter build flavor inferred from archive contents:
+   *   - `'debug'` — kernel_blob.bin present; JIT VM; driver extension wireable.
+   *   - `'aot'`   — profile or release (not distinguishable statically).
+   * Only set when `detectedFramework === 'flutter'`.
+   */
+  flutterBuildMode?: 'debug' | 'aot';
+  /**
+   * `android:debuggable` flag from AndroidManifest.xml. True signals a
+   * debug build on the Android side. Orthogonal to `flutterBuildMode`.
+   */
+  debuggable?: boolean;
+  /**
+   * Result of the last user-triggered enableFlutterDriverExtension probe.
+   * Persisted so the Settings UI can show the verdict across reloads
+   * without re-running the runner round-trip.
+   */
+  driverExtensionDetected?: 'detected' | 'not_detected' | 'error';
+  /** Short human-readable reason for the verdict above. */
+  driverExtensionDetail?: string;
+  /** ISO timestamp of the probe that produced the verdict. */
+  driverExtensionDetectedAt?: string;
 }
 
 /**
@@ -183,6 +214,19 @@ export class MobileAppStorageService {
       .from(BUCKET)
       .getPublicUrl(storagePath);
 
+    // Run framework + Flutter-build-mode detection on the in-memory buffer
+    // BEFORE building the metadata. We do it here (inside uploadApp) so the
+    // CI upload-from-URL path gets the same `detectedFramework` /
+    // `flutterBuildMode` stamp that the signed-URL + finalize flow produces
+    // — with ZERO extra I/O (the buffer is already in memory) — without
+    // forcing every caller to wire detection by hand. Detection is hard-
+    // contract non-throwing, so any failure just leaves the fields unset.
+    const buildInfo = file.buffer
+      ? await detectBuildInfoFromBuffer(file.buffer, file.originalname)
+      : undefined;
+    const detectedFramework = buildInfo?.framework;
+    const flutterBuildMode = buildInfo?.flutterBuildMode;
+
     const metadata: MobileAppMetadata = {
       platform,
       packageName,
@@ -191,6 +235,8 @@ export class MobileAppStorageService {
       originalName: file.originalname,
       fileSize: file.size,
       uploadedAt: new Date().toISOString(),
+      ...(detectedFramework ? { detectedFramework } : {}),
+      ...(flutterBuildMode ? { flutterBuildMode } : {}),
     };
 
     logger.info('[MOBILE_APP_STORAGE] Upload successful', {
@@ -317,6 +363,9 @@ export class MobileAppStorageService {
     fileSize: number;
     versionName?: string;
     versionCode?: number;
+    detectedFramework?: 'android' | 'ios' | 'flutter' | 'react-native';
+    flutterBuildMode?: 'debug' | 'aot';
+    debuggable?: boolean;
   }): MobileAppMetadata {
     const { data: urlData } = supabaseAdmin.storage
       .from(BUCKET)
@@ -332,6 +381,9 @@ export class MobileAppStorageService {
       uploadedAt: new Date().toISOString(),
       ...(params.versionName ? { versionName: params.versionName } : {}),
       ...(typeof params.versionCode === 'number' ? { versionCode: params.versionCode } : {}),
+      ...(params.detectedFramework ? { detectedFramework: params.detectedFramework } : {}),
+      ...(params.flutterBuildMode ? { flutterBuildMode: params.flutterBuildMode } : {}),
+      ...(typeof params.debuggable === 'boolean' ? { debuggable: params.debuggable } : {}),
     };
   }
 
@@ -701,6 +753,45 @@ export class MobileAppStorageService {
       } as unknown as MobileAppBuildRecord;
     }
 
+    // 6. Flutter → Android binary fallback. A Flutter Android build IS a
+    //    plain .apk, recorded/uploaded under platform 'android' (there is no
+    //    separate flutter artifact). When a flutter run found nothing above,
+    //    reuse the project's latest android build / legacy android slot —
+    //    same .apk an android session would install. iOS never falls through
+    //    here (an .ipa and .apk are genuinely different binaries).
+    if (ctx.platform === 'flutter') {
+      const { data: androidBuild } = await supabaseAdmin
+        .from('mobile_app_builds')
+        .select('*')
+        .eq('project_id', ctx.projectId)
+        .eq('platform', 'android')
+        .order('uploaded_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (androidBuild) {
+        logger.info('[MOBILE_APP_STORAGE] flutter resolver fell back to android build', {
+          projectId: ctx.projectId,
+          buildId: androidBuild.id,
+        });
+        return this.mapBuildRow(androidBuild);
+      }
+      if (legacy && legacy.storagePath && (legacy.platform ?? 'android') === 'android') {
+        logger.info('[MOBILE_APP_STORAGE] flutter resolver fell back to legacy android mobileApp', {
+          projectId: ctx.projectId,
+        });
+        return {
+          id: 'legacy-settings',
+          project_id: ctx.projectId as any,
+          ...legacy,
+          branch: null,
+          commitSha: null,
+          buildNumber: null,
+          ciRunId: null,
+          source: 'manual',
+        } as unknown as MobileAppBuildRecord;
+      }
+    }
+
     return null;
   }
 
@@ -724,6 +815,33 @@ export class MobileAppStorageService {
       return [];
     }
     return (data || []).map((row) => this.mapBuildRow(row));
+  }
+
+  /**
+   * Read the app framework detected at upload time for a project, independent
+   * of platform. Source of truth is `projects.settings.mobileApp.detectedFramework`
+   * (set by `uploadApp`); the `mobile_app_builds` table does not persist it.
+   *
+   * Returns undefined when no app has been uploaded or detection didn't run
+   * (older uploads). Callers should treat undefined as "assume native android".
+   *
+   * Used by the test-case save path to keep Flutter apps on `mobile_flutter`
+   * even though the runner's live ui-state only ever reports the host platform.
+   */
+  static async getDetectedFramework(
+    projectId: string,
+  ): Promise<MobileAppMetadata['detectedFramework'] | undefined> {
+    const { data: project, error } = await supabaseAdmin
+      .from('projects')
+      .select('settings')
+      .eq('id', projectId)
+      .maybeSingle();
+    if (error) {
+      logger.warn('[MOBILE_APP_STORAGE] getDetectedFramework failed', { projectId, error });
+      return undefined;
+    }
+    const legacy = (project?.settings as any)?.mobileApp as MobileAppMetadata | undefined;
+    return legacy?.detectedFramework;
   }
 
   /** Convert a raw `mobile_app_builds` row into the service shape. */

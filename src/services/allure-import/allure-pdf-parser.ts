@@ -30,6 +30,17 @@ const CHUNK_MAX_CHARS = 12_000;
 /** Delay between LLM calls (ms). */
 const INTER_CHUNK_DELAY_MS = 200;
 
+/**
+ * Trailing characters carried from the end of one chunk into the start of the
+ * next when we split at a test-case boundary. A test case whose text straddles
+ * a chunk cut would otherwise be parsed from only its tail (losing its `#NNNN`
+ * header → wrong/empty fields). With the overlap the whole test case appears
+ * intact in at least one chunk; the cross-chunk dedup-by-name in
+ * `parseAllurePdf` drops the partial copy. ~1 KB is enough for the header +
+ * custom-fields block of a single Allure test case without bloating tokens.
+ */
+const CHUNK_OVERLAP_CHARS = 1_000;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LLM prompt
 // ─────────────────────────────────────────────────────────────────────────────
@@ -154,14 +165,19 @@ function chunkPdfText(fullText: string): string[] {
     return splitBySize(fullText, CHUNK_MAX_CHARS, 500);
   }
 
-  // Merge small adjacent sections up to CHUNK_MAX_CHARS
+  // Merge small adjacent sections up to CHUNK_MAX_CHARS. When a section would
+  // overflow the current chunk, flush and start a new one — but seed the new
+  // chunk with a trailing overlap from the flushed text so a test case sitting
+  // across the cut still appears whole in one chunk (dedup-by-name removes the
+  // duplicate downstream).
   const chunks: string[] = [];
   let current = '';
 
   for (const section of sections) {
     if (current.length + section.length > CHUNK_MAX_CHARS && current) {
       chunks.push(current);
-      current = section;
+      const overlap = current.slice(-CHUNK_OVERLAP_CHARS);
+      current = overlap + '\n' + section;
     } else {
       current += (current ? '\n' : '') + section;
     }

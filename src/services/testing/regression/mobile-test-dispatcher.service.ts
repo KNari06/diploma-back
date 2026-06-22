@@ -1,4 +1,4 @@
-import { supabaseAdmin } from '@/db/supabase';
+import * as regressionDb from './db/regression.db';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { logger } from '@/utils/core/logger';
 import { dbAdminService } from '@/db/supabase';
@@ -6,7 +6,9 @@ import { IntelligentTestStorageService } from '../results/intelligent-test-stora
 import { QueueManager } from '@/config/infrastructure/queues';
 import { buildMetadataFromTestCase } from '@/services/mobile/mobile-runner.types';
 import type { MobileTestJobData, MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { sanitizeTriggers } from '@/services/mobile/trigger-validation.util';
 import { env } from '@/config/environment/env';
+import { isPaidUser } from '@/services/core/plan-access.service';
 import { ValidationError } from '@/types';
 import { v4 as uuidv4 } from 'uuid';
 import { applyParameters } from '@/utils/testing/parameter-substitution.utils';
@@ -53,26 +55,60 @@ export class MobileTestDispatcherService {
      */
     analyticsExecutionId?: string,
   ): Promise<{ testId: string; jobId: string; appBuildId: string | null }> {
+    // 0. Plan gate — mobile testing is a Pro feature. This is the single choke
+    // point for every mobile dispatch path (single-case run, plan/module
+    // orchestrator, CI), so free users can't queue mobile jobs from any route.
+    if (!(await isPaidUser(userId))) {
+      throw new ValidationError('Mobile testing is available on the Pro plan. Upgrade to run mobile tests.');
+    }
+
     // 1. Resolve platform and browser
     const PLATFORM_MAP: Record<string, MobilePlatform> = {
       mobile_ios: 'ios',
       mobile_flutter: 'flutter',
     };
-    const platform: MobilePlatform = PLATFORM_MAP[intentCase.platform] ?? 'android';
+    let platform: MobilePlatform = PLATFORM_MAP[intentCase.platform] ?? 'android';
 
-    const BROWSER_MAP: Record<string, 'mobile-android' | 'mobile-ios' | 'mobile-flutter'> = {
-      mobile_ios: 'mobile-ios',
-      mobile_flutter: 'mobile-flutter',
-    };
-    const browser = BROWSER_MAP[intentCase.platform] ?? 'mobile-android';
+    // Self-correct stale platform: a test case saved before the
+    // detectedFramework-aware save (or saved while the runner reported the
+    // host platform) can be `mobile_android` for what is actually a Flutter
+    // app. Running it as `android` skips attach-flutter and leaves element
+    // resolution blind. If the project's app is detected as Flutter, upgrade
+    // an android-typed case to flutter here. Never downgrade — an explicit
+    // ios/flutter label wins. Read failure is non-fatal (keep stored value).
+    if (platform === 'android') {
+      const framework = await MobileAppStorageService.getDetectedFramework(
+        intentCase.project_id,
+      ).catch(() => undefined);
+      if (framework === 'flutter') {
+        logger.warn('[MOBILE-DISPATCH] Upgrading android→flutter from detectedFramework', {
+          testCaseId: intentCase.id,
+          projectId: intentCase.project_id,
+          storedPlatform: intentCase.platform,
+        });
+        platform = 'flutter';
+      }
+    }
+
+    const browser: 'mobile-android' | 'mobile-ios' | 'mobile-flutter' =
+      platform === 'ios' ? 'mobile-ios'
+      : platform === 'flutter' ? 'mobile-flutter'
+      : 'mobile-android';
 
     // 2. Fetch project workspace (needed for MobileTestJobData; the APK
     // itself comes from the resolver below, not from project settings).
-    const { data: project } = await supabaseAdmin
-      .from('projects')
-      .select('workspace_id')
-      .eq('id', intentCase.project_id)
-      .single();
+    // workspaceId is REQUIRED for a mobile run — it keys billing, telemetry,
+    // and dedicated-emulator routing. After the workspace backfill +
+    // projects.workspace_id NOT NULL migration this can only be null for a
+    // genuinely broken project, so fail loudly instead of persisting a '' key
+    // (an empty workspaceId silently breaks workspace-scoped lookups
+    // downstream).
+    const workspaceId = await regressionDb.getProjectWorkspaceId(intentCase.project_id);
+    if (!workspaceId) {
+      throw new Error(
+        `Cannot dispatch mobile test: project ${intentCase.project_id} has no workspace assigned`,
+      );
+    }
 
     // Phase 5: resolve which APK to install.
     // Precedence inside the resolver:
@@ -169,6 +205,12 @@ export class MobileTestDispatcherService {
       }
     }
 
+    // 3c. User-defined triggers (event→action rules) — echoed from the test
+    // case verbatim into the job. Sanitize (not throw): a stale/legacy row
+    // shouldn't crash a run; only well-formed triggers are forwarded. The
+    // worker hands them to the runner in the run-steps body.
+    const triggers = sanitizeTriggers(intentCase.triggers);
+
     // 4. Create test record in DB (same pattern as ci.controller.ts)
     const testId = uuidv4();
     await dbAdminService.createTest({
@@ -226,7 +268,7 @@ export class MobileTestDispatcherService {
     const jobData: MobileTestJobData = {
       testId,
       userId,
-      workspaceId: project?.workspace_id || '',
+      workspaceId,
       projectId: intentCase.project_id,
       platform,
       browser,
@@ -265,6 +307,10 @@ export class MobileTestDispatcherService {
       // own — decrypts, prepends setup steps, builds the audit snapshot.
       // Secrets therefore never appear in BullMQ job data.
       ...(rawBindings.length > 0 ? { resourceBindings: rawBindings } : {}),
+      // User-defined triggers (no secrets — pure event→action rules). Only
+      // attached when non-empty so no-trigger jobs are byte-identical to
+      // pre-trigger dispatch.
+      ...(triggers.length > 0 ? { triggers } : {}),
     };
 
     await QueueManager.addMobileTestRunJob(jobData);
@@ -284,6 +330,7 @@ export class MobileTestDispatcherService {
       testCaseName: intentCase.name,
       stepsCount: intentSteps.length,
       resourceBindingsCount: rawBindings.length,
+      triggersCount: triggers.length,
       // Phase 5: which build ran, for operator debugging.
       appBuildId: resolvedBuild?.id,
       appBranch: resolvedBuild?.branch,

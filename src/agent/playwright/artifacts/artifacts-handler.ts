@@ -131,6 +131,54 @@ export async function stopTracingAndGetVideo(
 }
 
 /**
+ * Capture a per-step screenshot for the web replay path and upload it to the
+ * artifacts bucket, returning its public URL (or undefined).
+ *
+ * - Viewport-only for passing steps (cheap); full-page on failure (more context).
+ * - Captures JPEG from Playwright, then re-encodes per config (webp via sharp).
+ * - NEVER throws — a capture/upload failure must not fail the test path.
+ * - Uploads in ALL environments (unlike uploadArtifacts, which skips dev to keep
+ *   local video files): screenshots have no local fallback, and the mobile path
+ *   has no dev-skip — so skipping here would silently disable per-step
+ *   screenshots locally and break web/mobile parity.
+ */
+export async function captureStepScreenshot(
+  page: Page | null,
+  testData: TestJobData,
+  stepIndex: number,
+  opts?: { isFailure?: boolean },
+): Promise<string | undefined> {
+  if (!page) return undefined;
+  try {
+    if (typeof page.isClosed === 'function' && page.isClosed()) return undefined;
+    const raw = await page.screenshot({
+      type: 'jpeg',
+      quality: 90,
+      fullPage: !!opts?.isFailure,
+      timeout: 5000,
+    });
+    // Deferred upload: encode is awaited (cheap, and needed to know the URL
+    // extension), but the storage round-trip is fire-and-forget so it does NOT
+    // block the replay step loop. Returns the deterministic public URL now.
+    const { processAndDeferStepScreenshot } = await import('@/services/storage/step-screenshot.service');
+    return await processAndDeferStepScreenshot(raw, 'jpg', {
+      testId: testData.testId,
+      userId: testData.userId || 'anonymous',
+      stepIndex,
+      isFailure: opts?.isFailure,
+      ts: Date.now(),
+    });
+  } catch (err) {
+    logger.debug('[PLAYWRIGHT] per-step screenshot capture failed (non-fatal)', {
+      testId: testData.testId,
+      stepIndex,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
+}
+
+/**
  * Upload artifacts (video, trace, screenshots) to storage
  */
 export async function uploadArtifacts(

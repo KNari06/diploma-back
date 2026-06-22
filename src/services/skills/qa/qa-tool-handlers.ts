@@ -41,6 +41,30 @@ function resolveProjectId(args: Record<string, any>, context: SkillContext): str
   return context.projectId || args.project_id;
 }
 
+/** Upper bound on iterative-authoring rounds we'll ever bill for. Defends
+ * against a runaway/garbage `roundsExecuted` charging a user a huge amount.
+ * Matches the service's DEFAULT_MAX_ROUNDS (12) with headroom. */
+export const MAX_BILLABLE_AUTHORING_ROUNDS = 20;
+
+/**
+ * Credits to charge for iterative authoring, ON TOP OF the base 1 the chat turn
+ * already deducts. Pure + total-safe so billing can never go wrong:
+ *   - Only charges on success (the chat turn only takes its base 1 on success,
+ *     so total = rounds on success, 0 on failure — symmetric, no cross-file
+ *     assumptions beyond the shared success signal).
+ *   - NaN / non-finite / negative rounds → 0 (never charge garbage).
+ *   - rounds clamped to MAX_BILLABLE_AUTHORING_ROUNDS (never over-charge).
+ *   - Returns `rounds - 1` (the base 1 is the turn's) → never negative.
+ *
+ * @returns extra credits to deduct here (0 means: charge nothing beyond base).
+ */
+export function computeAuthoringExtraCredits(success: boolean, roundsExecuted: number): number {
+  if (!success) return 0;
+  if (!Number.isFinite(roundsExecuted) || roundsExecuted <= 0) return 0;
+  const rounds = Math.min(Math.floor(roundsExecuted), MAX_BILLABLE_AUTHORING_ROUNDS);
+  return Math.max(0, rounds - 1); // base 1 is taken by the chat turn
+}
+
 // ── Name → ID resolvers ───────────────────────────────────────────────────
 // Allow users to reference entities by name instead of UUID.
 // Each resolver returns the ID if exactly one match is found,
@@ -91,6 +115,26 @@ async function resolveFlowByName(name: string, moduleId: string): Promise<Resolv
     .from('test_flows')
     .select('id, name')
     .eq('module_id', moduleId)
+    .ilike('name', `%${name}%`) as { data: any[] | null; error: any };
+
+  if (error) return { error: `Failed to search flow: ${error.message}` };
+  if (!data || data.length === 0) return { error: `No flow found matching "${name}"` };
+  if (data.length === 1) return { id: data[0].id };
+
+  const list = data.slice(0, 5).map((r: any) => `• ${r.name} (${r.id})`).join('\n');
+  return { error: `Multiple flows match "${name}":\n${list}\nPlease specify the exact name or ID.` };
+}
+
+/**
+ * Resolve a flow by name within a PROJECT (flows are module-scoped, so we join
+ * through test_modules). Used by add_item, where only a project is in scope —
+ * not a specific module. Mirrors the resolveByName contract.
+ */
+async function resolveFlowByNameInProject(name: string, projectId: string): Promise<ResolveResult> {
+  const { data, error } = await supabaseAdmin
+    .from('test_flows')
+    .select('id, name, test_modules!inner(project_id)')
+    .eq('test_modules.project_id', projectId)
     .ilike('name', `%${name}%`) as { data: any[] | null; error: any };
 
   if (error) return { error: `Failed to search flow: ${error.message}` };
@@ -1458,7 +1502,7 @@ export async function handleListSchedules(
   try {
     let query = supabaseAdmin
       .from('test_schedules')
-      .select('id, name, cron_expression, timezone, is_active, module_id, plan_id, last_run_at, next_run_at, created_at')
+      .select('id, name, schedule_type, cron_expression, run_at, timezone, is_active, module_id, plan_id, last_run_at, next_run_at, created_at')
       .eq('project_id', projectId)
       .order(sortBy, { ascending: sortOrder });
 
@@ -1486,18 +1530,27 @@ export async function handleListSchedules(
       return { success: false, message: `Database error: ${error.message}`, displayToUser: false };
     }
 
-    const schedules = (data || []).map((s) => ({
-      id: s.id,
-      name: s.name,
-      cronExpression: s.cron_expression,
-      timezone: s.timezone,
-      isActive: s.is_active,
-      moduleId: s.module_id || null,
-      planId: s.plan_id || null,
-      lastRunAt: s.last_run_at || null,
-      nextRunAt: s.next_run_at || null,
-      createdAt: s.created_at,
-    }));
+    const schedules = (data || []).map((s) => {
+      const scheduleType = (s.schedule_type as 'recurring' | 'one_time') || 'recurring';
+      return {
+        id: s.id,
+        name: s.name,
+        scheduleType,
+        cronExpression: s.cron_expression || null,
+        runAt: s.run_at || null,
+        // Human-readable "when" so the chat agent can describe either mode.
+        when: scheduleType === 'one_time'
+          ? (s.run_at ? `once at ${ScheduleService.formatRunAtForHuman(s.run_at, s.timezone)}` : 'one-time (time unset)')
+          : (s.cron_expression || 'recurring'),
+        timezone: s.timezone,
+        isActive: s.is_active,
+        moduleId: s.module_id || null,
+        planId: s.plan_id || null,
+        lastRunAt: s.last_run_at || null,
+        nextRunAt: s.next_run_at || null,
+        createdAt: s.created_at,
+      };
+    });
 
     return {
       success: true,
@@ -3720,6 +3773,7 @@ export async function handleManageRegressionPlan(
           const itemResolvers: Record<string, (name: string, scope: string) => Promise<ResolveResult>> = {
             module: resolveModuleByName,
             test_case: resolveTestCaseByName,
+            flow: resolveFlowByNameInProject,
           };
           const resolver = itemResolvers[itemType];
           if (resolver) {
@@ -3822,6 +3876,7 @@ export async function handleManageSchedule(
         const projectId = resolveProjectId(args, context);
         const name = args.name as string | undefined;
         const cronExpression = args.cron_expression as string | undefined;
+        const runAt = args.run_at as string | undefined;
 
         if (!projectId) {
           return { success: false, message: 'Missing required field: project_id', displayToUser: false };
@@ -3829,8 +3884,9 @@ export async function handleManageSchedule(
         if (!name) {
           return { success: false, message: 'Missing required field: name', displayToUser: false };
         }
-        if (!cronExpression) {
-          return { success: false, message: 'Missing required field: cron_expression', displayToUser: false };
+        // Timing: exactly one of cron_expression (recurring) or run_at (one-time).
+        if (!!cronExpression === !!runAt) {
+          return { success: false, message: 'Provide exactly one of cron_expression (recurring) or run_at (one-time)', displayToUser: false };
         }
 
         // Resolve plan_id/module_id by name if needed
@@ -3862,7 +3918,8 @@ export async function handleManageSchedule(
           projectId,
           userId: context.userId,
           name,
-          cronExpression,
+          cronExpression: cronExpression || undefined,
+          runAt: runAt || undefined,
           timezone: args.timezone || undefined,
           planId: resolvedPlanId || undefined,
           moduleId: resolvedModuleId || undefined,
@@ -3870,16 +3927,22 @@ export async function handleManageSchedule(
 
         logger.info('[QA_TOOL] Schedule created', { scheduleId: schedule.id, userId: context.userId });
 
+        const when = schedule.scheduleType === 'one_time'
+          ? `once at ${schedule.runAt ? ScheduleService.formatRunAtForHuman(schedule.runAt, schedule.timezone) : 'the scheduled time'}`
+          : schedule.cronExpression;
+
         return {
           success: true,
           data: {
             scheduleId: schedule.id,
             name: schedule.name,
+            scheduleType: schedule.scheduleType,
             cronExpression: schedule.cronExpression,
+            runAt: schedule.runAt,
             isActive: schedule.isActive,
             nextRunAt: schedule.nextRunAt,
           },
-          message: `Created schedule "${schedule.name}" (${schedule.cronExpression})`,
+          message: `Created schedule "${schedule.name}" (${when})`,
           displayToUser: true,
         };
       }
@@ -3902,6 +3965,7 @@ export async function handleManageSchedule(
           userId: context.userId,
           ...(args.name !== undefined ? { name: args.name } : {}),
           ...(args.cron_expression !== undefined ? { cronExpression: args.cron_expression } : {}),
+          ...(args.run_at !== undefined ? { runAt: args.run_at } : {}),
           ...(args.timezone !== undefined ? { timezone: args.timezone } : {}),
           ...(args.is_active !== undefined ? { isActive: args.is_active } : {}),
         });
@@ -3913,7 +3977,9 @@ export async function handleManageSchedule(
           data: {
             scheduleId: schedule.id,
             name: schedule.name,
+            scheduleType: schedule.scheduleType,
             cronExpression: schedule.cronExpression,
+            runAt: schedule.runAt,
             isActive: schedule.isActive,
             nextRunAt: schedule.nextRunAt,
           },
@@ -5006,6 +5072,18 @@ export async function handleGetRunStatus(
       planName = plan?.name;
     }
 
+    // [CHAIN] trace: the agent checked this run's status. Keyed by runId so
+    // `rg "<runId>"` reconstructs the full run→status→notify chain across
+    // processes/turns. [REGRESSION_RUN] already logs the start with runId.
+    logger.info('[CHAIN] status_checked', {
+      runId: run.id,
+      status: run.status,
+      passed: progress.passed,
+      failed: progress.failed,
+      total: progress.total,
+      userId: context.userId,
+    });
+
     return {
       success: true,
       data: {
@@ -5319,4 +5397,137 @@ export async function handleManageAutomationAction(
       displayToUser: false,
     };
   }
+}
+
+/**
+ * qa_author_test_iteratively — build a test case by GENERATING-AND-EXECUTING
+ * each step on the live preview, grounded in the real DOM at every step.
+ *
+ * Unlike qa_run_draft_steps (LLM guesses the whole array up front, then runs it
+ * blind), this drives the agentic Planner→Executor→Reviewer loop against the
+ * live page: snapshot → pick a real element by ref → execute → re-snapshot →
+ * next step, until the goal is met. The returned steps have ALREADY passed, so
+ * the user's later "save" persists them via qa_create_test_case with NO re-run.
+ *
+ * Safety / contract:
+ * - WRITE op: requires confirm=true (goes through the system confirm-gate, so
+ *   the LLM must describe the goal and get the user's "yes" first).
+ * - Requires an active editor preview session (editor mode only).
+ * - Holds the same run lock as Run-All (recording/apply/Run-All reject while
+ *   authoring is in flight). Cancellable via preview run-cancel.
+ * - Caches the grounded steps in DraftStepsCache so the "Save as test case"
+ *   quick action / qa_create_test_case can persist them.
+ */
+export async function handleAuthorTestIteratively(
+  args: Record<string, any>,
+  context: SkillContext,
+): Promise<SkillResult> {
+  const goalRaw = args.goal;
+  const goal = typeof goalRaw === 'string' ? goalRaw.trim() : '';
+  const suggestedNameRaw = args.suggested_name;
+  const suggestedName = typeof suggestedNameRaw === 'string' && suggestedNameRaw.trim()
+    ? suggestedNameRaw.trim().slice(0, 120)
+    : undefined;
+  const confirm = args.confirm === true;
+
+  // 1. Confirm gate (mirrors the other WRITE tools).
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe the test you will build to the user (the goal + that you will execute steps live on the preview), wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  // 2. Validate goal.
+  if (!goal) {
+    return { success: false, message: 'Missing required field: goal (what the test should accomplish, in plain language)', displayToUser: false };
+  }
+
+  // 3. Validate preview session.
+  if (!context.previewSessionId) {
+    return {
+      success: false,
+      message: 'Iterative authoring requires an active editor preview session. This tool is only available in editor mode.',
+      displayToUser: false,
+    };
+  }
+
+  // 4. Drive build-by-executing on the live preview.
+  const { EditorIterativeAuthorService } = await import('@/services/testing/ui/preview/editor-iterative-author.service');
+  const result = await EditorIterativeAuthorService.authorTest({
+    previewSessionId: context.previewSessionId,
+    userId: context.userId,
+    goal,
+  });
+
+  if (result.error) {
+    return { success: false, message: result.error, displayToUser: true };
+  }
+
+  // 5. Convert grounded DiscoveredStep[] → IntentStep[] (carries compiled plans
+  //    + masks secrets) and cache for the later save / quick action.
+  const { toIntentSteps } = await import('@/agent/core/lite/exploration/types');
+  const intentSteps = toIntentSteps(result.steps);
+
+  if (context.chatSessionId && intentSteps.length > 0) {
+    const { DraftStepsCache } = await import('@/services/testing/ui/preview/draft-steps-cache');
+    DraftStepsCache.set(context.chatSessionId, {
+      steps: intentSteps,
+      startUrl: result.startUrl,
+      userId: context.userId,
+      ...(suggestedName ? { suggestedName } : {}),
+    });
+  }
+
+  // 5.5 Per-AI-work credit charge. Iterative authoring drives the
+  //     Planner→Executor→Reviewer loop once PER ROUND (each round = several LLM
+  //     calls), so the flat 1-credit chat turn under-charges. We charge the
+  //     EXTRA AI rounds here; the base 1 is taken by the surrounding chat turn.
+  //
+  //     Contract (kept self-consistent so we never over/under-charge):
+  //       • The chat turn deducts its base 1 credit only when the tool returns
+  //         success=true (shouldDeductCredits is derived from tool success).
+  //       • So we ALSO gate this extra charge on result.success — on the same
+  //         signal — meaning total = roundsExecuted credits on success, and
+  //         0 here on failure (the turn likewise charges nothing). No reliance
+  //         on cross-file state beyond that shared success signal.
+  //     `computeAuthoringExtraCredits` is exported + unit-tested so the math is
+  //     pinned (never NaN, never negative, never an unbounded charge).
+  const extraCredits = computeAuthoringExtraCredits(result.success, result.roundsExecuted);
+  if (extraCredits > 0) {
+    try {
+      const { CreditCostTrackerService } = await import('@/services/core/credit-cost-tracker.service');
+      await CreditCostTrackerService.deductCreditsForTest({
+        userId: context.userId,
+        testType: 'chat',
+        credits: extraCredits,
+        costUSD: 0,
+        testId: context.previewSessionId,
+        description: `Iterative test authoring — ${result.roundsExecuted} AI rounds`,
+      });
+    } catch (err) {
+      logger.warn('[QA_TOOL] Iterative authoring credit deduction failed (non-fatal)', {
+        previewSessionId: context.previewSessionId,
+        extraCredits,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  const durationSec = (result.durationMs / 1000).toFixed(1);
+  const statusWord = result.success ? 'completed' : 'stopped';
+  return {
+    success: result.success,
+    data: {
+      previewSessionId: context.previewSessionId,
+      ephemeral: true,
+      startUrl: result.startUrl,
+      endUrl: result.endUrl,
+      stepCount: intentSteps.length,
+      roundsExecuted: result.roundsExecuted,
+    },
+    message: `Built ${intentSteps.length} grounded step${intentSteps.length === 1 ? '' : 's'} in ${durationSec}s (run ${statusWord} — ${result.reason}). Each step was executed live on the page, so it's already verified. Say "save" to persist this as a test case.`,
+    displayToUser: true,
+  };
 }

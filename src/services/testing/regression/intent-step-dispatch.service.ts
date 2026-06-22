@@ -140,6 +140,42 @@ export function normaliseIntentStep(
 }
 
 /**
+ * Normalise `open_app`/`close_app` package targets before dispatch.
+ *
+ * A saved step's `value` can carry a stale display label (e.g. the platform
+ * name "android" / "ANDROID") instead of a real package id. The mobile runner
+ * would then try to launch/close a non-existent package and fail, instead of
+ * acting on the app under test. We rewrite such values to the resolved build's
+ * package; when none resolves we blank them (empty string — NOT undefined,
+ * otherwise the runner's `value ?? description` falls through to the human
+ * description) so the runner falls back to `session.packageName`.
+ *
+ * A value that already looks like a real package id (contains a dot and is not
+ * a bare platform name) is left untouched, so flows that intentionally target
+ * a specific package keep working. Mutates and returns the same array.
+ *
+ * Called once at the single mobile job consumer (`mobile-test-run.job.ts`)
+ * before `runSteps`, so every dispatch path (regression / CI / chat / preview)
+ * is covered in one place and the normalisation rule lives in exactly one spot.
+ */
+export function sanitizeMobileAppPackageSteps<T extends { type?: unknown; value?: unknown }>(
+  steps: T[],
+  resolvedPackage?: string | null,
+): T[] {
+  const looksLikePackageId = (v: unknown): v is string =>
+    typeof v === 'string'
+    && v.includes('.')
+    && !['android', 'ios', 'flutter'].includes(v.trim().toLowerCase());
+  for (const step of steps) {
+    const stepType = String((step as { type?: unknown }).type);
+    if (stepType !== 'open_app' && stepType !== 'close_app') continue;
+    if (looksLikePackageId((step as { value?: unknown }).value)) continue;
+    (step as { value?: string }).value = resolvedPackage ?? '';
+  }
+  return steps;
+}
+
+/**
  * Stitch setup + main + teardown into a single ordered IntentStep[].
  *
  * @param mainSteps  The test's own body (IntentStep[] — whatever the

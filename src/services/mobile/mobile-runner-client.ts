@@ -18,11 +18,15 @@ import type {
   MobileHealthResponse,
   MobileIntentStep,
   MobileTestMetadata,
+  Trigger,
   MobileUiState,
   MobileForegroundResponse,
   MobileStepHistoryResponse,
   MobileLogsResponse,
   MobileLogLevel,
+  MobileExplorationStartResponse,
+  MobileExplorationReadiness,
+  MobileExplorationSnapshot,
 } from './mobile-runner.types';
 import { MobileRunnerError } from './mobile-runner.types';
 import { mintRunnerUserToken } from './user-token';
@@ -157,6 +161,29 @@ export class MobileRunnerClient {
     await this.request('DELETE', `/api/sessions/${sessionId}`, { userId: opts?.userId });
   }
 
+  /**
+   * End a DEDICATED session without destroying its device.
+   *
+   * A dedicated emulator container is pinned to a workspace and must outlive a
+   * single run — `destroySession` would tear down the remote container (it
+   * calls `emulatorManager.stop(serial)` → `adb emu kill`). This endpoint ends
+   * the session and resets app state (force-stop + clear data) but leaves the
+   * container alive for the workspace's next run.
+   *
+   * Runner contract (qait-mobile-runner): `POST /api/sessions/:id/end-dedicated`
+   * — the app-reset half of `resetSession` WITHOUT `releaseAndroidDevice`.
+   * Until the runner ships it, this 404s and the caller's catch logs it; the
+   * container is NOT destroyed either way, which is the safety property that
+   * matters.
+   */
+  async endDedicatedSession(sessionId: string, opts?: { userId?: string }): Promise<void> {
+    await this.request('POST', `/api/sessions/${sessionId}/end-dedicated`, {
+      timeoutMs: 15_000,
+      noRetry: true,
+      userId: opts?.userId,
+    });
+  }
+
   async sessionExists(sessionId: string): Promise<boolean> {
     try {
       const sessions = await this.request<{ id: string }[]>('GET', '/api/sessions', {
@@ -188,6 +215,119 @@ export class MobileRunnerClient {
       timeoutMs: 5000,
       userId: opts?.userId,
     });
+  }
+
+  /**
+   * Set the session's user-defined triggers for an editor run. The editor
+   * applies steps one at a time (NOT the batch run-steps body), so triggers
+   * must ride on the session — set once before the run, like permissionPolicy.
+   * Passing `[]` clears them.
+   */
+  async setTriggers(
+    sessionId: string,
+    triggers: Trigger[],
+    opts?: { userId?: string },
+  ): Promise<void> {
+    await this.request('PATCH', `/api/sessions/${sessionId}/triggers`, {
+      body: { triggers },
+      timeoutMs: 5000,
+      userId: opts?.userId,
+    });
+  }
+
+  // ── Exploration (autonomous app crawl) ──────────────────────────
+  //
+  // Brokers the runner's /api/explorer/* API so the runner API key stays
+  // server-side and never reaches the browser (B2C). Mirrors the web
+  // exploration flow: backend starts a run, relays the runner's per-run
+  // socket events, and fetches the final result on completion.
+  //
+  // The runner authenticates these calls via the X-API-Key header that
+  // `request()` injects from the server-held MOBILE_RUNNER_API_KEY.
+
+  /**
+   * Start an exploration on an already-warmed session.
+   * Runner returns 202 with the run id; 409 if the session is already
+   * exploring, 404 if the session is gone.
+   */
+  async startExploration(
+    sessionId: string,
+    body: { appId: string; goal?: string; budget?: Record<string, number> },
+    opts?: { userId?: string },
+  ): Promise<MobileExplorationStartResponse> {
+    return this.request<MobileExplorationStartResponse>(
+      'POST',
+      `/api/explorer/sessions/${sessionId}/start`,
+      { body, timeoutMs: 30_000, userId: opts?.userId },
+    );
+  }
+
+  /** UI-contract snapshot of a live or cold run (404 if unknown). */
+  async getExplorationStatus(
+    runId: string,
+    opts?: { userId?: string },
+  ): Promise<MobileExplorationSnapshot> {
+    return this.request<MobileExplorationSnapshot>(
+      'GET',
+      `/api/explorer/runs/${runId}`,
+      { timeoutMs: 10_000, userId: opts?.userId },
+    );
+  }
+
+  /** Final result snapshot — 409 until the run is finished. */
+  async getExplorationResult(
+    runId: string,
+    opts?: { userId?: string },
+  ): Promise<MobileExplorationSnapshot> {
+    return this.request<MobileExplorationSnapshot>(
+      'GET',
+      `/api/explorer/runs/${runId}/result`,
+      { timeoutMs: 15_000, userId: opts?.userId },
+    );
+  }
+
+  /** Answer an awaiting_user prompt (captcha / 2FA / credential). */
+  async submitExplorationAnswer(
+    runId: string,
+    answer: { questionId: string; value?: string; credentialValue?: string; skipped?: boolean },
+    opts?: { userId?: string },
+  ): Promise<unknown> {
+    return this.request(
+      'POST',
+      `/api/explorer/runs/${runId}/answer`,
+      { body: answer, timeoutMs: 10_000, userId: opts?.userId },
+    );
+  }
+
+  /** Abort a run. Idempotent on the runner side. */
+  async cancelExploration(runId: string, opts?: { userId?: string }): Promise<unknown> {
+    return this.request(
+      'POST',
+      `/api/explorer/runs/${runId}/cancel`,
+      { timeoutMs: 10_000, userId: opts?.userId },
+    );
+  }
+
+  /** Runner-side default budget (UI hint shown before a run starts). */
+  async getExplorationDefaults(opts?: { userId?: string }): Promise<Record<string, unknown>> {
+    return this.request<Record<string, unknown>>(
+      'GET',
+      '/api/explorer/defaults',
+      { timeoutMs: 5_000, userId: opts?.userId },
+    );
+  }
+
+  /**
+   * Readiness probe: LLM keys configured on the runner + emulator pool
+   * capacity. Used by the launcher before a run; replaces the browser's
+   * direct runner call.
+   */
+  async getExplorationReadiness(opts?: { userId?: string }): Promise<MobileExplorationReadiness> {
+    return this.request<MobileExplorationReadiness>(
+      'GET',
+      '/api/explorer/readiness',
+      { timeoutMs: 5_000, userId: opts?.userId },
+    );
   }
 
   // ── Fast-auth (app-data snapshot) ────────────────────────────────
@@ -377,6 +517,9 @@ export class MobileRunnerClient {
       screenshotEachStep?: boolean;
       stopOnFailure?: boolean;
       metadata?: MobileTestMetadata;
+      /** User-defined event→action rules forwarded verbatim to the runner.
+       *  Omitted from the body when absent/empty. */
+      triggers?: Trigger[];
       /** Propagated to the outgoing fetch so client-disconnect aborts
        *  reach the runner and free its session mutex. */
       signal?: AbortSignal;
@@ -388,6 +531,9 @@ export class MobileRunnerClient {
       screenshotEachStep: opts?.screenshotEachStep ?? true,
       stopOnFailure: opts?.stopOnFailure,
       metadata: opts?.metadata,
+      // Only attach when present so a no-trigger run sends a byte-identical
+      // body to pre-trigger behaviour (the runner schema treats it optional).
+      ...(opts?.triggers && opts.triggers.length > 0 ? { triggers: opts.triggers } : {}),
     };
 
     return this.request<MobileRunStepsResponse>(
@@ -397,6 +543,74 @@ export class MobileRunnerClient {
         body,
         timeoutMs: CLIENT_CONFIG.runStepsTimeoutMs,
         signal: opts?.signal,
+        userId: opts?.userId,
+      },
+    );
+  }
+
+  // ── Flutter driver-extension probe ─────────────────────────────
+
+  /**
+   * Ask the runner to verify whether the user's Flutter APK actually
+   * calls `enableFlutterDriverExtension()`. The APK is delivered the same
+   * way as a normal run — the caller first pushes the bytes via
+   * `uploadApp()` and passes the resulting on-disk `apkPath` here; the
+   * runner boots an emulator, installs + launches the APK, watches logcat
+   * for the Dart VM Service URL, and tears down the session.
+   *
+   * Always resolves to a verdict; the runner never throws an error to
+   * the HTTP layer.
+   *
+   * 240 s timeout: a cold probe pays full session bring-up — emulator
+   * connect/boot (can be ~90 s), the APK install, app launch, the 10 s
+   * VM-Service log scan, then teardown. Measured cold runs land around
+   * 120-130 s, so 240 s leaves headroom for a genuinely cold emulator
+   * without hanging the request forever.
+   */
+  async probeFlutterDriverExtension(
+    input: { packageName: string; apkPath: string },
+    opts?: { userId?: string },
+  ): Promise<{ detected: boolean; vmServiceUrl?: string; detail: string }> {
+    return this.request<{ detected: boolean; vmServiceUrl?: string; detail: string }>(
+      'POST',
+      '/api/probe/driver-extension',
+      {
+        body: input,
+        timeoutMs: 240_000,
+        noRetry: true,
+        userId: opts?.userId,
+      },
+    );
+  }
+
+  // ── Flutter attach (native session → flutter session) ──────────
+
+  /**
+   * Upgrade an already-installed native android session into a Flutter
+   * session. The caller must have installed the APK on `sessionId` first
+   * (normal `install_app`); the runner then launches the app, detects the
+   * Dart VM Service, connects, and keeps the SAME session id.
+   *
+   * Throws `MobileRunnerError` with status 422 / code `FLUTTER_NOT_DETECTED`
+   * when the build isn't debug/profile or doesn't call
+   * `enableFlutterDriverExtension()` — that's a rebuild-required failure,
+   * not transient, so `noRetry`.
+   *
+   * 45 s timeout covers `logcat -c` + launch + the 20 s VM-Service scan +
+   * FlutterClient connect, with headroom for a slow/cold emulator.
+   */
+  async attachFlutter(
+    sessionId: string,
+    input: { packageName: string },
+    opts?: { userId?: string },
+  ): Promise<{ sessionId: string; platform: string }> {
+    return this.request<{ sessionId: string; platform: string }>(
+      'POST',
+      `/api/sessions/${sessionId}/attach-flutter`,
+      {
+        body: input,
+        timeoutMs: 45_000,
+        noRetry: true,
         userId: opts?.userId,
       },
     );
@@ -507,6 +721,13 @@ export class MobileRunnerClient {
     screenSize?: { width: number; height: number };
     confidence?: number;
     resolvedVia?: string;
+    /**
+     * True when the bounding box came from the vision model (screenshot pixels)
+     * rather than an a11y/inspector tree node — common on Semantics-less Flutter
+     * screens. These coords are low-trust: callers should demote coordsConfidence
+     * so the runner re-resolves by text/keys instead of tapping the pixel blindly.
+     */
+    visionMode?: boolean;
     elementText?: string;
     elementType?: string;
     screenshot?: string;
@@ -514,8 +735,22 @@ export class MobileRunnerClient {
     /** Compiled locator plan built from the resolved node — persist onto IntentStep. */
     compiledPlan?: import('./mobile-runner.types').MobileCompiledPlan;
     visibleNodeCount?: number;
-    topNodes?: string[];
+    /**
+     * Structured sample of the first ~10 visible nodes (was `string[]`). Carries
+     * type/bounds/resourceId/creationLocation so a Flutter screen with unbuilt
+     * Semantics — unlabeled View containers — is legible in the editor trace
+     * instead of collapsing to an empty list. Trace-only; not returned to the FE.
+     */
+    topNodes?: Array<{
+      type?: string;
+      label?: string;
+      bounds?: { left: number; top: number; right: number; bottom: number };
+      resourceId?: string;
+      creationLocation?: string;
+    }>;
     intentWords?: string[];
+    /** Platform that produced the result — labels Flutter vs native in the trace. */
+    framework?: 'android' | 'ios' | 'flutter';
   }> {
     return this.request('POST', `/api/commands/${sessionId}/lint`, {
       // Only attach bindingHints when we actually have some — keeps the wire
@@ -524,7 +759,12 @@ export class MobileRunnerClient {
       body: bindingHints && Object.keys(bindingHints).length > 0
         ? { intent, actionType, bindingHints }
         : { intent, actionType },
-      timeoutMs: 15_000, // LLM resolve can take a few seconds
+      // Must exceed the runner's lint phase budget (RUN_LINT_PHASE_BUDGET_MS,
+      // default 16s) so the runner's own budget-abort wins and returns a clean
+      // phase-named error, instead of this client cutting the connection first.
+      // The runner needs headroom on slow emulators for the Flutter VM-Service
+      // bounds walk (a keyed node found instantly still needs its on-screen box).
+      timeoutMs: 18_000,
       userId: opts?.userId,
     });
   }

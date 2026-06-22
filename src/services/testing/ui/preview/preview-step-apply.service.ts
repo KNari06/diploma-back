@@ -6,7 +6,7 @@
 
 import { logger } from '@/utils/core/logger';
 import { recordSource, resolvePlaceholders } from '@/utils/interpolation/resolve-placeholders';
-import { collectSecretValues } from '@/utils/interpolation/redact-secrets';
+import { collectSecretValues, redactWithValues } from '@/utils/interpolation/redact-secrets';
 import { logIntentResolveApply } from './intent-resolve-audit';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -36,6 +36,9 @@ import type {
 import { STEP_APPLY_CONFIG, STEP_READINESS_CONFIG, COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { executeCoordinateDrag, parseDragCoordinates } from '@/agent/playwright/core/drag-helpers';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
+import { recordedFingerprintHasStrongIdentity, hasStrongIdentityContradiction } from './recorded-identity.util';
+import { probeIdentity } from './step-readiness-v2.service';
+import { typedValueLooksApplied, clearFieldBeforeType, verifyTypedValueAndRetry } from './type-action.helpers';
 import { waitForHoverEffect } from '../wait-phases/hover-effect-settle';
 import { smartStepWait } from '../smart-step-wait.service';
 
@@ -370,7 +373,7 @@ const POST_ACTION_SETTLE_TIMEOUT = STEP_APPLY_CONFIG.postActionSettleTimeoutMs;
 const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click', 'upload']);
 
 // V11: Actions that don't target elements — skip modal check
-const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for', 'ai_check', 'wait_for_email', 'dialog', 'download']);
+const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'timeout', 'scroll', 'wait_for', 'ai_check', 'wait_for_email', 'dialog', 'download']);
 
 // Actions that mutate DOM and require a fresh snapshot for the next step's lint.
 // After these, we invalidate the cached snapshot so hover→click sequences get fresh nodes.
@@ -384,6 +387,13 @@ const DOM_MUTATING_ACTIONS = new Set(['hover', 'click', 'open', 'close', 'toggle
  * Anything not in this set keeps the old (full) post-action behaviour.
  */
 const POST_ACTION_BUFFER_ACTIONS = new Set(['click', 'dblclick', 'contextmenu', 'press', 'type', 'toggle', 'check', 'uncheck', 'open', 'close']);
+
+/**
+ * Cap (ms) for the live identity probe used by the compiled fast-path
+ * recorded-identity guard. The element was just resolved, so the probe is fast;
+ * on timeout `probeIdentity` returns null → guard fails open (never blocks a hit).
+ */
+const RECORDED_IDENTITY_PROBE_CAP_MS = 1000;
 
 /**
  * V11: Detect if a modal/popup/overlay is currently blocking the page.
@@ -1366,7 +1376,7 @@ interface StepDecisionTrace {
     locatorCount?: number;
     succeededStrategy?: string;
     succeededWithFingerprintMatch?: number;
-    fellThroughTo?: 'lint' | 'click_no_effect' | 'click_failed' | 'postcondition' | 'skipped' | null;
+    fellThroughTo?: 'lint' | 'click_no_effect' | 'click_failed' | 'postcondition' | 'skipped' | 'recorded_identity_mismatch' | null;
   };
   /** Identity fast-path diagnostic (id/testId/name match against live DOM). */
   identity?: {
@@ -1573,6 +1583,12 @@ type ClickPreState = {
   targetDataState: string | null;
   targetDisabled: boolean;
   pageCount: number; // browser-context tab count for new-tab detection
+  // V28: resolved absolute href of the click target when it's an anchor
+  // (`<a href>` / closest `<a>` ancestor — covers icon-in-link). Lets the
+  // post-click verifier decide whether a `target="_blank"` newtab landed on
+  // the link's OWN destination (strong, real navigation) vs an unrelated tab
+  // an ad/tracker popped (weak, fake-success symptom). null for non-anchors.
+  targetHref: string | null;
   // V24: overlay/popup signature captured BEFORE click. Used by parasitic-overlay
   // dismiss helper to distinguish a popup that was already there (legitimate,
   // recorded by user) from one our wrong click just opened. Format: count of
@@ -1651,6 +1667,7 @@ async function captureClickPreState(
     targetDataState: null,
     targetDisabled: false,
     pageCount,
+    targetHref: null,
     overlayPreSig: '',
     downloadDetected: () => downloaded,
     cleanupDownloadListener,
@@ -1713,6 +1730,15 @@ async function captureClickPreState(
       const aeSig = ae ? `${ae.tagName}#${ae.id || ''}.${(ae.getAttribute('class') || '').slice(0, 30)}` : null;
       let targetEl: any = null;
       if (refSel) targetEl = doc.querySelector(`[data-agent-ref="${refSel}"]`);
+      // V28: resolve the anchor destination. The click target may be an icon
+      // or <span> INSIDE the link, so walk up to the closest <a href>. `.href`
+      // (not getAttribute) returns the browser-resolved absolute URL, so a
+      // relative href compares cleanly against the new tab's absolute URL.
+      let targetHref: string | null = null;
+      if (targetEl) {
+        const anchor = targetEl.closest ? targetEl.closest('a[href]') : null;
+        if (anchor && anchor.href) targetHref = String(anchor.href);
+      }
       return {
         activeElementSig: aeSig,
         targetAriaPressed: targetEl ? targetEl.getAttribute('aria-pressed') : null,
@@ -1725,12 +1751,59 @@ async function captureClickPreState(
         targetDisabled: targetEl
           ? (targetEl.hasAttribute('disabled') || targetEl.getAttribute('aria-disabled') === 'true')
           : false,
+        targetHref,
       };
     }, { refSel: safeRef });
     return { ...pageSig, ...elemSig, pageCount, downloadDetected: () => downloaded, cleanupDownloadListener };
   } catch {
     return fallback;
   }
+}
+
+/**
+ * V28: does a tab URL point at the same destination as a clicked anchor's href?
+ * Compares origin+path first, then bare origin (covers tracking query params
+ * the link adds, or a redirect that lands on the same site). Only http/https
+ * count — `about:blank` (brand-new popup not yet navigated) and other schemes
+ * return false, so an ad's blank popup doesn't masquerade as the link's
+ * destination. Pure + exported so it's unit-testable without a browser.
+ */
+export function hrefMatchesUrl(targetHref: string, tabUrl: string): boolean {
+  const norm = (u: string): { origin: string; originPath: string } | null => {
+    try {
+      const p = new URL(u);
+      if (p.protocol !== 'http:' && p.protocol !== 'https:') return null;
+      const host = p.host.toLowerCase();
+      const path = p.pathname.replace(/\/$/, '') || '/';
+      return { origin: `${p.protocol}//${host}`, originPath: `${p.protocol}//${host}${path}` };
+    } catch { return null; }
+  };
+  const want = norm(targetHref);
+  const got = norm(tabUrl);
+  if (!want || !got) return false;
+  return got.originPath === want.originPath || got.origin === want.origin;
+}
+
+/**
+ * V28: does a NEWLY-OPENED tab point at the same destination as the clicked
+ * anchor's href? Synchronous read of `page.context().pages()` — no await,
+ * best-effort. Newest tab is last, so it's checked first.
+ *
+ * CRITICAL: the opener page (`page` itself) is excluded. hrefMatchesUrl allows
+ * an origin-only match, and the opener almost always shares the href's origin —
+ * so without this exclusion an ad/tracker popup to a foreign site would still
+ * "match" the opener and be wrongly promoted to the strong 'url' signal. Only
+ * the tab the click actually spawned counts as the link's destination.
+ */
+function newTabMatchesHref(page: Page, targetHref: string): boolean {
+  try {
+    const pages = page.context().pages();
+    for (const pg of [...pages].reverse()) {
+      if (pg === page) continue; // opener, not the click's new destination
+      if (hrefMatchesUrl(targetHref, pg.url())) return true;
+    }
+  } catch { /* best-effort */ }
+  return false;
 }
 
 async function verifyClickHadEffect(
@@ -1745,7 +1818,9 @@ async function verifyClickHadEffect(
   // path bounded at ~800ms while keeping the fast path effectively free.
   const safeRef = ref ? ref.replace(/[^a-zA-Z0-9_-]/g, '') : '';
   const checkpoints = [0, 800];
-  for (const delay of checkpoints) {
+  for (let ci = 0; ci < checkpoints.length; ci++) {
+    const delay = checkpoints[ci];
+    const isLastCheckpoint = ci === checkpoints.length - 1;
     if (delay > 0) await page.waitForTimeout(delay).catch(() => {});
 
     // V23: download detection — checked first because download events fire
@@ -1767,8 +1842,29 @@ async function verifyClickHadEffect(
     try {
       const nowPageCount = page.context().pages().length;
       if (nowPageCount > pre.pageCount) {
-        pre.cleanupDownloadListener?.();
-        return { effected: true, signal: 'newtab' };
+        // V28: a new tab opened. Decide STRONG vs WEAK by comparing the new
+        // tab's destination against the clicked anchor's own href. A link with
+        // target="_blank" landing on ITS OWN destination is a real navigation
+        // (strong → 'url'), not a fake-success. Only when the new tab is
+        // unrelated (ad/tracker popup, or the click target wasn't even an
+        // anchor) do we keep the weak 'newtab' signal so the fake-success
+        // guard still rejects it. This stops the editor from discarding the
+        // compiled plan on legitimate "opens in new tab" links — the bug that
+        // made the orange "Needs apply" dot stick on passing steps.
+        if (pre.targetHref && newTabMatchesHref(page, pre.targetHref)) {
+          pre.cleanupDownloadListener?.();
+          return { effected: true, signal: 'url' };
+        }
+        // No href match yet. The popup may still be on about:blank mid-open —
+        // on an early checkpoint, keep waiting so its URL can resolve and match
+        // (and so a download that opens via a transient tab can still fire and
+        // be caught by the download listener, which we therefore DON'T clean up
+        // here). Only at the FINAL checkpoint do we commit to the weak 'newtab'
+        // signal (unrelated popup, or non-anchor click → fake-success guard).
+        if (isLastCheckpoint) {
+          pre.cleanupDownloadListener?.();
+          return { effected: true, signal: 'newtab' };
+        }
       }
     } catch { /* best-effort */ }
 
@@ -1819,13 +1915,37 @@ async function verifyClickHadEffect(
       // own `page.url()` (no in-page eval needed) and only claim 'url' when
       // we can prove navigation happened. Otherwise drop to a 'detach' /
       // 'dom' signal so the post-click guard can actually do its job.
-      pre.cleanupDownloadListener?.();
       try {
         const liveUrl = page.url();
         if (liveUrl && liveUrl !== pre.url) {
+          pre.cleanupDownloadListener?.();
           return { effected: true, signal: 'url' };
         }
       } catch { /* page closed — fall through */ }
+      // V28: the evaluate often throws on `target="_blank"` clicks because the
+      // popup-open briefly busies the opener's JS context — and that race fired
+      // BEFORE the top-of-loop tab-count check could see the new tab. Re-check
+      // here so a legit "opens in new tab" link isn't mislabelled 'detach'
+      // (weak → stale orange dot). Same decision: href match → strong 'url',
+      // else weak 'newtab'.
+      try {
+        if (page.context().pages().length > pre.pageCount) {
+          if (pre.targetHref && newTabMatchesHref(page, pre.targetHref)) {
+            pre.cleanupDownloadListener?.();
+            return { effected: true, signal: 'url' };
+          }
+          // Tab present but no href match yet. On an early checkpoint the popup
+          // may still be on about:blank — fall through to the loop's next pass
+          // so its URL can resolve. Only commit to weak 'newtab' at the last
+          // checkpoint. (Skip the 'detach' return below in either case.)
+          if (isLastCheckpoint) {
+            pre.cleanupDownloadListener?.();
+            return { effected: true, signal: 'newtab' };
+          }
+          continue;
+        }
+      } catch { /* best-effort */ }
+      pre.cleanupDownloadListener?.();
       // Eval threw and URL is unchanged. Treat as a DOM-shake signal — it
       // IS an effect (something destroyed our eval context) but it isn't
       // a navigation. 'detach' is in the WEAK set, so the fake-success
@@ -1867,6 +1987,24 @@ async function verifyClickHadEffect(
         return { signal: 'none' as const };
       }, { refSel: safeRef, prev: pre });
     } catch {
+      // V28: same target="_blank" race as the page-eval catch above — the
+      // popup-open can busy/destroy the element eval context AFTER the
+      // top-of-loop tab check already passed. Re-check for a new tab before
+      // settling on 'detach' so a legit "opens in new tab" link gets the
+      // strong 'url' signal (href match) or weak 'newtab', not 'detach'.
+      try {
+        if (page.context().pages().length > pre.pageCount) {
+          if (pre.targetHref && newTabMatchesHref(page, pre.targetHref)) {
+            pre.cleanupDownloadListener?.();
+            return { effected: true, signal: 'url' };
+          }
+          if (isLastCheckpoint) {
+            pre.cleanupDownloadListener?.();
+            return { effected: true, signal: 'newtab' };
+          }
+          continue; // early checkpoint — let the popup URL resolve next pass
+        }
+      } catch { /* best-effort */ }
       // Frame detached / navigating — count as effect.
       return { effected: true, signal: 'detach' };
     }
@@ -1882,6 +2020,22 @@ async function verifyClickHadEffect(
   pre.cleanupDownloadListener?.();
   if (downloadFinal) return { effected: true, signal: 'download' };
   return { effected: false, signal: 'none' };
+}
+
+/**
+ * Test-only: run the real pre-state → click → verify pipeline against a live
+ * Playwright page, so integration tests exercise the actual V28 newtab logic
+ * (targetHref capture + checkpoint-aware newtab branch + newTabMatchesHref)
+ * end-to-end instead of re-implementing it. Not used by production code.
+ */
+export async function __test__captureClickAndVerify(
+  page: Page,
+  ref: string,
+  doClick: () => Promise<void>,
+): Promise<{ effected: boolean; signal: ClickEffectSignal }> {
+  const pre = await captureClickPreState(page, ref, null);
+  await doClick();
+  return verifyClickHadEffect(page, pre, ref, null);
 }
 
 /**
@@ -2413,15 +2567,18 @@ async function executeAction(
   step: IntentStep,
   candidate: LintCandidate,
   preResolvedLocator?: Locator,
-  options?: { expectsNavigation?: boolean }
+  options?: { expectsNavigation?: boolean; secretValues?: readonly string[] }
 ): Promise<{ success: boolean; error?: string; urlChanged: boolean }> {
   const urlBefore = page.url();
+  // Post-interpolation step bodies (the `type` value) can contain resolved
+  // `secrets.*` plaintext — redact through these before any log line (#10).
+  const secretValues = options?.secretValues ?? [];
 
   try {
     // Build selector (unless we have a pre-resolved locator from compiled plan)
     const selector = preResolvedLocator ? '' : buildSelector(step, candidate);
 
-    if (!selector && !preResolvedLocator && !['navigate', 'wait', 'scroll', 'press'].includes(step.type)) {
+    if (!selector && !preResolvedLocator && !['navigate', 'wait', 'timeout', 'scroll', 'press'].includes(step.type)) {
       return { success: false, error: 'No valid selector for element', urlChanged: false };
     }
 
@@ -2434,7 +2591,7 @@ async function executeAction(
 
     // Scroll element into viewport before action (fullPage snapshots can resolve off-screen elements)
     // Skip for non-targeting actions that don't need a visible element
-    if (locator && !['navigate', 'wait', 'wait_for', 'scroll'].includes(step.type)) {
+    if (locator && !['navigate', 'wait', 'timeout', 'wait_for', 'scroll'].includes(step.type)) {
       await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
     }
 
@@ -2545,8 +2702,9 @@ async function executeAction(
 
           // If we want to "replace", clear existing content before typing.
           // We clear quickly, then type gradually for the human-like effect.
-          if (step.options?.replaceContent !== false) {
-            await locator.fill('', { timeout });
+          const isReplace = step.options?.replaceContent !== false;
+          if (isReplace) {
+            await clearFieldBeforeType(locator, timeout, { secretValues });
           }
 
           // Delay between keystrokes:
@@ -2557,6 +2715,14 @@ async function executeAction(
             : randomIntInclusive(50, 150);
 
           await locator.pressSequentially(value, { timeout, delay });
+
+          // Verify the value landed (Finding 2): humanLike types char-by-char
+          // with a 50–150ms delay — slower typing makes mask races WORSE, so
+          // this path needs the masked-drop verify most. Replace-mode only
+          // (append-mode field holds prior content, so it can't match `value`).
+          if (isReplace) {
+            await verifyTypedValueAndRetry(page, locator, value, timeout, { secretValues });
+          }
 
           // Sometimes pause after typing (e.g., user thinking / UI debounce)
           await maybeRandomPause(page, 0.35, 80, 220);
@@ -2575,9 +2741,13 @@ async function executeAction(
           if (value.length <= 50 || userKeyPressDelay != null) {
             // Short text (credentials, emails, OTP) OR user-requested gradual typing:
             // use pressSequentially for full keyboard event chain.
-            await locator.fill('', { timeout }).catch(() => {}); // Clear existing content first
+            await clearFieldBeforeType(locator, timeout, { secretValues }); // Clear existing content (verified — see helper)
             await locator.click({ timeout });
             await locator.pressSequentially(value, { timeout, delay: userKeyPressDelay ?? 20 });
+            // Read back the value and, on a SAFE masked-drop mismatch, repair
+            // once with fill(). Gated so it can't wipe an OTP/maxlength/multi-box
+            // entry; logs are secret-redacted. See verifyTypedValueAndRetry.
+            await verifyTypedValueAndRetry(page, locator, value, timeout, { secretValues });
           } else {
             // Long text (comments, descriptions): fast fill with post-blur fallback
             await locator.fill(value, { timeout });
@@ -2592,10 +2762,13 @@ async function executeAction(
               // Re-focus to check value
               await locator.focus({ timeout: 2000 }).catch(() => {});
               const postBlurValue = await locator.inputValue().catch(() => '');
-              if (value && postBlurValue.trim() !== value.trim()) {
+              // Share the tolerant comparator with the short-text path (Finding
+              // 9) — strict `!==` false-positives on an auto-formatting long
+              // field and spuriously clears + retypes.
+              if (value && !typedValueLooksApplied(value, postBlurValue)) {
                 logger.info('[EXECUTE_ACTION] fill() value lost after blur — retrying with pressSequentially', {
-                  expected: value.slice(0, 50),
-                  actual: postBlurValue.slice(0, 50),
+                  expected: redactWithValues(value, secretValues).slice(0, 50),
+                  actual: redactWithValues(postBlurValue, secretValues).slice(0, 50),
                 });
                 // Clear and retry with pressSequentially (generates full keyboard event chain)
                 await locator.fill('', { timeout }).catch(() => {});
@@ -2817,6 +2990,13 @@ async function executeAction(
       case 'wait': {
         const waitTimeout = step.options?.timeout || 1000;
         await page.waitForTimeout(waitTimeout);
+        break;
+      }
+
+      case 'timeout': {
+        // Explicit sleep/pause: ms lives in step.value (number of ms to wait)
+        const ms = Number(step.value) || step.options?.timeout || 1000;
+        await page.waitForTimeout(ms);
         break;
       }
 
@@ -3466,6 +3646,32 @@ export class PreviewStepApplyService {
         };
       }
 
+      // open_tab action — create a new tab and navigate it to `value` (URL).
+      // The new tab becomes active (popup-adoption semantics). A URL is
+      // required; openTab refuses an empty value because a blank tab is
+      // auto-closed by the popup handler.
+      if (stepDraft.type === 'open_tab') {
+        const url = (stepDraft.value || '').trim();
+        const opened = await sessionService.openTab(previewSessionId, userId, url);
+
+        // V18: Lightweight settle after open — domcontentloaded only. Full
+        // readiness for the new page is handled by the lookahead before the
+        // next step (same pattern as switch_tab).
+        if (opened) {
+          const newPage = sessionService.getPage(previewSessionId, userId);
+          if (newPage) {
+            try { await newPage.waitForLoadState('domcontentloaded', { timeout: 5_000 }); } catch { /* proceed */ }
+          }
+        }
+
+        return {
+          success: opened,
+          error: opened ? undefined : (url ? `Could not open new tab at ${url}` : 'open_tab requires a URL'),
+          url: sessionService.getPage(previewSessionId, userId)?.url() || '',
+          attempts: 1,
+        };
+      }
+
       // V15: Auto-switch tab if step targets a different tab than currently active
       const session = sessionService.getSession(previewSessionId);
       if (session && stepDraft.tabIndex !== undefined && stepDraft.tabIndex !== session.activeTabIndex) {
@@ -3502,9 +3708,9 @@ export class PreviewStepApplyService {
         };
       }
 
-      // Handle non-targeting actions (navigate, wait, scroll)
+      // Handle non-targeting actions (navigate, wait, timeout, scroll)
       // Scroll is page-level: uses step.value (deltaY) without targeting a DOM element
-      if (['navigate', 'wait', 'scroll'].includes(stepDraft.type)) {
+      if (['navigate', 'wait', 'timeout', 'scroll'].includes(stepDraft.type)) {
         // V5: Capture URL BEFORE action for accurate compiled context
         // This is important for auto-wait-for-url injection which compares adjacent pageUrls
         const urlBeforeAction = page.url();
@@ -3526,7 +3732,7 @@ export class PreviewStepApplyService {
 
         let result;
         try {
-          result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 });
+          result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 }, undefined, { secretValues: secretValuesForAudit });
           // Emit complete phase for navigate
           if (stepDraft.type === 'navigate') {
             const navUrl = stepDraft.value || '';
@@ -4187,7 +4393,7 @@ export class PreviewStepApplyService {
         // V5: Capture URL BEFORE action for accurate compiled context
         const urlBeforeAction = page.url();
         
-        const result = await executeAction(page, stepDraft, confirmedCandidate, undefined, { expectsNavigation });
+        const result = await executeAction(page, stepDraft, confirmedCandidate, undefined, { expectsNavigation, secretValues: secretValuesForAudit });
 
         if (result.success) {
           // V16: Post-action settle via smartStepWait('post'). In run-mode
@@ -4411,6 +4617,46 @@ export class PreviewStepApplyService {
               fellThroughTo: null,
             });
 
+            // ── Recorded-identity guard ──────────────────────────────────
+            // `executeCompiledLocatorPlan` only validated the match against the
+            // plan's OWN `targetFingerprint` — a self-echo of a PRIOR resolver
+            // decision (invariant #15). It never re-checks the ORIGINAL recorded
+            // identity, so a drifted text/label strategy can "succeed" on a
+            // different element than a fresh single-step Apply (which always
+            // resolves via the LLM, because the editor sends no compiled plan).
+            // Re-probe the resolved element and reject when a recorded STRONG
+            // identifier (id/testId/name/href/svgIcon/routerLink, URL-normalized)
+            // contradicts it — throw to fall through to lint so Run and Apply
+            // converge. SAME comparator as the evidence path and the readiness
+            // gate (hasStrongIdentityContradiction). Only probes when the
+            // fingerprint has strong identity; manual-add steps (no fingerprint)
+            // and probe failures fail open.
+            if (recordedFingerprintHasStrongIdentity(stepDraft.recordedFingerprint)) {
+              const identityProbe = await probeIdentity(compiledResult.locator, RECORDED_IDENTITY_PROBE_CAP_MS).catch(() => null);
+              if (hasStrongIdentityContradiction(identityProbe, stepDraft.recordedFingerprint)) {
+                logger.info('[PREVIEW_APPLY] Compiled hit rejected — recorded-identity contradiction, falling through to lint', {
+                  previewSessionId,
+                  stepId: stepDraft.id,
+                  strategy: compiledResult.usedStrategy,
+                });
+                setTraceCompiled({ fellThroughTo: 'recorded_identity_mismatch' });
+                try {
+                  EditorTraceService.get(previewSessionId)?.writeCompiledPostcondition({
+                    stepId: stepDraft.id,
+                    expectsNavigation: false,
+                    urlChanged: false,
+                    accepted: false,
+                    reason: 'recorded_identity_mismatch',
+                  });
+                } catch { /* non-fatal */ }
+                compiledWasTried = true;
+                // Break out of the success path; the surrounding try/catch turns
+                // this into a `compiledWasTried = true` fall-through to lint —
+                // same idiom as the compiled-click-no-effect bail below.
+                throw new Error('compiled-recorded-identity-mismatch');
+              }
+            }
+
             // Build candidate from compiled result
             // V15: Extract data-agent-ref from resolved element so evidence shortcut
             // works on next run (previously stored '' which made evidence cache miss every time)
@@ -4451,7 +4697,7 @@ export class PreviewStepApplyService {
               : null;
 
             // Execute action with compiled locator
-            const result = await executeAction(page, stepDraft, compiledCandidate, compiledResult.locator, { expectsNavigation });
+            const result = await executeAction(page, stepDraft, compiledCandidate, compiledResult.locator, { expectsNavigation, secretValues: secretValuesForAudit });
 
             if (result.success) {
               // V13: Postcondition verification — if the compiled plan
@@ -5552,7 +5798,7 @@ export class PreviewStepApplyService {
           });
         } catch { /* non-fatal */ }
         let playwrightThrew = false;
-        const result = await executeAction(page, stepDraft, candidate, undefined, { expectsNavigation });
+        const result = await executeAction(page, stepDraft, candidate, undefined, { expectsNavigation, secretValues: secretValuesForAudit });
         const actionDur = Date.now() - actionStart;
         if (!result.success && result.error) playwrightThrew = true;
         try {

@@ -6,6 +6,7 @@ import path from 'path';
 import {
   getOnboarding,
   saveOnboarding,
+  saveProfile,
 } from './onboarding.controller';
 import {
   createWorkspace,
@@ -216,6 +217,14 @@ router.post(
   '/onboarding',
   requireAuth,
   asyncHandler(saveOnboarding)
+);
+
+// Lightweight B2C profile capture (role + goal/source) for the dashboard
+// one-time modal. Does not require the full onboarding payload.
+router.put(
+  '/profile',
+  requireAuth,
+  asyncHandler(saveProfile)
 );
 
 /**

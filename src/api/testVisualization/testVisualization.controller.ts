@@ -927,7 +927,9 @@ function mapIntentTypeToPlaywright(intentType: string): PlaywrightStepType {
     case 'drag_and_drop': return 'custom';
     case 'dialog':       return 'custom';
     case 'download':     return 'custom';
-    case 'switch_tab':   return 'custom';
+    case 'switch_tab':
+    case 'close_tab':
+    case 'open_tab':     return 'custom';
     default:             return 'custom';
   }
 }

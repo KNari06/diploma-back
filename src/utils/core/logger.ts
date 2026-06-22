@@ -391,6 +391,54 @@ try {
   console.error('Failed to create etap2-cdp.log transport:', error);
 }
 
+// ── Mobile session lifecycle log ────────────────────────────────────
+// Why a separate file: the editor's "start session" (warmup) flow, the
+// mobile regression run path, and the preview stream all log at info/warn.
+// In dev those lines go ONLY to each service's own Terminal window (see
+// run-dev.sh — every process gets its own window, nothing is tee'd to
+// disk), so a "Failed to start session" in the editor leaves NO trace the
+// next morning: error.log only catches `error` level, and a warmup that
+// fails via a guard `res.status(4xx/5xx).json()` return never throws, so
+// it never reaches the catch that logs at error. This transport ALWAYS
+// writes (dev + prod), level=info, tag-filtered so the file stays small
+// and grep-friendly. Kill switch: rm logs/mobile-session.log.
+try {
+  const MOBILE_TAGS = [
+    '[MOBILE_SESSION]',
+    '[MOBILE-TEST]',
+    '[MOBILE_TEST_WORKER]',
+    '[MOBILE_STREAM]',
+  ];
+  const mobileFilter = winston.format((info) => {
+    const msg = typeof info.message === 'string' ? info.message : String(info.message);
+    return MOBILE_TAGS.some((tag) => msg.includes(tag)) ? info : false;
+  });
+
+  const mobileLogTransport = new winston.transports.File({
+    filename: path.join(logsDir, 'mobile-session.log'),
+    // info captures the per-phase warmup breadcrumbs + the guard-return
+    // warns; we don't need debug-level stream chatter here.
+    level: 'info',
+    maxsize: 10 * 1024 * 1024, // 10MB
+    maxFiles: 3,                // rotate, keep last 3
+    format: winston.format.combine(
+      mobileFilter(),
+      winston.format.timestamp(),
+      winston.format.errors({ stack: true }),
+      truncateLargeFields(),
+      winston.format.json(),
+    ),
+  });
+
+  mobileLogTransport.on('error', (error) => {
+    console.error('Error writing to mobile-session.log:', error);
+  });
+
+  transports.push(mobileLogTransport);
+} catch (error) {
+  console.error('Failed to create mobile-session.log transport:', error);
+}
+
 // Add additional file transports in production
 if (env.NODE_ENV === 'production') {
   try {

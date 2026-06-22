@@ -6,9 +6,12 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { FlowService } from '@/services/testing/flows/flow.service';
 import { ModuleService } from '@/services/testing/modules/module.service';
+import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
+import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
+import { emitFlowMutated, emitTestCaseMutated } from '@/websocket/helpers/project-mutation-emit';
 import { Request, Response } from 'express';
 
 interface AuthenticatedRequest extends Request {
@@ -55,12 +58,25 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
 
     const isMobilePlatform = typeof platform === 'string' && platform.startsWith('mobile_');
 
-    // Mobile gate: a mobile flow is unrunnable without an uploaded app AND
-    // a package name (the runner uses both to install + launch). Previously
-    // we only enforced this at editor warm-up time — the flow + initial
-    // test case still got persisted, then the user got redirected to
-    // settings. Reject up-front instead so the project state never gets a
-    // half-configured mobile flow.
+    // Mobile gate: validate the package name when an app IS uploaded for
+    // the requested platform.
+    //
+    // History — this gate used to also reject flow creation when no
+    // binary was uploaded at all (`MOBILE_APP_MISSING`). That was too
+    // strict for the dual-platform workflow: teams routinely scaffold
+    // iOS test cases BEFORE the first .ipa is built and signed, using
+    // the editor on a bare simulator to validate the runner + WDA path.
+    // The editor (frontend `TestSuitesMobile.tsx`) and runner already
+    // handle the no-binary case gracefully — editor shows a warning
+    // toast and warmup boots a blank simulator. Blocking flow creation
+    // here would force a chicken-and-egg state: you can't scaffold iOS
+    // tests without an .ipa, and you can't validate that the runner can
+    // host iOS tests without a scaffolded flow.
+    //
+    // We DO still reject when a binary exists but its packageName is
+    // missing — that's a known-broken upload (rare; happens for very
+    // old slot rows where packageName was optional at upload time).
+    // The check_package fast path would loop forever in that state.
     if (isMobilePlatform) {
       const { data: projectRow, error: projectErr } = await supabaseAdmin
         .from('projects')
@@ -71,18 +87,11 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
         res.status(404).json({ success: false, error: 'Project not found' });
         return;
       }
-      const mobileApp = (projectRow.settings as any)?.mobileApp as
-        | { storagePath?: string; packageName?: string }
-        | undefined;
-      if (!mobileApp?.storagePath) {
-        res.status(400).json({
-          success: false,
-          error: 'No mobile app uploaded for this project. Upload an APK/IPA in settings before creating a mobile test case.',
-          code: 'MOBILE_APP_MISSING',
-        });
-        return;
-      }
-      if (!mobileApp.packageName || !String(mobileApp.packageName).trim()) {
+      const PLATFORM_MAP: Record<string, MobilePlatform> = { mobile_ios: 'ios', mobile_flutter: 'flutter' };
+      const mobilePlatform: MobilePlatform = PLATFORM_MAP[platform ?? ''] ?? 'android';
+      const mobileApp = getProjectMobileApp(projectRow.settings as Record<string, unknown> | undefined, mobilePlatform);
+      if (mobileApp?.storagePath
+        && (!mobileApp.packageName || !String(mobileApp.packageName).trim())) {
         res.status(400).json({
           success: false,
           error: 'The uploaded mobile app has no package name. Set it in settings before creating a mobile test case.',
@@ -235,6 +244,18 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
       });
     }
 
+    // Live cache invalidation for other open editors (best-effort).
+    emitFlowMutated({ projectId, action: 'created', id: flow.id, name, moduleId });
+    if (createdTestCaseId) {
+      emitTestCaseMutated({
+        projectId,
+        action: 'created',
+        id: createdTestCaseId,
+        name,
+        flowId: flow.id,
+      });
+    }
+
     res.json({
       success: true,
       data: {
@@ -246,6 +267,19 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
   } catch (error) {
     logger.error('[FLOWS_API] Failed to create flow', { error });
     handleError(res, error, 'Failed to create flow');
+  }
+}
+
+/**
+ * Resolve a flow's projectId via its module — flows don't carry projectId
+ * directly. Best-effort: returns null on any failure so emit callers skip.
+ */
+async function resolveFlowProjectId(moduleId: string, userId: string): Promise<string | null> {
+  try {
+    const module = await ModuleService.getById(moduleId, userId);
+    return module?.projectId ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -299,13 +333,14 @@ export async function listFlows(req: AuthenticatedRequest, res: Response): Promi
 export async function updateFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { name, flowType, tags, priority, preconditions, expectedResult, orderIndex } = req.body;
+    const { name, moduleId, flowType, tags, priority, preconditions, expectedResult, orderIndex } = req.body;
     const userId = getUserId(req);
 
     const flow = await FlowService.update({
       id,
       userId,
       name,
+      moduleId,
       flowType,
       tags,
       priority,
@@ -313,6 +348,17 @@ export async function updateFlow(req: AuthenticatedRequest, res: Response): Prom
       expectedResult,
       orderIndex,
     });
+
+    const projectId = await resolveFlowProjectId(flow.moduleId, userId);
+    if (projectId) {
+      emitFlowMutated({
+        projectId,
+        action: 'updated',
+        id: flow.id,
+        name: flow.name,
+        moduleId: flow.moduleId,
+      });
+    }
 
     res.json({ success: true, data: flow, timestamp: new Date() });
   } catch (error) {
@@ -332,6 +378,17 @@ export async function duplicateFlow(req: AuthenticatedRequest, res: Response): P
 
     const flow = await FlowService.duplicate(id, userId);
 
+    const projectId = await resolveFlowProjectId(flow.moduleId, userId);
+    if (projectId) {
+      emitFlowMutated({
+        projectId,
+        action: 'created',
+        id: flow.id,
+        name: flow.name,
+        moduleId: flow.moduleId,
+      });
+    }
+
     res.json({ success: true, data: { flow }, timestamp: new Date() });
   } catch (error) {
     logger.error('[FLOWS_API] Failed to duplicate flow', { error });
@@ -347,7 +404,24 @@ export async function deleteFlow(req: AuthenticatedRequest, res: Response): Prom
     const { id } = req.params;
     const userId = getUserId(req);
 
+    // Capture module/project BEFORE delete — needed for the invalidation emit.
+    let projectId: string | null = null;
+    let moduleId: string | undefined;
+    try {
+      const existing = await FlowService.getById(id, userId);
+      if (existing) {
+        moduleId = existing.moduleId;
+        projectId = await resolveFlowProjectId(existing.moduleId, userId);
+      }
+    } catch {
+      // Best-effort — proceed with delete regardless.
+    }
+
     await FlowService.delete(id, userId);
+
+    if (projectId) {
+      emitFlowMutated({ projectId, action: 'deleted', id, moduleId });
+    }
 
     res.json({ success: true, message: 'Flow deleted', timestamp: new Date() });
   } catch (error) {

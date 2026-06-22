@@ -13,6 +13,7 @@ import { logger } from '@/utils/core/logger';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { testRunQueue } from '@/config/infrastructure/queues';
 import { env } from '@/config/environment/env';
+import type { DueSchedule } from '@/types/testing.types';
 
 /**
  * Redis key holding the scheduler's last-tick wall-clock (ms).
@@ -101,6 +102,23 @@ export class TestSchedulerJobHandler {
   }
 
   /**
+   * Wait for any in-flight tick to finish (bounded). Call on graceful shutdown
+   * BEFORE process.exit so a deploy landing inside the claim→dispatch window
+   * doesn't abandon a just-claimed (and, for one_time, already-deactivated)
+   * schedule mid-flight — which would lose that run with no record. A hard
+   * kill (SIGKILL/OOM) can still interrupt; this only covers graceful stops.
+   */
+  static async waitForIdle(timeoutMs = 10000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.isRunning && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (this.isRunning) {
+      logger.warn('[TEST_SCHEDULER] waitForIdle timed out with a tick still running');
+    }
+  }
+
+  /**
    * Process all due schedules
    */
   static async processSchedules(): Promise<void> {
@@ -163,15 +181,54 @@ export class TestSchedulerJobHandler {
   /**
    * Execute a single schedule
    */
-  private static async executeSchedule(schedule: {
-    scheduleId: string;
-    projectId: string;
-    userId: string;
-    targetType: 'module' | 'plan';
-    targetId: string;
-    parameters: Record<string, any>;
-  }): Promise<void> {
+  private static async executeSchedule(schedule: DueSchedule): Promise<void> {
     const { targetType, targetId, userId, parameters } = schedule;
+
+    // Guard 1: unrunnable target. Suites have no runSuite() path, and a null
+    // targetId means the row resolved to nothing. Deactivate with the real
+    // reason instead of misrouting to runPlan(undefined) → "not found" →
+    // misleading "target was deleted" self-deactivation.
+    if (targetType === 'suite' || !targetId) {
+      await this.deactivateUnrunnable(
+        schedule,
+        targetType === 'suite'
+          ? 'Scheduling regression suites is not supported. Schedule a plan or module instead.'
+          : 'This schedule has no valid target. It has been disabled.'
+      );
+      return;
+    }
+
+    // Guard 2 (E1): the owner must STILL have access to the target. The schedule
+    // stores user_id and would otherwise run forever as a user who may have lost
+    // access (left the workspace, plan moved, etc.) — silently spending credits.
+    //
+    // CRITICAL: only a DEFINITIVE "no access" (userOwnsTarget → false) deactivates.
+    // A thrown error means we COULDN'T determine access (DB blip, WorkspaceAccess
+    // hiccup) — in that case skip this tick and retry next minute. Do NOT
+    // deactivate: a momentary error must never permanently disable a valid
+    // schedule. next_run_at was already advanced by claimDueSchedule, so the user
+    // misses at most this one occurrence (logged for visibility).
+    let stillOwns: boolean;
+    try {
+      stillOwns = await ScheduleService.userOwnsTarget(userId, {
+        ...(targetType === 'module' ? { moduleId: targetId } : { planId: targetId }),
+      });
+    } catch (accessError) {
+      logger.error('[TEST_SCHEDULER] Owner access check failed (transient) — skipping this tick, NOT deactivating', {
+        scheduleId: schedule.scheduleId,
+        targetType,
+        targetId,
+        error: accessError instanceof Error ? accessError.message : String(accessError),
+      });
+      return;
+    }
+    if (!stillOwns) {
+      await this.deactivateUnrunnable(
+        schedule,
+        'The owner no longer has access to this schedule\'s target. The schedule has been disabled.'
+      );
+      return;
+    }
 
     try {
       switch (targetType) {
@@ -293,12 +350,17 @@ export class TestSchedulerJobHandler {
       }
 
       // ── Branch 3: All other failures ─────────────────────────────────
-      // Network blip, DB error, runner crash. Schedule's next_run_at
-      // was already advanced by claimDueSchedule(), so the user misses
-      // exactly one occurrence. Tell them so they aren't surprised.
+      // Network blip, DB error, runner crash. For a RECURRING schedule,
+      // next_run_at was already advanced by claimDueSchedule(), so the user
+      // misses exactly one occurrence and the next one retries. For a ONE_TIME
+      // schedule, claimDueSchedule() already deactivated it (is_active=false,
+      // next_run_at=null) — there is NO next occurrence, so the run is lost and
+      // the message must NOT promise a retry.
+      const isOneTime = schedule.scheduleType === 'one_time';
       logger.error('[TEST_SCHEDULER] Scheduled run failed', {
         userId,
         scheduleId: schedule.scheduleId,
+        scheduleType: schedule.scheduleType,
         targetType,
         targetId,
         error: errorMessage,
@@ -309,8 +371,10 @@ export class TestSchedulerJobHandler {
           userId,
           type: 'personal',
           category: 'system',
-          title: 'Scheduled run failed',
-          message: `Your scheduled ${targetType} couldn't start: ${errorMessage.slice(0, 200)}. The next scheduled run will try again.`,
+          title: isOneTime ? 'One-time scheduled run failed' : 'Scheduled run failed',
+          message: isOneTime
+            ? `Your one-time scheduled ${targetType} couldn't start: ${errorMessage.slice(0, 200)}. It will NOT retry — please reschedule it.`
+            : `Your scheduled ${targetType} couldn't start: ${errorMessage.slice(0, 200)}. The next scheduled run will try again.`,
           metadata: {
             scheduleId: schedule.scheduleId,
             targetType,
@@ -332,6 +396,54 @@ export class TestSchedulerJobHandler {
       // Re-throw to let the caller (processSchedules loop) record it
       // and continue with the next schedule.
       throw error;
+    }
+  }
+
+  /**
+   * Deactivate a schedule that can never run (unsupported suite target, a row
+   * with no resolvable target, or an owner who lost access) and notify the user
+   * with the real reason. Best-effort: failures here are logged but never
+   * re-thrown — the schedule was already claimed, so the loop should move on.
+   */
+  private static async deactivateUnrunnable(
+    schedule: DueSchedule,
+    message: string
+  ): Promise<void> {
+    logger.warn('[TEST_SCHEDULER] Unrunnable schedule — deactivating', {
+      scheduleId: schedule.scheduleId,
+      targetType: schedule.targetType,
+      targetId: schedule.targetId,
+    });
+
+    try {
+      await ScheduleService.deactivate(schedule.scheduleId, schedule.userId);
+    } catch (deactivateError) {
+      logger.error('[TEST_SCHEDULER] Failed to deactivate unrunnable schedule', {
+        error: deactivateError instanceof Error ? deactivateError.message : String(deactivateError),
+        scheduleId: schedule.scheduleId,
+      });
+    }
+
+    try {
+      await NotificationService.createNotification({
+        userId: schedule.userId,
+        type: 'personal',
+        category: 'system',
+        title: 'Scheduled run disabled',
+        message,
+        metadata: {
+          scheduleId: schedule.scheduleId,
+          targetType: schedule.targetType,
+          targetId: schedule.targetId,
+          projectId: schedule.projectId,
+          dedupeKey: `schedule:${schedule.scheduleId}:unrunnable`,
+        },
+      });
+    } catch (notifError) {
+      logger.error('[TEST_SCHEDULER] Failed to create unrunnable-schedule notification', {
+        error: notifError instanceof Error ? notifError.message : String(notifError),
+        userId: schedule.userId,
+      });
     }
   }
 

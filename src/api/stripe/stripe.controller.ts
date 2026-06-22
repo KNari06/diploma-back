@@ -1,8 +1,8 @@
 import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
+import { EmailService } from '@/services/core/email.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { WorkspaceCreditsService } from '@/services/core/workspace-credits.service';
-import { SUBSCRIPTION_PLANS, WORKSPACE_PLANS } from '@/services/core/token-calculator.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import Stripe from 'stripe';
@@ -351,7 +351,7 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
   // Get user by Stripe customer ID
   const { data: user } = await supabaseAdmin
     .from('users')
-    .select('id')
+    .select('id, email, name')
     .eq('stripe_customer_id', customerId)
     .maybeSingle();
 
@@ -388,10 +388,6 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
     ? new Date(subscription.current_period_end * 1000).toISOString()
     : null;
   const subscriptionPlanLabel = plan?.name || plan?.code || 'pro';
-  const latestInvoiceId =
-    typeof subscription.latest_invoice === 'string'
-      ? subscription.latest_invoice
-      : subscription.latest_invoice?.id || null;
 
   // Upsert subscription record
   const subscriptionData: Record<string, any> = {
@@ -432,7 +428,10 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
           status: 'inactive',
           credits_included: 0,
         },
-    last_credits_invoice_id: latestInvoiceId,
+    // Intentionally does NOT write last_credits_invoice_id: that field belongs to
+    // the invoice-payment handler's bookkeeping, and this handler never grants
+    // credits. Writing it here previously could falsely mark an invoice as
+    // "already credited" before the grant ran.
     updated_at: new Date().toISOString(),
   };
 
@@ -504,6 +503,42 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
     });
     // Don't throw - notification failure shouldn't break webhook processing
   }
+
+  // Branded "plan canceled" email — fire-and-forget, only for a GENUINE
+  // cancellation: a hard delete, or an updated event whose status is actually
+  // 'canceled'. We deliberately do NOT email on transient inactive states
+  // (past_due / unpaid / paused / incomplete_expired) — those are dunning, not
+  // a cancellation, and the payment-failed handler covers them. Stripe's
+  // notification block above is in-app only.
+  const wasCanceled =
+    event.type === 'customer.subscription.deleted' ||
+    (event.type === 'customer.subscription.updated' && subscription.status === 'canceled');
+  // Only surface an end date that's still in the future (a hard delete often
+  // carries a past current_period_end → "access until <past date>" reads wrong).
+  const endsOn = currentPeriodEnd && new Date(currentPeriodEnd) > new Date() ? currentPeriodEnd : null;
+  if (user.email && wasCanceled) {
+    EmailService.sendSubscriptionCanceledEmail({
+      recipientEmail: user.email,
+      recipientName: user.name || undefined,
+      planName: subscriptionPlanLabel,
+      endsOn,
+      frontendUrl: env.FRONTEND_URL || 'http://localhost:3000',
+    })
+      .then((result) => {
+        if (!result.success) {
+          logger.error('[STRIPE_WEBHOOK] Cancellation email not sent', {
+            userId: user.id,
+            error: result.error,
+          });
+        }
+      })
+      .catch((err) =>
+        logger.error('[STRIPE_WEBHOOK] Failed to send cancellation email', {
+          userId: user.id,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      );
+  }
 }
 
 async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void> {
@@ -524,7 +559,7 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
 
   const { data: user } = await supabaseAdmin
     .from('users')
-    .select('id, last_credits_invoice_id, stripe_price_id')
+    .select('id, email, name, last_credits_invoice_id, stripe_price_id')
     .eq('stripe_customer_id', customerId)
     .maybeSingle();
 
@@ -533,42 +568,11 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     return;
   }
 
-  const { data: existingTransaction, error: existingTransactionError } = await supabaseAdmin
-    .from('stripe_transactions')
-    .select('id')
-    .or(`stripe_invoice_id.eq.${invoice.id},stripe_event_id.eq.${event.id}`)
-    .maybeSingle();
-
-  if (existingTransactionError) {
-    logger.error('[STRIPE_WEBHOOK] Failed to check transaction duplicate', {
-      invoiceId: invoice.id,
-      eventId: event.id,
-      error: existingTransactionError.message,
-    });
-  }
-
-  if (existingTransaction) {
-    logger.info('[STRIPE_WEBHOOK] Duplicate transaction ignored', {
-      invoiceId: invoice.id,
-      eventId: event.id,
-      userId: user.id,
-    });
-    return;
-  }
-
-  if (user.last_credits_invoice_id === invoice.id) {
-    logger.info('[STRIPE_WEBHOOK] Invoice already processed', {
-      userId: user.id,
-      invoiceId: invoice.id,
-    });
-    return;
-  }
-
-  let priceId =
-    invoice.lines?.data?.[0]?.price?.id ||
-    // @ts-ignore
-    invoice.lines?.data?.[0]?.pricing?.price_details?.price?.id ||
-    null;
+  // NOTE: idempotency is enforced solely by the stripe_transactions
+  // UNIQUE(stripe_invoice_id) barrier + credits_granted flag below. We do NOT
+  // gate on user.last_credits_invoice_id here: that field is also written by the
+  // subscription-event handler (which never grants credits), so a same-invoice
+  // subscription event arriving first could falsely short-circuit the grant.
 
   const subscriptionId =
     typeof invoice.subscription === 'string'
@@ -578,17 +582,25 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
         invoice.parent?.subscription_details?.subscription ||
         null;
 
-  if (!priceId && subscriptionId) {
-    if (!stripe) {
-      logger.error('[STRIPE_WEBHOOK] Stripe not configured');
-      return;
-    }
+  // Resolve the priceId that determines which plan's credits to grant.
+  // Order matters for correctness, NOT just for null-filling:
+  // 1) For a subscription invoice, the SUBSCRIPTION's current item price is
+  //    authoritative. invoice.lines.data[0] is unreliable — on a plan change /
+  //    proration the invoice carries multiple lines (an unused-time credit line
+  //    for the old price + a remaining-time line for the new price) and Stripe
+  //    does not guarantee the line you want is index [0]. Trusting [0] can grant
+  //    the WRONG tier's credits.
+  // 2) Only for a one-off (no subscription) do we read invoice lines, and even
+  //    then we skip proration/credit/$0 lines.
+  // 3) Last resort: the user's stored price id.
+  let priceId: string | null = null;
 
+  if (subscriptionId && stripe) {
     try {
       const subscription = await stripe.subscriptions.retrieve(subscriptionId, {
         expand: ['items.data.price'],
       });
-      priceId = subscription.items?.data?.[0]?.price?.id;
+      priceId = subscription.items?.data?.[0]?.price?.id ?? null;
     } catch (error) {
       logger.error('[STRIPE_WEBHOOK] Failed to fetch subscription for price', {
         subscriptionId,
@@ -596,6 +608,26 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
       });
     }
   }
+
+  if (!priceId) {
+    const lines = invoice.lines?.data ?? [];
+    const lineprice = (l: any) => l?.price?.id || l?.pricing?.price_details?.price?.id || null;
+    // Prefer a positive-amount, non-proration line; fall back progressively.
+    const chosen =
+      lines.find((l: any) => (l.amount ?? 0) > 0 && !l.proration && lineprice(l)) ||
+      lines.find((l: any) => (l.amount ?? 0) > 0 && lineprice(l)) ||
+      lines[0];
+    priceId = chosen ? lineprice(chosen) : null;
+
+    if (lines.length > 1) {
+      logger.info('[STRIPE_WEBHOOK] Multi-line invoice — chosen priceId for grant', {
+        invoiceId: invoice.id,
+        chosenPriceId: priceId,
+        candidates: lines.map((l: any) => ({ price: lineprice(l), amount: l.amount, proration: l.proration })),
+      });
+    }
+  }
+
   if (!priceId && user.stripe_price_id) {
     priceId = user.stripe_price_id;
   }
@@ -608,13 +640,42 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
         .maybeSingle()
     : { data: null };
 
+  // plans-desync guard: a PAID invoice whose price has no matching plans row
+  // means the plans table is out of sync with Stripe (new/rotated price, or an
+  // un-replaced placeholder price id). The old code only warned and continued —
+  // which recorded the transaction as 'succeeded' and granted ZERO credits, and
+  // because the barrier row was then committed, no retry could ever heal it.
+  // THROW here (BEFORE the transaction INSERT below) so Stripe retries with
+  // backoff (~3 days), giving an operator time to seed/fix the plans row so a
+  // later retry grants correctly — and crucially no 'succeeded' row is recorded.
+  if (priceId && !plan && (invoice.amount_paid ?? 0) > 0) {
+    logger.error('[STRIPE_WEBHOOK] Paid invoice for unknown price — plans table desync; failing for retry', {
+      priceId,
+      invoiceId: invoice.id,
+      userId: user.id,
+      eventId: event.id,
+      amountPaid: invoice.amount_paid,
+    });
+    throw new Error(`No plan row for paid Stripe price ${priceId} (invoice ${invoice.id})`);
+  }
   if (!plan && priceId) {
-    logger.warn('[STRIPE_WEBHOOK] Plan not found for price', { priceId });
+    // Non-paid (e.g. $0/trial) invoice with no plan — log but don't hard-fail.
+    logger.warn('[STRIPE_WEBHOOK] Plan not found for price (non-paid invoice)', { priceId, invoiceId: invoice.id });
   }
 
   const creditsPerPeriod = plan?.credits_per_period || 0;
   const planCode = plan?.code || 'unknown';
   const subscriptionPlanLabel = plan?.name || plan?.code || 'pro';
+
+  // B2B plans are credited at the WORKSPACE level (renewPlan/upgradeToPlan below),
+  // not as personal user credits. Today B2B plans carry credits_per_period=0 so
+  // the personal-credit block is naturally skipped, but guard explicitly so a
+  // future B2B plan with credits_per_period>0 can't double-grant (personal + workspace).
+  const isBusinessPlanCode = ['business', 'Business', 'small_business', 'middle_business', 'enterprise'].includes(planCode);
+
+  // A recurring renewal must RESET credits to the period allotment, not stack
+  // them. The first charge / upgrade adds; every `subscription_cycle` resets.
+  const billingReason = (invoice as Stripe.Invoice).billing_reason;
 
   const transactionData: Record<string, any> = {
     user_id: user.id,
@@ -637,54 +698,94 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
       : new Date().toISOString(),
   };
 
+  // Idempotency lock: INSERT (not upsert) the transaction row BEFORE granting
+  // any credits. The unique constraint on stripe_invoice_id makes this the
+  // atomic barrier — only the FIRST delivery of an invoice inserts a row; a
+  // concurrent retry hits a 23505 unique violation and bows out WITHOUT
+  // granting. (The old code did a separate SELECT-then-act check and granted
+  // before the upsert, so two concurrent retries could both pass the check and
+  // double-grant.)
+  // Insert the barrier row with credits_granted=false. The row existing is NOT
+  // proof credits landed; credits_granted is the real "delivered" flag so a
+  // failed/crashed grant self-heals on Stripe's retry instead of being swallowed.
   const { error: transactionError } = await supabaseAdmin
     .from('stripe_transactions')
-    .upsert(transactionData, { onConflict: 'stripe_invoice_id' });
+    .insert({ ...transactionData, credits_granted: false });
 
   if (transactionError) {
-    logger.error('[STRIPE_WEBHOOK] Failed to save transaction', {
-      invoiceId: invoice.id,
-      userId: user.id,
-      error: transactionError.message,
-    });
-  } else {
-    logger.info('[STRIPE_WEBHOOK] Transaction saved', {
-      invoiceId: invoice.id,
-      userId: user.id,
-      amount: transactionData.amount,
-      currency: transactionData.currency,
-    });
+    if (transactionError.code === '23505') {
+      // A row already exists for this invoice. If its grant already completed,
+      // this is a true duplicate. If not, fall through and re-attempt the grant
+      // (recovers a prior transient failure or crash between INSERT and grant).
+      const { data: existing } = await supabaseAdmin
+        .from('stripe_transactions')
+        .select('credits_granted')
+        .eq('stripe_invoice_id', invoice.id)
+        .maybeSingle();
+
+      if (existing?.credits_granted) {
+        logger.info('[STRIPE_WEBHOOK] Duplicate invoice ignored (credits already granted)', {
+          invoiceId: invoice.id,
+          eventId: event.id,
+          userId: user.id,
+        });
+        return;
+      }
+      logger.warn('[STRIPE_WEBHOOK] Invoice row exists but credits not granted — re-attempting', {
+        invoiceId: invoice.id,
+        userId: user.id,
+      });
+      // fall through to grant
+    } else {
+      // Could not record the transaction — throw so Stripe retries the whole event.
+      logger.error('[STRIPE_WEBHOOK] Failed to record transaction', {
+        invoiceId: invoice.id,
+        userId: user.id,
+        error: transactionError.message,
+      });
+      throw new Error(`Failed to record stripe transaction for invoice ${invoice.id}`);
+    }
   }
 
-  if (creditsPerPeriod > 0) {
-    logger.info('[STRIPE_WEBHOOK] Adding credits on invoice payment', {
+  // First charge / one-off ADDS the allotment; a recurring/period event RESETS
+  // to the allotment (no rollover). subscription_update (proration / mid-period
+  // plan change) is a period event too — reset, NOT a second full add.
+  const isPeriodReset =
+    billingReason === 'subscription_cycle' || billingReason === 'subscription_update';
+
+  if (creditsPerPeriod > 0 && !isBusinessPlanCode) {
+    const result = isPeriodReset
+      ? await UserCreditsService.resetToPlanCredits(
+          user.id,
+          creditsPerPeriod,
+          `Subscription renewal - ${planCode} plan`,
+          { invoice_id: invoice.id, event_type: event.type }
+        )
+      : await UserCreditsService.addCredits(
+          user.id,
+          creditsPerPeriod,
+          'purchase',
+          `Subscription payment - ${planCode} plan`,
+          { invoice_id: invoice.id, event_type: event.type }
+        );
+
+    // On failure THROW so handleWebhook returns 500 and Stripe retries; the
+    // credits_granted flag stays false so the retry re-attempts (not swallowed).
+    if (!result.success) {
+      logger.error('[STRIPE_WEBHOOK] Credit grant failed — throwing for Stripe retry', {
+        userId: user.id,
+        credits: creditsPerPeriod,
+        invoiceId: invoice.id,
+      });
+      throw new Error(`Credit grant failed for invoice ${invoice.id}`);
+    }
+    logger.info('[STRIPE_WEBHOOK] Credits granted', {
       userId: user.id,
       credits: creditsPerPeriod,
+      newBalance: result.newBalance,
       invoiceId: invoice.id,
+      mode: isPeriodReset ? 'reset' : 'add',
     });
-
-    const result = await UserCreditsService.addCredits(
-      user.id,
-      creditsPerPeriod,
-      'purchase',
-      `Subscription payment - ${planCode} plan`,
-      { invoice_id: invoice.id, event_type: event.type }
-    );
-
-    if (result.success) {
-      logger.info('[STRIPE_WEBHOOK] Credits added after invoice payment', {
-        userId: user.id,
-        credits: creditsPerPeriod,
-        newBalance: result.newBalance,
-        invoiceId: invoice.id,
-      });
-    } else {
-      logger.error('[STRIPE_WEBHOOK] Failed to add credits', {
-        userId: user.id,
-        credits: creditsPerPeriod,
-        invoiceId: invoice.id,
-      });
-    }
   }
 
   // V16: Provision workspace credits for B2B plans.
@@ -704,55 +805,59 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
   const isBusinessPlan = !!workspacePlanSlug;
 
   if (isBusinessPlan) {
-    try {
-      // Find the workspace where this user is the owner
-      const { data: ownerMembership } = await supabaseAdmin
-        .from('workspace_members')
-        .select('workspace_id')
-        .eq('user_id', user.id)
-        .eq('role', 'owner')
-        .eq('status', 'active')
-        .maybeSingle();
+    // Resolve the owner workspace. A paid B2B invoice MUST land workspace
+    // credits — if we can't, THROW so Stripe retries (workspace may provision
+    // moments later) rather than finalizing a paid invoice with zero credits.
+    const { data: ownerMembership } = await supabaseAdmin
+      .from('workspace_members')
+      .select('workspace_id')
+      .eq('user_id', user.id)
+      .eq('role', 'owner')
+      .eq('status', 'active')
+      .maybeSingle();
 
-      if (ownerMembership) {
-        const workspaceId = ownerMembership.workspace_id;
-
-        const result = await WorkspaceCreditsService.upgradeToPlan(workspaceId, workspacePlanSlug);
-
-        if (result) {
-          logger.info('[STRIPE_WEBHOOK] B2B workspace plan provisioned via upgradeToPlan', {
-            workspaceId,
-            userId: user.id,
-            plan: workspacePlanSlug,
-            credits: result.credits_balance,
-            graceLimit: result.grace_limit,
-            invoiceId: invoice.id,
-          });
-        } else {
-          logger.error('[STRIPE_WEBHOOK] upgradeToPlan returned null', {
-            workspaceId,
-            userId: user.id,
-            plan: workspacePlanSlug,
-            invoiceId: invoice.id,
-          });
-        }
-      } else {
-        logger.warn('[STRIPE_WEBHOOK] No owned workspace found for B2B plan user', {
-          userId: user.id,
-          plan: workspacePlanSlug,
-          invoiceId: invoice.id,
-        });
-      }
-    } catch (wsError) {
-      logger.error('[STRIPE_WEBHOOK] Exception provisioning B2B workspace credits', {
-        error: wsError instanceof Error ? wsError.message : String(wsError),
+    if (!ownerMembership) {
+      logger.error('[STRIPE_WEBHOOK] No owned workspace for paid B2B invoice — throwing for retry', {
         userId: user.id,
         plan: workspacePlanSlug,
         invoiceId: invoice.id,
       });
-      // Don't fail the webhook - user credits were already handled
+      throw new Error(`No owned workspace for B2B invoice ${invoice.id}`);
     }
+
+    const workspaceId = ownerMembership.workspace_id;
+    // First charge / upgrade ADDS; a recurring/period event RESETS to allotment.
+    const result = isPeriodReset
+      ? await WorkspaceCreditsService.renewPlan(workspaceId, workspacePlanSlug)
+      : await WorkspaceCreditsService.upgradeToPlan(workspaceId, workspacePlanSlug);
+
+    if (!result) {
+      logger.error('[STRIPE_WEBHOOK] B2B workspace grant failed — throwing for Stripe retry', {
+        workspaceId,
+        userId: user.id,
+        plan: workspacePlanSlug,
+        invoiceId: invoice.id,
+      });
+      throw new Error(`B2B workspace grant failed for invoice ${invoice.id}`);
+    }
+
+    logger.info('[STRIPE_WEBHOOK] B2B workspace plan provisioned', {
+      workspaceId,
+      userId: user.id,
+      plan: workspacePlanSlug,
+      mode: isPeriodReset ? 'renew' : 'upgrade',
+      credits: result.credits_balance,
+      graceLimit: result.grace_limit,
+      invoiceId: invoice.id,
+    });
   }
+
+  // Grant succeeded (or nothing to grant). Flip the barrier row to granted so a
+  // future duplicate delivery short-circuits, and only THEN finalize plan state.
+  await supabaseAdmin
+    .from('stripe_transactions')
+    .update({ credits_granted: true })
+    .eq('stripe_invoice_id', invoice.id);
 
   const userUpdateData: Record<string, any> = {
     last_credits_invoice_id: invoice.id,
@@ -775,6 +880,42 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
   }
 
   await supabaseAdmin.from('users').update(userUpdateData).eq('id', user.id);
+
+  // Branded purchase confirmation — fire-and-forget so a mail failure never
+  // breaks webhook processing (Stripe still sends its own receipt).
+  // Only on the FIRST charge of a subscription (`subscription_create`) or a
+  // one-off (`manual`/`subscription_update`) — NOT on monthly renewals
+  // (`subscription_cycle`), which would spam "Payment confirmed" every cycle.
+  // Stripe still sends its own receipt for every charge.
+  const isFirstOrOneOff =
+    !billingReason || billingReason === 'subscription_create' || billingReason === 'manual' || billingReason === 'subscription_update';
+  if (user.email && isFirstOrOneOff) {
+    EmailService.sendPlanPurchasedEmail({
+      recipientEmail: user.email,
+      recipientName: user.name || undefined,
+      planName: subscriptionPlanLabel,
+      amountCents: transactionData.amount,
+      currency: transactionData.currency,
+      creditsIncluded: creditsPerPeriod || undefined,
+      frontendUrl: env.FRONTEND_URL || 'http://localhost:3000',
+    })
+      .then((result) => {
+        if (!result.success) {
+          logger.error('[STRIPE_WEBHOOK] Purchase email not sent', {
+            userId: user.id,
+            invoiceId: invoice.id,
+            error: result.error,
+          });
+        }
+      })
+      .catch((err) =>
+        logger.error('[STRIPE_WEBHOOK] Failed to send purchase email', {
+          userId: user.id,
+          invoiceId: invoice.id,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      );
+  }
 }
 
 async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {
@@ -794,7 +935,7 @@ async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {
 
   const { data: user } = await supabaseAdmin
     .from('users')
-    .select('id')
+    .select('id, email, name')
     .eq('stripe_customer_id', customerId)
     .maybeSingle();
 
@@ -862,6 +1003,38 @@ async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {
       invoiceId: invoice.id,
     });
     // Don't throw - notification failure shouldn't break webhook processing
+  }
+
+  // Branded payment-failed email — fire-and-forget (the in-app notification
+  // above is separate). Stripe retries a failed invoice several times and
+  // fires invoice.payment_failed on EACH attempt; only email on the FINAL
+  // failure (next_payment_attempt === null) so the user gets one email per
+  // invoice, not one per retry. Stripe also runs its own dunning if configured.
+  const isFinalAttempt = invoice.next_payment_attempt == null;
+  if (user.email && isFinalAttempt) {
+    EmailService.sendPaymentFailedEmail({
+      recipientEmail: user.email,
+      recipientName: user.name || undefined,
+      amountCents: invoice.amount_due || 0,
+      currency: invoice.currency || 'usd',
+      frontendUrl: env.FRONTEND_URL || 'http://localhost:3000',
+    })
+      .then((result) => {
+        if (!result.success) {
+          logger.error('[STRIPE_WEBHOOK] Payment failed email not sent', {
+            userId: user.id,
+            invoiceId: invoice.id,
+            error: result.error,
+          });
+        }
+      })
+      .catch((err) =>
+        logger.error('[STRIPE_WEBHOOK] Failed to send payment failed email', {
+          userId: user.id,
+          invoiceId: invoice.id,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      );
   }
 }
 

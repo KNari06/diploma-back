@@ -22,6 +22,8 @@ import {
 } from '@/services/mobile/mobile-idle.service';
 import { cancelIdle as cancelPreviewIdle } from '@/services/testing/ui/preview/preview-idle.service';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
+import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
 
@@ -54,6 +56,27 @@ async function performDisconnectCleanup(userId: string): Promise<void> {
               sessionId: sid,
               error: err instanceof Error ? err.message : String(err),
             });
+          }
+          // Close + upload the mobile editor trace, same as the explicit
+          // DELETE /sessions/:id path and the web editor's recording:stop.
+          // Without this, a browser-close teardown left the trace writer
+          // open and the file never reached Supabase. Dev mode keeps the
+          // file local (uploadEditorTrace skips the upload).
+          try {
+            const meta = await EditorTraceService.close(`mobile-${sid}`);
+            if (meta) {
+              uploadEditorTrace({
+                filePath: meta.filePath,
+                userId: meta.userId,
+                previewSessionId: `mobile-${sid}`,
+                traceType: 'editor',
+              }).catch((err) => logger.error('[WebSocket] Editor trace upload failed on cleanup', {
+                sessionId: sid,
+                error: err instanceof Error ? err.message : String(err),
+              }));
+            }
+          } catch {
+            // Trace close is best-effort — never block cleanup on it.
           }
         }),
       );

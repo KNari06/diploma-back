@@ -26,17 +26,25 @@ import { Job } from 'bullmq';
 import type { MobileTestJobData, MobileRunStepsResponse, MobileIntentStep } from '@/services/mobile/mobile-runner.types';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
+import { sanitizeMobileAppPackageSteps } from '@/services/testing/regression/intent-step-dispatch.service';
+import { describeDeviceError, type DeviceFailureCategory } from '@/services/testing/regression/device-error-catalog';
 import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
 import { env } from '@/config/environment/env';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { MOBILE_STEP_CREDIT_MULTIPLIER } from '@/services/core/token-calculator.service';
+import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
+import { uploadMobileStepScreenshots, processAndUploadStepScreenshot, decodeBase64Screenshot } from '@/services/storage/step-screenshot.service';
 // Phase 2 (May 2026) telemetry helpers. Kept in a side-effect-free
 // module so unit tests can exercise them without booting supabase/BullMQ.
 import { sumStepDurations } from './helpers/telemetry';
 import { classifyStepResults } from '@/utils/testing/step-result-classifier';
 import { CompiledPlanPersistenceService } from '@/services/testing/ui/preview/compiled-plan-persistence.service';
 import { MobileSessionAcquisitionService } from '@/services/mobile/session-acquisition.service';
+import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
+import type { TestStepCompletedPayload } from '@/websocket/types/types';
 import { FastAuthOrchestratorService } from '@/services/mobile/fast-auth-orchestrator.service';
 
 // ============================================================================
@@ -121,6 +129,10 @@ export class MobileTestRunJobHandler {
       // Track 5 (shared resources): raw bindings only — the worker
       // compiles them on its own so plaintext secrets never land in Redis.
       resourceBindings,
+      // User-defined event→action rules — forwarded verbatim to the runner
+      // in the run-steps call below (matched before the built-in permission
+      // policy).
+      triggers,
       // `intent_test_cases.id`. Required for `persistCompiledPlansFromRun`
       // to find the test case row and merge per-step compiled plans back
       // into `intent_test_cases.steps_json`. Pre-fix the worker passed
@@ -268,8 +280,16 @@ export class MobileTestRunJobHandler {
       client.setGeminiApiKey(geminiApiKey);
     }
 
+    // Flutter runs as a NATIVE android session that we upgrade via
+    // `attachFlutter` after install+launch. The runner's direct
+    // createSession('flutter') probes the VM Service before the app is
+    // installed (chicken-and-egg → always fails), and the pool only warms
+    // android, so we acquire 'android' here and attach below.
+    const isFlutter = platform === 'flutter';
+    const acquirePlatform = isFlutter ? 'android' : platform;
+
     let sessionId: string | null = null;
-    let sessionSource: 'pool' | 'warmup' | 'cold' = 'cold';
+    let sessionSource: 'pool' | 'warmup' | 'cold' | 'dedicated' = 'cold';
     // Fast-auth: filled from compileResult.fastAuthRestores. Each entry is a
     // snapshot the worker will restore via runner HTTP between Phase 3b
     // (prepApp) and Phase 4 (runSteps). Empty array (not undefined) so the
@@ -393,9 +413,10 @@ export class MobileTestRunJobHandler {
       const sessionAcq = await MobileSessionAcquisitionService.acquireSession({
         client,
         testId,
-        platform,
+        platform: acquirePlatform,
         browser,
         userId,
+        workspaceId,
         projectId,
         chatSessionId,
       });
@@ -508,15 +529,15 @@ export class MobileTestRunJobHandler {
             appPackage,
             appStoragePathOverride: appStoragePath,
             appOriginalNameOverride: appOriginalName,
+            // Flutter: install only — attachFlutter (below) clears logcat
+            // and launches so the VM Service log line is in the scan window.
+            skipLaunch: isFlutter,
             onProgress: (stage, _progress) => {
               switch (stage) {
-                case 'launching_browser':
-                  emitInstallStep(`Preparing app on ${platform} runner…`, 13);
-                  break;
-                case 'loading_page':
+                case 'installing_app':
                   emitInstallStep(`Downloading + installing app binary…`, 15);
                   break;
-                case 'extracting_elements':
+                case 'launching_app':
                   emitInstallStep(`Launching ${appPackage}…`, 17);
                   break;
                 default:
@@ -554,6 +575,21 @@ export class MobileTestRunJobHandler {
         if (!fastAuthResult.fastAuthUsed) {
           tlm.fastAuthFallbackReason = fastAuthResult.fastAuthFallbackReason;
         }
+      }
+
+      // ── Phase 3d: Flutter attach ──────────────────────────────
+      // Upgrade the native android session into a Flutter session: launch
+      // the app (now that install + fast-auth restore are done), detect the
+      // Dart VM Service, and connect. FATAL — a Flutter test can't run
+      // without the driver connection. Throwing here routes into the outer
+      // catch, which marks the test failed with the runner's message
+      // (e.g. FLUTTER_NOT_DETECTED when the build isn't debug/profile).
+      if (isFlutter && sessionId) {
+        if (!appPackage) {
+          throw new Error('Flutter test has no resolved package name — cannot attach the Dart VM Service.');
+        }
+        await client.attachFlutter(sessionId, { packageName: appPackage }, { userId });
+        logger.info('[MOBILE-TEST] Flutter session attached', { testId, sessionId, appPackage });
       }
 
 
@@ -602,11 +638,23 @@ export class MobileTestRunJobHandler {
       // Don't keep the worker process alive just for this timer.
       cancelPoller.unref?.();
 
+      // open_app/close_app: rewrite stale display labels (e.g. "ANDROID") to
+      // the resolved package so the runner acts on the app under test instead
+      // of failing on a non-existent package. Done here, at the single mobile
+      // job consumer, so every dispatch path (regression/CI/chat/preview) is
+      // covered in one place. Runs after resource-step compilation so injected
+      // setup steps are normalised too. Empty `appPackage` → blank value →
+      // runner falls back to session.packageName.
+      sanitizeMobileAppPackageSteps(intentSteps, appPackage);
+
       let runResult: MobileRunStepsResponse;
       try {
         runResult = await client.runSteps(sessionId, intentSteps, {
           screenshotEachStep: true,
           metadata,
+          // Forward the test's user-defined triggers verbatim (no-op when
+          // undefined/empty — the client drops the field from the body).
+          triggers,
           signal: runStepsAbort.signal,
           userId,
         });
@@ -655,6 +703,40 @@ export class MobileTestRunJobHandler {
         telemetryTestStepsMs: tlm.testStepsMs,
         telemetrySessionClaimMs: tlm.sessionClaimMs,
       });
+
+      // ── Billing: charge mobile steps at the mobile multiplier ─────────
+      // A mobile run never went through the per-step web billing path
+      // (test-executor); it runs as a batch RPC to the runner. Charge here,
+      // once, for the user-authored test steps (the scenario_setup prefix —
+      // logins etc. — is excluded). Mobile steps cost MOBILE_STEP_CREDIT_
+      // MULTIPLIER× a web step (emulator COGS). Best-effort: a failed
+      // deduction must never fail the run the user already received.
+      if (userId) {
+        const billableSteps = Math.max(
+          0,
+          (runResult.steps?.length ?? 0) - (tlm.scenarioStepCount ?? 0),
+        );
+        const mobileCredits = billableSteps * MOBILE_STEP_CREDIT_MULTIPLIER;
+        if (mobileCredits > 0) {
+          try {
+            await CreditCostTrackerService.deductCreditsForTest({
+              userId,
+              testType: 'intelligent',
+              credits: mobileCredits,
+              costUSD: 0,
+              testId,
+              description: `Mobile run — ${billableSteps} steps × ${MOBILE_STEP_CREDIT_MULTIPLIER}`,
+            });
+          } catch (creditError) {
+            logger.warn('[MOBILE-TEST] Credit deduction failed (non-critical)', {
+              testId,
+              userId,
+              billableSteps,
+              error: creditError instanceof Error ? creditError.message : String(creditError),
+            });
+          }
+        }
+      }
 
       // ── Diagnostic: aborted/timed-out steps ──────────────────────────
       // The runner pushes per-step results with `error: 'Client aborted'`
@@ -730,6 +812,47 @@ export class MobileTestRunJobHandler {
         });
       }
 
+      // Per-step screenshots come back from the runner as base64. Upload them
+      // to the artifacts bucket and replace each step's `screenshot` with the
+      // resulting URL — so the DB stores light URLs (not base64 blobs) and the
+      // report's Screenshots tab can render them. Mutates runResult.steps in
+      // place so both the Redis append below and createTestResult see URLs.
+      if (ScreenshotCaptureFeature.isEnabled()) {
+        await uploadMobileStepScreenshots(runResult.steps, testId, userId);
+        // "Step 0" initial screenshot — the starting screen before any step
+        // ran. Uploaded base64→URL (stepIndex 0) so the report can show it
+        // alongside the per-step shots. Best-effort: never fail the test path.
+        if (typeof runResult.initialScreenshot === 'string' && runResult.initialScreenshot) {
+          const shot = runResult.initialScreenshot;
+          if (shot.startsWith('http://') || shot.startsWith('https://')) {
+            // Already a URL (defensive) — keep as-is.
+          } else {
+            try {
+              const { buffer, sourceExt } = decodeBase64Screenshot(shot);
+              runResult.initialScreenshot = await processAndUploadStepScreenshot(
+                buffer,
+                sourceExt,
+                { testId, userId: userId || 'anonymous', stepIndex: 0, isFailure: false, ts: Date.now() },
+              );
+            } catch (err) {
+              logger.debug('[MOBILE-TEST] initial (step 0) screenshot upload failed (non-fatal)', {
+                testId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+              runResult.initialScreenshot = undefined;
+            }
+          }
+        }
+      }
+
+      // Human-readable step labels: the runner returns per-step results keyed
+      // by `stepId`, but only the original `intentSteps` carry the authored
+      // `description` ("Click Login button", "Email input"). Map id → description
+      // so the WS event below shows a meaningful name instead of the raw UUID.
+      const stepDescriptionById = new Map(
+        intentSteps.map((s) => [s.id, s.description]),
+      );
+
       // Emit step-level progress
       for (let i = 0; i < runResult.steps.length; i++) {
         const stepResult = runResult.steps[i];
@@ -762,11 +885,15 @@ export class MobileTestRunJobHandler {
               : isSoftFailure
                 ? 'soft-failed'
                 : 'failed';
-          webSocketService.emitTestStepCompleted(testId, {
+          // Persist to the Redis buffer in-process (the worker owns step
+          // persistence), then broadcast. The job's finally drains this buffer
+          // via finalizeToDb — no cross-process append round-trip.
+          const mobileStepEvent: TestStepCompletedPayload = {
             testId,
             browser,
             step: i + 1,
-            stepDescription: `Step: ${stepResult.stepId}`,
+            stepDescription:
+              stepDescriptionById.get(stepResult.stepId) || `Step: ${stepResult.stepId}`,
             // For soft-fails the per-step result remains `success: false`
             // (the action did fail), but the UI should not flag it as a
             // failure — `softFailure: true` on runtimeMeta is the signal
@@ -793,8 +920,16 @@ export class MobileTestRunJobHandler {
               ...(stepResult.warnings && stepResult.warnings.length > 0
                 ? { warnings: stepResult.warnings }
                 : {}),
+              // After uploadMobileStepScreenshots, `screenshot` is a URL (or absent).
+              // Surface it so the report assembler picks it up uniformly with
+              // the web path. Guard on http to never leak a base64 blob here.
+              ...(typeof stepResult.screenshot === 'string' && stepResult.screenshot.startsWith('http')
+                ? { stepScreenshotUrl: stepResult.screenshot }
+                : {}),
             },
-          });
+          };
+          await TestExecutedStepsRedisService.appendStepCompleted(testId, mobileStepEvent);
+          webSocketService.emitTestStepCompleted(testId, mobileStepEvent);
         } catch { /* non-fatal */ }
       }
 
@@ -1018,7 +1153,18 @@ export class MobileTestRunJobHandler {
       const retryableError = error instanceof MobileRunnerError
         ? error.statusCode === undefined || error.statusCode === 0 || error.statusCode >= 500 || error.statusCode === 429
         : true;
-      if (retryableError && shouldRetry(error, retryCount, MAX_MOBILE_RETRIES)) {
+      // The retry works by re-throwing so BullMQ re-runs the job — which only
+      // happens when the queue is configured with >1 attempt. The
+      // mobile-test-run queue is attempts=1 (queues.ts: "No auto-retry — mobile
+      // runner handles step-level failures"), so a re-throw here would just
+      // kill the job WITHOUT running the failure-persistence branch below
+      // (createFailedJobTestResult + finalizeAnalyticsLinkage). The run would
+      // then be finalized by the abandoned-test reaper with NO failureReason /
+      // env marker — a bare "no steps" card that also counts toward flaky.
+      // Only re-throw when BullMQ has a spare attempt; otherwise fall through to
+      // terminal failure handling (same path non-retryable errors already take).
+      const bullmqWillRetry = (job.opts?.attempts ?? 1) > 1;
+      if (retryableError && bullmqWillRetry && shouldRetry(error, retryCount, MAX_MOBILE_RETRIES)) {
         const delay = calculateRetryDelay(retryCount);
         logger.info('[MOBILE-TEST] Retrying job', {
           testId,
@@ -1030,11 +1176,9 @@ export class MobileTestRunJobHandler {
         try {
           await job.updateData({ ...job.data, retryCount: retryCount + 1 });
         } catch { /* non-fatal — counter increment failed but BullMQ retry still runs */ }
-        // Re-throw triggers BullMQ retry (the queue is configured with
-        // exponential backoff and finite attempts elsewhere in
-        // QueueManager). Doing the rethrow BEFORE the failure-state DB
-        // writes is important — those writes are for the FINAL failure
-        // path, not transient retries.
+        // Re-throw triggers BullMQ retry. Doing the rethrow BEFORE the
+        // failure-state DB writes is important — those writes are for the FINAL
+        // failure path, not transient retries.
         throw new Error(`Mobile test retry ${retryCount + 1}/${MAX_MOBILE_RETRIES}: ${errorMessage}`);
       }
 
@@ -1057,12 +1201,18 @@ export class MobileTestRunJobHandler {
         workspaceId,
       );
 
-      // Same finalizer as the success path, different outcome.
+      // Same finalizer as the success path, different outcome. For environment
+      // failures (device attach / session setup — the test never ran) we also
+      // stamp a marker on the execution row so flaky / fail-rate math can
+      // exclude it as infrastructure noise, not a test outcome.
       await MobileTestRunJobHandler.finalizeAnalyticsLinkage({
         analyticsExecutionId,
         intelligentSessionId,
         passed: false,
         errorMessage,
+        failureTestId: testId,
+        failureCode: errorCode,
+        failureCategory: describeDeviceError(errorCode).category,
       });
 
       // Persist snapshot even on job-level failure (session couldn't
@@ -1139,12 +1289,32 @@ export class MobileTestRunJobHandler {
         await MobileTestRunJobHandler.persistTelemetrySnapshot(testId, tlm);
       }
 
-      // ── Cleanup: release pooled session or destroy adhoc/warmed ──
+      // ── Persist executed steps from Redis → tests.executed_steps ──
+      // The worker owns the completed run, so it drains its own step buffer
+      // here rather than relying on the main API process reacting to the
+      // pub/sub `test:completed` event (that reactive finalize never runs
+      // when the API process isn't subscribed, stranding steps in Redis and
+      // leaving the run report with no step timeline). Mobile emits per-step
+      // events via `emitTestStepCompleted` the same way web does. Idempotent
+      // (distributed lock) and best-effort (never throws).
+      if (testId) {
+        await TestExecutedStepsRedisService.finalizeToDb(testId);
+      }
+
+      // ── Cleanup: release pooled / end-dedicated / destroy adhoc+warmed ──
+      // A dedicated session is pinned to a workspace's persistent container —
+      // it must be ENDED (app-state reset) but NEVER destroyed, since
+      // destroySession tears down the remote container (emulatorManager.stop →
+      // adb emu kill). Pool sessions reset-and-return; everything else (cold /
+      // warmup adhoc) is destroyed as before.
       if (sessionId) {
         try {
           if (sessionSource === 'pool') {
             await client.releaseSession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Pool session released', { testId, sessionId });
+          } else if (sessionSource === 'dedicated') {
+            await client.endDedicatedSession(sessionId, { userId });
+            logger.debug('[MOBILE-TEST] Dedicated session ended (container preserved)', { testId, sessionId });
           } else {
             await client.destroySession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Session destroyed', { testId, sessionId, sessionSource });
@@ -1234,10 +1404,17 @@ export class MobileTestRunJobHandler {
         timestamp: new Date(e.timestamp).toISOString(),
       }));
 
+      // `mobile_test_results.browser` is CHECK-constrained to the DEVICE
+      // platform ('mobile-android' | 'mobile-ios') — NOT the framework. The
+      // job's `browser` can be 'mobile-flutter' (Flutter runs on an Android
+      // host), which the constraint rejects → the whole row insert fails and
+      // no artifacts/screenshots are ever persisted. Map to the device value:
+      // only native iOS is 'mobile-ios'; android/flutter/etc. → 'mobile-android'.
+      const deviceBrowser = browser === 'mobile-ios' ? 'mobile-ios' : 'mobile-android';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result: any = await dbAdminService.createMobileTestResult({
         test_id: testId,
-        browser,
+        browser: deviceBrowser,
         // FIX: 'completed' not 'passed' — consistent with web tests and TestStatus type.
         // `testPassed` reflects the worker's verdict (real-failure aware:
         // optional / continueOnError / auto-injected steps are tolerable).
@@ -1259,6 +1436,13 @@ export class MobileTestRunJobHandler {
         workspace_id: workspaceId,
         metadata: {
           platform: 'mobile',
+          // "Step 0" — the starting screen captured before any step ran. URL
+          // (uploaded above). The report assembler surfaces it as a labeled
+          // gallery entry, mirroring the final screenshot.
+          ...(typeof runResult.initialScreenshot === 'string'
+            && runResult.initialScreenshot.startsWith('http')
+            ? { initialScreenshot: runResult.initialScreenshot }
+            : {}),
           steps: runResult.steps.map((s) => ({
             stepId: s.stepId,
             success: s.success,
@@ -1309,10 +1493,13 @@ export class MobileTestRunJobHandler {
     try {
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorCode = error instanceof MobileRunnerError ? error.code : 'UNKNOWN';
+      // mobile_test_results.browser is the DEVICE platform, not the framework
+      // (CHECK: 'mobile-android' | 'mobile-ios'). See createTestResult for why.
+      const deviceBrowser = browser === 'mobile-ios' ? 'mobile-ios' : 'mobile-android';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result: any = await dbAdminService.createMobileTestResult({
         test_id: testId,
-        browser,
+        browser: deviceBrowser,
         status: 'failed',
         // No screenshot / dom / logs at this stage — the job didn't get
         // far enough to capture them. Provide a structured `errors` entry
@@ -1377,6 +1564,12 @@ export class MobileTestRunJobHandler {
     totalSteps?: number;
     firstError?: string;
     errorMessage?: string;
+    // Job-level failure provenance. When `failureCategory === 'environment'`
+    // the execution's `result` is stamped with the marker that flaky / fail-
+    // rate detection reads to exclude infrastructure failures.
+    failureTestId?: string;
+    failureCode?: string;
+    failureCategory?: DeviceFailureCategory;
   }): Promise<void> {
     const {
       analyticsExecutionId,
@@ -1386,7 +1579,19 @@ export class MobileTestRunJobHandler {
       totalSteps,
       firstError,
       errorMessage,
+      failureTestId,
+      failureCode,
+      failureCategory,
     } = params;
+    // Re-stamp the execution `result` with the env marker. Keep the same
+    // `{ type, testId }` shape the orchestrator seeds at dispatch so the
+    // `result->>testId` matchers (test-completion / executed-resources) and the
+    // report assembler's `result.testId` lookup keep working — trigger/startedAt
+    // are intentionally not carried (no reader depends on them post-failure).
+    const envMarker =
+      failureCategory === 'environment' && failureTestId
+        ? { type: 'ui', testId: failureTestId, failureLayer: 'job', errorCode: failureCode, failureCategory }
+        : undefined;
 
     // All three targets are independent — parallelize. allSettled so one
     // failure doesn't skip the others; per-branch try/catch logs locally.
@@ -1400,6 +1605,7 @@ export class MobileTestRunJobHandler {
             status: passed ? 'passed' : 'failed',
             ...(durationMs !== undefined ? { durationMs } : {}),
             ...((firstError || errorMessage) ? { errorMessage: firstError || errorMessage } : {}),
+            ...(envMarker ? { result: envMarker } : {}),
           });
         } catch (err) {
           logger.warn('[MOBILE-TEST] Failed to finalize test_executions', {
@@ -1408,6 +1614,13 @@ export class MobileTestRunJobHandler {
           });
         }
       })());
+    } else {
+      // No execution id → the test_executions row stays 'pending', so
+      // recomputeRunStatus skips the terminal regression:run:progress emit and
+      // the regressions LIST never auto-refreshes for this mobile run (web
+      // finalizes via result->>testId; mobile relies solely on this id).
+      // If this fires, the dispatch path isn't threading execId through.
+      logger.warn('[MOBILE-TEST] finalizeAnalyticsLinkage: no analyticsExecutionId — test_executions stays pending; run-completion WS emit (and list refresh) will be skipped');
     }
 
     // Note: `regression_runs.status` is intentionally NOT finalized here.

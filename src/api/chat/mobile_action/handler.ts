@@ -46,11 +46,15 @@ import {
   emitMobileToolStep,
 } from '../mobile_agent/progress';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { redactPii } from '@/services/chat/pii-redactor';
+import { wrapUntrusted, UNTRUSTED_CONTENT_INSTRUCTION } from '@/services/chat/untrusted-content-wrapper';
+import { env } from '@/config/environment/env';
 import {
   assertMobileSessionOwnership,
   MobileSessionAuthzError,
 } from '@/services/mobile/mobile-session-authz';
 import { incCounter } from '@/utils/core/mobile-chat-metrics';
+import { GLOBAL_STORE, type ChatStore } from '@/services/utils/chat-store';
 
 interface MobileActionParams {
   message: string;
@@ -62,6 +66,13 @@ interface MobileActionParams {
   context?: any;
   abortSignal?: AbortSignal;
   mode?: 'lite' | 'pro' | 'editor';
+  /**
+   * Persistence backend for this turn — TESTCASE_STORE when the mobile
+   * editor is scoped to a saved test case, GLOBAL_STORE otherwise. Threaded
+   * to `saveMobileChatTurn` (and `respondError`) so test-case turns land in
+   * the test-case store. Defaults to GLOBAL_STORE.
+   */
+  chatStore?: ChatStore;
 }
 
 const SYSTEM_PROMPT = [
@@ -83,6 +94,8 @@ const SYSTEM_PROMPT = [
   '  the FIRST reasonable single action; the caller will follow up.',
   '- If you truly cannot decide, still call the most plausible tool — never reply',
   '  with plain text from this handler.',
+  '',
+  UNTRUSTED_CONTENT_INSTRUCTION,
 ].join('\n');
 
 export async function handleMobileAction(
@@ -91,6 +104,7 @@ export async function handleMobileAction(
   params: MobileActionParams,
 ): Promise<void> {
   const { message, userId, chatSessionId, context, abortSignal } = params;
+  const chatStore: ChatStore = params.chatStore ?? GLOBAL_STORE;
   const startedAt = Date.now();
 
   const ctxObj = parseMobileContext(context);
@@ -104,6 +118,7 @@ export async function handleMobileAction(
       NO_SESSION_REPLY,
       { noSession: true },
       'mobile_action',
+      chatStore,
     );
     res.json({
       success: false,
@@ -135,6 +150,7 @@ export async function handleMobileAction(
         NO_SESSION_REPLY,
         { noSession: true, authzRejected: true },
         'mobile_action',
+        chatStore,
       );
       res.status(403).json({
         success: false,
@@ -198,7 +214,7 @@ export async function handleMobileAction(
       );
       const reply =
         '📱 The mobile session is no longer active. Start a fresh device and try again.';
-      await saveMobileChatTurn(chatSessionId, message, reply, { sessionGone: true }, 'mobile_action');
+      await saveMobileChatTurn(chatSessionId, message, reply, { sessionGone: true }, 'mobile_action', chatStore);
       res.json({
         success: false,
         reply,
@@ -222,6 +238,7 @@ export async function handleMobileAction(
         reply,
         { runnerUnreachable: true, error: err.message },
         'mobile_action',
+        chatStore,
       );
       res.json({
         success: false,
@@ -264,6 +281,7 @@ export async function handleMobileAction(
       mobileSessionId,
       err,
       'mobile_action',
+      chatStore,
     );
     return;
   }
@@ -277,6 +295,7 @@ export async function handleMobileAction(
       reply,
       { noToolCalls: true },
       'mobile_action',
+      chatStore,
     );
     res.json({
       success: true,
@@ -351,6 +370,7 @@ export async function handleMobileAction(
       durationMs: Date.now() - startedAt,
     },
     'mobile_action',
+    chatStore,
   );
 
   res.json({
@@ -391,7 +411,18 @@ function formatSnapshotForPrompt(
   ]
     .filter(Boolean)
     .join('\n');
-  return `${header}\n${snap.formattedTree}`;
+
+  // Parity with the agentic path (tools.ts:formatSnapshotForLlm). The a11y
+  // tree is user-controlled content from arbitrary apps — it may carry PII
+  // (emails / OTPs / cards inside EditText) AND prompt-injection payloads.
+  // Redact FIRST so PII never sits between the untrusted markers, then wrap.
+  // The header is OUR text (runner-controlled fields), so it is not wrapped.
+  let body = snap.formattedTree ?? '';
+  if (env.MOBILE_CHAT_PII_REDACTION) {
+    body = redactPii(body);
+  }
+  const wrappedBody = wrapUntrusted(body);
+  return `${header}\n${wrappedBody}`;
 }
 
 async function respondError(
@@ -401,6 +432,7 @@ async function respondError(
   mobileSessionId: string,
   err: unknown,
   intentTag: 'mobile_action' | 'mobile_agent',
+  store: ChatStore = GLOBAL_STORE,
 ): Promise<void> {
   const fallback =
     err instanceof MobileRunnerError && err.statusCode === 503
@@ -431,6 +463,7 @@ async function respondError(
       error: err instanceof Error ? err.message : String(err),
     },
     intentTag,
+    store,
   );
 
   if (!res.headersSent) {

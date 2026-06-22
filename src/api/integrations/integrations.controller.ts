@@ -5,6 +5,33 @@ import { getGitLabToken, ensureValidGitLabToken, listUserProjects, listBranches 
 import { createJiraOAuthUrl } from '@/api/jira/jira.controller';
 import { logger } from '@/utils/core/logger';
 import { env } from '@/config/environment/env';
+import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
+import { isValidUUID } from '@/utils/validation/validation';
+
+/**
+ * Authorize a caller-supplied workspace_id for integration writes.
+ * Returns a typed outcome instead of throwing so callers can shape the HTTP
+ * response. A missing workspace_id is allowed (global/user-level token).
+ *
+ * Closes an IDOR: setup/disconnect previously trusted the request's
+ * workspace_id with no membership check, letting a user attach or remove an
+ * integration in a workspace they don't belong to. Also rejects a malformed
+ * (non-UUID) workspace_id before it reaches any PostgREST filter.
+ */
+async function authorizeWorkspaceId(
+  userId: string,
+  workspaceId: string | undefined,
+): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+  if (workspaceId === undefined) return { ok: true };
+  if (!isValidUUID(workspaceId)) {
+    return { ok: false, status: 400, error: 'workspace_id must be a valid UUID' };
+  }
+  const isMember = await WorkspaceAccessService.isMember(userId, workspaceId);
+  if (!isMember) {
+    return { ok: false, status: 403, error: 'You do not have access to this workspace' };
+  }
+  return { ok: true };
+}
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -949,6 +976,12 @@ export async function setupSlack(req: Request, res: Response): Promise<void> {
     const workspaceId = (req.query.workspace_id as string) || (req.body.workspace_id as string) || undefined;
     const { webhook_url, channel, description } = req.body;
 
+    const wsAuth = await authorizeWorkspaceId(userId, workspaceId);
+    if (!wsAuth.ok) {
+      res.status(wsAuth.status).json({ success: false, error: wsAuth.error });
+      return;
+    }
+
     if (!webhook_url || typeof webhook_url !== 'string') {
       res.status(400).json({
         success: false,
@@ -1026,6 +1059,12 @@ export async function setupTelegram(req: Request, res: Response) {
     const workspaceId = (req.query.workspace_id as string) || (req.body.workspace_id as string) || undefined;
     const { bot_token, chat_id, description } = req.body;
 
+    const wsAuth = await authorizeWorkspaceId(userId, workspaceId);
+    if (!wsAuth.ok) {
+      res.status(wsAuth.status).json({ success: false, error: wsAuth.error });
+      return;
+    }
+
     // Validate required fields
     if (!bot_token || typeof bot_token !== 'string') {
       res.status(400).json({
@@ -1083,6 +1122,18 @@ export async function setupTelegram(req: Request, res: Response) {
       res.status(400).json({
         success: false,
         error: 'chat_id must be a string or number',
+      });
+      return;
+    }
+
+    // Validate chat_id SHAPE — numeric id or @channel handle, never a bot
+    // username (storing the bot username here makes every send fail).
+    const { isValidTelegramChatId } = await import('@/services/api/telegram.service');
+    if (!isValidTelegramChatId(chat_id)) {
+      res.status(400).json({
+        success: false,
+        error:
+          'Invalid chat_id. It must be a numeric chat ID (e.g. 8238452651, or a negative number for groups) or a public @channel handle — not the bot username. Message your bot and get the numeric chat ID from @userinfobot or @getidsbot.',
       });
       return;
     }

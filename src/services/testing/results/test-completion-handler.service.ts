@@ -1,4 +1,9 @@
 import { supabaseAdmin } from '@/db/supabase';
+import {
+  forceFailStuckExecutions,
+  forceFailStuckTests,
+  getRunsByIds,
+} from '@/services/testing/results/db/test-completion.db';
 import { executionCompletionEmitter } from '@/services/testing/executions/execution-completion-emitter';
 import { TestResultsFormatterService } from '@/services/testing/results/test-results-formatter.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
@@ -8,6 +13,7 @@ import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { getTelegramToken, sendMessage as sendTelegramMessage } from '@/services/api/telegram.service';
+import { escTg } from '@/utils/notifications/telegram-notify';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { RegressionRunProgressPayload } from '@/websocket/types/types';
 import { env } from '@/config/environment/env';
@@ -399,18 +405,20 @@ export class TestCompletionHandlerService {
     try {
       const testId = test.id;
 
+      // `timeout` maps to `failed`: the `test_executions.status` CHECK
+      // constraint has no `timeout` value, and nothing downstream distinguishes
+      // a timeout from a failure (every consumer groups them). Mapping to
+      // `timeout` here raised a 23514 constraint violation and left the run dirty.
       const mappedStatus =
         test.status === 'completed'
           ? 'passed'
-          : test.status === 'timeout'
-            ? 'timeout'
-            : test.status === 'failed'
-              ? 'failed'
-              : test.status === 'cancelled'
-                ? 'cancelled'
-                : test.status === 'running' || test.status === 'pending'
-                  ? 'running'
-                  : 'failed';
+          : test.status === 'timeout' || test.status === 'failed'
+            ? 'failed'
+            : test.status === 'cancelled'
+              ? 'cancelled'
+              : test.status === 'running' || test.status === 'pending'
+                ? 'running'
+                : 'failed';
 
       const durationMs =
         test.created_at && test.completed_at
@@ -545,12 +553,12 @@ export class TestCompletionHandlerService {
       const [directResult, batchResult, execResult] = await Promise.all([
         supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at, summary')
           .eq('test_id', testId)
           .in('status', ['running', 'pending']),
         supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at, summary')
           .filter('test_ids', 'cs', `["${testId}"]`)
           .in('status', ['running', 'pending']),
         // Fallback: find via test_executions table (most reliable for plan runs)
@@ -571,7 +579,7 @@ export class TestCompletionHandlerService {
       if (execRunId && !runMap.has(execRunId)) {
         const { data: execRun } = await supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at, summary')
           .eq('id', execRunId)
           .in('status', ['running', 'pending'])
           .maybeSingle();
@@ -758,9 +766,12 @@ export class TestCompletionHandlerService {
         // Continue without share link — still send the notification
       }
 
+      // title/message here are built from hardcoded strings + numeric counts
+      // (safe). shareUrl is a generated URL — escape it so a `&` in query
+      // params can't break Telegram's HTML parsing (400 → lost notification).
       let htmlMessage = `<b>${title}</b>\n\n${message}`;
       if (shareUrl) {
-        htmlMessage += `\n\n<a href="${shareUrl}">View full report</a>`;
+        htmlMessage += `\n\n<a href="${escTg(shareUrl)}">View full report</a>`;
       }
 
       await sendTelegramMessage(tokenData.access_token, tokenData.external_id, htmlMessage, 'HTML');
@@ -777,8 +788,47 @@ export class TestCompletionHandlerService {
         userId,
         runId,
       });
-      // Don't throw - Telegram failure shouldn't break completion pipeline
+      // A token EXISTS but delivery failed — the user configured Telegram and
+      // would otherwise never know it silently broke. Surface it in-app with an
+      // actionable reason. Best-effort: never let this break the pipeline.
+      await this.notifyTelegramDeliveryFailure(userId, runId, error).catch(() => {});
     }
+  }
+
+  /**
+   * Map a Telegram send failure to an in-app notification so the user learns
+   * their configured bot stopped delivering (and why). Best-effort.
+   */
+  private static async notifyTelegramDeliveryFailure(
+    userId: string,
+    runId: string,
+    error: unknown,
+  ): Promise<void> {
+    const msg = error instanceof Error ? error.message : String(error);
+    let reason: string;
+    if (/Telegram API error: (401|403)/i.test(msg) || /Unauthorized/i.test(msg)) {
+      reason = 'Your bot token is invalid or was revoked. Reconnect Telegram with a fresh token from @BotFather.';
+    } else if (/chat not found|invalid.*chat|peer_id_invalid|chat_id is empty/i.test(msg)) {
+      reason = 'The chat ID is wrong or the bot was never started in that chat. Message your bot, get the numeric chat ID from @userinfobot, then reconnect Telegram.';
+    } else {
+      reason = 'We could not deliver the message to Telegram. Check your Telegram integration settings.';
+    }
+
+    await NotificationService.createNotification({
+      userId,
+      type: 'personal',
+      category: 'system',
+      title: 'Telegram notification not delivered',
+      message: reason,
+      actionUrl: '/integrations',
+      metadata: {
+        runId,
+        kind: 'telegram_delivery_failure',
+        // Fires at most once per run — run finalization is gated by the
+        // optimistic lock in recomputeRunStatus, so no extra dedupe needed.
+        dedupeKey: `telegram_delivery_failure:${runId}`,
+      },
+    });
   }
 
   /**
@@ -845,7 +895,35 @@ export class TestCompletionHandlerService {
    *
    * @param run - Regression run record with test_id or test_ids
    */
-  private static async recomputeRunStatus(run: any): Promise<void> {
+  /**
+   * Public because `StaleReaperService` drives it for orphaned runs. It remains
+   * the single funnel for run finalization + telemetry aggregation (invariant 11).
+   */
+  /**
+   * Recompute a run by id — for callers that only hold the run id (e.g. the
+   * orchestrator after stamping timed-out executions, where no worker-side
+   * completion event will ever fire). Hydrates the full row and delegates to
+   * `recomputeRunStatus`; its optimistic lock makes a redundant call a no-op.
+   */
+  static async recomputeRunStatusById(runId: string): Promise<void> {
+    const runs = await getRunsByIds([runId]);
+    if (runs.length === 0) {
+      logger.warn('[TEST_COMPLETION] recomputeRunStatusById: run not found', { runId });
+      return;
+    }
+    await this.recomputeRunStatus(runs[0]);
+  }
+
+  static async recomputeRunStatus(
+    run: any,
+    options: { suppressSideEffects?: boolean } = {},
+  ): Promise<void> {
+    // `suppressSideEffects` is set by the stale-run reaper: finalizing a
+    // run that's been orphaned for hours/days must NOT fire fresh "run
+    // failed" notifications, automation actions (Jira/Telegram), flaky
+    // retries, or Regression Doctor — those are noise long after the fact.
+    // The DB status update + WS sync (live UI refresh) still happen.
+    const { suppressSideEffects = false } = options;
     try {
       // Prefer unified executions if present (covers UI + API and avoids relying only on tests table)
       const { data: unifiedExecutions, error: execError } = await supabaseAdmin
@@ -892,14 +970,21 @@ export class TestCompletionHandlerService {
                 stuckCount: stillStuck.length,
               });
               const stuckIds = stillStuck.map((e: any) => e.id);
-              await supabaseAdmin
-                .from('test_executions')
-                .update({
-                  status: 'failed',
-                  error_message: 'Execution timed out (stuck for >30 minutes)',
-                  completed_at: new Date().toISOString(),
-                })
-                .in('id', stuckIds);
+              const { error: forceFailError } = await forceFailStuckExecutions(
+                stuckIds,
+                'Execution timed out (stuck for >30 minutes)',
+              );
+
+              if (forceFailError) {
+                // Log but do NOT return — the in-memory statuses remap below is
+                // independent of the DB write. Bailing here would leave the run
+                // in 'running' indefinitely with no future trigger to finalise it.
+                logger.error('[TEST_COMPLETION] Force-fail update failed — execution row may stay dirty', {
+                  runId: run.id,
+                  stuckIds,
+                  error: forceFailError,
+                });
+              }
 
               // Refresh statuses after force-fail
               statuses = (freshExecs || []).map((e: any) => {
@@ -936,6 +1021,12 @@ export class TestCompletionHandlerService {
           skipped: statuses.filter((s: string) => s === 'skipped').length,
           cancelled: statuses.filter((s: string) => s === 'cancelled').length,
           creditExhausted,
+          // The orchestrator records out-of-run depends_on references in the
+          // run summary at dispatch time; this recompute replaces the summary
+          // wholesale, so carry the warning over or the report loses it.
+          ...(run?.summary?.missingDependencies
+            ? { missingDependencies: run.summary.missingDependencies }
+            : {}),
           completed_at: new Date().toISOString(),
         };
 
@@ -1121,25 +1212,27 @@ export class TestCompletionHandlerService {
             }
           } catch { /* non-fatal */ }
 
-          // Create notification for regression run
-          await this.createRegressionRunNotification(run, finalStatus, summary);
+          if (!suppressSideEffects) {
+            // Create notification for regression run
+            await this.createRegressionRunNotification(run, finalStatus, summary);
 
-          // Fire automation actions for run-level events (non-blocking)
-          AutomationActionService.fireEvent({
-            triggerEvent: finalStatus === 'passed' ? 'run_passed' : finalStatus === 'failed' ? 'run_failed' : 'run_completed',
-            sourceEntityType: 'regression_run',
-            sourceEntityId: run.id,
-            userId: run.user_id,
-            projectId: run.project_id,
-            planId: run.plan_id,
-            eventData: {
-              status: finalStatus,
-              runId: run.id,
-              summary,
-              title: `Regression ${finalStatus}`,
-              message: `${summary.passed}/${summary.total} passed`,
-            },
-          }).catch(() => {});
+            // Fire automation actions for run-level events (non-blocking)
+            AutomationActionService.fireEvent({
+              triggerEvent: finalStatus === 'passed' ? 'run_passed' : finalStatus === 'failed' ? 'run_failed' : 'run_completed',
+              sourceEntityType: 'regression_run',
+              sourceEntityId: run.id,
+              userId: run.user_id,
+              projectId: run.project_id,
+              planId: run.plan_id,
+              eventData: {
+                status: finalStatus,
+                runId: run.id,
+                summary,
+                title: `Regression ${finalStatus}`,
+                message: `${summary.passed}/${summary.total} passed`,
+              },
+            }).catch(() => {});
+          }
         }
 
         return;
@@ -1184,7 +1277,7 @@ export class TestCompletionHandlerService {
       }
 
       // Check if all tests are complete
-      const statuses = tests.map(t => t.status);
+      let statuses = tests.map(t => t.status);
       const hasRunning = statuses.some(s => s === 'running' || s === 'pending');
 
       if (hasRunning) {
@@ -1201,10 +1294,34 @@ export class TestCompletionHandlerService {
           return; // Don't update yet
         }
 
+        // Actually force-fail the stuck `tests` rows — otherwise the status
+        // computation below would treat lingering 'running' as a non-failure
+        // and finalize the run as 'passed' with the rows left dirty. Mirrors
+        // the unified (test_executions) path above.
+        const stuckTestIds = tests
+          .filter(t => t.status === 'running' || t.status === 'pending')
+          .map(t => t.id);
+
         logger.warn('[TEST_COMPLETION] Force-failing stale run with stuck tests', {
           runId: run.id,
-          stuckCount: statuses.filter(s => s === 'running' || s === 'pending').length,
+          stuckCount: stuckTestIds.length,
         });
+
+        const { error: forceFailError } = await forceFailStuckTests(stuckTestIds);
+
+        if (forceFailError) {
+          // Log but don't bail — the in-memory remap below keeps the run
+          // finalization correct even if the row write failed.
+          logger.error('[TEST_COMPLETION] Force-fail of stuck tests failed — rows may stay dirty', {
+            runId: run.id,
+            stuckTestIds,
+            error: forceFailError,
+          });
+        }
+
+        // Reflect the force-fail in the local snapshot so the status
+        // computation below sees them as terminal.
+        statuses = statuses.map(s => (s === 'running' || s === 'pending' ? 'timeout' : s));
       }
 
       // All tests are complete - compute final status
@@ -1290,28 +1407,30 @@ export class TestCompletionHandlerService {
           });
         } catch { /* non-fatal */ }
 
-        // Create notification for regression run
-        await this.createRegressionRunNotification(run, finalStatus, summary);
+        if (!suppressSideEffects) {
+          // Create notification for regression run
+          await this.createRegressionRunNotification(run, finalStatus, summary);
 
-        // Fire automation actions for run-level events (non-blocking)
-        AutomationActionService.fireEvent({
-          triggerEvent: finalStatus === 'passed' ? 'run_passed' : finalStatus === 'failed' ? 'run_failed' : 'run_completed',
-          sourceEntityType: 'regression_run',
-          sourceEntityId: run.id,
-          userId: run.user_id,
-          projectId: run.project_id,
-          planId: run.plan_id,
-          eventData: {
-            status: finalStatus,
-            runId: run.id,
-            summary,
-            title: `Regression ${finalStatus}`,
-            message: `${passed}/${tests.length} passed`,
-          },
-        }).catch(() => {});
+          // Fire automation actions for run-level events (non-blocking)
+          AutomationActionService.fireEvent({
+            triggerEvent: finalStatus === 'passed' ? 'run_passed' : finalStatus === 'failed' ? 'run_failed' : 'run_completed',
+            sourceEntityType: 'regression_run',
+            sourceEntityId: run.id,
+            userId: run.user_id,
+            projectId: run.project_id,
+            planId: run.plan_id,
+            eventData: {
+              status: finalStatus,
+              runId: run.id,
+              summary,
+              title: `Regression ${finalStatus}`,
+              message: `${passed}/${tests.length} passed`,
+            },
+          }).catch(() => {});
+        }
 
         // V14: Auto-retry flaky tests (non-blocking, best-effort)
-        if (finalStatus === 'failed' && run.plan_id) {
+        if (!suppressSideEffects && finalStatus === 'failed' && run.plan_id) {
           this.maybeRetryFlakyTests(run, tests).catch(err => {
             logger.warn('[TEST_COMPLETION] Auto-retry flaky check failed (non-fatal)', {
               runId: run.id,
@@ -1331,7 +1450,7 @@ export class TestCompletionHandlerService {
         // `doctor-${runId}` jobId inside addRegressionDoctorJob — if this
         // hook fires twice (e.g. retry), BullMQ silently rejects the
         // duplicate instead of running the LLM twice.
-        if (finalStatus === 'failed' && failed >= 2) {
+        if (!suppressSideEffects && finalStatus === 'failed' && failed >= 2) {
           this.maybeEnqueueRegressionDoctor(run, failed).catch(err => {
             logger.warn('[TEST_COMPLETION] Failed to enqueue Regression Doctor (non-fatal)', {
               runId: run.id,

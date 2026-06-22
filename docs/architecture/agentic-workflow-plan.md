@@ -45,6 +45,52 @@ The work splits cleanly into two stages. Stage 2 *requires* Stage 1 to land firs
 
 ---
 
+## 0.5 Changelog — what shipped since this plan was written
+
+> This block is reconciled against `git log` on `dev`. When code and plan disagree, **trust the code** (per the header rule). The plan below (§1–§16) is the original design; this section records where the shipped code has already moved past it — and, more importantly, where it took a **different path** than the plan assumed.
+
+### The pragmatic divergence (read this first)
+
+The plan's Stage-1 spine is **Phase 2: "kill `parseIntent`, route every turn through `SubAgentPipeline`."** The shipped code did **not** do that. Instead it **hardened and extended the intent-router**:
+
+- Kept `parseIntent` as the front door, but folded ANALYZE + IMPROVE into a **single LLM call** that now also returns an `analysis` block — `targetSelector`, `executionModifiers`, `isCompound/subRequests`, `manage{…}`, `lookbackDays` ([request-understanding-prompts.ts](../../src/ai/prompts/request-understanding-prompts.ts)).
+- Added **4 new first-class intents** (`flaky_report`, `manage_schedule`, `manage_module`, `manage_plan`) → registry now ~23–27 intents, not 17 ([handler-registry.ts](../../src/api/chat/shared/handler-registry.ts)).
+- Built a **compound queue** ([compound-queue.ts](../../src/api/chat/shared/compound-queue.ts)) for multi-step requests ("test A and B, then save as a plan") — Redis-backed, **advance-after-success**, session-keyed only.
+- Built a **deterministic two-phase confirm** for write ops ([manage-confirmation.ts](../../src/api/chat/regression/shared/manage-confirmation.ts), [manage-tool.helper.ts](../../src/api/chat/regression/shared/manage-tool.helper.ts)): turn 1 preview (`confirm:false`, cached in Redis), turn 2 "yes" re-runs the **same cached args** with `confirm:true` via `executeTool` (so the central SkillRegistry confirm-gate applies). This is **Phase-5 Governor machinery arriving early**, scoped to management writes.
+
+**Implication for the plan:** Phase 2 (unify pipeline) is effectively **deferred / partially obsoleted**. The team chose "smarter router + per-intent handlers + shared confirm/compound infra" over "one pipeline for all turns." Pillar 1 ("one loop, every door", §16.1) is therefore **not yet met via Phase 2** — it would now be met via Phase 4 (webhooks → `processChatTurn`) instead. Decide explicitly whether Phase 2 is still wanted or whether the router-centric path is the new target.
+
+### Phase-by-phase status (vs §6)
+
+| Phase | Plan goal | Shipped status |
+|---|---|---|
+| **0 — Stop the bleeding** | Thread collected context into LiteEngine; `correlation_id`; readiness 2-read gate; scroll stasis | **Partial.** Readiness/scroll/preview hardening landed ([step-readiness-v2](../../src/services/testing/ui/preview/step-readiness-v2.service.ts), recorded-identity comparator consolidation). `priorKnowledge` into LiteEngine + `correlation_id` propagation **not confirmed** — verify before claiming done. |
+| **1 — QA execution as tools** | `qa-execution`/`qa-context`/`qa-collab`/`qa-auth` skills; `run_*` callable | **Partial / sideways.** No new `qa-*.skill.ts` files added in this window. Instead, **management** ops were exposed as chat intents calling existing `qa_manage_*` tools via `executeTool`. TOTP/2FA (1.16), `preview_action` (1.17), `fill_form` (1.14), `read_pdf` (1.15) **not shipped.** |
+| **2 — Unify pipeline** | Kill `parseIntent`, one pipeline | **Not done — divergent (see above).** Router was extended, not removed. |
+| **3 — Durable missions** | `missions` table, orchestrator, resumable ticks | **Not started.** No `missions` table / `mission.service.ts` / `mission-tick` queue. Compound queue is a *turn-scoped* substitute, not a durable mission. |
+| **4 — Triggers from the world** | Jira/Telegram/git webhooks → mission start | **Infra groundwork only.** `qait-infra`: Cloud Run Jobs for scheduler ticks + daily tasks (Terraform). Telegram still **outbound-only** (`chat_id` validation added, no inbound webhook). |
+| **5 — Control plane (Governor)** | Policy/budget/kill/confidence/audit around tools | **Early slice shipped.** Two-phase confirm + central confirm-gate + Unicode-safe affirm/cancel classifier ([confirmation-classifier.ts](../../src/api/chat/shared/confirmation-classifier.ts)) are the first Governor primitives. **Missing:** budget regimes (5.5), kill-switch (5.3), audit `step_log` sink (5.1/5.7), `team_routing` (5.4). Credit pre-checks + **refund-on-failure** + idempotent `cancelRun` landed alongside ([chat.controller](../../src/api/chat/chat.controller.ts)). |
+| **6 — Memory & reflection** | Closed loop: flaky/recurring → plan/schedule changes | **Read side only.** `flaky_report` detects (with `lookbackDays`); **nothing closes the loop** to `manage_plan`/`manage_schedule`. This is the single highest-leverage missing piece (see below). |
+
+### New invariants now codified (CLAUDE.md §Hard invariants 13–15)
+
+13. Chat write/management ops go through `executeTool`, never the raw skill or a hand-rolled confirm.
+14. Chat pending-state (manage-confirm / compound-queue) is Redis-keyed by `chatSessionId` **only** (no userId fallback) and cleared on cancel + error; compound advances **after** a step succeeds.
+15. Unicode word boundaries: use `(?![\p{L}\p{N}])`, never `\b`, for affirmative/cancel/keyword regex (ASCII `\b` never matches Cyrillic).
+
+### The one gap that most blocks "really autonomous"
+
+All three pieces of a self-improving loop now **exist independently** but are **not wired together**:
+
+```
+flaky_report (detect)  ──✗──►  analyze/decide  ──✗──►  manage_plan / manage_schedule (act)
+   read-only today                missing               write path exists (2-phase confirm)
+```
+
+Closing this — `flaky_report` output → reasoning step → proposed plan/schedule change → existing two-phase confirm → execute — is the **smallest change that turns "assisted" into "autonomous"** under §16.1 Pillar 5. It reuses machinery that already shipped; it needs an orchestration step, not new infrastructure. **Recommend this as the next concrete work item.**
+
+---
+
 ## 1. What exists today, in code
 
 Verified counts (May 2026):
@@ -229,6 +275,8 @@ Each item is something I would write a real ticket for. Anchored to file:line.
 | B16 | low | repeated | `intent_test_cases.platform.startsWith('mobile_')` string-match used in 5+ places. Deserves a helper, e.g. `isMobilePlatform(p)`. |
 | B17 | medium | [ai-analysis.job.ts:104-130](../../src/jobs/ai-analysis.job.ts) | `bugReportChargedAt` idempotency marker is good. No parallel marker for `telegramNotifiedAt`/`slackNotifiedAt` — BullMQ retries can re-spam channels. |
 | B18 | high | [chat.controller.ts:52-475](../../src/api/chat/chat.controller.ts) | `handleChat` is tightly bound to `req/res`. Blocks every non-HTTP entry point (Telegram, cron-triggered chat, internal mission ticks) from reusing the same logic cleanly. |
+| B19 | medium | gap | No **2FA/TOTP/OTP-in-authenticator** handling. We have `wait_for_email` (IMAP) for email OTP and `test_resources` auth adapter for logins, but no TOTP secret → time-based code generation. Tests on 2FA-gated apps stall. Skyvern has this; it's a recurring real QA blocker. |
+| B20 | low | [spawner.ts:31](../../src/api/chat/general/sub-agents/spawner.ts) | Sub-executor context is trimmed (system msgs + last few conversation msgs) — partial isolation exists. But it does NOT enforce R10's "return ≤2k-token distilled summary" on the way back; sub-executor full output flows into parent. Verified, not a guess. |
 
 ---
 
@@ -283,9 +331,14 @@ We deliberately do not adopt LATS — for QA workflows the 50× cost is uneconom
 | **R6** | Confidence-based escalation / HITL | Agent runs autonomously while confidence > threshold; otherwise escalates to a human with diagnostic context. The Atos / IBM "bounded autonomy" pattern. | [Atos whitepaper (private)], [IBM Agentic Reasoning](https://www.ibm.com/think/topics/agentic-reasoning) |
 | **R7** | Control plane sidecar | Policy, budget, kill-switch, immutable audit live *around* the agent, intercepting every tool call. Not inside the agent loop. | Atos Polaris pattern, mirrored in LangGraph's checkpointer hooks. |
 | **R8** | Agent-initiated dialog with hybrid rails | Agent speaks first. Each turn returns 2-4 quick-action buttons + a free-text input as fallback. Skeleton of the flow is fixed; button text + ranking is LLM-generated under current context. Replaces forms for onboarding and complex setup. | [Manus Agent Skills onboarding](https://manus.im/features/agent-skills), [Robylon: AI Chatbot for SaaS Onboarding](https://www.robylon.ai/blog/ai-chatbot-saas-onboarding), v0 / Lovable "first artifact" pattern. |
-| **R9** | Content-readiness escalation ladder | When a page returns empty/minimal content, escalate through: L1 `waitForLoadState('load')` → L2 wait for known selector → L3 `evaluate()` for shadow/iframe targeted extract → L4 vision (screenshot + coordinate-based action) → L5 scroll-discover with `scrollHeight` stability detect. Maps onto our existing 3-stage resolver + `visionHints`; the gap is the **auto-escalation between levels** when one fails silently. | [k-kolomeitsev/agent-browser-workspace](https://github.com/k-kolomeitsev/agent-browser-workspace) (MIT). Our own [project_iframe_aware_probe](memory) and Documentolog ONLYOFFICE incident validate the need. |
+| **R9** | Content-readiness escalation ladder | When a page returns empty/minimal content, escalate through: L1 `waitForLoadState('load')` → L2 wait for known selector → L3 `evaluate()` for shadow/iframe targeted extract → L4 vision (screenshot + coordinate-based action) → L5 scroll-discover with `scrollHeight` stability detect. Maps onto our existing 3-stage resolver + `visionHints`; the gap is the **auto-escalation between levels** when one fails silently. **Note:** our [step-readiness-v2.service.ts:561](../../src/services/testing/ui/preview/step-readiness-v2.service.ts) `pageStable` consensus already implements L1→L2 more rigorously than the reference. | [k-kolomeitsev/agent-browser-workspace](https://github.com/k-kolomeitsev/agent-browser-workspace) (MIT). Our own [project_iframe_aware_probe](memory) and Documentolog ONLYOFFICE incident validate the need. |
+| **R10** | Context engineering | (1) **Just-in-time retrieval** — agents hold lightweight identifiers and pull data via tools at runtime, hybrid with a small up-front hint; don't pre-load everything. (2) **Sub-agent isolation** — children get a clean window, return 1–2k-token distilled summaries, not raw traces. (3) **Compaction** — summarize + reinitialize the window near the limit (mandatory for hours-long missions). (4) **Budget regimes** — track spend in HIGH/MED/LOW/CRITICAL bands, report status after each tool call. | [Anthropic: effective context engineering](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents), BATS budget-tracker (2026), [Maxim: context engineering production](https://www.getmaxim.ai/articles/context-engineering-for-ai-agents-production-optimization-strategies/) |
+| **R11** | AI-on-deterministic with cache-replay-heal | Resolve an action with the LLM **once**, cache the resolved action (`{description, method, selector, args}`), replay deterministically at <100ms with zero LLM cost, and self-heal (re-invoke LLM) only when the cached action fails on a changed page. Our `compiled plan` + `identity fast-path` + `evidence shortcut` already do this; the missing piece is a single explicit **`preview_action`/`observe`** primitive that returns the resolved action *before* executing — useful for approval cards. | [Stagehand caching](https://docs.stagehand.dev/v2/best-practices/caching) (`ObserveResult` shape), the production-favored hybrid per [framework-wars 2026](https://dev.to/stevengonsalvez/browser-tools-for-ai-agents-part-2-the-framework-wars-browser-use-stagehand-skyvern-4gn) |
+| **R12** | KV-cache-aware context discipline | Six rules that make long missions economically viable (Manus measured **~10× cost difference** from cache hits): (1) **stable prompt prefix** — one token change invalidates cache from there on; (2) **append-only context** — never edit prior actions/observations; (3) **deterministic JSON serialization** — unstable key order silently breaks cache; (4) **mask, don't remove tools** — dropping a tool mid-run invalidates cache and confuses the model; constrain via prefill/logits instead; (5) **recitation** — rewrite the plan/todo into the *end* of context each step to fight "lost-in-the-middle"; (6) **keep wrong turns in** — failed actions + stack traces stay; the model updates its prior away from them. | [Manus: Context Engineering Lessons](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus), [Claude Agent SDK subagent isolation](https://code.claude.com/docs/en/agent-sdk/overview) (`parent_tool_use_id`) |
 
 **R4 vs R5 honest note:** in the original Phase 3 of this document I wrote "durable missions via Postgres rows" — that is technically R4 (checkpointing), not R5 (full durable execution). For our scale and BullMQ background it is sufficient. The [Diagrid critique](https://www.diagrid.io/blog/checkpoints-are-not-durable-execution-why-langgraph-crewai-google-adk-and-others-fall-short-for-production-agent-workflows) is correct in principle (checkpoints lose in-flight side effects on crash), but adopting Temporal would be a separate, much larger lift. We note the gap and ship R4. Upgrade to R5 stays on the table for the future.
+
+**The 98.4% rule (most important framing in this section).** A study of Claude Code's codebase found **only ~1.6% is AI decision logic; the other ~98.4% is deterministic infrastructure** — permission gates, context management, tool routing, recovery logic. The implication for "super-autonomous": autonomy is NOT achieved by smarter prompts or bigger models — it is achieved by **more deterministic guardrails around the LLM**. This is why R7 (control plane) and R12 (context discipline) matter more than any prompt tuning. Our Phase 5 Governor *is* that 98.4%. When in doubt about where to invest, invest in the deterministic shell, not the model call. Source: [Dive into Claude Code](https://github.com/VILA-Lab/Dive-into-Claude-Code), [Anthropic: building agents with the Agent SDK](https://www.anthropic.com/engineering/building-agents-with-the-claude-agent-sdk).
 
 ### 4.3 Memory taxonomy (consensus in 2026)
 
@@ -325,6 +378,18 @@ We are not adopting a framework — we have our own runtime. But the framework c
 | **Letta** | Three-tier memory with self-editing function calls. The production fork of MemGPT. | Phase 0 + Phase 6 import this directly: memory access as tools, episodic loop closure. |
 
 Source: [LangGraph + MCP 2026 Guide](https://techbytes.app/posts/langgraph-mcp-multi-agent-workflow-guide-2026/), [BSWEN: Which AI Agent Framework for Production](https://docs.bswen.com/blog/2026-04-29-agent-framework-production-comparison/), [Turing: Top 6 AI Agent Frameworks 2026](https://www.turing.com/resources/ai-agent-frameworks).
+
+### 4.5a Closest browser/QA analogs (study these, not the general frameworks)
+
+The general frameworks above are orchestration. These three are doing *our actual job* — browser/QA agents — and are the truest mirror of where we stand.
+
+| Project | What it is | What to take | What to ignore |
+|---|---|---|---|
+| **[Stagehand](https://github.com/browserbase/stagehand)** | "AI primitives on top of Playwright" (TS). `act` / `observe` / `extract` / `agent`. Cache-replay-heal. Reviews call its architecture **"the template others will follow."** This is our nearest architectural twin. | The explicit **`observe()` preview primitive** → R11. Single `ObserveResult` JSON contract `{description, method, selector, arguments}` as the unit between "decide" and "do". | Their deterministic-first default — our recording/replay already covers known flows. |
+| **[Skyvern](https://github.com/Skyvern-AI/skyvern)** | Vision-first swarm. "DOM is a lie." observe(screenshot)→plan→act→**verify** loop. | **2FA/TOTP support** (QR/email/SMS) + **password-manager integrations** — a real QA blocker we lack (B19). Their explicit verify-as-loop-step. | Vision-first as *default* — too slow/expensive for production (industry consensus). We use vision only as R9 escalation L4. |
+| **[TestZeus Hercules](https://github.com/test-zeus-ai/testzeus-hercules)** | Open-source QA agent (AutoGen-based). Planner + Browser-Nav agents. **DOM Distillation** (compress HTML to task-relevant subset) + injected `md` attrs for stable targeting. | The DOM-distillation idea (compress before sending to LLM — we already do candidate-pruning, similar spirit). Watch as a direct competitor. | No persistent memory, no self-heal detail, Gherkin-only input — we're ahead here. |
+
+Honest read: **we are roughly at Stagehand's architectural level** (AI-on-Playwright, cache-replay-heal) but **ahead on QA-specifics** (recording, mobile, regression, AI bug analysis) and **behind on**: explicit observe-primitive, 2FA, and the unified mission layer (which is exactly Stages 1–2 of this doc).
 
 ### 4.6 Mapping our phases to research patterns
 
@@ -419,41 +484,48 @@ Goal: today's agent sees the context it already collects.
 | Step | File | Change |
 |---|---|---|
 | 0.1 | [chat.controller.ts:425](../../src/api/chat/chat.controller.ts), [test-creator.ts:11](../../src/services/testing/ui/manual/test-creator.ts) | Thread `parsedIntent.resolvedContext` into `TestRunRequest.metadata.priorKnowledge`. Pass through `QueueManager.addTestRunJob`. Fixes **B1**. |
-| 0.2 | LiteEngine entry | Read `priorKnowledge` from job data → seed `lite-state.initialContext` (new field). Strategist/Critic prompts gain a new `priorKnowledge` block (1-2 paragraphs of KB + similar bugs + similar tests). Fixes the "agent sees only the page" complaint. |
+| 0.2 | LiteEngine entry | **Hybrid context (Anthropic JIT principle, §4.3a):** seed a *small* up-front `priorKnowledge` hint (1 short paragraph: top similar bug + similar test name) into `lite-state.initialContext`, AND give Strategist `search_kb` / `search_past_bugs` as **tools** so it pulls more just-in-time when stuck. Do NOT dump all 5 context sources into the prompt — that pollutes attention. Fixes "agent sees only the page" without bloating the window. |
 | 0.3 | Cross-cutting | Introduce `correlation_id` (UUID) at the chat entry. Propagate through logs / BullMQ job data / WS payloads / `test_runs` / `test_results` (new column on each). Fixes **B9**. |
 | 0.4 | [ai-analysis.job.ts:50](../../src/jobs/ai-analysis.job.ts) | Codemod `resultId` → `testResultId` everywhere. Fixes **B5**. |
 | 0.5 | [auto-learn.service.ts](../../src/services/kb/auto-learn.service.ts) | Add fingerprint dedupe (`UPSERT ON CONFLICT (project_id, fingerprint)`) before writing to `intelligent_test_findings`. Fixes **B12**. |
-| 0.6 | [step-readiness-v2.service.ts](../../src/services/testing/ui/preview/step-readiness-v2.service.ts) | Add `pageContentStable` detector: poll `document.body.innerText.length` 3 × 300ms; declare stable on 3 consecutive equal readings, soft-fail (continue) on timeout. Closes the gap between `waitForLoadState('load')` and Strategist running on a half-rendered page. Implements R9 level L1→L2 transition. |
+| 0.6 | [step-readiness-v2.service.ts:561](../../src/services/testing/ui/preview/step-readiness-v2.service.ts) | **CORRECTED after code review:** the `pageStable` consensus (DOM-mutation tail + same-origin XHR tail + URL/nav tail) is ALREADY implemented and is *stronger* than k-kolomeitsev's `innerText.length` poll. The only real gap: `StabilityWatcher.quietForMs()` does a single read — a poll landing between XHR batches can falsely report `quiet=true`. Fix = require **2 consecutive quiet reads** before passing the gate. ~10 LOC. (Original "add pageContentStable poll" step was redundant — V2 already exceeds it.) |
+| 0.7 | [preview-step-apply.service.ts:2326](../../src/services/testing/ui/preview/preview-step-apply.service.ts) | Scroll loop currently does fixed `el.scrollTop += 300` with no bottom-detect. Add k-kolomeitsev's stasis check: compare `scrollHeight + scrollTop` before/after each tick, break after 2 unchanged. Closes the silent-infinite-scroll class. ~6 LOC. Implements R9 level L5. |
 
 **Exit criterion:** in a manual run, KB chunks and similar bugs appear inside LiteEngine prompts. Verified by grepping JSONL traces for the new `priorKnowledge:` block.
 
-### Phase 1 — Wrap QA execution as tools (5–7 days)
+### Phase 1 — Wrap QA execution as tools (REVISED — mostly already shipped)
 
-> **Pattern reference:** §4.4 MCP tool primitive; §4.3 Letta principle "memory access is a tool". Every layer of the system becomes addressable through a tool the Planner can invoke.
+> **Pattern reference:** §4.4 MCP tool primitive; §4.3 Letta principle "memory access is a tool".
+>
+> **⚠️ REVISED after code audit (see §0.5).** This phase was written in May assuming the QA execution layer was NOT yet tool-addressable. **It now is.** [qa.skill.ts](../../src/services/skills/qa/qa.skill.ts) exposes **~49 tools**, and **12 of the 13** originally-proposed tools already exist. The skill infrastructure the plan wanted to build (confirm/preview gate keyed `chatSessionId:toolName` with 5-min TTL, retry, loop-detection, per-tool timeouts, hook system) is **already in production** in [skill-registry.ts](../../src/services/skills/skill-registry.ts) + [tool-executor.ts](../../src/services/skills/tool-executor.ts). So Phase 1 is **no longer "build tools"** — it is **"wire + fill 2 gaps + teach the planner."**
 
-Goal: collapse the 17-intent switch into something the agent can call.
+#### 1A. What already exists (DO NOT rebuild)
 
-| Step | New file | Implements |
+| Originally proposed | Already shipped as | Evidence |
 |---|---|---|
-| 1.1 | `src/services/skills/qa/qa-execution.skill.ts` | `run_web_test(url, goal, mode)` → wraps `createTest` + `QueueManager.addTestRunJob` ([queues.ts:461](../../src/config/infrastructure/queues.ts)). Returns `{ testId, jobId, correlationId }`. |
-| 1.2 | same file | `run_mobile_test(...)` → uses mobile dispatch path. Wraps `QueueManager.addMobileTestRunJob` ([queues.ts:707](../../src/config/infrastructure/queues.ts)). |
-| 1.3 | same file | `run_api_test(endpoint, level)` → wraps API test service. |
-| 1.4 | same file | `run_regression_by_id(test_case_id)` → wraps `RegressionRunService.runSavedTestCase`. |
-| 1.5 | same file | `run_plan(plan_id)`, `run_module(module_id)`, `run_by_tag(tag)` → wraps `RegressionRunService.runPlan/runModule/runByTag`. |
-| 1.6 | same file | `save_test_case(intent_steps)` → wraps `IntentTestCaseService.create`. |
-| 1.7 | same file | `analyze_failure(test_result_id)` → joins `ai_summary` + `intelligent_test_findings` for one consolidated view. |
-| 1.8 | same file | `wait_for_run(run_id, timeout_ms)` → polls `regression_runs.state` until completed/failed/cancelled. Lets a plan continue after a test finishes. |
-| 1.9 | `src/services/skills/qa/qa-context.skill.ts` | `search_past_bugs(query, projectId)` — promote `searchProjectFindings` from `jira-qa-orchestrator` into a public tool. Fixes **B10** by making `patterns-query.service.ts` the single funnel. |
-| 1.10 | same file | `recall_similar_missions(query, limit=5)` — once missions exist, reads from `missions` table. Returns plan + outcome of nearest past missions. Closes **B11** loop. |
-| 1.11 | `src/services/skills/qa/qa-collab.skill.ts` | `notify_owner(owner_ref, payload)`. `owner_ref` accepts `jira:component:payments` or `codeowner:/checkout` or `user:<id>`. Resolves channel + recipient internally. Replaces hardcoded `#qa-alerts`. Fixes **B3, B6**. |
-| 1.12 | same file | `ask_human(question, urgency, options?)` — emits WS + sends to user's preferred channel (Telegram/Slack/in-app). Resolves on reply via channel webhook. |
-| 1.13 | `src/services/skills/qa/qa-browser.skill.ts` | `escalate_to_vision(step_id)` — Critic-callable when DOM-resolver returned 0 candidates AND `pageMetadata.isDOMWeak=true`. Routes to coordinate-based fallback via existing `visionHints`. Implements R9 level L3→L4 transition. Closes the Documentolog-class regression where canvas/heavy-SPA pages have unreachable elements. |
-| 1.14 | [manifest.ts](../../src/services/skills/manifest.ts) | Register the four new skill files (`qa-execution`, `qa-context`, `qa-collab`, `qa-browser`). |
-| 1.15 | [router-prompt.ts](../../src/api/chat/general/sub-agents/prompts/router-prompt.ts), [planner-prompt.ts](../../src/api/chat/general/sub-agents/prompts/planner-prompt.ts) | Teach Router about category `qa_execution` and Planner about how to compose `run_*` with `wait_for_run` and `notify_owner`. |
+| `run_web_test` / `run_mobile_test` / `run_api_test` | **`qa_run_test`** (`run_type`, mobile auto-routed by platform) | [qa-tool-handlers.ts](../../src/services/skills/qa/qa-tool-handlers.ts) `handleRunTest` |
+| `run_regression_by_id` / `run_plan` / `run_module` / `run_by_tag` | **`qa_run_test`** (`run_type='test_case'|'plan'|'module'|'flow'|'tag'|'priority'`) | wraps `RegressionRunService.runSavedTestCase/runPlan/runModule/runFlow/runByTag/runByPriority` |
+| `save_test_case` | **`qa_create_test_case`** | wraps `IntentTestCaseService.create` |
+| `analyze_failure` | **`qa_analyze_failure`** | — |
+| `wait_for_run` | **`qa_get_run_status`** (poll status) | — |
+| `search_past_bugs` | **`qa_list_test_findings`** + `PatternsQueryService` | — |
+| `escalate_to_vision` / `fill_form` / `preview_action` | covered by existing resolver waterfall + `qa_run_draft_steps` + `intent-step-lint` dry-run | (defer; not blocking) |
 
-**No legacy handler is touched in this phase.** All wrappers run alongside the existing code path under a feature flag (off by default).
+Infra already present: confirm-gate (`skill-registry.ts` `CONFIRM_TTL_MS = 5min`, keyed `chatSessionId:toolName`), retry (`retry.ts`, default 2 + backoff), loop-detection (`hooks/loop-detection.hook.ts` `ToolCallTracker`), per-tool timeout (`sub-agents/tool-constants.ts`, `qa_run_test = 8min`), hook system (`tool-executor.ts` `registerToolHook`). Executor already calls `executeTool(ctx)` ([executor-agent.ts](../../src/api/chat/general/sub-agents/agents/executor-agent.ts)).
 
-**Exit criterion:** with the flag on, a user can type *"запусти регрессию на плане Q2-smoke и пни owner в slack если упадёт"* and the agent composes 3 tool calls in one turn. Verified by Reviewer output `goalAlignment > 0.8`.
+#### 1B. The real work (this is what's left)
+
+| Step | Where | Change | Status |
+|---|---|---|---|
+| 1.1 | `qa-collab.skill.ts` (new) or extend qa.skill | **`ask_human(question, urgency, options?)`** — the ONE genuinely missing primitive. Lets a sub-agent pause mid-mission and resume on a human reply (via WS now; channel webhook after Phase 4). Today clarification only happens through the Responder ending the turn — there's no resumable ask. | ❌ missing |
+| 1.2 | `qa-collab.skill.ts` / extend | **`notify_owner(owner_ref, payload)`** — direct result-driven ping. Today only indirect via `qa_manage_automation_action`. `owner_ref` resolves `jira:component:*` / `codeowner:/path` / `user:<id>` → channel + recipient. | 🟡 partial |
+| 1.3 | [router-prompt.ts](../../src/api/chat/general/sub-agents/prompts/router-prompt.ts), [planner-prompt.ts](../../src/api/chat/general/sub-agents/prompts/planner-prompt.ts) | Teach Router category `qa_execution` and Planner to **compose** `qa_run_test` + `qa_get_run_status` + `notify_owner` in one plan. **R12 law 4:** mask unavailable categories via prefill, never delete mid-session (KV-cache). | ❌ todo |
+| 1.4 | config / feature flag | Flag to allow QA-execution intents (`run_regression`, `run_plan`, `platform_test`, …) to reach `SubAgentPipeline` instead of their hardcoded handlers, so the agent can actually compose. **This is the Phase-1↔Phase-2 hinge** — small slice here, full unification deferred to Phase 2 (which the team may now skip in favor of the router-centric path; decide explicitly). | ❌ todo |
+| 1.5 | `correlation_id` | Thread a mission/correlation id through `qa_run_test` → BullMQ job data → results, so a composed plan can correlate "the run I started" with "the result that came back". Overlaps Phase 0.3. | ❌ todo |
+
+**Exit criterion (revised):** with the flag on, *"запусти регрессию на плане Q2-smoke, дождись результата и пни owner в slack если упадёт"* → agent composes `qa_run_test` + `qa_get_run_status` + `notify_owner` in one turn. Verified by Reviewer `goalAlignment > 0.8`. `ask_human` proven by a mid-run clarification that resumes without losing plan state.
+
+**Deferred from original 1.x (not blocking autonomy now):** `recall_similar_missions` (needs Phase 3 missions table), `read_pdf_at_url`, `generate_totp`/2FA (B19), `fill_form` composite, `preview_action` standalone tool. Re-prioritize after the compose loop works end-to-end.
 
 ### Phase 2 — Unify the pipeline (5–7 days, then canary)
 
@@ -473,9 +545,9 @@ Goal: kill `parseIntent` switch. One pipeline for all chat turns.
 
 ### Phase 3 — Durable missions (2 weeks)
 
-> **Pattern reference:** §4.2 R4 — Checkpointed state machine (not R5 — see §4.2 honest note). LangGraph's `PostgresSaver` thread-based persistence pattern, recreated on our existing Supabase. 92% of production LangGraph deployments use this exact shape.
+> **Pattern reference:** §4.2 R4 (checkpointed state machine) + R12 (KV-cache discipline — this is where the ~10× cost lever lives). LangGraph's `PostgresSaver` thread-based persistence pattern, recreated on Supabase. OpenHands validates the event-stream-as-source-of-truth shape.
 
-Goal: missions are first-class, survive crashes, are replayable.
+Goal: missions are first-class, survive crashes, are replayable — **and stay cheap over hours-long runs**.
 
 | Step | Where | Change |
 |---|---|---|
@@ -486,8 +558,13 @@ Goal: missions are first-class, survive crashes, are replayable.
 | 3.5 | tools | `run_*_test` tools now accept `mission_id` and propagate it through BullMQ job data. AI-analysis posts results back as a tick trigger. |
 | 3.6 | new BullMQ queue | `mission-tick` queue with one worker. Anything that produces a result for a mission enqueues a tick. The tick runs `MissionOrchestrator.tick(missionId)`. |
 | 3.7 | new API | `GET /api/v1/missions/:id`, `GET /api/v1/missions/:id/log` (immutable), `POST /api/v1/missions/:id/kill`, `POST /api/v1/missions/:id/approve`. |
+| 3.8 | `blackboard.ts` serialization | **R12 laws 1-3:** serialize `blackboard_snapshot` and `step_log` with a **deterministic key order** (sorted keys) and **append-only** writes — never rewrite prior entries. Unstable JSON order silently destroys the KV-cache → up to 10× cost on every tick. This is a correctness-of-economics requirement, not a nicety. |
+| 3.9 | `mission-orchestrator.ts` recitation | **R12 law 5:** on each `tick`, re-emit the current `plan` + remaining steps into the *end* of the context before the LLM call. Fights "lost-in-the-middle" on long missions — the agent keeps its goal in recent attention. Cheap (the plan is small); prevents goal drift. |
+| 3.10 | `step_log` artifact offload | **R10/Manus law 3 (file-system-as-context):** large artifacts (screenshots, HAR, full page snapshots) go to storage; `step_log` keeps only the **reference** (URL/path/id), not the blob. Context stays lean; the agent re-fetches via tool if needed (JIT). |
+| 3.11 | `step_log` failure retention | **R12 law 6:** failed actions + their error/stack stay in `step_log` and in context — do NOT prune them. The model updates its prior away from the failed path. Pruning errors re-invites the same mistake. |
+| 3.12 | sub-executor origin tag | **Fixes B20:** tag every sub-executor message with `parent_tool_use_id`-style origin (Claude Agent SDK pattern) so parent context isn't polluted and the log is traceable. Sub-executor returns a ≤2k-token distilled summary, not its raw trace (R10). |
 
-**Exit criterion:** restart any process mid-mission. Mission resumes on the next tick. Audit log shows every Router/Planner/Executor decision with `correlation_id`.
+**Exit criterion:** restart any process mid-mission → resumes on next tick. Audit log shows every decision with `correlation_id`. A 2-hour mission's per-tick token cost stays flat (KV-cache holding), not climbing — verified by token telemetry per tick.
 
 ### Phase 4 — Triggers from the world (1 week)
 
@@ -508,7 +585,9 @@ Goal: missions wake up on real events.
 
 ### Phase 5 — Control plane (1 week)
 
-> **Pattern reference:** §4.2 R6 (confidence-based escalation / bounded autonomy) + R7 (sidecar). Atos Polaris model recreated as middleware around our existing `tool-executor.ts`. Critically: starts in **audit-only** mode for 2 weeks before any policy enforces.
+> **Pattern reference:** §4.2 R6 (confidence-based escalation) + R7 (sidecar) + the **98.4% rule** (this phase IS the deterministic infrastructure that makes autonomy safe — see §4.2 note). Atos Polaris model recreated as middleware around our existing `tool-executor.ts`. Critically: starts in **audit-only** mode for 2 weeks before any policy enforces.
+>
+> **Reuse note:** the skill registry already has a **preview→confirm gate** ([skill-registry.ts:213-229](../../src/services/skills/skill-registry.ts)) — a `confirm=true` tool call is only allowed if a prior `confirm=false` preview exists within a 5-min TTL. And `requires_confirmation` lists already exist per-skill (jira/github/notion/telegram manifests). The Governor extends this existing machinery — it does not invent approval from scratch.
 
 Goal: bounded autonomy. The Atos word, concrete code.
 
@@ -518,10 +597,11 @@ Goal: bounded autonomy. The Atos word, concrete code.
 | 5.2 | [tool-executor.ts:103](../../src/services/skills/tool-executor.ts) | `registerToolHook` already exists — `MissionGovernor` registers as a hook. No invasive change. |
 | 5.3 | kill-switch | `POST /missions/:id/kill` flips state. Each tool checks `mission.state === 'killed'` at start; in-flight tools check before enqueuing follow-ups. |
 | 5.4 | new table | `team_routing(workspace_id, key, channel, recipients[])` where `key` is `jira:component:payments` or `codeowner:/checkout`. Read by `notify_owner` tool. |
-| 5.5 | budget gate | `MissionGovernor.beforeToolCall` blocks if `mission.spent_credits + tool.estimated_cost > mission.budget_credits`. Mission transitions to `blocked`; owner receives `ask_human` request. Fixes **B15**. |
+| 5.5 | budget regimes (R10) | `MissionGovernor.beforeToolCall` tracks `spent/budget` in **4 bands** (BATS 2026): **HIGH** (≥70% left) run freely · **MED** (30-70%) prefer cheap tools, no speculative exploration · **LOW** (10-30%) finish current goal only, no new branches · **CRITICAL** (<10%) stop, summarize, `ask_human`. Status reported to the Planner after each tool call so it adapts depth. Replaces the single hard "blocked" cutoff. Fixes **B15**. |
 | 5.6 | retry idempotency | `MissionGovernor.afterToolCall` writes `step_log[i].notifiedAt` markers per channel. Notification tools skip if marker exists. Fixes **B17**. |
+| 5.7 | secret redaction at audit sink | Governor's `afterToolCall` writes `step_log` — a NEW sink for interpolated step bodies. Per hard-invariant #10, run `result_summary`/`args` through `redactSecrets`/`buildStepRedactor` before persisting. TOTP codes (1.16) and credentials never land in the audit trail. |
 
-**Exit criterion:** simulate a runaway plan (100 tool calls in a loop) — Governor stops it at budget. Kill button works mid-run.
+**Exit criterion:** simulate a runaway plan (100 tool calls in a loop) — Governor de-escalates through regimes and stops at CRITICAL. Kill button works mid-run. No secret value appears in any `step_log` row.
 
 ### Phase 6 — Memory and reflection (ongoing)
 
@@ -535,8 +615,10 @@ Goal: closed-loop learning.
 | 6.2 | Planner | Before planning, call `recall_similar_missions(goal)` automatically. Plan can reference past mission ids in its `summary`. |
 | 6.3 | Reviewer prompt | Add explicit instruction: cite prior missions when proposing a retry strategy. |
 | 6.4 | Auto-learn job | Tag stored patterns with `mission_id`. Retirement job ([auto-learn-retire.job.ts](../../src/jobs/auto-learn-retire.job.ts)) gains a "supersedes" link so older patterns don't pollute search. |
+| 6.5 | new `domain_profiles` table + lookup | **Procedural memory per-domain** (k-kolomeitsev site-profile pattern, distinct from per-test compiled plans): `{ workspace_id, host, path_prefix?, known_selectors jsonb, known_forms jsonb, known_auth_flow jsonb, updated_at }`. Resolver consults it FIRST (before LLM) on a known host. Auto-populated from successful runs. A 2nd test on the same domain skips most LLM resolution → 2-3× faster. Lookup by hostname + optional path prefix. This is the cheap early slice of the "memory loop" — ships value before full mission recall. |
+| 6.6 | Planner prompt | **R12 law 6 (don't-get-few-shotted):** when `step_log` holds many near-identical action/observation pairs, inject small structured variation so the model doesn't lock into a brittle pattern. Relevant for long exploration missions that loop over similar pages. |
 
-**Exit criterion:** the same recurring bug ("checkout button covered by banner") gets detected on the second occurrence, and the third mission's plan references missions 1 and 2 in its reasoning.
+**Exit criterion:** the same recurring bug ("checkout button covered by banner") gets detected on the second occurrence; the third mission's plan references missions 1 and 2; and a re-run on a known domain resolves >70% of elements from `domain_profiles` without an LLM call (measured via resolverPath telemetry).
 
 ---
 
@@ -666,7 +748,7 @@ Twelve weeks end-to-end, with the system measurably better at week 2 (priorKnowl
 
 ---
 
-## 11. Behavioral spec — 15 scenarios
+## 11. Behavioral spec — 20 scenarios
 
 This section is a contract for what "done" looks like. Each scenario describes a user input and how the target system (post-Phase 5) should respond. Treated as the acceptance test suite for the migration: a phase is complete when its associated scenarios work end-to-end.
 
@@ -1286,5 +1368,48 @@ Stage 2 (§13 + §14) depends on Stage 1 but can ship earlier than Phase 3-6:
 **Stage 1** (engineering): one durable agent runtime, every layer is a tool, control plane around it, can run any QA mission. Backbone.
 
 **Stage 2** (product): a new user lands on `/start`, has a 90-second chat where the agent does most of the talking via quick actions, drops their APK / URL / swagger, and walks away in <5 minutes with a Workflow they can run, edit, schedule, and share. The agent stays in the sidebar for follow-ups.
+
+---
+
+## 16. Super-autonomous capstone — what actually makes it autonomous
+
+The whole document distilled to the few things that separate "a chatbot that runs tests" from "an autonomous QA agent." Each is sourced from a top production system, not invented here.
+
+### 16.1 The five pillars
+
+| Pillar | One-line | Source / pattern | Where in plan |
+|---|---|---|---|
+| **1. One loop, every door** | Web, Telegram, Slack, Jira, git, cron — all enter the same `processChatTurn` / `MissionOrchestrator.start`. No parallel pipelines. | OpenClaw (gateway + one core), our §1.1 finding | Phase 2, Phase 4 |
+| **2. Every layer is a tool** | Run test, search KB, notify owner, ask human, read PDF, generate TOTP — all callable, all composable. Composition is free. | MCP standard (R-§4.4), Stagehand primitives | Phase 1 |
+| **3. Durable + cheap missions** | State in Postgres, resumable on any worker, replayable. KV-cache discipline keeps a 2-hour mission flat-cost, not climbing. | LangGraph checkpointing (R4) + Manus context laws (R12) | Phase 3 |
+| **4. Deterministic shell (the 98.4%)** | Autonomy ≠ smarter prompts. It's the Governor: policy gates, budget regimes, kill-switch, confidence escalation, immutable audit — wrapped around the LLM. | Claude Code (1.6% AI / 98.4% infra), Atos control plane (R6/R7) | Phase 5 |
+| **5. Closed memory loop** | Past missions + per-domain profiles shape new plans. The agent gets faster and smarter on familiar ground. | Letta self-editing memory, k-kolomeitsev site profiles | Phase 6 |
+
+If any one of these is missing, the agent is not autonomous — it's assisted. Pillar 4 is the one most teams skip and the one that matters most: **invest in the deterministic shell, not the model call.**
+
+### 16.2 The context-engineering laws we now obey (R12 + R10)
+
+These are cheap to follow and catastrophic to ignore (Manus measured ~10× cost from getting them wrong). They live across Phase 1, 3, 5:
+
+1. **Stable prefix + append-only + deterministic JSON** — or the KV-cache shatters and every tick costs 10×.
+2. **Mask tools, don't remove them** — Router constrains via prefill, never deletes mid-session.
+3. **File-system-as-context** — big artifacts to storage, refs in context, re-fetch JIT.
+4. **Recitation** — re-emit the plan to the end of context each tick; fights goal drift.
+5. **Keep wrong turns in** — failed actions stay; the model learns to avoid them.
+6. **Don't get few-shotted** — inject variation when context is full of identical pairs.
+7. **Sub-agents return ≤2k summaries**, tagged with origin (`parent_tool_use_id`).
+
+### 16.3 Where we genuinely stand (honest, post-research)
+
+- **At Stagehand's architectural level** — AI-on-Playwright, cache-replay-heal. Our 5-stage resolver is arguably more sophisticated than their selector+heal.
+- **Ahead on QA-specifics** — recording, mobile (scrcpy/redroid), regression scheduling, AI bug analysis, video screencast. None of the hyped general agents (OpenHands/Devin/Manus) do these.
+- **Our `step-readiness-v2` already exceeds** k-kolomeitsev's content-readiness poll (causal multi-signal consensus vs symptomatic text-length).
+- **Behind on, and this plan closes:** the unified mission layer (Phase 2-3), the deterministic Governor shell (Phase 5), 2FA/TOTP (B19/1.16), explicit `observe`/`preview_action` primitive (1.17), per-domain procedural memory (6.5).
+
+> **Update (see §0.5):** since this was written, the shipped code moved **sideways** on Pillar 4 (deterministic shell) and Pillar 2 (every layer a tool) rather than along Phase 2/3. A real **two-phase confirm + central confirm-gate** now exists for management writes (early Governor), and **management itself is exposed as chat intents** (`manage_schedule/module/plan`, `flaky_report`). What did *not* happen: the Phase-2 pipeline unification and the Phase-3 durable mission layer. Pillar 1 (one loop, every door) and Pillar 3 (durable + cheap missions) remain **unmet**. Pillar 5 (closed memory loop) has its read side (`flaky_report`) but no act side — closing `detect → decide → act` is the recommended next step.
+
+### 16.4 The single most important sentence
+
+Super-autonomy is **not** a bigger model or a cleverer prompt. It is a **durable mission loop** (Phase 3) where **every capability is a composable tool** (Phase 1), wrapped in a **deterministic control plane** (Phase 5), fed by a **closed memory loop** (Phase 6), reachable **from any channel** (Phase 4) — with **KV-cache-aware context discipline** (R12) making it economically viable to run for hours. Everything else in this document is detail in service of that sentence.
 
 After both stages: a user types one Telegram message *or* drops one file on signup, and the system delivers value end-to-end without forms, without configuration screens, without the user having to know what a "test case" or "regression plan" is until they want to.

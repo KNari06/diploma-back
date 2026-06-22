@@ -6,8 +6,6 @@
 // Main engine
 export { LiteEngine } from './lite-engine';
 export { LiteState } from './lite-state';
-export { ModeRouter } from './mode-router';
-export type { TestMode } from './mode-router';
 
 // Types
 export type {

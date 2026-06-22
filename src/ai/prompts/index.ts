@@ -16,6 +16,18 @@ export {
   buildChatSystemPrompt, buildIntentPrompt, type IntentParserContext
 } from './intent-and-chat-prompts';
 
+// Re-export from request-understanding-prompts.ts (ANALYZE / ENRICH / IMPROVE)
+export {
+  buildUnderstandingExtension,
+  buildEnrichPrompt,
+  type AnalyzeResult,
+  type EnrichResult,
+  type EnrichInputCandidate,
+  type EnrichSessionContext,
+  type ExecutionModifiers,
+  type TargetSelectorType,
+} from './request-understanding-prompts';
+
 // Re-export from test-plan-prompts.ts
 export {
   buildApiFuzzingPrompt,

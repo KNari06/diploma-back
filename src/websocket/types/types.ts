@@ -41,6 +41,15 @@ export interface ClientToServerEvents {
   ) => void;
   'unsubscribe:chat:testcase': (data: { testCaseId: string }) => void;
 
+  // Project room subscription — receives test-case / flow / module mutation
+  // events for live cache invalidation in the test-suites editor. Access is
+  // verified fail-closed (owner OR active workspace member) at subscribe time.
+  'subscribe:project': (
+    data: { projectId: string },
+    callback?: (response: { ok: boolean; error?: string }) => void,
+  ) => void;
+  'unsubscribe:project': (data: { projectId: string }) => void;
+
   // Preview subscriptions
   'subscribe:preview': (data: { previewSessionId: string }) => void;
   'unsubscribe:preview': (data: { previewSessionId: string }) => void;
@@ -109,6 +118,8 @@ export interface ClientToServerEvents {
   'preview:mouse:up': (data: PreviewMouseButtonRequest) => void;
   'preview:mouse:wheel': (data: PreviewMouseWheelRequest) => void;
   'preview:mouse:probe': (data: PreviewMouseProbeRequest) => void;
+  // Client-reported video render health → server adapts its send rate (fps only).
+  'preview:video:health': (data: PreviewVideoHealthReport) => void;
   'preview:keyboard:type': (data: PreviewKeyboardTypeRequest) => void;
   'preview:keyboard:press': (data: PreviewKeyboardPressRequest) => void;
 
@@ -251,6 +262,15 @@ export interface ServerToClientEvents {
   'exploration:completed': (data: ExplorationCompletedPayload) => void;
   'exploration:clarification:request': (data: ExplorationClarificationPayload) => void;
 
+  // Project resource mutation events — broadcast to the `project:<id>` room
+  // so editors open in other tabs/sessions/users invalidate their cached
+  // test-case / flow / module lists without a page reload. See
+  // `subscribe:project` (subscription.handler.ts) and the emit* methods in
+  // websocket.service.ts.
+  'project:testcase:mutated': (data: ProjectResourceMutationPayload) => void;
+  'project:flow:mutated': (data: ProjectResourceMutationPayload) => void;
+  'project:module:mutated': (data: ProjectResourceMutationPayload) => void;
+
   // Negative testing events
   'negatives:generation:started': (data: any) => void;
   'negatives:generation:progress': (data: any) => void;
@@ -327,7 +347,11 @@ export interface ServerToClientEvents {
   // `intentTestCaseId` from the URL, toasts the user, and bounces back to
   // the Repository view. The Playwright preview session is stopped server-
   // side before this event is emitted (cheap to re-create on reopen).
-  'preview:session:expired': (data: { reason: 'idle' | 'disconnect' }) => void;
+  // `previewSessionId` scopes the event to the session that expired so the
+  // frontend can ignore a stale/phantom expiry meant for a session it has
+  // already replaced (e.g. reopening a test case right after an idle kick).
+  // Optional for backwards-compat with older clients during deploy skew.
+  'preview:session:expired': (data: { reason: 'idle' | 'disconnect'; previewSessionId?: string }) => void;
 
   // Preview video stream lifecycle. Emitted when the backend tears down the
   // video stream for reasons the FE watchdog cannot infer from frame gaps
@@ -411,11 +435,31 @@ export interface ServerToClientEvents {
   }) => void;
 
   // Preview session startup progress (emitted to user room — client not yet subscribed to preview room)
+  //
+  // Two stage vocabularies share this event:
+  //   • Web preview  — launching_browser / loading_page / extracting_elements
+  //   • Mobile warmup — boot_emulator / installing_app / launching_app /
+  //                      waiting_first_frame
+  // Both terminate in `ready`. The mobile names mirror the actual warmup
+  // steps (emulator boot → APK/IPA install → cold launch → first video
+  // frame) instead of reusing the web names, so the editor's loading bar
+  // can show truthful per-step copy. The frontend maps unknown stages to
+  // its timer fallback, so adding mobile stages is backward-compatible.
   'preview:session:progress': (data: {
-    stage: 'launching_browser' | 'loading_page' | 'extracting_elements' | 'ready';
+    stage:
+      | 'launching_browser' | 'loading_page' | 'extracting_elements'
+      | 'boot_emulator' | 'installing_app' | 'launching_app' | 'waiting_first_frame'
+      | 'ready';
     progress: number;     // 0-100
     url?: string;
-    elapsedMs: number;
+    // elapsedMs is optional: the web preview path stamps it, the mobile warmup
+    // path historically didn't. Keeping it optional avoids forcing a fake value.
+    elapsedMs?: number;
+    // When set, this stage FAILED — `stage` names the phase that failed (e.g.
+    // 'boot_emulator' when the emulator crashed during startup) and `error` is
+    // the user-facing message. The frontend stops the spinner and shows this
+    // instead of optimistically completing the checklist. Absent on success.
+    error?: string;
   }) => void;
 
   // Login required — emitted when the preview lands on a login / auth
@@ -450,6 +494,25 @@ export interface ServerToClientEvents {
     score?: number;
     /** v3 — diagnostic list of which weights fired. Old clients ignore. */
     triggers?: string[];
+    timestamp: string;
+  }) => void;
+
+  /**
+   * Stage 3 — proactive background-observer hint. Emitted by `observer.service`
+   * ONLY when emission is enabled (flag `OBSERVER_LLM_EMIT`, separate from the
+   * shadow-logging flag) AND the LLM returned a non-`none` verdict above the
+   * confidence floor. Advisory: the editor shows an unobtrusive, dismissable
+   * chip — it never blocks the user or auto-acts. `kind` tailors the copy.
+   *   'login_required' — the flow hit a login gate
+   *   'step_missing'   — an obvious step looks missing before the next one
+   *   'blocked'        — captcha / verification / error blocks progress
+   *   'wrong_page'     — the latest step looks recorded on a different page
+   */
+  'preview:observer:hint': (data: {
+    previewSessionId: string;
+    kind: 'login_required' | 'step_missing' | 'blocked' | 'wrong_page';
+    message: string;
+    confidence: number;
     timestamp: string;
   }) => void;
 
@@ -580,6 +643,8 @@ export interface ServerToClientEvents {
   'api:flow:dag-ready': (data: ApiFlowDagReadyPayload) => void;
   'api:flow:step-start': (data: ApiFlowStepStartPayload) => void;
   'api:flow:step-complete': (data: ApiFlowStepCompletePayload) => void;
+  'api:flow:step-skipped': (data: ApiFlowStepSkippedPayload) => void;
+  'api:flow:step-retrying': (data: ApiFlowStepRetryingPayload) => void;
   'api:flow:variable-extracted': (data: ApiFlowVariableExtractedPayload) => void;
   'api:flow:completed': (data: ApiFlowCompletedPayload) => void;
   'api:flow:failed': (data: ApiFlowFailedPayload) => void;
@@ -608,6 +673,28 @@ export interface TestCreatedPayload {
   url: string;
   browsers: string[];
   userId?: string;
+  timestamp: string;
+}
+
+/**
+ * Project resource mutation — emitted to the `project:<id>` room when a test
+ * case / flow / module is created, updated, or deleted, so other open editors
+ * invalidate the matching cache slice. Payload is intentionally minimal: the
+ * frontend patches by id where it can (delete → filter, rename → update name)
+ * and refetches the affected flow/module on create. `flowId` / `moduleId`
+ * scope the refetch; `name` lets renames patch in-place without a round-trip.
+ */
+export interface ProjectResourceMutationPayload {
+  projectId: string;
+  action: 'created' | 'updated' | 'deleted';
+  /** Id of the mutated resource (test case / flow / module). */
+  id: string;
+  /** Current name on create/update; omitted on delete. */
+  name?: string;
+  /** Parent flow id for a test-case mutation, when known. */
+  flowId?: string;
+  /** Parent module id for a flow mutation, when known. */
+  moduleId?: string;
   timestamp: string;
 }
 
@@ -785,6 +872,13 @@ export interface TestStepCompletedPayload {
 
     /** Screenshot URL captured at the moment a bug was detected */
     bugScreenshotUrl?: string;
+
+    /**
+     * Screenshot URL captured after EVERY step (pass or fail) when per-step
+     * capture is enabled. Distinct from `bugScreenshotUrl` (failure-only) —
+     * the report assembler surfaces this in the Screenshots artifact tab.
+     */
+    stepScreenshotUrl?: string;
 
     /**
      * Non-blocking, advisory warnings raised by the runner for this step.
@@ -1566,7 +1660,7 @@ export interface PreviewDialogPayload {
 
 /**
  * Video frame payload for preview stream (CDP screencast)
- * ~10 fps, 1280x720, JPEG quality 60
+ * 1280x720, JPEG. The client decodes via createImageBitmap (byte-sniffed).
  */
 export interface PreviewVideoFramePayload {
   previewSessionId: string;
@@ -1575,7 +1669,7 @@ export interface PreviewVideoFramePayload {
   /**
    * Frame bytes — base64 string only when binary transport is unavailable.
    * When binary transport is used (preferred), this is an empty string and
-   * the actual JPEG bytes are passed as the second `emit()` argument.
+   * the actual image bytes are passed as the second `emit()` argument.
    */
   data: string;
   width: number;             // 1280
@@ -1584,6 +1678,18 @@ export interface PreviewVideoFramePayload {
   timestamp: string;
   /** V20: byte length of the binary frame (set when binary transport is used) */
   byteLength?: number;
+  /**
+   * Per-frame viewport scroll + zoom from CDP screencast metadata
+   * (`scrollOffsetX/Y`, `pageScaleFactor`). The editor subtracts scrollX/Y from
+   * document-relative highlight bboxes (LiteElement.bounds, invariant #18) to
+   * position the "is this the element?" border on THIS frame's visible viewport,
+   * so the border tracks live scrolling. Absent on screenshot-injected frames
+   * (first-frame / idle watchdog / run-sync) — the client keeps the last known
+   * scroll, which is correct for a static page.
+   */
+  scrollX?: number;
+  scrollY?: number;
+  pageScaleFactor?: number;
 }
 
 /**
@@ -1608,6 +1714,38 @@ export interface PreviewStepLintResultPayload {
    * V3: True if Apply should be disabled (status is needs_clarification without user selection)
    */
   applyDisabled?: boolean;
+  /**
+   * Diagnostic parity across branches. The resolved/not_found branch spreads
+   * the whole LintResult, but the needs_clarification branch builds its
+   * payload by hand — these fields let the FE distinguish "LLM degraded,
+   * retry later" from "genuinely ambiguous, refine the description" and
+   * feed latency telemetry. All optional; absent on older servers.
+   */
+  degradedMode?: boolean;
+  degradedReason?: string;
+  aiFallbackReason?: 'semantic_zero' | 'ambiguous' | 'low_confidence';
+  cacheHit?: boolean;
+  resolverPath?: string;
+  /** V23 coaching hint (already emitted via conditional spread; now typed) */
+  suggestion?: {
+    issue: 'NO_MATCH' | 'AMBIGUOUS' | 'GENERIC_INTENT' | 'VAGUE_INTENT' | 'LOW_CONFIDENCE';
+    hint: string;
+    examples?: string[];
+  };
+  phaseTimings?: {
+    snapshotMs?: number;
+    resolveMs?: number;
+    totalMs?: number;
+    domNodeCount?: number;
+  };
+  /**
+   * True when the "is this the element?" border was already painted IN-PAGE
+   * (inside the browser, by data-agent-ref). The FE then SKIPS its React-<div>
+   * fallback overlay to avoid a double border. False when the element wasn't in
+   * the main frame (cross-origin iframe / not in DOM) — the FE draws the React
+   * fallback (which works over the video regardless of frame origin).
+   */
+  inPageHighlightDrawn?: boolean;
   timestamp: string;
 }
 
@@ -2146,6 +2284,20 @@ export interface PreviewMouseProbeRequest {
 }
 
 /**
+ * Client video-render health report. Sent periodically (every few seconds) by
+ * the preview video hook with the FPS it actually painted over the last window.
+ * The server compares it to the rate it's sending and adapts its throttle
+ * (fps-only — never restarts the screencast or changes quality).
+ */
+export interface PreviewVideoHealthReport {
+  previewSessionId: string;
+  /** Frames the client actually rendered per second over the report window. */
+  renderedFps: number;
+  /** Optional: count of seq gaps the client observed (dropped frames). Telemetry only. */
+  droppedFrames?: number;
+}
+
+/**
  * Mouse probe result (debug: element info at given coordinates)
  * Allows frontend to verify coordinate mapping by showing what element backend sees
  */
@@ -2484,7 +2636,7 @@ export interface AIActionLogPayload {
 // ROOM TYPES
 // ============================================================================
 
-export type RoomType = 'test' | 'chat' | 'user' | 'preview';
+export type RoomType = 'test' | 'chat' | 'user' | 'preview' | 'project';
 
 export interface RoomIdentifier {
   type: RoomType;
@@ -2494,8 +2646,10 @@ export interface RoomIdentifier {
 // Helper to create room names
 export const createRoomName = (type: RoomType, id: string): string => {
   // Validate inputs
-  if (!type || !['test', 'chat', 'user', 'preview'].includes(type)) {
-    throw new Error(`Invalid room type: ${type}. Must be 'test', 'chat', 'user', or 'preview'`);
+  if (!type || !['test', 'chat', 'user', 'preview', 'project'].includes(type)) {
+    throw new Error(
+      `Invalid room type: ${type}. Must be 'test', 'chat', 'user', 'preview', or 'project'`,
+    );
   }
 
   if (!id || typeof id !== 'string' || id.trim().length === 0) {
@@ -2706,6 +2860,9 @@ export interface ApiFlowStepStartPayload {
   path: string;
   resolvedUrl: string;
   variablesInjected: string[]; // variable names used
+  // Case Matrix (Group 5): set when this is one case of a node's matrix.
+  caseId?: string;
+  caseName?: string;
   timestamp: string;
 }
 
@@ -2720,6 +2877,35 @@ export interface ApiFlowStepCompletePayload {
   durationMs: number;
   variablesExtracted: Array<{ name: string; value: string }>;
   error?: string;
+  // Case Matrix (Group 5): set when this is one case of a node's matrix.
+  caseId?: string;
+  caseName?: string;
+  timestamp: string;
+}
+
+export interface ApiFlowStepSkippedPayload {
+  flowSpecId: string;
+  flowRunId: string;
+  sessionId: string;
+  stepIndex: number;
+  nodeId: string;
+  // 'unsupported' | dependency failure | user cancelled — drives node visual state
+  reason: 'unsupported' | 'dependency_failed' | 'cancelled';
+  // when reason === 'cancelled' the frontend renders the node as 'cancelled', else 'skipped'
+  status: 'skipped' | 'cancelled';
+  message?: string;
+  timestamp: string;
+}
+
+export interface ApiFlowStepRetryingPayload {
+  flowSpecId: string;
+  flowRunId: string;
+  sessionId: string;
+  stepIndex: number;
+  nodeId: string;
+  attempt: number; // current retry attempt (1-based)
+  maxRetries: number;
+  reason: 'rate_limited' | 'auth_refresh';
   timestamp: string;
 }
 
@@ -2727,6 +2913,8 @@ export interface ApiFlowVariableExtractedPayload {
   flowSpecId: string;
   flowRunId: string;
   sessionId: string;
+  nodeId: string; // source node that produced the variable (for edge/node highlight)
+  stepIndex: number;
   variableName: string;
   extractedFrom: string; // e.g. "POST /auth/login → $.data.token"
   value: string; // masked for sensitive values (tokens show first 8 chars + ***)

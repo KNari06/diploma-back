@@ -265,6 +265,20 @@ export interface AllureImportResultHierarchy {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
+ * Target platform for test cases created by an import. Mirrors the
+ * `intent_test_cases.platform` enum. The user picks this in the import
+ * dialog; Allure reports carry no reliable web-vs-mobile signal of their
+ * own (the `framework` label — appium/espresso/… — is only a hint), so the
+ * choice is explicit rather than inferred.
+ */
+export type ImportPlatform = 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
+
+/** Valid `ImportPlatform` values, for runtime validation of the wire field. */
+const IMPORT_PLATFORMS: readonly ImportPlatform[] = [
+  'web', 'mobile_android', 'mobile_ios', 'mobile_flutter',
+];
+
+/**
  * User-configurable options for an Allure import.
  * All fields are optional and default to sane values in the service.
  */
@@ -297,6 +311,12 @@ export interface AllureImportOptions {
    * write `""` to `intent_test_cases.start_url`, only a real URL or null.
    */
   defaultStartUrl?: string;
+  /**
+   * Platform applied to every test case created from this import, and used
+   * to pick the platform-tree node (web_ui vs mobile) that imported
+   * Modules/Flows land under. Default: `'web'`.
+   */
+  platform?: ImportPlatform;
 }
 
 /**
@@ -315,6 +335,8 @@ export interface ResolvedAllureImportOptions {
    * test cases match the legacy behaviour.
    */
   defaultStartUrl: string | null;
+  /** Always populated — defaults to `'web'`. */
+  platform: ImportPlatform;
 }
 
 /**
@@ -339,6 +361,17 @@ function normaliseDefaultStartUrl(raw: unknown): string | null {
 }
 
 /**
+ * Validate an arbitrary value against the platform enum. Accepts `unknown`
+ * (the wire field is an unvalidated multipart string) and falls back to
+ * `'web'` for anything outside the enum — typo, stale client, missing field.
+ */
+function normalisePlatform(raw: unknown): ImportPlatform {
+  return typeof raw === 'string' && (IMPORT_PLATFORMS as readonly string[]).includes(raw)
+    ? (raw as ImportPlatform)
+    : 'web';
+}
+
+/**
  * Apply user-provided options on top of defaults.
  */
 export function resolveImportOptions(
@@ -351,6 +384,7 @@ export function resolveImportOptions(
     deduplicateTests:  opts.deduplicateTests  ?? true,
     saveDocsToKB:      opts.saveDocsToKB      ?? true,
     defaultStartUrl:   normaliseDefaultStartUrl(opts.defaultStartUrl),
+    platform:          normalisePlatform(opts.platform),
   };
 }
 
@@ -417,6 +451,14 @@ export interface AllureImportStats {
   kbDocumentsCreated: number;
   filesSkipped: number;
   videosSkipped: number;
+  /**
+   * Number of imported tests whose steps were produced by the deterministic
+   * fallback (every step → 'click') because AI step conversion failed for at
+   * least one batch. These tests imported successfully but their step TYPES are
+   * unreliable and likely need manual review before they'll replay correctly.
+   * Surfaced to the user so a degraded import isn't mistaken for a clean one.
+   */
+  testsWithDegradedSteps: number;
   /** Non-fatal errors (one string per issue). */
   errors: string[];
 }
@@ -470,6 +512,7 @@ export function emptyStats(): AllureImportStats {
     kbDocumentsCreated: 0,
     filesSkipped: 0,
     videosSkipped: 0,
+    testsWithDegradedSteps: 0,
     errors: [],
   };
 }

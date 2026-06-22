@@ -19,7 +19,7 @@ Transforms a `LiteSnapshot` (raw page collection — produced by `agent/core/lit
 - `DomAnalysisData = { interactiveNodes, url?, title?, capturedAt, version }`.
 
 ### Constants
-- `MAX_INTERACTIVE_NODES = 500` — caps payload (raised from 200 for modern dashboards).
+- `MAX_INTERACTIVE_NODES = 1500` — caps payload (200 → 500 → 1500, V-bigroup-3 May 2026, matched to the CDP snapshot cap). Cut is document-order; only a `logger.debug` fires when the cap hits.
 - `MAX_TEXT_LENGTH = 100` — text/label truncation.
 - `MAX_PARENT_CHAIN_LENGTH = 6` — ancestor chain depth cap.
 - `DOM_ANALYSIS_VERSION = '2.0'` — V2 adds ARIA state, validation, labels, hierarchy.
@@ -44,9 +44,9 @@ Transforms a `LiteSnapshot` (raw page collection — produced by `agent/core/lit
 - **Side-effects:** none (input snapshot unchanged).
 - **Steps:**
   1. Iterate `snapshot.elements`.
-  2. Skip disabled + non-visible (these are filtered, not retained as soft penalties at this layer).
+  2. Skip ONLY elements that are BOTH disabled AND non-visible (`element.disabled && !element.visible`). Invisible-but-enabled and disabled-but-visible nodes ARE retained — downstream layers decide (resolver `buildAllowedSets` hard-excludes invisible; rule-based lint only penalizes it).
   3. Convert each via internal `elementToInteractiveNode()`.
-  4. Stop at `MAX_INTERACTIVE_NODES`.
+  4. Stop at `MAX_INTERACTIVE_NODES` (document order; tail silently cut, debug log only).
 
 ### `DomAnalysisExtractorService.getVersion(): string`
 

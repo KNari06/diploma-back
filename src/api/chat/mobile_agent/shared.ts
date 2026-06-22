@@ -9,7 +9,8 @@
  * Keep this thin — it's plumbing, not business logic.
  */
 
-import { ChatService } from '@/services/utils/chat.service';
+import { ChatPersistence } from '@/services/utils/chat-persistence';
+import { GLOBAL_STORE, type ChatStore } from '@/services/utils/chat-store';
 import { logger } from '@/utils/core/logger';
 
 export interface MobileChatContext {
@@ -41,6 +42,11 @@ export function parseMobileContext(context: unknown): MobileChatContext | null {
  * Persist both turns of the exchange, tagged with `editorKind: 'mobile'` so
  * analytics / history filters can distinguish mobile-editor chats from web.
  * Best-effort — a DB failure must not break the user-visible reply.
+ *
+ * `store` selects the persistence backend (mirrors web's editor_action):
+ * GLOBAL_STORE for workspace-level mobile chat, TESTCASE_STORE when the
+ * mobile editor is scoped to a saved test case. Defaults to GLOBAL_STORE so
+ * callers that don't yet thread the store keep their previous behaviour.
  */
 export async function saveMobileChatTurn(
   chatSessionId: string | undefined,
@@ -48,10 +54,11 @@ export async function saveMobileChatTurn(
   aiReply: string,
   metadata: Record<string, unknown>,
   intentTag: 'mobile_action' | 'mobile_agent',
+  store: ChatStore = GLOBAL_STORE,
 ): Promise<void> {
   if (!chatSessionId) return;
   try {
-    await ChatService.saveChatMessages(chatSessionId, [
+    await ChatPersistence.saveMessages(store, chatSessionId, [
       {
         role: 'user',
         content: userMessage,

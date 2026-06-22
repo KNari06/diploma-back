@@ -859,8 +859,11 @@ Respond with JSON ONLY.`;
 
     for (const signal of negativeSignals) {
       const signalLower = signal.toLowerCase();
-      // Build regex with word boundary for Latin, simple includes for Cyrillic
-      const isCyrillic = /[а-яё]/i.test(signal);
+      // Build regex with word boundary for Latin, simple includes for Cyrillic.
+      // Cyrillic class includes Kazakh-specific letters (ә ғ қ ң ө ұ ү һ і) —
+      // otherwise a Kazakh signal like "қате" fails the test, falls into the
+      // ASCII `\b` regex (which never matches Cyrillic), and is silently missed.
+      const isCyrillic = /[а-яёәғқңөұүһі]/i.test(signal);
       const regex = isCyrillic ? null : new RegExp(`\\b${signalLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
 
       for (const text of elementTexts) {

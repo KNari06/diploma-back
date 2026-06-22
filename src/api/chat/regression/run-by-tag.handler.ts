@@ -10,12 +10,13 @@
  * - "запусти критические тесты"
  */
 
-import { supabaseAdmin } from '@/db/supabase';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { getLocalizedMessages } from './localization';
+import { getResolvedTargets } from '../shared/intent-target-resolution';
+import { resolveProjectId } from './project-resolver';
 
 /**
  * Handler for run_by_tag intent
@@ -47,7 +48,12 @@ export async function handleRunByTagIntent(
       userId,
     });
 
-    const tag = parsedIntent?.tag || parsedIntent?.target;
+    // Prefer an explicit tag; otherwise fall back to the understanding layer's
+    // resolved tag descriptor (e.g. user said "run the smoke ones" → the
+    // classifier emitted targetSelector{type:'tag', value:'smoke'}).
+    const resolved = getResolvedTargets(parsedIntent);
+    const resolvedTag = resolved?.selectorType === 'tag' ? resolved.descriptor : undefined;
+    const tag = parsedIntent?.tag || parsedIntent?.target || resolvedTag;
 
     if (!tag) {
       res.json({
@@ -65,21 +71,15 @@ export async function handleRunByTagIntent(
       return;
     }
 
-    // Get project from workspace
-    const { data: project } = await supabaseAdmin
-      .from('projects')
-      .select('id')
-      .eq('workspace_id', workspace_id)
-      .eq('user_id', userId)
-      .limit(1)
-      .maybeSingle();
+    // Resolve the target project (workspace-membership scoped — see resolver).
+    const projectId = await resolveProjectId(params);
 
-    if (!project) {
+    if (!projectId) {
       throw new NotFoundError('Project', workspace_id);
     }
 
     const result = await RegressionRunService.runByTag({
-      projectId: project.id,
+      projectId,
       tag,
       userId,
       trigger: 'chat',

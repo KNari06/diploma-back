@@ -3,6 +3,10 @@ import {
   normalizeTypeActionValue,
 } from '../preview-step-apply.service';
 
+// Note: the type-action helpers (typedValueLooksApplied / shouldRetryTypeWithFill
+// / clearFieldBeforeType / verifyTypedValueAndRetry) were extracted to
+// `type-action.helpers.ts` — their tests live in `type-action.helpers.test.ts`.
+
 describe('preview-step-apply helpers', () => {
   describe('globToRegexPatternForWaitFor', () => {
     it('keeps ** and * semantics without replacement collisions', () => {

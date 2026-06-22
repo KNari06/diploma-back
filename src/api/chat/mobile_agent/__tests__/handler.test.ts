@@ -63,6 +63,19 @@ jest.mock('../reasoning-trace', () => ({
   isReasoningPersistEnabled: jest.fn(() => false),
 }));
 
+// AI-usage tracking — boundary-mocked so the suite doesn't pull the real
+// Supabase-backed tracker (which throws on missing env at import time).
+jest.mock('@/services/ai/tracking/ai-usage-tracker', () => ({
+  AIUsageTracker: {
+    beginSession: jest.fn(),
+    recordPipelineMetrics: jest.fn(),
+    endSession: jest.fn(async () => null),
+  },
+}));
+jest.mock('@/services/ai/tracking/ai-context', () => ({
+  withAIContext: jest.fn((_ctx: any, fn: () => any) => fn()),
+}));
+
 // Env flag — re-mock per test where needed.
 const mockEnv = {
   MOBILE_CHAT_EAGER_SNAPSHOT: true,

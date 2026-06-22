@@ -46,10 +46,17 @@ const isOriginAllowed = (origin: string | undefined): boolean => {
 };
 
 // Error handler middleware
+// NOTE: the 4th `_next` param is REQUIRED. Express identifies error-handling
+// middleware solely by arity (length === 4). Without it, `app.use(errorHandler)`
+// is treated as ordinary middleware and is NEVER invoked on `next(err)` —
+// errors from asyncHandler-wrapped routes would fall through to Express's
+// default HTML error handler instead of this JSON envelope.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 export const errorHandler = (
   error: Error,
   req: Request,
-  res: Response
+  res: Response,
+  _next: NextFunction
 ): void => {
   // ✅ FIX: Ensure CORS headers are always set, even on errors
   // This prevents CORS errors when backend is unavailable (502/503)

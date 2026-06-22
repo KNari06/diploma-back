@@ -20,9 +20,9 @@
 
 import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
-import { AI_MODELS } from '@/config/ai/ai-models.config';
 
 import type { ExplorationBlackboard, SentinelInput, SentinelAssessment } from './agent-types';
+import { EXPLORATION_AGENT_LLM } from './agent-llm-config';
 import {
   buildFlowSummaries,
   buildBlockedFlowSummaries,
@@ -36,8 +36,8 @@ import {
   parseSentinelResponse,
 } from './sentinel-prompts';
 
-/** Timeout for Sentinel AI call */
-const SENTINEL_TIMEOUT_MS = 20_000;
+/** Centralized LLM tuning for this agent (model / temp / tokens / timeout). */
+const LLM = EXPLORATION_AGENT_LLM.sentinel;
 
 export class ExplorationSentinel {
   constructor(private readonly bb: ExplorationBlackboard) {}
@@ -50,7 +50,7 @@ export class ExplorationSentinel {
     const prompt = buildSentinelPrompt(input);
 
     this.bb.trace?.writeSentinelPrompt({
-      model: AI_MODELS.smart,
+      model: LLM.model,
       systemPrompt: SENTINEL_SYSTEM_PROMPT,
       userPrompt: prompt,
     });
@@ -67,14 +67,14 @@ export class ExplorationSentinel {
             { role: 'user', content: prompt },
           ],
           {
-            model: AI_MODELS.smart,
-            temperature: 0.1,
-            max_tokens: 1500,
+            model: LLM.model,
+            temperature: LLM.temperature,
+            max_tokens: LLM.maxTokens,
             response_format: { type: 'json_object' },
           },
         ),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Sentinel AI timeout')), SENTINEL_TIMEOUT_MS),
+          setTimeout(() => reject(new Error('Sentinel AI timeout')), LLM.timeoutMs),
         ),
       ]);
 
@@ -84,7 +84,7 @@ export class ExplorationSentinel {
       const latencyMs = Date.now() - aiStartTime;
 
       this.bb.trace?.writeSentinelResponse({
-        model: AI_MODELS.smart,
+        model: LLM.model,
         rawResponse: response.content,
         parsed: result ? {
           coverageScore: result.coverageScore,
@@ -120,29 +120,42 @@ export class ExplorationSentinel {
   }
 
   private buildInput(): SentinelInput {
-    const completedFlows = buildFlowSummaries(this.bb.completedFlows);
+    // Split executed vs skipped: budget-skipped tasks live in completedFlows
+    // (with status 'skipped') but were never run — they must be reported as
+    // SKIPPED, not as tested, and excluded from step/error/coverage stats.
+    const executedFlows = this.bb.completedFlows.filter((f) => f.status !== 'skipped');
+    const skippedTaskFlows = this.bb.completedFlows.filter((f) => f.status === 'skipped');
+
+    const completedFlows = buildFlowSummaries(executedFlows);
     const skippedEntryPoints = this.bb.queue?.remaining() ?? [];
 
     return {
       pagesDiscovered: this.bb.tree?.getNodeCount() ?? 0,
       pageInsights: getPageInsightsArray(this.bb),
       completedFlows,
-      blockedFlows: buildBlockedFlowSummaries(this.bb.completedFlows),
-      skippedFlows: skippedEntryPoints.filter((ep) => ep?.name && ep?.category).map((ep) => ({
-        name: ep.name,
-        category: ep.category,
-        reason: 'Budget exhausted',
-      })),
+      blockedFlows: buildBlockedFlowSummaries(executedFlows),
+      skippedFlows: [
+        // Tasks dequeued but skipped because budget ran out mid-run.
+        ...skippedTaskFlows.map((f) => ({ name: f.name, category: f.category, reason: 'Budget exhausted' })),
+        // Entry points still queued (never dequeued).
+        ...skippedEntryPoints.filter((ep) => ep?.name && ep?.category).map((ep) => ({
+          name: ep.name,
+          category: ep.category,
+          reason: 'Budget exhausted',
+        })),
+      ],
       categoriesCovered: getCategoriesCovered(this.bb),
-      totalStepsExecuted: this.bb.completedFlows.reduce((sum, f) => sum + f.stepsCount, 0),
-      errorsFound: this.bb.completedFlows.reduce((sum, f) => sum + f.errors.length, 0),
+      totalStepsExecuted: executedFlows.reduce((sum, f) => sum + f.stepsCount, 0),
+      errorsFound: executedFlows.reduce((sum, f) => sum + f.errors.length, 0),
       budget: buildBudgetSummary(this.bb.budget),
       scopeHint: this.bb.scopeHint,
     };
   }
 
   private fallbackAssessment(): SentinelAssessment {
-    const completed = this.bb.completedFlows.length;
+    // Only count flows that actually executed — skipped (budget-exhausted)
+    // flows are not coverage and must not inflate the score.
+    const completed = this.bb.completedFlows.filter((f) => f.status !== 'skipped').length;
     const total = this.bb.tree?.getAllEntryPoints()?.length || 0;
     // Clamp to [0, 100]: Scout-discovered branches can push completed past the
     // initial tree entry point count, which would otherwise yield >100%.
@@ -171,7 +184,9 @@ export class ExplorationSentinel {
   }
 
   private identifyUncoveredCategories(): string[] {
-    const exploredCategories = new Set(this.bb.completedFlows.map((f) => f.category));
+    const exploredCategories = new Set(
+      this.bb.completedFlows.filter((f) => f.status !== 'skipped').map((f) => f.category),
+    );
     const allEntryPoints = this.bb.tree?.getAllEntryPoints() ?? [];
     const allCategories = new Set(allEntryPoints.map((ep) => ep.category));
     return [...allCategories].filter((c) => !exploredCategories.has(c));

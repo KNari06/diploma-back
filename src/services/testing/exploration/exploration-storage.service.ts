@@ -108,6 +108,136 @@ export class ExplorationStorageService {
   }
 
   /**
+   * Persist discovered MOBILE test cases straight from the runner snapshot.
+   *
+   * Mobile runs don't produce web `DiscoveredTestCase` objects — the runner
+   * returns nested cases under `flows[].mobile.cases[]`, each already
+   * carrying replay-ready `intentSteps` (the exact shape intent_test_cases
+   * .steps_json wants). So we insert directly here rather than round-trip
+   * through the web `toIntentTestCase` adapter (which would lose the mobile
+   * step shape). Returns inserted ids; never throws (best-effort, mirrors
+   * saveTestCases).
+   *
+   * `snapshotFlows` is `UiExplorationSnapshot.flows` from the runner — typed
+   * loosely on purpose so the backend doesn't import the runner's contract.
+   */
+  static async saveMobileTestCasesFromSnapshot(
+    snapshotFlows: Array<{
+      name?: string;
+      category?: string;
+      priority?: string;
+      mobile?: {
+        cases?: Array<{
+          name?: string;
+          description?: string;
+          status?: string;
+          intentSteps?: unknown[];
+        }>;
+      };
+    }>,
+    projectId: string,
+    userId: string,
+    platform: 'android' | 'ios' | 'flutter',
+  ): Promise<string[]> {
+    const browserTag = platform === 'ios' ? 'mobile_ios' : platform === 'flutter' ? 'mobile_flutter' : 'mobile_android';
+    const records: Array<Record<string, unknown>> = [];
+
+    for (const flow of snapshotFlows || []) {
+      const cases = flow.mobile?.cases || [];
+      for (const c of cases) {
+        const steps = Array.isArray(c.intentSteps) ? c.intentSteps : [];
+        // Skip empty cases — nothing replayable to save.
+        if (steps.length === 0) continue;
+        const priority = ['high', 'medium', 'low'].includes(flow.priority || '')
+          ? (flow.priority as string)
+          : 'medium';
+        records.push({
+          project_id: projectId,
+          user_id: userId,
+          name: c.name || flow.name || 'Mobile flow',
+          description: c.description || null,
+          start_url: null, // mobile has no URL
+          steps_json: steps,
+          tags: [browserTag, ...(flow.category ? [flow.category] : [])],
+          priority,
+          expected_result: null,
+          preconditions: null,
+          status: 'draft',
+          kind: 'standalone',
+          source: 'exploration',
+        });
+      }
+    }
+
+    if (records.length === 0) return [];
+
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('intent_test_cases')
+        .insert(records)
+        .select('id');
+
+      if (error) {
+        logger.error('[EXPLORATION_STORAGE] Failed to save mobile test cases', {
+          error: error.message,
+          count: records.length,
+        });
+        return [];
+      }
+      const ids = (data || []).map((r: { id: string }) => r.id);
+      logger.info('[EXPLORATION_STORAGE] Mobile test cases saved', { count: ids.length, projectId });
+      return ids;
+    } catch (error) {
+      logger.error('[EXPLORATION_STORAGE] Error saving mobile test cases', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+  }
+
+  /**
+   * Mark a MOBILE exploration run as completed.
+   *
+   * Mobile runs come from the runner (not the in-process ExplorationEngine),
+   * so we don't have a web `ExplorationResult` — only the relay's terminal
+   * outcome (status + summary + counts). This persists those directly,
+   * mirroring `completeRun`'s columns. `failRun` covers the failed path.
+   */
+  static async completeMobileRun(
+    explorationId: string,
+    data: {
+      summary: Record<string, unknown>;
+      durationMs?: number | null;
+      testCasesCount?: number;
+    },
+  ): Promise<void> {
+    try {
+      const { error } = await supabaseAdmin
+        .from('exploration_runs')
+        .update({
+          status: 'completed',
+          summary: data.summary,
+          duration_ms: data.durationMs ?? null,
+          test_cases_count: data.testCasesCount ?? 0,
+          completed_at: new Date().toISOString(),
+        })
+        .eq('exploration_id', explorationId);
+
+      if (error) {
+        logger.error('[EXPLORATION_STORAGE] Failed to complete mobile run', {
+          error: error.message,
+          explorationId,
+        });
+      }
+    } catch (error) {
+      logger.error('[EXPLORATION_STORAGE] Error completing mobile run', {
+        error: error instanceof Error ? error.message : String(error),
+        explorationId,
+      });
+    }
+  }
+
+  /**
    * Mark exploration run as failed.
    */
   static async failRun(explorationId: string, errorMessage: string): Promise<void> {
@@ -132,6 +262,52 @@ export class ExplorationStorageService {
         error: error instanceof Error ? error.message : String(error),
         explorationId,
       });
+    }
+  }
+
+  /**
+   * Backstop reaper: mark exploration runs stuck in 'running' since before
+   * `cutoffIso` as 'timed_out'. Exploration finalization is event-driven
+   * (completeRun/failRun in the job); if the worker dies without throwing
+   * (OOM / killed mid-deploy / stall-death) no terminal write ever lands and
+   * the row stays 'running' forever (perpetual spinner in history, no cancel).
+   * This single bulk UPDATE is the missing trigger, called from the periodic
+   * StaleReaperService sweep.
+   *
+   * Idempotent: the `status = 'running'` filter excludes already-terminal rows,
+   * so re-runs only ever touch genuinely-stuck rows. Requires the 'timed_out'
+   * status (migration 20260618_exploration_runs_terminal_status.sql).
+   *
+   * @returns count of rows flipped this sweep (0 on error — best-effort).
+   */
+  static async reapStaleRunningRuns(cutoffIso: string): Promise<number> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('exploration_runs')
+        .update({
+          status: 'timed_out',
+          error_message: 'Run abandoned — no terminal status before timeout (worker died or stalled)',
+          completed_at: new Date().toISOString(),
+        })
+        .eq('status', 'running')
+        .lt('started_at', cutoffIso)
+        .select('exploration_id');
+
+      if (error) {
+        logger.error('[EXPLORATION_STORAGE] Failed to reap stale runs', { error: error.message });
+        return 0;
+      }
+
+      const count = data?.length ?? 0;
+      if (count > 0) {
+        logger.info('[EXPLORATION_STORAGE] Reaped stale exploration runs', { count });
+      }
+      return count;
+    } catch (error) {
+      logger.error('[EXPLORATION_STORAGE] Error reaping stale runs', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 0;
     }
   }
 

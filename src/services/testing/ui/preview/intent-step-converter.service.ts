@@ -13,7 +13,11 @@
 
 import { PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
-import type { BindingHints, CompiledStepPlan, ExpectedStepOutcome, IntentActionType, IntentStep, StepEvidence } from './preview.types';
+import type { BindingHints, CompiledStepPlan, ExpectedStepOutcome, IntentActionType, IntentStep, StepEvidence, TargetFingerprint } from './preview.types';
+// Step.options.* forwarding (replaceContent, keyPressDelay, cssSelector,
+// disableStabilityChecks, disableCaching) lives in a dedicated module so
+// this converter stays focused on the action→command shape.
+import { applyStepOptionsToCommand } from './intent-step-options-forwarder';
 
 /**
  * Extended PlaywrightCommand with intent metadata for runtime resolution
@@ -34,6 +38,15 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     evidence?: StepEvidence;
     /** Binding hints for resolution */
     bindingHints?: BindingHints;
+    /**
+     * Recorded element fingerprint (id/testId/name/text/ancestor/landmark/…).
+     * Forwarded so the AUTO-HEAL resolver gets the same strong identity the
+     * editor had. Without this, a regression heal resolved blind (only
+     * description + soft bindingHints) — the #2 heal-context gap (2026-06).
+     */
+    recordedFingerprint?: TargetFingerprint;
+    /** Recorded natural-language description (record-time LLM note) — soft heal hint. */
+    recordedDescription?: string;
     /** Step index in the test case */
     stepIndex: number;
     /** V2: Parent IntentTestCase ID for heal persistence */
@@ -52,6 +65,40 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     lookaheadTimeoutMs?: number;
     /** V10: Press Enter after type action (from step.options.pressEnter) */
     pressEnter?: boolean;
+    /**
+     * Clear field before typing (from step.options.replaceContent).
+     * - undefined / true → clear before typing (default, matches preview behavior)
+     * - false → append to existing content
+     * See preview-step-apply.service.ts:2548 for the canonical condition shape.
+     */
+    replaceContent?: boolean;
+    /**
+     * Per-keystroke delay (ms) for `pressSequentially` in the intent `type`
+     * path. From `step.options.keyPressDelay`. When undefined we pass no
+     * `delay` option (Playwright default) — same as preview's non-humanLike
+     * branch when the user didn't set it. We deliberately do NOT inject a
+     * random delay here (that's preview's `humanLike` path, not wired).
+     */
+    keyPressDelay?: number;
+    /**
+     * Marks `command.selector` as a user-pinned raw CSS override from
+     * `step.options.cssSelector`. When set, the executor must short-circuit
+     * the resolver waterfall and use the literal selector — failing the step
+     * if the locator doesn't match, with no AI/self-heal fallback. Mirrors
+     * preview-step-apply.service.ts:2093.
+     */
+    cssSelectorOverride?: string;
+    /**
+     * From `step.options.disableStabilityChecks`. When true the executor
+     * skips smartStepWait calls (matches preview-step-apply.service.ts:2451).
+     */
+    disableStabilityChecks?: boolean;
+    /**
+     * From `step.options.disableCaching`. When true the executor skips the
+     * `evidence.lastSuccessRef` fast-path and always runs full resolution.
+     * Matches the gate in intent-step-lint.service.ts:1227 used by preview.
+     */
+    disableCaching?: boolean;
     /** V13: Content was pasted — use clipboard paste instead of fill/pressSequentially */
     isPaste?: boolean;
     /** V11: Expected outcome for 4xx detection (default: 'success') */
@@ -80,6 +127,8 @@ function mapActionType(intentAction: IntentActionType): string {
       return 'click';
     case 'wait':
       return 'wait';
+    case 'timeout':
+      return 'wait'; // Explicit sleep — reuses the executor's waitForTimeout command
     case 'assert':
       return 'assert'; // Dispatcher in executor: delegates by assertion.type (visible/text/value/etc)
     case 'navigate':
@@ -136,6 +185,10 @@ function mapActionType(intentAction: IntentActionType): string {
     // command-executor branch that handles the live preview path.
     case 'close_tab':
       return 'closeTab';
+    // Multi-tab open — symmetric with switch/close. Background replay maps
+    // this to the `openTab` Playwright action (context.newPage + goto).
+    case 'open_tab':
+      return 'openTab';
     // V16: Gestures and coordinates
     case 'swipe':
       return 'swipe';
@@ -226,6 +279,10 @@ export function convertIntentStepToCommand(
     description: step.description,
     timeout: step.options?.timeout || 30000,
     continueOnError: step.isAutoInjected === true
+      // User-authored "optional step" flag — a failing step is soft-failed by
+      // the executor (step_soft_failed) instead of aborting the run. Same flag
+      // the live preview-run loop honors, so editor Run and background replay agree.
+      || step.options?.continueOnError === true
       || (step.type === 'wait_for' && !!step.options?.urlMatcher?.changedFrom)
       // Teardown steps never fail the overall verdict — they run
       // best-effort after the body. If a teardown step throws, we want
@@ -243,6 +300,10 @@ export function convertIntentStepToCommand(
       compiled: step.compiled,
       evidence: step.evidence,
       bindingHints: step.bindingHints,
+      // Forward recorded identity so auto-heal resolves with the same strong
+      // fingerprint the editor had (regression-heal #2 gap fix, 2026-06).
+      recordedFingerprint: step.recordedFingerprint,
+      recordedDescription: step.recordedDescription,
       stepIndex,
       // V6: Action type for lookahead checks
       actionType: step.type,
@@ -272,6 +333,11 @@ export function convertIntentStepToCommand(
   if (primarySelector) {
     command.selector = primarySelector;
   }
+
+  // Forward user-toggle step.options.* (replaceContent, keyPressDelay,
+  // cssSelector, disableStabilityChecks, disableCaching). May also
+  // override command.selector when cssSelector is pinned.
+  applyStepOptionsToCommand(step, command);
 
   // Handle specific action types
   switch (step.type) {
@@ -304,8 +370,9 @@ export function convertIntentStepToCommand(
       command.value = step.value || '';
       break;
 
-    case 'wait': {
-      // For wait, value might be time in ms
+    case 'wait':
+    case 'timeout': {
+      // For wait/timeout, value is the time in ms to pause
       // ESLint: wrap in block to avoid no-case-declarations
       const waitTimeMsRaw = step.value ?? '1000';
       const waitTimeMs = typeof waitTimeMsRaw === 'number' ? waitTimeMsRaw : Number(waitTimeMsRaw);
@@ -421,6 +488,12 @@ export function convertIntentStepToCommand(
     // Multi-tab close — target tab index in `value`, same shape as switch.
     case 'close_tab':
       command.value = step.value || '0';
+      break;
+
+    // Multi-tab open — destination URL in `value`. CommandExecutor opens a new
+    // page in the context and navigates it there.
+    case 'open_tab':
+      command.value = step.value || '';
       break;
 
     // V18: Coordinate-based swipe gesture (mobile)

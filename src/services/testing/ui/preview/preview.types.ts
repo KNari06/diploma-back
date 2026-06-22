@@ -3,6 +3,10 @@
  * Types for realtime step editor and preview functionality
  */
 
+// Canonical cross-repo Trigger contract lives in the mobile runner types
+// (single source of truth, mirrored by qait-mobile-runner's zod schema).
+import type { Trigger } from '@/services/mobile/mobile-runner.types';
+
 // ═══════════════════════════════════════════════════════════════════════════
 // INTERACTIVE NODE (for dom_analysis storage)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -88,6 +92,14 @@ export interface InteractiveNode {
   isTopMostAtCenter?: boolean;
   /** True if element is inside the active modal/popup/overlay layer */
   isInsideActiveModal?: boolean;
+  /**
+   * True if element lies in a small fixed corner widget layer (geometry-derived,
+   * e.g. a chat/assistant bubble). Mirrors LiteElement.floatingWidget; computed
+   * in-page (viewport-relative) and symmetric across both collectors. The
+   * resolver deprioritizes such nodes so a corner widget's buttons don't pollute
+   * the candidate set (escape-hatch when the step actually targets the widget).
+   */
+  floatingWidget?: boolean;
   /** True if id looks like a dynamic GUID/random string */
   isDynamicId?: boolean;
 
@@ -341,6 +353,8 @@ export type IntentActionType =
   | 'type'
   | 'click'
   | 'wait'
+  // Real sleep/pause: wait N milliseconds, no element, no URL matcher
+  | 'timeout'
   | 'assert'
   | 'navigate'
   | 'select'
@@ -376,6 +390,10 @@ export type IntentActionType =
   // the same tabIndex; if it's already gone the step soft-succeeds (the
   // intent — "this tab should not exist anymore" — is already true).
   | 'close_tab'
+  // Multi-tab — open a new tab and navigate it to a URL. The new tab becomes
+  // active (matches popup adoption). Requires a URL: a tab left at about:blank
+  // is auto-closed by `attachPopupHandler`. URL travels in `step.value`.
+  | 'open_tab'
   // V16: Gesture and coordinate actions (carousels, canvas, maps)
   | 'swipe'
   | 'click_at'
@@ -884,6 +902,19 @@ export interface LocatorEntry {
    * False also covers timeout / throw — not the same as proven-broken.
    */
   validated?: boolean;
+  /**
+   * V25 first-priority probe flag. Set ONLY on the stable-token `:has-text`
+   * chain (`<tag>:has-text("X"):has-text("Y")`). `sortAndCap` orders flagged
+   * entries ahead of ALL tiers so the cheap (~50ms) token chain is tried
+   * before role/testId/etc. — its whole reason for existing (a token match
+   * beats waiting on a full-text role/getByText timeout when the recorded
+   * string drifted). Ordering is intentionally decoupled from `tier`: the
+   * chain stays `TEXTUAL` for durability/legacy-confidence semantics, but
+   * runs first as a probe. Safe to rank first because the chain is generated
+   * ONLY when the node has no structural anchor (id/testId/href/…), so it
+   * never out-orders a real identity attribute on the same element.
+   */
+  firstPriorityProbe?: boolean;
 }
 
 /**
@@ -1150,6 +1181,13 @@ export interface StepOptions {
   disableStabilityChecks?: boolean;
   /** Force fresh element lookup, skip evidence cache */
   disableCaching?: boolean;
+  /**
+   * User-authored "optional step" flag. When true, a failing step does NOT
+   * fail the overall run — the preview-run loop continues to the next step and
+   * background replay soft-fails it (step_soft_failed). Mirrors the mobile
+   * runner's `options.continueOnError` (see step-result-classifier.ts).
+   */
+  continueOnError?: boolean;
   /** Iframe configuration for actions within iframes */
   iframe?: IframeConfig;
   /**
@@ -1264,6 +1302,14 @@ export interface IntentStep {
   options?: StepOptions;
   /** Hints for element resolution */
   bindingHints?: BindingHints;
+  /**
+   * Runtime-only marker: set when this step was inlined as a precondition
+   * (a transitive dependency's step prepended before the target test's own
+   * steps). Holds the owning test-case id. Used by post-run compiled-plan
+   * writeback to EXCLUDE borrowed steps from the target's persisted
+   * `steps_json`. Never persisted on the owning case.
+   */
+  _preconditionSource?: string;
   /** Cached evidence from last execution (optimization, not truth) */
   evidence?: StepEvidence;
   /**
@@ -1649,6 +1695,11 @@ export interface StepRuntimeMeta {
   retryAttempts?: number;
   /** Screenshot URL at the time of failure (for bug investigation) */
   bugScreenshotUrl?: string;
+  /**
+   * Screenshot URL captured after every step (pass or fail) when per-step
+   * capture is enabled. Distinct from `bugScreenshotUrl` (failure-only).
+   */
+  stepScreenshotUrl?: string;
   /** Step ID from intent step */
   stepId?: string;
 }
@@ -1850,6 +1901,11 @@ export interface IntentTestCase {
     resource_id: string;
     required?: boolean;
   }>;
+
+  // User-defined event→action rules forwarded to the mobile runner per run.
+  // Surfaces intent_test_cases.triggers to the UI. CANONICAL cross-repo shape
+  // (`Trigger` in @/services/mobile/mobile-runner.types) — do not diverge.
+  triggers?: Trigger[];
 
   // Provenance (when saved from a completed test)
   sourceTestId?: string;

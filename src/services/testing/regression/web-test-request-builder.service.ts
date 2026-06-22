@@ -1,4 +1,4 @@
-import { supabaseAdmin } from '@/db/supabase';
+import * as regressionDb from './db/regression.db';
 import { logger } from '@/utils/core/logger';
 import { ValidationError } from '@/types';
 import { applyParameters } from '@/utils/testing/parameter-substitution.utils';
@@ -35,13 +35,9 @@ export class WebTestRequestBuilderService {
 
     // Get source test for base configuration (optional - only for browsers/options)
     // Step editor test cases have no source_test_id — query returns null, defaults apply
-    const { data: sourceTest } = intentCase.source_test_id
-      ? await supabaseAdmin
-          .from('tests')
-          .select('browsers, options')
-          .eq('id', intentCase.source_test_id)
-          .maybeSingle()
-      : { data: null };
+    const sourceTest = intentCase.source_test_id
+      ? await regressionDb.getTestBrowsersAndOptions(intentCase.source_test_id)
+      : null;
 
     let commands: any[] = [];
 

@@ -17,7 +17,7 @@
  */
 
 import type { TestAction, TestCase, TestStep } from '../test-case/types';
-import type { IntentStep, IntentActionType } from '@/services/testing/ui/preview/preview.types';
+import type { IntentStep, IntentActionType, CompiledStepPlan } from '@/services/testing/ui/preview/preview.types';
 import type { IntentTestCase, Priority } from '@/types/testing.types';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -29,8 +29,9 @@ export type ExplorationProgressEvent = {
   explorationId: string;
   phase: 'survey' | 'strategizing' | 'flow' | 'evaluating' | 'complete';
   event:
-    | 'page_discovered' | 'survey_complete'
+    | 'page_discovered' | 'page_skipped' | 'survey_complete'
     | 'strategy_planned'
+    | 'auth_started' | 'auth_completed'
     | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'flow_step' | 'branch_found'
     | 'coverage_evaluated'
     | 'agent_warning' | 'agent_error';
@@ -127,6 +128,41 @@ export const DEFAULT_EXPLORATION_BUDGET: ExplorationBudget = {
   maxTotalPipelineRounds: 150,
   maxFlowsPerPage: 3,
 };
+
+/**
+ * Budget presets selectable at exploration start.
+ *
+ * - 'quick': onboarding / "magic first test". Caps total wall-clock at ~2 min
+ *   so a self-serve user gets a starter pack of a few tests fast, trading
+ *   coverage for time-to-value. Survey shallow, few flows.
+ * - 'full': the default thorough sweep (DEFAULT_EXPLORATION_BUDGET).
+ *
+ * A preset resolves to a Partial<ExplorationBudget> that is shallow-merged
+ * over DEFAULT_EXPLORATION_BUDGET by the engine, so omitted fields fall back
+ * to defaults.
+ */
+export type ExplorationPreset = 'quick' | 'full';
+
+export const EXPLORATION_PRESETS: Record<ExplorationPreset, Partial<ExplorationBudget>> = {
+  quick: {
+    totalTimeoutMs: 2 * 60 * 1000,
+    perFlowTimeoutMs: 45 * 1000,
+    maxSurveyPages: 3,
+    maxFlows: 5,
+    maxTotalPipelineRounds: 25,
+    maxFlowsPerPage: 2,
+  },
+  // Spread so callers can't mutate DEFAULT_EXPLORATION_BUDGET through this ref.
+  full: { ...DEFAULT_EXPLORATION_BUDGET },
+};
+
+/**
+ * Build a unique exploration run id. Single source of format for every call
+ * site (chat confirmation + REST start) so ids stay greppable.
+ */
+export function generateExplorationId(userId: string): string {
+  return `expl-${Date.now()}-${userId.slice(0, 8)}`;
+}
 
 export const DEFAULT_MAX_CONCURRENCY = 5;
 
@@ -325,6 +361,8 @@ export interface FlowExplorationTask {
   roundsUsed: number;
   /** Error info if failed at infra level */
   infraError?: string;
+  /** Actual page URL when the flow finished (before context teardown). Falls back to the source page when unavailable. */
+  finalUrl?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -370,6 +408,13 @@ export interface DiscoveredStep {
    * Empty/undefined for reads (observe_page) and on non-interactive steps.
    */
   networkCalls?: CapturedApiCall[];
+  /**
+   * Compiled locator plan frozen from the resolved element at action time.
+   * Present only for targeting actions whose executor returned a
+   * `resolvedElement`. Carries the step into replay's stage-1 fast path so
+   * the first regression run does NOT re-resolve the element via the LLM.
+   */
+  compiled?: CompiledStepPlan;
 }
 
 /**
@@ -477,7 +522,7 @@ export function toTestCase(discovered: DiscoveredTestCase): TestCase {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /** Map DiscoveredStep action to IntentActionType */
-const ACTION_TO_INTENT_TYPE: Record<string, IntentActionType> = {
+export const ACTION_TO_INTENT_TYPE: Record<string, IntentActionType> = {
   navigate: 'navigate',
   click: 'click',
   fill: 'type',
@@ -535,6 +580,13 @@ export function toIntentSteps(steps: DiscoveredStep[]): IntentStep[] {
         label: step.ref,
         nearText: step.description,
       };
+    }
+
+    // Carry the compiled locator plan (frozen at action time) into the
+    // persisted step so replay's stage-1 fast path hits on the first run
+    // instead of re-resolving every element through the LLM.
+    if (step.compiled) {
+      intentStep.compiled = step.compiled;
     }
 
     return intentStep;

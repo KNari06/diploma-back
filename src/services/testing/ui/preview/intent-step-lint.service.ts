@@ -8,6 +8,7 @@ import { AI_MODELS, AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { cacheMetrics } from '@/utils/core/cache-metrics';
 import { extractKeywordsSync } from '@/utils/text-processing/ai-keyword-extractor';
+import { FIELD_SEMANTIC_KEYWORDS, fieldSemanticStems } from '@/config/testing/field-semantic-keywords';
 import {
     getEffectiveLabel,
     resolveElement,
@@ -19,6 +20,7 @@ import { logIntentResolveLint } from './intent-resolve-audit';
 import { collectSecretValues } from '@/utils/interpolation/redact-secrets';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
 import { isDynamicId } from './dynamic-id.util';
+import { recordedFingerprintHasStrongIdentity, nodeToIdentityProbe, hasStrongIdentityContradiction } from './recorded-identity.util';
 import { getPreviewSessionService } from './preview-session.service';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
 import type {
@@ -178,6 +180,17 @@ function scoreCandidate(node: InteractiveNode, step: IntentStep): { score: numbe
   if (!node.isVisible) {
     score += WEIGHTS.NOT_VISIBLE_PENALTY;
     reasons.push('Not visible');
+  }
+  // Hard-reject invisible elements, symmetric with buildAllowedSets Rule 1
+  // (the AI path's ONLY hard exclude). Without this, a hidden duplicate that
+  // shares a strong identifier with the visible target — the classic case is
+  // a hidden mobile-menu item with the same data-testid as the desktop
+  // button (150 + 120 - 100 = 170 > 0) — survives rule-based ranking and can
+  // be suggested in degraded mode. Strict `=== false` mirrors the resolver's
+  // condition: nodes with isVisible undefined (test fixtures) keep only the
+  // soft penalty above.
+  if (node.isVisible === false) {
+    hardReject = true;
   }
 
   if (node.isDisabled) {
@@ -358,18 +371,15 @@ function scoreCandidate(node: InteractiveNode, step: IntentStep): { score: numbe
     }
   }
 
-  // Smart autocomplete inference from description
+  // Smart autocomplete inference from description (degraded path only).
+  // Stems live in FIELD_SEMANTIC_KEYWORDS — the {en,ru,kk} contract forces
+  // Kazakh coverage (CLAUDE.md Hard invariant #17 spirit). The inline ru/en
+  // map this replaced silently dropped Kazakh, so "құпиясөз" never inferred
+  // password.
   const descLower = step.description.toLowerCase();
   if (!hints.autocomplete) {
-    const autocompleteMappings: Record<string, string[]> = {
-      'email': ['email', 'почт', 'e-mail'],
-      'username': ['username', 'login', 'логин', 'пользовател'],
-      'password': ['password', 'пароль', 'current-password', 'new-password'],
-      'tel': ['phone', 'телефон', 'mobile', 'мобильн'],
-    };
-
-    for (const [autoVal, terms] of Object.entries(autocompleteMappings)) {
-      if (terms.some(t => descLower.includes(t))) {
+    for (const [autoVal, langList] of Object.entries(FIELD_SEMANTIC_KEYWORDS)) {
+      if (fieldSemanticStems(langList).some(t => descLower.includes(t))) {
         if (node.autocomplete === autoVal || node.type === autoVal) {
           score += WEIGHTS.AUTOCOMPLETE_MATCH;
           reasons.push(`Inferred autocomplete=${autoVal}`);
@@ -732,7 +742,7 @@ export class IntentStepLintService {
       const domNodes = snapshot.domNodes ?? [];
 
       // Non-targeting actions — page-level steps that don't target a specific DOM element
-      if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab'].includes(stepDraft.type)) {
+      if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
         return {
           status: 'resolved',
           message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -951,7 +961,7 @@ export class IntentStepLintService {
           logEntityType: 'test_execution',
           logEntityId: params.previewSessionId,
         },
-        () => IntentStepLintService._lintStepWithAIImpl(params, (url, count) => {
+        () => IntentStepLintService._lintStepWithAIImplWithRetry(params, (url, count) => {
           lastUrl = url;
           domNodeCount = count;
         }),
@@ -981,6 +991,11 @@ export class IntentStepLintService {
           secretValues: auditSecretValues,
         });
       } catch { /* never break lint on diagnostics */ }
+      // NOTE: highlight bboxes are DOCUMENT-relative (LiteElement.bounds, invariant
+      // #18). The editor converts them to viewport space using the per-frame
+      // scrollX/scrollY shipped on `preview:video:frame` (screencastFrame metadata)
+      // — NOT here. That keeps the scroll consistent with the exact frame the user
+      // sees AND lets the border track live scrolling, with zero extra evaluate.
       return result;
     } catch (err) {
       const auditSecretValuesErr = (() => {
@@ -1014,6 +1029,60 @@ export class IntentStepLintService {
     }
   }
 
+  /**
+   * Circuit-broken retry wrapper around `_lintStepWithAIImpl` for the explicit
+   * Find button.
+   *
+   * WHY: a descriptor-poor framework-clickable wrapper (e.g. the documentolog
+   * header "Login": a role-less `<div onClick>` with no id/testid) is located by
+   * Phase 3.5 `assignAgentRefs` via bbox/`elementsFromPoint` — the coordinate-
+   * sensitive path (invariant #18). That match intermittently fails to stamp
+   * `data-agent-ref`; an element without a ref is filtered out of the candidate
+   * set, so the resolver never sees it and returns a SPURIOUS `not_found` even
+   * though the element is present (confirmed: same step flips not_found↔resolved
+   * across consecutive Find clicks, 1:1 with ref present/absent). Apply (Run)
+   * hides this behind its readiness settle + retry; Find is single-shot.
+   *
+   * Mirror that resilience: on `not_found`, re-collect a FRESH snapshot
+   * (re-runs refAssign, which usually stamps the ref on a later try) up to 3
+   * attempts, with a short settle between so any layout shift completes. Gated
+   * to the user-initiated Find — debounced auto-lint / pick dry-run / apply
+   * pre-lint either tolerate not_found (mid-typing) or already retry (apply), so
+   * they must not pay the extra LLM round-trips.
+   */
+  private static async _lintStepWithAIImplWithRetry(
+    params: {
+      previewSessionId: string;
+      stepDraft: IntentStep;
+      pageRef?: string;
+      userId: string;
+      includeAlternatives?: boolean;
+      forceFreshSnapshot?: boolean;
+      auditTrigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'pick_dry_run' | 'other';
+    },
+    onContext?: (url: string | undefined, domNodeCount: number) => void,
+  ): Promise<LintResult> {
+    const maxAttempts = params.auditTrigger === 'find_button' ? 3 : 1;
+    const SETTLE_MS = 250;
+
+    let result = await IntentStepLintService._lintStepWithAIImpl(params, onContext);
+    for (let attempt = 2; attempt <= maxAttempts && result.status === 'not_found'; attempt++) {
+      logger.debug('[INTENT_LINT] not_found — retrying with fresh snapshot (refAssign coordinate flake)', {
+        previewSessionId: params.previewSessionId,
+        attempt,
+        maxAttempts,
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, SETTLE_MS));
+      // forceFreshSnapshot bypasses the 500ms throttle so the retry actually
+      // re-collects (and re-runs refAssign) instead of reusing the cached DOM.
+      result = await IntentStepLintService._lintStepWithAIImpl(
+        { ...params, forceFreshSnapshot: true },
+        onContext,
+      );
+    }
+    return result;
+  }
+
   private static async _lintStepWithAIImpl(params: {
     previewSessionId: string;
     stepDraft: IntentStep;
@@ -1033,7 +1102,7 @@ export class IntentStepLintService {
     });
 
     // Non-targeting actions don't need element resolution
-    if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab'].includes(stepDraft.type)) {
+    if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
       return {
         status: 'resolved',
         message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -1129,7 +1198,7 @@ export class IntentStepLintService {
     //   - Hash routing: normalizer strips hash. Known limitation, same as
     //     evidence-shortcut.
     // ═══════════════════════════════════════════════════════════════════════════
-    const NON_TARGETING_FOR_URL_GUARD = new Set(['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'wait_for_email']);
+    const NON_TARGETING_FOR_URL_GUARD = new Set(['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab', 'wait_for_email']);
     if (!NON_TARGETING_FOR_URL_GUARD.has(stepDraft.type)) {
       // Priority order matters. `evidence.pageUrl` is set by the recorder at
       // capture time (the URL the user was actually on when they clicked) and
@@ -1172,7 +1241,7 @@ export class IntentStepLintService {
               if (hits.length === 1) { identityRescue = true; rescueReason = 'href'; }
             }
             if (!identityRescue && name) {
-              const hits = domNodes.filter(n => (n as any).htmlName === name);
+              const hits = domNodes.filter(n => (n as any).name === name);
               if (hits.length === 1) { identityRescue = true; rescueReason = 'name'; }
             }
           }
@@ -1276,7 +1345,38 @@ export class IntentStepLintService {
         // isVisible !== false heuristic) so it stays here and NOT in the utility.
         const compat = this.isEvidenceShortcutNodeCompatible(stepDraft, cachedNode, snapshot.url);
 
-        if (compat.ok) {
+        if (
+          compat.ok
+          && recordedFingerprintHasStrongIdentity(stepDraft.recordedFingerprint)
+          && hasStrongIdentityContradiction(nodeToIdentityProbe(cachedNode), stepDraft.recordedFingerprint)
+        ) {
+          // Recorded-identity guard: the cached lastSuccessRef still exists and
+          // is action-compatible, but a recorded STRONG identifier (id / testId /
+          // name / href / svgIcon / routerLink) now resolves to a DIFFERENT value
+          // — the page drifted and the ref points at another element than a fresh
+          // resolution would pick. Bypass the cache so a full Run converges on the
+          // same element as single-step Apply (which never carries evidence and
+          // always resolves fresh). Same comparator (hasStrongIdentityContradiction,
+          // URL-normalized) as the compiled path. Fail-open on weak fingerprints —
+          // manual-add steps are untouched.
+          logger.info('[INTENT_LINT_V5] Evidence shortcut bypass — recorded-identity mismatch', {
+            previewSessionId,
+            cachedRef,
+            actionType: stepDraft.type,
+            nodeTag: cachedNode.tag,
+            nodeText: cachedNode.text ? cachedNode.text.slice(0, 40) : undefined,
+          });
+          cacheMetrics.inc('evidence-shortcut', 'identity_mismatch');
+          cacheMetrics.inc('evidence-shortcut', 'miss');
+          try {
+            EditorTraceService.get(previewSessionId)?.writeEvidenceShortcut({
+              stepId: stepDraft.id,
+              hit: false,
+              cachedRef,
+              reason: 'recorded_identity_mismatch',
+            });
+          } catch { /* trace logging must never break resolution */ }
+        } else if (compat.ok) {
           logger.debug('[INTENT_LINT_V5] Evidence shortcut hit', {
             previewSessionId,
             cachedRef,
@@ -1334,17 +1434,21 @@ export class IntentStepLintService {
         }
 
         // Passed shared checks but failed action-type compat — bypass cache.
-        logger.debug('[INTENT_LINT_V5] Evidence shortcut bypass - node incompatible with action', {
-          previewSessionId,
-          cachedRef,
-          actionType: stepDraft.type,
-          nodeTag: cachedNode.tag,
-          nodeRole: cachedNode.role,
-          nodeType: cachedNode.type || cachedNode.inputType,
-          reason: compat.reason,
-        });
-        cacheMetrics.inc('evidence-shortcut', 'compat_mismatch');
-        cacheMetrics.inc('evidence-shortcut', 'miss');
+        // Guarded so the recorded-identity-mismatch branch above (which also
+        // leaves compat.ok true) doesn't double-count as a compat mismatch.
+        if (!compat.ok) {
+          logger.debug('[INTENT_LINT_V5] Evidence shortcut bypass - node incompatible with action', {
+            previewSessionId,
+            cachedRef,
+            actionType: stepDraft.type,
+            nodeTag: cachedNode.tag,
+            nodeRole: cachedNode.role,
+            nodeType: cachedNode.type || cachedNode.inputType,
+            reason: compat.reason,
+          });
+          cacheMetrics.inc('evidence-shortcut', 'compat_mismatch');
+          cacheMetrics.inc('evidence-shortcut', 'miss');
+        }
       }
     }
 
@@ -1731,6 +1835,7 @@ export class IntentStepLintService {
    * 
    * Does NOT select elements - just helps user refine their description.
    */
+
   /**
    * V23: Generate context-aware clarification message.
    *

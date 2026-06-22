@@ -13,6 +13,7 @@ describe('RecordingCaptureService iframe probing', () => {
       evaluate: jest
         .fn()
         .mockResolvedValueOnce(null) // main frame probe
+        .mockResolvedValueOnce(null) // diagnostic evaluate (post-null probe)
         .mockResolvedValueOnce([
           { index: 0, x: 0, y: 0, width: 100, height: 100 },
           { index: 1, x: 100, y: 0, width: 100, height: 100 },

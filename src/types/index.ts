@@ -301,15 +301,30 @@ export type WorkspaceRole =
 // Workspace account type enum
 export type WorkspaceAccountType = 'company' | 'individual';
 
+export type WorkspaceProjectType = 'web' | 'mobile';
+export type MobileOnboardingPlatform = 'android' | 'ios' | 'flutter';
+
 export interface WorkspaceOnboardingRequest {
   name: string; // Project/Workspace name
-  baseUrls: string[]; // Array of base URLs
-  environments: {
+  // projectType drives which fields are required:
+  //  - 'web' (default): baseUrls + environments + browserType required
+  //  - 'mobile': baseUrls/environments NOT required; mobilePlatform required.
+  //    The APK/IPA is uploaded separately (mobileService.uploadApp) once the
+  //    workspace/project exists, so it's not part of this payload.
+  projectType?: WorkspaceProjectType; // Default: 'web'
+  // When true the user chose "skip for now" — no web/mobile config is required;
+  // onboarding completes and they configure the target later on the dashboard.
+  skipped?: boolean;
+  baseUrls?: string[]; // Array of base URLs (required for web)
+  environments?: {
     dev?: string;
     predprod?: string;
     prod?: string;
   };
-  browserType: BrowserTypeEnum; // Default: 'chrome'
+  browserType?: BrowserTypeEnum; // Default: 'chrome' (web)
+  // Mobile fields — required/used only when projectType === 'mobile'
+  mobilePlatform?: MobileOnboardingPlatform; // 'android' | 'ios' | 'flutter'
+  mobilePackageName?: string; // package name / bundle id (optional)
   // NEW FIELDS (all optional)
   role?: WorkspaceRole; // User's role (optional)
   position?: string; // User's position (optional, max 255 chars)
@@ -320,6 +335,8 @@ export interface WorkspaceOnboardingRequest {
 export interface WorkspaceOnboardingResponse {
   workspace_id?: string; // Workspace ID returned in response (only when completed)
   name?: string;
+  projectType?: WorkspaceProjectType;
+  skipped?: boolean;
   baseUrls?: string[];
   environments?: {
     dev?: string;
@@ -327,6 +344,8 @@ export interface WorkspaceOnboardingResponse {
     prod?: string;
   };
   browserType?: BrowserTypeEnum;
+  mobilePlatform?: MobileOnboardingPlatform;
+  mobilePackageName?: string;
   completed: boolean; // Whether onboarding was completed
   // NEW FIELDS
   role?: WorkspaceRole;
@@ -365,8 +384,24 @@ export interface ProjectCreateRequest {
     common_elements?: Record<string, string>;
     common_scope?: string;
     defaultBrowsers?: BrowserType[];
-    /** Mobile app metadata (APK/IPA) — set via mobile upload API */
+    /**
+     * Legacy single-app metadata (APK/IPA). Kept for back-compat with
+     * pre-multi-platform code paths. New code should prefer `mobileApps`.
+     * Writers continue to mirror the latest upload here so the legacy
+     * editor + resolveAppForRun fallback keep working unchanged.
+     */
     mobileApp?: Record<string, unknown> | null;
+    /**
+     * Per-platform mobile app metadata. Lets a project ship Android and
+     * iOS (and Flutter) builds side by side without one overwriting
+     * the other. Each key is optional — the absence of, say, `ios`
+     * means "no .ipa uploaded yet for this project".
+     */
+    mobileApps?: {
+      android?: Record<string, unknown>;
+      ios?: Record<string, unknown>;
+      flutter?: Record<string, unknown>;
+    } | null;
     /** CI/CD API key metadata — set via CI key management API */
     ciApiKey?: { hash: string; prefix: string; createdAt: string } | null;
     /** Project-level runtime-permission policy for Android sessions. */
@@ -981,7 +1016,7 @@ export interface IntentResult {
 
   // Optional fields (all intents)
   urgency?: 'high' | 'normal' | null; // Detect: "urgent", "ASAP", "critical", "quick"
-  userLanguage?: 'en' | 'ru' | 'neutral'; // User's language for localization
+  userLanguage?: 'en' | 'ru' | 'kk' | 'neutral'; // User's language for localization
 
   selector?: string; // For UI testing intents
   // Playwright commands generated from intent
@@ -1013,6 +1048,22 @@ export interface IntentResult {
   // false → pipeline skips Router agent (~600ms saved), goes directly to Responder.
   // true/undefined → normal Router flow (backward compatible).
   needsTools?: boolean;
+
+  // Request-understanding layer (Phase 1). Populated from the ANALYZE block of
+  // the intent classification call. Optional + additive — existing handlers
+  // ignore these; the post-parse enrichment stage in intent-parsing.ts consumes
+  // them. Full analysis (isCompound/subRequests/routeHint) lives in
+  // metadata.analysis; these two are lifted out for typed access.
+  targetSelector?: {
+    type: 'test_case' | 'module' | 'plan' | 'flow' | 'tag' | 'keyword' | 'url' | 'element' | 'none';
+    value: string;
+  } | null;
+  executionModifiers?: {
+    browser?: 'chromium' | 'firefox' | 'webkit';
+    device?: string;
+    env?: 'local' | 'staging' | 'prod';
+    build?: string;
+  } | null;
 }
 
 // Playwright Command types
@@ -1059,6 +1110,10 @@ export type PlaywrightActionType =
   | 'press'             // Press keyboard key
   | 'focus'             // Focus element
   | 'blur'              // Blur element
+  // Multi-tab
+  | 'switchTab'         // Switch active tab by index
+  | 'closeTab'          // Close tab by index
+  | 'openTab'           // Open a new tab and navigate it to a URL
   // Touch/Mobile
   | 'dragAndDrop'       // Drag and drop element
   | 'swipe'             // Swipe gesture (mobile)

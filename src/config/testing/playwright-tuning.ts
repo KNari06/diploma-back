@@ -118,6 +118,35 @@ export const STEP_READINESS_CONFIG = {
   blindSettleMs: 800,
 
   /**
+   * DOM-density settle (inter-step). Page-level readiness (loaders/overlays/
+   * animation) can pass while a navigation-heavy SPA is still hydrating — the
+   * interactive DOM is sparse for a beat (e.g. 22 interactive nodes now → 134
+   * after hydration). Resolving on that sparse snapshot misses the target and
+   * triggers scroll-hunt. Wait until the interactive-node count plateaus (stops
+   * growing for `quietMs`) at/above `floor`, capped by `maxWaitMs`. Fail-open on
+   * budget exhaustion or probe failure. Only runs on fresh-page cases (a
+   * navigation just happened OR no fast locator) so stable mid-page clicks are
+   * untouched. Override gate: PREVIEW_DOM_DENSITY (set to 'off' to disable).
+   */
+  domDensity: {
+    enabled: (process.env.PREVIEW_DOM_DENSITY ?? '').toLowerCase().trim() !== 'off',
+    /** Poll interval for the interactive-node count (ms). */
+    pollMs: 120,
+    /** Count must not grow for this long to be considered settled (ms). */
+    quietMs: 320,
+    /**
+     * Below this many interactive nodes the page is treated as not-yet-rendered
+     * (kept low — the growth plateau is the primary signal, this floor only
+     * rejects a transiently empty/near-empty DOM, not minimal real pages).
+     */
+    floor: 3,
+    /** Hard cap on the whole density wait (ms). */
+    maxWaitMs: 2_500,
+    /** Skip the density wait if less than this remains in the readiness budget (ms). */
+    minBudgetMs: 300,
+  },
+
+  /**
    * Max time to wait for SPA URL change after a navigation-trigger action.
    * Override: PREVIEW_SPA_NAV_DETECT_MS
    */
@@ -434,20 +463,21 @@ export const BROWSER_LAUNCH_ARGS = [
 ] as const;
 
 /**
- * Extra HTTP headers to look like a real browser (not automation tool).
- * Applied to browser contexts to pass WAF/bot detection.
+ * Extra HTTP headers applied to every browser context.
+ *
+ * CRITICAL: `extraHTTPHeaders` is sent on EVERY request, not just the top-level
+ * navigation. ONLY CORS-safelisted request headers may live here. Anything else
+ * (`Cache-Control`, `Upgrade-Insecure-Requests`, `Sec-Fetch-*`, `Connection`,
+ * `Accept-Encoding`, …) forces a CORS preflight on cross-origin XHR/fetch that
+ * the target API may reject, breaking the app under test (documentolog: its own
+ * API returned `status: 0` on boot). Chromium already sets navigation /
+ * Sec-Fetch / Accept-Encoding headers natively per request type — forcing them
+ * globally also looks MORE bot-like on XHR, not less. Keep this to Accept +
+ * Accept-Language only. (Guarded by `__tests__/playwright-tuning.test.ts`.)
  */
 export const BROWSER_EXTRA_HEADERS = {
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'Connection': 'keep-alive',
-  'Upgrade-Insecure-Requests': '1',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Sec-Fetch-User': '?1',
-  'Cache-Control': 'max-age=0',
 } as const;
 
 /**

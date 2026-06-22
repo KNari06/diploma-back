@@ -9,7 +9,12 @@
 
 import { env } from '@/config/environment/env';
 import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
+import { ArtifactRetentionJob } from '@/jobs/artifact-retention.job';
 import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
+import { ExpiringPlansJob } from '@/jobs/expiring-plans.job';
+import { StaleRunReaperJob } from '@/jobs/stale-run-reaper.job';
+import { AiCallLogsRetentionJob } from '@/jobs/ai-call-logs-retention.job';
+import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
 import { TestSchedulerJobHandler } from '@/jobs/test-scheduler.job';
 import { logger } from '@/utils/core/logger';
 import { initLogBridge } from '@/utils/core/log-bridge';
@@ -41,12 +46,43 @@ async function main(): Promise<void> {
   // copies in parallel.
   AccountDeletionPurgeJob.start();
 
-  const shutdown = (signal: string) => {
+  // Stale-run reaper. Finalizes regression runs orphaned in
+  // 'running'/'pending' when no test-completion event ever fires (worker
+  // crash, queue stall, mobile runner unreachable). Single-instance only,
+  // same Cloud Run reasoning as the purge sweep above.
+  StaleRunReaperJob.start();
+
+  // Daily TTL sweep for ai_call_logs (redacted LLM I/O store). Same
+  // single-instance reasoning as the sweeps above.
+  AiCallLogsRetentionJob.start();
+
+  // Daily "plan expiring in 3 days" reminder. Emails paid users whose
+  // current_period_end is within 3 days; per-period dedup marker prevents
+  // re-sending. Single-instance (same Cloud Run reasoning as the sweeps above).
+  ExpiringPlansJob.start();
+
+  // Per-step screenshot retention. Prunes `${userId}/step-screenshots/...`
+  // older than SCREENSHOT_RETENTION_DAYS. Only meaningful while per-step
+  // capture is enabled (default ON) — skip the sweep otherwise so we don't
+  // walk storage for nothing.
+  if (ScreenshotCaptureFeature.isEnabled()) {
+    ScreenshotCaptureFeature.logStatus();
+    ArtifactRetentionJob.start();
+  }
+
+  const shutdown = async (signal: string) => {
     logger.info('[SCHEDULER_PROCESS] Received shutdown signal', { signal });
     try {
+      // Stop the timers first (no new ticks), then wait for any in-flight tick
+      // to finish so a deploy doesn't abandon a just-claimed schedule mid-dispatch.
       TestSchedulerJobHandler.stop();
       AutoLearnRetireJob.stop();
       AccountDeletionPurgeJob.stop();
+      StaleRunReaperJob.stop();
+      AiCallLogsRetentionJob.stop();
+      ArtifactRetentionJob.stop();
+      ExpiringPlansJob.stop();
+      await TestSchedulerJobHandler.waitForIdle();
     } finally {
       process.exit(0);
     }

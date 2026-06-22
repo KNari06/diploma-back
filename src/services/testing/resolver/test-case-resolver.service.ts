@@ -12,8 +12,16 @@
 
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { supabaseAdmin } from '@/db/supabase';
-import { generateEmbedding, cosineSimilarity } from '@/services/ai/core/embedding.service';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import {
+  combinedScore,
+  computeNameSimilarity,
+  computeUrlScore,
+  cosineSimilarity,
+  generateEmbedding,
+  getCachedEmbedding,
+  scoreReason,
+} from './resolver-scoring';
 // Phase B (May 2026) — shared_steps resolver deactivated. See regression-run
 // service for full rationale; this file's `hasSharedSteps` branch (below)
 // was always false in production because nothing emits `action: 'shared_steps'`.
@@ -42,28 +50,12 @@ const DEFAULT_CONFIG: ResolverConfig = {
   timeoutMs: 5000,
 };
 
-// Scoring weights
-const WEIGHT_EMBEDDING = 0.70;
-const WEIGHT_NAME = 0.20;
-const WEIGHT_URL = 0.10;
-
-// URL scoring constants (reused from saved-case-dependency-suggester pattern)
-const SCORE_URL_SAME_PAGE = 0.75;
-const SCORE_URL_AUTH_PATH = 0.70;
-const SCORE_URL_SAME_DOMAIN = 0.35;
-
-const AUTH_PATH_KEYWORDS = [
-  'login', 'auth', 'signin', 'sign-in',
-  'register', 'signup', 'sign-up', 'onboarding',
-];
+// Scoring weights, URL constants, name/URL similarity, and the embedding
+// cache now live in ./resolver-scoring (shared with TestQueryResolverService).
 
 // LLM refinement zone: scores in this range trigger LLM confirmation
 const LLM_REFINE_MIN = 0.70;
 const LLM_REFINE_MAX = 0.84;
-
-// Embedding cache (in-memory, TTL 10min)
-const embeddingCache = new Map<string, { embedding: number[]; expiresAt: number }>();
-const CACHE_TTL_MS = 10 * 60 * 1000;
 
 // Command action mapping: PlaywrightCommand action → AICommand action
 const ACTION_MAP: Record<string, AICommand['action'] | null> = {
@@ -252,30 +244,23 @@ export class TestCaseResolverService {
     // Generate message embedding
     const messageEmbedding = await generateEmbedding(message);
 
-    // Generate/retrieve candidate embeddings
+    // Generate/retrieve candidate embeddings (shared cache, keyed by id:updatedAt)
     const candidateEmbeddings = await Promise.all(
-      candidates.map(c => this.getCandidateEmbedding(c))
+      candidates.map((c) =>
+        getCachedEmbedding(
+          `${c.id}:${c.updatedAt}`,
+          [c.name, c.description].filter(Boolean).join(' — '),
+        ),
+      ),
     );
 
-    // Score each candidate
+    // Score each candidate (shared scoring — see resolver-scoring.ts)
     const scored: ResolvedTestCase[] = candidates.map((candidate, idx) => {
       const embeddingSim = candidateEmbeddings[idx]
         ? cosineSimilarity(messageEmbedding, candidateEmbeddings[idx]!)
         : 0;
-      const nameSim = this.computeNameSimilarity(message, candidate.name);
-      const urlScore = currentUrl
-        ? this.computeUrlScore(currentUrl, candidate.url)
-        : 0;
-
-      const score =
-        WEIGHT_EMBEDDING * Math.max(0, embeddingSim) +
-        WEIGHT_NAME * nameSim +
-        WEIGHT_URL * urlScore;
-
-      const reasons: string[] = [];
-      if (embeddingSim >= 0.7) reasons.push(`embed=${embeddingSim.toFixed(2)}`);
-      if (nameSim >= 0.5) reasons.push(`name=${nameSim.toFixed(2)}`);
-      if (urlScore > 0) reasons.push(`url=${urlScore.toFixed(2)}`);
+      const nameSim = computeNameSimilarity(message, candidate.name);
+      const urlScore = currentUrl ? computeUrlScore(currentUrl, candidate.url) : 0;
 
       return {
         id: candidate.id,
@@ -287,9 +272,9 @@ export class TestCaseResolverService {
         projectId: candidate.projectId,
         flowId: candidate.flowId,
         tags: candidate.tags,
-        score,
+        score: combinedScore(embeddingSim, nameSim, urlScore),
         matchType: 'none' as MatchType,
-        matchReason: reasons.join(', ') || 'low similarity',
+        matchReason: scoreReason(embeddingSim, nameSim, urlScore),
       };
     });
 
@@ -308,9 +293,9 @@ export class TestCaseResolverService {
     candidates: RawCandidate[]
   ): ResolvedTestCase[] {
     const scored = candidates.map(candidate => {
-      const nameSim = this.computeNameSimilarity(message, candidate.name);
+      const nameSim = computeNameSimilarity(message, candidate.name);
       const descSim = candidate.description
-        ? this.computeNameSimilarity(message, candidate.description) * 0.5
+        ? computeNameSimilarity(message, candidate.description) * 0.5
         : 0;
       const score = Math.max(nameSim, descSim);
 
@@ -519,112 +504,6 @@ Return JSON: {"isExactMatch": boolean, "confidence": number, "matchedIndex": num
     return aiCommand;
   }
 
-  // ==========================================================================
-  // PRIVATE: Embedding Cache
-  // ==========================================================================
-
-  private static async getCandidateEmbedding(
-    candidate: RawCandidate
-  ): Promise<number[] | null> {
-    const cacheKey = `${candidate.id}:${candidate.updatedAt}`;
-    const now = Date.now();
-
-    // Check cache
-    const cached = embeddingCache.get(cacheKey);
-    if (cached && cached.expiresAt > now) {
-      return cached.embedding;
-    }
-
-    // Generate embedding from name + description
-    const text = [candidate.name, candidate.description]
-      .filter(Boolean)
-      .join(' — ');
-
-    if (!text.trim()) return null;
-
-    try {
-      const embedding = await generateEmbedding(text);
-      embeddingCache.set(cacheKey, { embedding, expiresAt: now + CACHE_TTL_MS });
-
-      // Cleanup expired entries periodically
-      if (embeddingCache.size > 200) {
-        for (const [key, val] of embeddingCache) {
-          if (val.expiresAt <= now) embeddingCache.delete(key);
-        }
-      }
-
-      return embedding;
-    } catch (err) {
-      logger.warn('[RESOLVER] Failed to generate candidate embedding', {
-        candidateId: candidate.id,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return null;
-    }
-  }
-
-  // ==========================================================================
-  // PRIVATE: Name Similarity (normalized token overlap, case-insensitive)
-  // ==========================================================================
-
-  private static computeNameSimilarity(message: string, name: string): number {
-    if (!message || !name) return 0;
-
-    const tokenize = (text: string): Set<string> => {
-      return new Set(
-        text
-          .toLowerCase()
-          .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-          .split(/\s+/)
-          .filter(t => t.length > 1)
-      );
-    };
-
-    const msgTokens = tokenize(message);
-    const nameTokens = tokenize(name);
-
-    if (msgTokens.size === 0 || nameTokens.size === 0) return 0;
-
-    let overlap = 0;
-    for (const token of nameTokens) {
-      if (msgTokens.has(token)) overlap++;
-    }
-
-    // Jaccard-like: overlap / union
-    const union = new Set([...msgTokens, ...nameTokens]).size;
-    return union > 0 ? overlap / union : 0;
-  }
-
-  // ==========================================================================
-  // PRIVATE: URL Score
-  // ==========================================================================
-
-  private static computeUrlScore(currentUrl: string, candidateUrl: string): number {
-    if (!currentUrl || !candidateUrl) return 0;
-
-    try {
-      const current = new URL(currentUrl);
-      const candidate = new URL(candidateUrl);
-
-      // Same page
-      if (current.origin + current.pathname === candidate.origin + candidate.pathname) {
-        return SCORE_URL_SAME_PAGE;
-      }
-
-      // Same domain
-      if (current.hostname === candidate.hostname) {
-        // Auth path boost
-        if (AUTH_PATH_KEYWORDS.some(k => candidate.pathname.toLowerCase().includes(k))) {
-          return SCORE_URL_AUTH_PATH;
-        }
-        return SCORE_URL_SAME_DOMAIN;
-      }
-    } catch {
-      // Invalid URL, skip
-    }
-
-    return 0;
-  }
 }
 
 // ============================================================================

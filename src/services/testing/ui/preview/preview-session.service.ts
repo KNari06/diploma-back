@@ -177,21 +177,24 @@ async function probeExternalAnchorAt(
           };
         }
 
-        // Same-origin http(s) is fine — navigate normally.
-        // Treat subdomain variants of the same registrable name as same-origin
-        // to avoid false positives on www./m./dev./staging. prefixes. Compare
-        // by the last two labels of each hostname — a coarse heuristic that
-        // accepts x.com ↔ www.x.com, dev.x.com ↔ x.com, etc. without pulling
-        // in a full public-suffix list. Multi-label ccTLDs (foo.co.uk vs
-        // bar.co.uk) can over-match, but tolerating one occasional unblocked
-        // external click is better than blocking the common subdomain case.
+        // Same-app http(s) is fine — navigate normally. Same-app = identical
+        // host, subdomain (www/m/dev/staging), last-2-labels, OR the same brand
+        // label across sibling ccTLDs (documentolog.com ≡ documentolog.kz),
+        // guarded by a >= 4 char label so co.uk/com.au don't over-match.
+        // KEEP IN SYNC with isSameApp in same-app.util.ts — this copy runs
+        // inside page.evaluate and cannot import the Node module.
         const here = g.document.location.hostname;
         const lastTwo = (h: string) => h.split('.').slice(-2).join('.');
+        const brand = (h: string) => {
+          const p = h.split('.').filter(Boolean);
+          return p.length >= 2 ? (p[p.length - 2] || '') : (p[0] || '');
+        };
         if (
           hostname === here ||
           hostname.endsWith('.' + here) ||
           here.endsWith('.' + hostname) ||
-          lastTwo(hostname) === lastTwo(here)
+          lastTwo(hostname) === lastTwo(here) ||
+          (brand(hostname).length >= 4 && brand(hostname) === brand(here))
         ) return null;
 
         // Cross-origin http(s) opened inline (no target=_blank) strands the
@@ -1360,6 +1363,90 @@ export class PreviewSessionService {
   }
 
   /**
+   * Peek at the active page's CDP navigation history and report whether a
+   * back step would land on `about:blank` — the synthetic origin entry a
+   * promoted popup carries (created at about:blank, then `goto(href)`). Used
+   * only as a popup-tab guard in `goBack`; opens its OWN short-lived CDP
+   * session (own/use/detach, identical to `getNavigationHistoryCapability`)
+   * and never piggybacks the screencast session.
+   *
+   * Fail-CLOSED (returns false) on any error: a false negative just lets the
+   * normal `goBack` run, which is the pre-existing behaviour.
+   */
+  private async wouldGoBackLandOnBlank(session: InternalSession): Promise<boolean> {
+    let cdp: import('playwright').CDPSession | null = null;
+    try {
+      const TIMEOUT_MS = 1000;
+      cdp = await Promise.race([
+        session.page.context().newCDPSession(session.page),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('CDP newSession timeout')), TIMEOUT_MS),
+        ),
+      ]);
+      const history = await Promise.race([
+        cdp.send('Page.getNavigationHistory'),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Page.getNavigationHistory timeout')), TIMEOUT_MS),
+        ),
+      ]) as { currentIndex: number; entries: Array<{ id: number; url: string }> };
+      const prevIndex = history.currentIndex - 1;
+      if (prevIndex < 0) return false; // no in-popup back target at all
+      const prevUrl = history.entries?.[prevIndex]?.url ?? '';
+      return prevUrl === 'about:blank' || prevUrl === '';
+    } catch (error) {
+      logger.debug('[PREVIEW_SESSION] wouldGoBackLandOnBlank failed (fail-closed)', {
+        sessionId: session.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    } finally {
+      if (cdp) {
+        try { await cdp.detach(); } catch { /* non-fatal */ }
+      }
+    }
+  }
+
+  /**
+   * Popup-tab back fallback: close the active (popup) tab and activate the
+   * previous one, then kick a forced snapshot. Returns the goBack result
+   * shape on success, or null if the close failed (caller falls through to a
+   * normal in-popup goBack so the user is never wedged on a dead tab).
+   *
+   * Shared by both back paths: the promoted-popup pre-check (back would land
+   * on about:blank) and the null-response branch (popup had no history at all).
+   */
+  private async closePopupTabToPrevious(
+    sessionId: string,
+    userId: string,
+    previousUrl: string,
+    startMs: number,
+  ): Promise<{ url: string; domVersion: number; pageSignature: string; changed: boolean } | null> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return null;
+    const closedIndex = session.activeTabIndex;
+    logger.info('[PREVIEW_SESSION] goBack closing popup tab → previous', {
+      sessionId, closedIndex, switchingToIndex: closedIndex - 1, popupUrl: previousUrl,
+    });
+    const closed = await this.closeTab(sessionId, userId, closedIndex);
+    if (!closed) return null;
+    const restoredUrl = session.page.url();
+    logPerformance('preview.goBack', Date.now() - startMs, {
+      sessionId, from: previousUrl, to: restoredUrl, via: 'popup_close',
+    });
+    setImmediate(() => {
+      this.getSnapshot(sessionId, userId, {
+        force: true, includeDomNodes: true, onlyIfChanged: false,
+      }).catch(() => { /* non-fatal */ });
+    });
+    return {
+      url: restoredUrl,
+      domVersion: session.domVersion,
+      pageSignature: session.lastPageSignature,
+      changed: restoredUrl !== previousUrl,
+    };
+  }
+
+  /**
    * Navigate back in browser history
    */
   async goBack(sessionId: string, userId: string): Promise<{
@@ -1383,6 +1470,28 @@ export class PreviewSessionService {
         const { markIntentionalGoto } = await import('./external-nav-trap');
         markIntentionalGoto(sessionId, previousUrl);
       } catch { /* non-fatal */ }
+
+      // Promoted-popup pre-check: a tab opened via `new-tab-opener`
+      // (`<a target=_blank>` / cross-origin / window.open) was created with
+      // `context.newPage()` — which starts at about:blank — and only THEN
+      // `goto(href)`. So its navigation history is `[about:blank, href, ...]`.
+      // When the user presses back and there is no real prior in-popup page,
+      // `goBack()` would navigate the popup to its synthetic `about:blank`
+      // origin (white screen, snapshot returns 0 elements, then the blank tab
+      // gets torn down). A real browser's back button on such a popup does
+      // nothing; the user's intent is "return to the tab I came from". When
+      // back would land on about:blank AND a previous tab exists, skip the
+      // in-popup navigation and close the popup instead — same fallback as the
+      // null-response branch below.
+      if (session.pages.length > 1 && session.activeTabIndex > 0) {
+        const backTargetIsBlank = await this.wouldGoBackLandOnBlank(session);
+        if (backTargetIsBlank) {
+          const closed = await this.closePopupTabToPrevious(sessionId, userId, previousUrl, startMs);
+          if (closed) return closed;
+          // closePopupTabToPrevious failed — fall through to the normal
+          // goBack so the user isn't left wedged on the popup.
+        }
+      }
 
       const response = await session.page.goBack({
         waitUntil: 'load',
@@ -1411,29 +1520,8 @@ export class PreviewSessionService {
         // activating the previous one; closeTab emits the right tab
         // events and restarts video on the now-active page.
         if (session.pages.length > 1 && session.activeTabIndex > 0) {
-          const previousTabIndex = session.activeTabIndex - 1;
-          const closedIndex = session.activeTabIndex;
-          logger.info('[PREVIEW_SESSION] goBack fell back to closing popup tab', {
-            sessionId, closedIndex, switchingToIndex: previousTabIndex, popupUrl: previousUrl,
-          });
-          const closed = await this.closeTab(sessionId, userId, closedIndex);
-          if (closed) {
-            const restoredUrl = session.page.url();
-            logPerformance('preview.goBack', Date.now() - startMs, {
-              sessionId, from: previousUrl, to: restoredUrl, via: 'popup_close',
-            });
-            setImmediate(() => {
-              this.getSnapshot(sessionId, userId, {
-                force: true, includeDomNodes: true, onlyIfChanged: false,
-              }).catch(() => { /* non-fatal */ });
-            });
-            return {
-              url: restoredUrl,
-              domVersion: session.domVersion,
-              pageSignature: session.lastPageSignature,
-              changed: restoredUrl !== previousUrl,
-            };
-          }
+          const closed = await this.closePopupTabToPrevious(sessionId, userId, previousUrl, startMs);
+          if (closed) return closed;
         }
         // SPA back path: URL didn't change but history index did. Force a
         // snapshot so the UI sees the new DOM state.
@@ -3758,6 +3846,41 @@ export class PreviewSessionService {
       activeTabIndex: session.activeTabIndex,
     });
 
+    return true;
+  }
+
+  /**
+   * Open a new tab and navigate it to `url`. The new page is created in the
+   * session's BrowserContext, so `attachPopupHandler` (context.on('page'))
+   * adopts it automatically — pushes it to `session.pages`, makes it active,
+   * restarts the screencast and emits `preview:tab:opened`. We just wait
+   * briefly for that adoption so the caller's follow-up reads see the new page.
+   *
+   * A URL is REQUIRED: a tab left at about:blank is auto-closed by
+   * `attachPopupHandler`'s blank-popup guard, so an empty open is a no-op.
+   */
+  async openTab(sessionId: string, userId: string, url?: string): Promise<boolean> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return false;
+
+    const target = (url || '').trim();
+    if (!target) {
+      logger.warn('[PREVIEW_SESSION] openTab: missing URL — skipping (blank tabs are auto-closed)', { sessionId });
+      return false;
+    }
+
+    const { openHrefInNewTab } = await import('./new-tab-opener');
+    const result = await openHrefInNewTab(session.context, target, 'programmatic');
+    if (!result) return false;
+
+    // attachPopupHandler runs concurrently on the 'page' event. Wait (≤2s) for
+    // it to finish adopting the new page so getPage() returns the right tab.
+    const newPage = result.newPage;
+    for (let i = 0; i < 20; i++) {
+      if (session.pages.includes(newPage) && session.page === newPage) return true;
+      await new Promise(r => setTimeout(r, 100));
+    }
+    // Adoption lagged but the page exists and will be adopted — report success.
     return true;
   }
 

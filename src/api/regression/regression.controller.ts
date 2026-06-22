@@ -5,6 +5,7 @@ import { cache } from '@/utils/core/redis-cache';
 import { ExecutionService } from '@/services/testing/executions/execution.service';
 import { DependencySuggestion, SavedCaseDependencySuggester } from '@/services/testing/flows/saved-case-dependency-suggester.service';
 import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
+import { NegativeGenerationService } from '@/services/testing/negative/negative-generation.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { RegressionSaveService } from '@/services/testing/regression/regression-save.service';
 import {
@@ -1976,29 +1977,19 @@ export async function toggleNegativeTesting(req: AuthenticatedRequest, res: Resp
       return;
     }
 
-    // Verify plan ownership
     const userId = getUserId(req);
-    const plan = await RegressionPlanService.getById(planId, userId);
-    if (!plan) {
+    const result = await NegativeGenerationService.toggleItem(planId, itemId, userId, enabled);
+
+    if (result.status === 'plan_not_found') {
       res.status(404).json({ success: false, error: 'Plan not found' });
       return;
     }
-
-    // Update the plan item
-    const { data, error } = await supabaseAdmin
-      .from('regression_plan_items')
-      .update({ negative_testing_enabled: enabled })
-      .eq('id', itemId)
-      .eq('plan_id', planId)
-      .select()
-      .single();
-
-    if (error || !data) {
+    if (result.status === 'item_not_found') {
       res.status(404).json({ success: false, error: 'Plan item not found' });
       return;
     }
 
-    res.json({ success: true, data });
+    res.json({ success: true, data: result.item });
   } catch (error) {
     handleControllerError(res, error, 'Failed to toggle negative testing');
   }
@@ -2013,41 +2004,19 @@ export async function generateNegatives(req: AuthenticatedRequest, res: Response
     const { planId } = req.params;
     const userId = getUserId(req);
 
-    // Verify plan ownership
-    const plan = await RegressionPlanService.getById(planId, userId);
-    if (!plan) {
+    const result = await NegativeGenerationService.dispatchGeneration(planId, userId);
+
+    if (result.status === 'plan_not_found') {
       res.status(404).json({ success: false, error: 'Plan not found' });
       return;
     }
 
-    // Resolve which test cases have negatives enabled
-    const { NegativeToggleResolverService } = await import(
-      '@/services/testing/plans/negative-toggle-resolver.service'
-    );
-    const enabledTestCaseIds = await NegativeToggleResolverService.getEnabledTestCaseIds(planId);
-
-    if (enabledTestCaseIds.length === 0) {
-      res.json({
-        success: true,
-        data: { testCaseCount: 0, message: 'No test cases have negative testing enabled' },
-      });
-      return;
-    }
-
-    // Dispatch BullMQ job
-    const { QueueManager } = await import('@/config/infrastructure/queues');
-    const job = await QueueManager.addNegativeGenerationJob({
-      planId,
-      userId,
-      testCaseIds: enabledTestCaseIds,
-    });
-
     res.json({
       success: true,
-      data: {
-        jobId: job.id,
-        testCaseCount: enabledTestCaseIds.length,
-      },
+      data:
+        result.testCaseCount === 0
+          ? { testCaseCount: 0, message: result.message }
+          : { jobId: result.jobId, testCaseCount: result.testCaseCount },
     });
   } catch (error) {
     handleControllerError(res, error, 'Failed to generate negatives');
@@ -2063,33 +2032,13 @@ export async function getNegatives(req: AuthenticatedRequest, res: Response) {
     const { planId } = req.params;
     const userId = getUserId(req);
 
-    // Verify plan ownership
-    const plan = await RegressionPlanService.getById(planId, userId);
-    if (!plan) {
+    const result = await NegativeGenerationService.listNegatives(planId, userId);
+    if (result.status === 'plan_not_found') {
       res.status(404).json({ success: false, error: 'Plan not found' });
       return;
     }
 
-    // Get all test case IDs in this plan
-    const expanded = await RegressionPlanService.expandPlan(planId);
-    const testCaseIds = expanded
-      .filter((tc) => !tc.isNegative)
-      .map((tc) => tc.testCaseId);
-
-    if (testCaseIds.length === 0) {
-      res.json({ success: true, data: [] });
-      return;
-    }
-
-    // Fetch negatives for these sources
-    const { data: negatives } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('id, name, source_intent_test_case_id, negative_meta, negative_stale_reason, created_at')
-      .eq('is_negative', true)
-      .in('source_intent_test_case_id', testCaseIds)
-      .order('created_at', { ascending: true });
-
-    res.json({ success: true, data: negatives || [] });
+    res.json({ success: true, data: result.negatives });
   } catch (error) {
     handleControllerError(res, error, 'Failed to list negatives');
   }
@@ -2104,37 +2053,120 @@ export async function getNegativesStatus(req: AuthenticatedRequest, res: Respons
     const { planId } = req.params;
     const userId = getUserId(req);
 
-    // Verify plan ownership
-    const plan = await RegressionPlanService.getById(planId, userId);
-    if (!plan) {
+    const result = await NegativeGenerationService.getStatus(planId, userId);
+    if (result.status === 'plan_not_found') {
       res.status(404).json({ success: false, error: 'Plan not found' });
       return;
     }
 
-    // Check if a generation job is currently running
-    const { negativeGenerationQueue } = await import('@/config/infrastructure/queues');
-    const activeJobs = await negativeGenerationQueue.getJobs(['active', 'waiting']);
-    const planJob = activeJobs.find((j) => j.data.planId === planId);
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    handleControllerError(res, error, 'Failed to get negatives status');
+  }
+}
 
-    if (planJob) {
-      const progress = await planJob.progress;
-      res.json({
-        success: true,
-        data: {
-          status: 'running',
-          jobId: planJob.id,
-          progress: typeof progress === 'number' ? progress : 0,
-        },
-      });
+/**
+ * GET /regression/plans/:planId/negatives/estimate
+ * Pre-run estimate of extra test count + minutes from enabling negatives.
+ */
+export async function getNegativesEstimate(req: AuthenticatedRequest, res: Response) {
+  try {
+    const { planId } = req.params;
+    const userId = getUserId(req);
+
+    const result = await NegativeGenerationService.estimate(planId, userId);
+    if (result.status === 'plan_not_found') {
+      res.status(404).json({ success: false, error: 'Plan not found' });
       return;
     }
 
-    // No active job — return idle
-    res.json({
-      success: true,
-      data: { status: 'idle' },
-    });
+    res.json({ success: true, data: result.data });
   } catch (error) {
-    handleControllerError(res, error, 'Failed to get negatives status');
+    handleControllerError(res, error, 'Failed to estimate negatives');
+  }
+}
+
+/**
+ * POST /regression/plans/:planId/sources/:testCaseId/regenerate-negatives
+ * Delete + regenerate negatives for one source test case.
+ */
+export async function regenerateNegatives(req: AuthenticatedRequest, res: Response) {
+  try {
+    const { testCaseId } = req.params;
+    const userId = getUserId(req);
+
+    const result = await NegativeGenerationService.regenerate(testCaseId, userId);
+    if (result.status === 'not_found') {
+      res.status(404).json({ success: false, error: 'Test case not found' });
+      return;
+    }
+    if (result.status === 'forbidden') {
+      res.status(403).json({ success: false, error: 'Forbidden' });
+      return;
+    }
+    if (result.status === 'error') {
+      res.status(500).json({ success: false, error: result.message });
+      return;
+    }
+
+    res.json({ success: true, data: { createdCount: result.createdIds.length } });
+  } catch (error) {
+    handleControllerError(res, error, 'Failed to regenerate negatives');
+  }
+}
+
+/**
+ * PATCH /regression/negatives/:negativeId
+ * Enable/disable one generated negative (kept in DB either way).
+ */
+export async function setNegativeEnabled(req: AuthenticatedRequest, res: Response) {
+  try {
+    const { negativeId } = req.params;
+    const { enabled } = req.body;
+    const userId = getUserId(req);
+
+    if (enabled !== true && enabled !== false) {
+      res.status(400).json({ success: false, error: 'enabled must be true or false' });
+      return;
+    }
+
+    const result = await NegativeGenerationService.setNegativeEnabled(negativeId, userId, enabled);
+    if (result.status === 'not_found') {
+      res.status(404).json({ success: false, error: 'Negative test not found' });
+      return;
+    }
+    if (result.status === 'forbidden') {
+      res.status(403).json({ success: false, error: 'Forbidden' });
+      return;
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    handleControllerError(res, error, 'Failed to update negative');
+  }
+}
+
+/**
+ * DELETE /regression/negatives/:negativeId
+ * Delete one generated negative.
+ */
+export async function deleteNegative(req: AuthenticatedRequest, res: Response) {
+  try {
+    const { negativeId } = req.params;
+    const userId = getUserId(req);
+
+    const result = await NegativeGenerationService.deleteNegative(negativeId, userId);
+    if (result.status === 'not_found') {
+      res.status(404).json({ success: false, error: 'Negative test not found' });
+      return;
+    }
+    if (result.status === 'forbidden') {
+      res.status(403).json({ success: false, error: 'Forbidden' });
+      return;
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    handleControllerError(res, error, 'Failed to delete negative');
   }
 }

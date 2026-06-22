@@ -15,6 +15,8 @@
 export interface RunStatusExecStats {
   total: number;
   failed: number;
+  /** Number of executions still in progress. Optional for backwards-compat with existing callers. */
+  running?: number;
 }
 
 /**
@@ -29,6 +31,7 @@ export function deriveRunStatus(params: {
   execStats: RunStatusExecStats;
 }): string | null {
   const { cachedStatus, execStats } = params;
+  const running = execStats.running ?? 0;
 
   // Trust in-progress and cancelled states — the bug only affects terminal
   // runs whose cached status diverges from the final execution outcomes.
@@ -37,6 +40,9 @@ export function deriveRunStatus(params: {
 
   // For terminal runs derive from live execution data to fix stale-cache mismatch.
   if (execStats.total > 0) {
+    // A terminal parent with live children means the force-fail didn't land in the DB.
+    // Surface 'running' so the UI doesn't mask a stuck execution with 'passed'.
+    if (running > 0) return 'running';
     if (execStats.failed > 0) return 'failed';
     return 'passed';
   }

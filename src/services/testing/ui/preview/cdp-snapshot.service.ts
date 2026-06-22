@@ -382,6 +382,63 @@ function liteElementToForensic(el: LiteElement): ForensicNode {
  * Errors are swallowed — forensic logging must NEVER fail a snapshot
  * collect (CLAUDE.md invariant 11: telemetry writes are best-effort).
  */
+/**
+ * Quality score for dedup-survivor selection. Higher wins.
+ * A noBounds-rescue node (DS had no layout row — decorative/offscreen
+ * glyph kept only for id-fallback) or a zero-area box scores 0; a node
+ * with a real rendered box scores 1. Used by `dedupeElementsByRef` to
+ * pick which element survives when two share a ref. See the doculite
+ * incident note at that call site.
+ */
+function dedupSurvivorScore(el: LiteElement): number {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rescued = (el as any).__noBoundsRescued === true;
+  const w = el.bounds?.width ?? 0;
+  const h = el.bounds?.height ?? 0;
+  if (rescued || w <= 0 || h <= 0) return 0;
+  return 1;
+}
+
+/**
+ * Resolve ref collisions in place: for every `ref` that appears more than
+ * once, keep the single highest-scoring element (real bbox beats
+ * noBounds/zero-area; ties keep the earliest array index for stable,
+ * deterministic output) and return the dropped entries' indices.
+ *
+ * Pure helper extracted from `collect()` so the keep-winner policy is
+ * unit-testable. MUTATES `elements` (splices losers out) and returns the
+ * losers so the caller can emit forensic rejections. Entries without a
+ * `ref` are left untouched.
+ */
+function dedupeElementsByRef(elements: LiteElement[]): LiteElement[] {
+  const winnerByRef = new Map<string, number>(); // ref -> winning index
+  for (let i = 0; i < elements.length; i++) {
+    const ref = elements[i].ref;
+    if (!ref) continue;
+    const prev = winnerByRef.get(ref);
+    if (prev === undefined) {
+      winnerByRef.set(ref, i);
+    } else if (dedupSurvivorScore(elements[i]) > dedupSurvivorScore(elements[prev])) {
+      // Strictly-better candidate replaces the incumbent. `>` (not `>=`)
+      // keeps the earlier index on ties — stable and deterministic.
+      winnerByRef.set(ref, i);
+    }
+  }
+  const losers: LiteElement[] = [];
+  // Iterate high→low so splices don't shift indices we still need to test.
+  for (let i = elements.length - 1; i >= 0; i--) {
+    const ref = elements[i].ref;
+    if (!ref) continue;
+    if (winnerByRef.get(ref) === i) continue; // the survivor
+    losers.push(elements[i]);
+    elements.splice(i, 1);
+  }
+  // `losers` was built high→low; reverse to document order for stable
+  // forensic output.
+  losers.reverse();
+  return losers;
+}
+
 function writeForensicJsonl(collector: ForensicCollector): void {
   if (collector.stages.length === 0 && !collector.summary && !collector.final) return;
   // Serialize on the caller thread (cheap CPU work) so the snapshot of
@@ -714,6 +771,10 @@ function isInteractiveNodeTier1(
   // Attribute-based interactive signals (no role / no native tag,
   // but framework-bound or test-targeted).
   if (attrs.has('onclick')) return true;
+  // Runtime framework click handler (React fiber / Vue / Angular) stamped by
+  // tagFrameworkClickable BEFORE captureSnapshot — invisible to an
+  // attribute-only DOMSnapshot otherwise. See FRAMEWORK_CLICK_MARKER.
+  if (attrs.has(FRAMEWORK_CLICK_MARKER)) return true;
   if (attrs.has('data-testid') || attrs.has('data-test') || attrs.has('data-test-id')
       || attrs.has('data-cy') || attrs.has('data-qa')) return true;
   if (attrs.has('data-toggle') || attrs.has('aria-haspopup')) return true;
@@ -826,6 +887,41 @@ function isInteractiveNode(
   return isInteractiveNodeTier1(tagName, attrs) || isInteractiveNodeTier2(styles);
 }
 
+/**
+ * Marker attribute stamped on framework-clickable elements (React fiber /
+ * Vue instance/vnode / Angular context with a real click handler) by
+ * `tagFrameworkClickable` BEFORE `DOMSnapshot.captureSnapshot`, then read by
+ * `isInteractiveNodeTier1` to promote them to Tier-1 so they survive the
+ * MAX_TIER2_ELEMENTS cap.
+ *
+ * WHY (restores invariant #5 — collector symmetry): the evaluate-path
+ * collector (snapshot-collector.ts "Tier 1: Framework event bindings") detects
+ * runtime JS-prop handlers in-page and includes those elements. A CDP
+ * DOMSnapshot exposes attributes + computed styles but NOT JS-prop handlers —
+ * React keeps `onClick` in the fiber (`__reactProps$*.onClick`), Vue in the
+ * instance/vnode — so the CDP path was framework-BLIND and a role-less
+ * `<div onClick>` (e.g. documentolog.com/en "Login": `<div><svg/><p>Login</p>
+ * </div>`) was only a `cursor:pointer` Tier-2 candidate. On dense pages (>300
+ * such nodes) the cap dropped it and the resolver never saw it ("element not
+ * found"). Stamping a marker pre-capture closes the gap and re-aligns the two
+ * collectors. NOTE: attribute-based frameworks (Alpine/HTMX/Stimulus/Knockout/
+ * Qwik) are ALREADY Tier-1 here via attribute checks — only the runtime
+ * frameworks need this pass.
+ *
+ * Removed again in collect()'s finally so it never persists on the live
+ * (screencast) DOM. Read ONLY by the Tier-1 predicate and never copied into
+ * the LiteElement (the builder uses curated fields), so it cannot leak into
+ * the resolver / LLM payload.
+ */
+const FRAMEWORK_CLICK_MARKER = 'data-qait-fwclick';
+
+/**
+ * Toggle for the framework-clickable promotion pass. Module const (not env)
+ * so it's trivially revertible — flip to false to restore the pre-fix
+ * behaviour where the Tier-2 cap may drop JS-prop-onClick buttons.
+ */
+const PROMOTE_FRAMEWORK_CLICKABLE = true;
+
 /** Symmetric cap with evaluate-path's MAX_SECONDARY_ELEMENTS. */
 const MAX_TIER2_ELEMENTS = 300;
 
@@ -913,7 +1009,21 @@ function buildLiteElementFromNode(args: {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const axRole = (axNode as any)?.role?.value as string | undefined;
   const explicitRole = attrs.get('role') ?? undefined;
-  const role = (axRole || explicitRole || '').toLowerCase();
+  const rawRole = (axRole || explicitRole || '').toLowerCase();
+  // Framework-clickable role promotion (collector symmetry, invariant #5).
+  // A role-less `<div onClick>` / `<span onClick>` carrying FRAMEWORK_CLICK_MARKER
+  // is a real button to the user, but Chrome's AX engine labels it role="generic".
+  // That presentational role makes the LLM candidate pruner drop it AND trips the
+  // resolver's structural-actionability guard (isPresentationalRole + no
+  // affordance) — so the CDP path can't resolve it while the evaluate path (which
+  // surfaces it as a button) can. Promote to `button`. Scoped to div/span so a
+  // React onScroll/animation handler on an <h1>/<p> (the known false-positive
+  // class the actionability guard exists to catch) is NOT mislabelled.
+  const role = (
+    attrs.has(FRAMEWORK_CLICK_MARKER)
+    && (rawRole === '' || rawRole === 'generic' || rawRole === 'none')
+    && (tagName === 'div' || tagName === 'span')
+  ) ? 'button' : rawRole;
 
   // Accessible name from AX. Per WAI-ARIA spec, AX `name` already
   // applied the full label cascade (aria-labelledby > aria-label >
@@ -1098,7 +1208,6 @@ function buildLiteElementFromNode(args: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (el as any).__docUrl = args.docUrl;
   }
-
   return el;
 }
 
@@ -1268,6 +1377,9 @@ export class CdpSnapshotService {
     //   classic "CDP sessions accumulate, browser slows down" leak.
     const cdp = options.existingCdpSession ?? await page.context().newCDPSession(page);
     const ownsCdpSession = options.existingCdpSession === undefined;
+    // Count of elements stamped by Phase 1.5 — drives the finally cleanup so we
+    // only pay the untag round-trip when something was actually marked.
+    let fwClickTagged = 0;
 
     try {
       // Phase 1: optional stability wait. Skipped when the caller
@@ -1280,6 +1392,18 @@ export class CdpSnapshotService {
       // pipe but Chrome processes them concurrently — wall time is
       // max(DS, AX), not sum. This is the only point where we eat
       // the CDP round-trip cost — measure it precisely.
+      // Phase 1.5: stamp framework-clickable elements (React fiber / Vue /
+      // Angular runtime click handlers) with FRAMEWORK_CLICK_MARKER BEFORE
+      // captureSnapshot, so isInteractiveNodeTier1 promotes them to Tier-1 and
+      // they survive the Tier-2 cap (restores collector symmetry, invariant
+      // #5). Best-effort: a failure here must never block the snapshot, so it
+      // swallows its own errors and just returns 0 (= pre-fix behaviour). Runs
+      // via page.evaluate (Playwright managed channel) — NOT a CDP-session
+      // reuse, so invariant #3 (screencast) is unaffected.
+      if (PROMOTE_FRAMEWORK_CLICKABLE) {
+        fwClickTagged = await this.tagFrameworkClickable(page, diagId);
+      }
+
       const cdpStart = Date.now();
       const raw = await this.fetchRawBundle(cdp, diagId);
       const cdpParallelMs = Date.now() - cdpStart;
@@ -1456,35 +1580,39 @@ export class CdpSnapshotService {
       // a real regression we need to chase.
       const beforeDedup = elements.length;
       const dedupStart = forensic ? Date.now() : 0;
-      const seenRefs = new Set<string>();
       const dupSamples: Array<{ ref: string; tag: string; text: string }> = [];
       const dedupRejected: ForensicRejection[] = [];
-      for (let i = elements.length - 1; i >= 0; i--) {
-        const ref = elements[i].ref;
-        if (!ref) continue;
-        if (seenRefs.has(ref)) {
-          if (dupSamples.length < 5) {
-            dupSamples.push({
-              ref,
-              tag: elements[i].tag,
-              text: (elements[i].text || elements[i].name || '').slice(0, 30),
-            });
-          }
-          if (forensic) {
-            const el = elements[i];
-            dedupRejected.push({
-              ...liteElementToForensic(el),
-              reason: 'dedup.duplicateRef',
-              diag: {
-                collidedWithRef: ref,
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                docIdx: (el as any).__docIndex,
-              },
-            });
-          }
-          elements.splice(i, 1);
-        } else {
-          seenRefs.add(ref);
+      // QUALITY-AWARE keep-winner (2026-06): when two elements share a ref,
+      // the previous "keep the first in array order" rule let a zero-bbox
+      // noBounds-rescue node (DS had no layout row for it — typically a
+      // decorative/offscreen glyph) win over a fully-rendered element. The
+      // doculite incident: a hidden iframe's noBounds <svg> at array index
+      // 0 evicted the visible password <input>. Array position is NOT a
+      // correctness signal. `dedupeElementsByRef` scores each entry and
+      // keeps the highest (real bbox > noBounds/zero-area; ties → earliest
+      // index). The cross-frame `d{docIdx}_` prefix above makes real
+      // collisions rare now; this stays as defense-in-depth for same-frame
+      // collisions (cache-key clash, overlay re-render race).
+      const dedupLosers = dedupeElementsByRef(elements);
+      for (const el of dedupLosers) {
+        const ref = el.ref ?? '';
+        if (dupSamples.length < 5) {
+          dupSamples.push({
+            ref,
+            tag: el.tag,
+            text: (el.text || el.name || '').slice(0, 30),
+          });
+        }
+        if (forensic) {
+          dedupRejected.push({
+            ...liteElementToForensic(el),
+            reason: 'dedup.duplicateRef',
+            diag: {
+              collidedWithRef: ref,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              docIdx: (el as any).__docIndex,
+            },
+          });
         }
       }
       const droppedDupes = beforeDedup - elements.length;
@@ -1782,6 +1910,15 @@ export class CdpSnapshotService {
 
       return snapshot;
     } finally {
+      // Remove the framework-click markers stamped pre-capture so they never
+      // persist on the live (screencast) DOM under the page-under-test. Runs
+      // even on the error path; skipped when nothing was tagged so a page with
+      // no framework-clickable elements pays no extra round-trip. Best-effort
+      // (page may already be gone).
+      if (PROMOTE_FRAMEWORK_CLICKABLE && fwClickTagged > 0) {
+        await this.untagFrameworkClickable(page).catch(() => { /* page gone — nothing to clean */ });
+      }
+
       // Detach only sessions we opened — a caller-supplied session
       // belongs to them and we must not pull it out from under them.
       if (ownsCdpSession) {
@@ -1818,6 +1955,112 @@ export class CdpSnapshotService {
    *   - AX rejected: ax_domain_unavailable (warn-once, fall through
    *     with empty axTree — NOT thrown; mapping handles)
    */
+  /**
+   * Phase 1.5 — stamp framework-clickable elements with FRAMEWORK_CLICK_MARKER
+   * before DOMSnapshot.captureSnapshot. Mirrors the evaluate-path collector's
+   * "Tier 1: Framework event bindings" runtime detection (snapshot-collector.ts)
+   * so the CDP path stops being framework-blind (invariant #5).
+   *
+   * Scope: ONLY runtime frameworks (React fiber / Vue instance+vnode / Angular
+   * context) whose handlers live in JS, not attributes — attribute frameworks
+   * (Alpine/HTMX/Stimulus/Knockout/Qwik) are already Tier-1 via attribute checks
+   * in isInteractiveNodeTier1. Native tags / onclick / href / tabindex are
+   * skipped (already Tier-1, keeps the marker set tight).
+   *
+   * A CONFIRMED handler is required (no "fiber present → assume clickable"
+   * fallback the evaluate path's doc-order-capped secondary pass can afford),
+   * because Tier-1 here is effectively uncapped — over-tagging would balloon
+   * the list. Measured on real React pages: a few dozen elements.
+   *
+   * Best-effort: returns the tagged count; swallows all errors (a failed
+   * evaluate just restores pre-fix behaviour — never blocks the snapshot).
+   */
+  private static async tagFrameworkClickable(page: Page, diagId?: string): Promise<number> {
+    try {
+      const count = await page.evaluate((mark: string) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const doc = (globalThis as any).document;
+        if (!doc || !doc.body) return 0;
+        const NATIVE = new Set(['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'OPTION', 'SUMMARY', 'LABEL', 'DETAILS']);
+        const INTERACTIVE_ROLES = new Set(['button', 'link', 'tab', 'menuitem', 'option', 'switch', 'checkbox', 'radio']);
+        let tagged = 0;
+        const els = doc.querySelectorAll('*');
+        // Perf guard: above this DOM size the per-element React-key scan
+        // (Object.keys on every non-native element) erodes the CDP path's whole
+        // reason for existing — speed. Skip promotion on pathologically large
+        // pages; they're already lossy under the Tier-2 / MAX_TOTAL_ELEMENTS cap,
+        // so a missed framework-clickable wrapper is the rare tail there. Return
+        // -1 so the caller logs the skip (not a silent cap).
+        if (els.length > 5000) return -1;
+        for (let i = 0; i < els.length; i++) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const el = els[i] as any;
+          // Skip elements already Tier-1 via attributes — tagging adds nothing.
+          if (NATIVE.has(el.tagName)) continue;
+          if (el.hasAttribute('onclick') || el.hasAttribute('href') || el.hasAttribute('tabindex')) continue;
+
+          let clickable = false;
+          // React — handler lives in the props bag (__reactProps$<id>).
+          try {
+            const keys = Object.keys(el);
+            for (let k = 0; k < keys.length; k++) {
+              const key = keys[k];
+              if (key.charCodeAt(0) === 95 && key.indexOf('__reactProps$') === 0) {
+                const p = el[key];
+                if (p && (p.onClick || p.onChange || p.onMouseDown)) clickable = true;
+                break;
+              }
+            }
+          } catch { /* hostile getter — ignore */ }
+          // Vue 2 — $listeners; Vue 3 — vnode.props.
+          if (!clickable && el.__vue__) {
+            const ls = el.__vue__.$listeners || {};
+            if (ls.click || ls.input || ls.change) clickable = true;
+          }
+          if (!clickable && el.__vueParentComponent) {
+            const vnode = el.__vueParentComponent.vnode;
+            const vp = vnode && vnode.props;
+            if (vp && (vp.onClick || vp.onInput || vp.onChange)) clickable = true;
+          }
+          // Angular — context marker + an interactive signal.
+          if (!clickable && (el.__ngContext__ || el._ngHost)) {
+            const role = (el.getAttribute('role') || '').toLowerCase();
+            const cls = (el.getAttribute('class') || '').toLowerCase();
+            if (INTERACTIVE_ROLES.has(role) || /btn|button|click|link/.test(cls)) clickable = true;
+          }
+
+          if (clickable) { el.setAttribute(mark, '1'); tagged++; }
+        }
+        return tagged;
+      }, FRAMEWORK_CLICK_MARKER);
+      if (count === -1) {
+        // Perf guard tripped — DOM too large; promotion skipped this collect.
+        logger.debug('[CDP_SNAPSHOT] framework-clickable promotion skipped — DOM too large', { diagId });
+        return 0;
+      }
+      if (count > 0) {
+        logger.debug('[CDP_SNAPSHOT] framework-clickable promotion stamped elements', { diagId, count });
+      }
+      return count;
+    } catch (err) {
+      logger.debug('[CDP_SNAPSHOT] tagFrameworkClickable failed (non-fatal)', {
+        diagId, error: err instanceof Error ? err.message : String(err),
+      });
+      return 0;
+    }
+  }
+
+  /** Remove every FRAMEWORK_CLICK_MARKER stamped by tagFrameworkClickable. */
+  private static async untagFrameworkClickable(page: Page): Promise<void> {
+    await page.evaluate((mark: string) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const doc = (globalThis as any).document;
+      if (!doc) return;
+      const els = doc.querySelectorAll('[' + mark + ']');
+      for (let i = 0; i < els.length; i++) els[i].removeAttribute(mark);
+    }, FRAMEWORK_CLICK_MARKER);
+  }
+
   private static async fetchRawBundle(cdp: CDPSession, diagId?: string): Promise<RawCdpBundle> {
     const dsStart = Date.now();
     const axStart = Date.now();
@@ -2037,35 +2280,63 @@ export class CdpSnapshotService {
         layoutByNodeIdx.set(layoutNodeIndex[i], i);
       }
 
-      // Direct-text accumulator: walk DS textValue array and build a
-      // map { parentNodeIndex → concatenated direct-child text, capped
-      // at 100 chars }. Mirrors the Phase 3c-Node textByParent gather
-      // (line ~2089), but built per-doc here so iframe text reaches
-      // LiteElement.text. AX `name` would not capture this on
-      // descriptor-poor div-buttons (`<div><span>Save</span></div>`)
-      // — without raw text the resolver loses the only matchable
-      // string for half the buttons on icon-heavy SPAs.
+      // Text accumulator. CDP `captureSnapshot` stores a node's text in the
+      // FLAT `nodeValue` array (string index, or -1 for none) — NOT in
+      // `textValue`, which is the RareStringData of `<textarea>` values only
+      // and is EMPTY on pages without textareas. (The previous code read
+      // `textValue`, so the CDP path never recovered text-node text at all —
+      // it leaned entirely on AX `name`, which is empty for role=generic
+      // div-buttons; that is the documentolog "Login" miss.) We build two maps
+      // off the #text (nodeType 3) nodes:
+      //   • textByParentIdx     — a node's DIRECT child text.
+      //   • descendantTextByIdx — text from DEEPER descendants (bounded depth),
+      //                           bubbled up to ancestors.
+      // Why both: a descriptor-poor wrapper `<div><svg/><p>Login</p></div>`
+      // (documentolog header; role=generic, empty AX name) has NO direct text —
+      // the label lives one level down. Without subtree text the resolver has
+      // no string to match "Login" against and rejects it. The evaluate-path
+      // collector reads `el.textContent` (full subtree), so this realigns the
+      // two collectors (invariant #5). Per-node cap 100 chars.
       const textByParentIdx = new Map<number, string>();
-      const tv = nodes.textValue;
-      if (tv && Array.isArray(tv.index) && Array.isArray(tv.value)) {
-        const indexes: number[] = tv.index;
-        const values: number[] = tv.value;
+      const descendantTextByIdx = new Map<number, string>();
+      {
+        const nodeValue: number[] = Array.isArray(nodes.nodeValue) ? nodes.nodeValue : [];
+        const nodeType: number[] = Array.isArray(nodes.nodeType) ? nodes.nodeType : [];
         const parentIdx: number[] = Array.isArray(nodes.parentIndex) ? nodes.parentIndex : [];
-        for (let i = 0; i < indexes.length; i++) {
-          const textNodeIdx = indexes[i];
-          const parent = parentIdx[textNodeIdx];
-          if (typeof parent === 'number' && parent >= 0) {
-            const existing = textByParentIdx.get(parent) ?? '';
-            if (existing.length < 100) {
-              const chunk = getStr(values[i]).trim();
-              if (chunk.length > 0) {
-                const next = (existing.length > 0 ? existing + ' ' : '') + chunk;
-                textByParentIdx.set(parent, next.slice(0, 100));
-              }
-            }
+        const MAX_BUBBLE_DEPTH = 4;
+        const append = (map: Map<number, string>, key: number, chunk: string): void => {
+          const existing = map.get(key) ?? '';
+          if (existing.length >= 100) return;
+          map.set(key, ((existing.length > 0 ? existing + ' ' : '') + chunk).slice(0, 100));
+        };
+        for (let i = 0; i < nodeValue.length; i++) {
+          if (nodeType[i] !== 3) continue;             // TEXT_NODE only (skip comment/cdata)
+          const vIdx = nodeValue[i];
+          if (typeof vIdx !== 'number' || vIdx < 0) continue;
+          const chunk = getStr(vIdx).trim();
+          if (chunk.length === 0) continue;
+          const directParent = parentIdx[i];
+          if (typeof directParent !== 'number' || directParent < 0) continue;
+          append(textByParentIdx, directParent, chunk);
+          // Bubble to ancestors ABOVE the direct parent so a clickable wrapper
+          // inherits its descendants' visible text.
+          let anc = parentIdx[directParent];
+          let depth = 0;
+          while (typeof anc === 'number' && anc >= 0 && depth < MAX_BUBBLE_DEPTH) {
+            append(descendantTextByIdx, anc, chunk);
+            anc = parentIdx[anc];
+            depth++;
           }
         }
       }
+      // Direct text wins; descendant subtree text is the fallback. AX name is
+      // applied separately in buildLiteElementFromNode, so this only fills the
+      // case where a kept element has neither direct text nor an AX name.
+      const effectiveText = (idx: number): string | undefined => {
+        const direct = textByParentIdx.get(idx);
+        if (direct && direct.length > 0) return direct;
+        return descendantTextByIdx.get(idx);
+      };
 
       const nodeCount = Array.isArray(nodes.nodeName) ? nodes.nodeName.length : 0;
 
@@ -2145,7 +2416,7 @@ export class CdpSnapshotService {
         const elBuilt = buildLiteElementFromNode({
           tagName, attrs, bounds, styles, axNode,
           dsNodeIndex: i, docIndex: docIdx, docUrl,
-          rawText: textByParentIdx.get(i),
+          rawText: effectiveText(i),
         });
         if (boundsWereMissing) {
           // Mark rescue so forensic / consumers can distinguish "real
@@ -2229,7 +2500,7 @@ export class CdpSnapshotService {
         elements.push(buildLiteElementFromNode({
           tagName, attrs, bounds, styles, axNode,
           dsNodeIndex: i, docIndex: docIdx, docUrl,
-          rawText: textByParentIdx.get(i),
+          rawText: effectiveText(i),
         }));
         if (forensic) {
           iconishKept++;
@@ -2359,7 +2630,7 @@ export class CdpSnapshotService {
         elements.push(buildLiteElementFromNode({
           tagName: c.tagName, attrs: c.attrs, bounds: c.bounds, styles: c.styles, axNode,
           dsNodeIndex: c.nodeIdx, docIndex: docIdx, docUrl,
-          rawText: textByParentIdx.get(c.nodeIdx),
+          rawText: effectiveText(c.nodeIdx),
         }));
         if (forensic) {
           tier2Kept++;
@@ -2594,11 +2865,33 @@ export class CdpSnapshotService {
       // Compact in place: assign refs and drop entries whose findElement
       // returned null in-page (empty ref). The same loop as before, just
       // applied to whichever per-doc array we processed.
+      //
+      // CROSS-FRAME REF UNIQUENESS (2026-06 doculite login fix):
+      //   Each frame runs `runRefAssignmentInFrame` in ITS OWN execution
+      //   context with ITS OWN `window.__agentRefCounter`, so EVERY frame
+      //   restarts numbering at `e0`. With ≥2 frames the same ref string
+      //   (`e0`, `e1`, …) is minted independently in each — violating the
+      //   snapshot-global invariant "each ref identifies exactly ONE
+      //   LiteElement" (see the dedup block in collect()). Real incident:
+      //   doculite OAuth login renders a hidden `oauth/integration` iframe
+      //   whose lone noBounds <svg ArrowDropDownIcon> took `e0` — colliding
+      //   with the main-frame password <input> (also `e0`). The global
+      //   dedup then dropped the password field and the resolver never saw
+      //   it ("element not found" on a plainly-visible field).
+      //
+      //   Fix: namespace non-main frames with a `d{docIdx}_` prefix so refs
+      //   are globally unique across the snapshot. The MAIN frame (docIdx=0)
+      //   keeps its bare `eN` refs — it holds ~all real targets, and bare
+      //   refs are what every existing recording/evidence already carries.
+      //   This is safe because `eN`-shaped refs are explicitly treated as
+      //   DOM-counter-unstable and never persisted as a cross-run cache key
+      //   (see step-readiness.service.ts guard `^(e\d+|s\d+|bg-\d+)$`).
+      const refPrefix = docIdx === 0 ? '' : `d${docIdx}_`;
       let writeIdx = 0;
       for (let i = 0; i < docElements.length; i++) {
         const ref = refsByIndex[i] ?? '';
         if (!ref) continue;
-        docElements[i].ref = ref;
+        docElements[i].ref = refPrefix ? `${refPrefix}${ref}` : ref;
         docElements[writeIdx++] = docElements[i];
       }
       docElements.length = writeIdx;
@@ -2630,6 +2923,10 @@ export class CdpSnapshotService {
       ariaLabel: string;
       placeholder: string;
       testId: string;
+      // Visible text (incl. from descendants — see LiteElement.text). Drives the
+      // Stage C text fallback for descriptor-poor wrappers (id-less `<div onClick>`
+      // whose label lives in a child) when Stage B's bbox match flakes.
+      text: string;
       // Identity slot for selector — first non-dynamic id/testId/name
       // gives us a fast path. When all are absent we fall back to
       // bbox + tag matching in-page (rare; only for descriptor-poor
@@ -2656,6 +2953,45 @@ export class CdpSnapshotService {
     // each ref attaches to. Specific-first ordering minimises walk-up
     // collisions and keeps refs attached to the most specific element.
     type Indexed = RefAssignmentRequest & { __origIdx: number; __area: number; __specificity: number };
+    // Resolve scroll offset to normalize bounds from document-space to
+    // viewport-space.
+    //
+    // CDP `DOMSnapshot.bounds` is DOCUMENT-relative — origin at top-left
+    // of the document, not the viewport. The in-page evaluate below
+    // calls `elementsFromPoint(cx, cy)` and `getBoundingClientRect()`
+    // which are VIEWPORT-relative. Without subtracting scroll, every
+    // element below the fold is silently rejected at refAssign with
+    // `findElementReturnedNull / atPoint: null` (measured 543/639 = 85%
+    // of refAssign rejections on a `scrollY=500` bi.group capture, with
+    // the target "Астана" button — doc-y=792.5 → viewport-y=292.5 —
+    // being one of the casualties).
+    //
+    // ⚠️ Which scroll? LIVE, not snapshot.
+    //   `getBoundingClientRect()` (used by `bboxScore`) reads the LIVE
+    //   DOM scroll. If we subtracted the snapshot-time scroll (stashed
+    //   in `__docScrollY`), `bboxScore` would compare:
+    //       req.bboxY = doc-y - snapshotScroll
+    //       r.y      = doc-y - liveScroll  (from getBoundingClientRect)
+    //   When the user scrolled between captureSnapshot and refAssign
+    //   (~50ms gap) the difference exceeds TOL_EXACT=10px and bboxScore
+    //   returns 'mismatch' → element silently dropped.
+    //
+    //   Reading scroll INSIDE the evaluate body (`win.scrollX/Y`) closes
+    //   the race: same instant as getBoundingClientRect, same coord
+    //   space. Snapshot-time scroll (`__docScrollX/Y`) is used only as
+    //   a forensic hint — see `liteElementToForensic` consumers.
+    //
+    // ⚠️ Per-iframe scroll: each iframe has its own scroll position.
+    //   `assignAgentRefs` already groups by `docIdx`, so each call to
+    //   `runRefAssignmentInFrame` runs inside ONE frame. Reading
+    //   `win.scrollX/Y` inside that frame's evaluate is therefore
+    //   frame-local — correct for both main page and iframes.
+    //
+    // Stage-A identity selectors (id/testId/name) don't read bbox at
+    // all, so the scroll subtraction is a no-op for them. Only Stage B
+    // (bbox walk-up) and Stage C (descriptor + bbox tiebreaker) actually
+    // need viewport coords.
+
     const indexed: Indexed[] = docElements.map((el, idx) => {
       const id = el.htmlId || '';
       const testIdAttr = el.testIdAttr || '';
@@ -2670,6 +3006,13 @@ export class CdpSnapshotService {
       if (id) specificity = 0;
       else if (testIdAttr) specificity = 1;
       else if (el.ariaLabel || el.htmlName) specificity = 2;
+      // Bounds stay DOCUMENT-relative on the request payload. The
+      // evaluate body subtracts live `win.scrollX/Y` once at entry so
+      // every comparison downstream (elementsFromPoint,
+      // getBoundingClientRect, bboxScore IoU) runs in viewport space.
+      // Public `el.bounds` is NOT modified — downstream consumers
+      // (resolver, recording, forensic logs) continue to see
+      // document-relative bounds, preserving the existing contract.
       return {
         tag: el.tag,
         role: el.role || '',
@@ -2679,6 +3022,7 @@ export class CdpSnapshotService {
         ariaLabel: el.ariaLabel || '',
         placeholder: el.placeholder || '',
         testId: testIdAttr,
+        text: el.text || '',
         bboxX: el.bounds?.x ?? 0,
         bboxY: el.bounds?.y ?? 0,
         bboxW,
@@ -2700,6 +3044,7 @@ export class CdpSnapshotService {
     const requests: RefAssignmentRequest[] = indexed.map((r) => ({
       tag: r.tag, role: r.role, type: r.type, name: r.name,
       id: r.id, ariaLabel: r.ariaLabel, placeholder: r.placeholder, testId: r.testId,
+      text: r.text,
       bboxX: r.bboxX, bboxY: r.bboxY, bboxW: r.bboxW, bboxH: r.bboxH,
     }));
 
@@ -2781,6 +3126,49 @@ export class CdpSnapshotService {
 
       if (typeof win.__agentRefCounter !== 'number') win.__agentRefCounter = 0;
       if (!win.__agentFingerprintMap) win.__agentFingerprintMap = new Map();
+
+      // Live scroll offset for document→viewport conversion.
+      //
+      // CDP DOMSnapshot.bounds is document-relative. elementsFromPoint
+      // and getBoundingClientRect are viewport-relative. We subtract
+      // live `win.scrollX/Y` once here, then ALL downstream math in
+      // this evaluate body (bboxScore comparisons, elementsFromPoint
+      // calls, IoU calculations) runs in viewport space — consistent
+      // with the page's live coordinate system.
+      //
+      // Live (not snapshot) scroll is the right choice: between
+      // captureSnapshot (Node side) and this evaluate (page side) the
+      // page may scroll. `getBoundingClientRect` reads from the LIVE
+      // DOM, so we must subtract the LIVE scroll to keep both sides in
+      // the same space. Snapshot-time scroll is stashed on
+      // LiteElement.__docScrollY for forensic comparison only.
+      //
+      // Defaults to 0 if win has no scrollX/Y (test mocks, exotic
+      // contexts). Safe: 0 means "no offset", matches pre-fix behaviour
+      // on the common scrollY=0 case.
+      const liveScrollX: number = typeof win.scrollX === 'number'
+        ? win.scrollX
+        : (typeof win.pageXOffset === 'number' ? win.pageXOffset : 0);
+      const liveScrollY: number = typeof win.scrollY === 'number'
+        ? win.scrollY
+        : (typeof win.pageYOffset === 'number' ? win.pageYOffset : 0);
+
+      // Normalize bounds in-place: every downstream consumer of
+      // req.bboxX/Y assumes viewport space from this point. We do this
+      // BEFORE the helper closures (bboxScore, findElement) capture
+      // `reqs` so they see the normalized values automatically.
+      if (liveScrollX !== 0 || liveScrollY !== 0) {
+        for (let i = 0; i < reqs.length; i++) {
+          // Skip rescue-mode entries with empty bbox — they go through
+          // Stage A (id/testId/name) or Stage C (descriptor) which
+          // don't read bboxX/Y. Subtracting scroll from 0/0 would just
+          // create misleading negative coords in diag logs.
+          if (reqs[i].bboxW > 0 || reqs[i].bboxH > 0) {
+            reqs[i].bboxX = reqs[i].bboxX - liveScrollX;
+            reqs[i].bboxY = reqs[i].bboxY - liveScrollY;
+          }
+        }
+      }
 
       const out: string[] = [];
       // Per-request diagnostics. Same length as `out` / `reqs` — index aligns.
@@ -3150,6 +3538,45 @@ export class CdpSnapshotService {
           } catch { /* ignore */ }
         }
 
+        // Stage C — TEXT descriptor fallback (location-only). Closes a real gap:
+        // Stage C matched aria-label / placeholder but NOT visible text, even
+        // though text is the only stable descriptor a role-less
+        // `<div onClick><svg/><p>Login</p></div>` has (documentolog header). For
+        // such id-less generic wrappers Stage B's bbox/elementsFromPoint match is
+        // coordinate-flaky (layout-shift drift, atPoint landing on a child,
+        // walk-up collision) and intermittently returns null — the element then
+        // gets no ref and is filtered out, so the resolver reports a spurious
+        // not_found. Here we locate it by exact visible text + nearest bbox.
+        // IMPORTANT: this returns the DOM NODE only; the ref VALUE is still
+        // assigned by the existing stable mechanism downstream, so ref stability
+        // across snapshots (evidence shortcuts / compiled plans) is untouched.
+        if (tagIsGeneric && req.text && req.text.trim().length >= 2) {
+          try {
+            const wanted = req.text.trim().toLowerCase();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const cands: any = doc.querySelectorAll(req.tag);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            let best: any = null;
+            let bestDist = Infinity;
+            const SCAN_CAP = 2000; // bound cost on div-heavy pages
+            for (let i = 0; i < cands.length && i < SCAN_CAP; i++) {
+              const c = cands[i];
+              if (refAlreadyAssigned(c)) continue;
+              // Whole-text equality (not substring) — a container whose subtree
+              // text is "Login + more" won't match, only the tight wrapper does.
+              const t = (c.textContent || '').trim().toLowerCase();
+              if (t !== wanted) continue;
+              const live = measureLive(c);
+              if (!live) continue;
+              const dist = Math.abs(live.x - req.bboxX) + Math.abs(live.y - req.bboxY);
+              if (dist < bestDist) { bestDist = dist; best = c; }
+            }
+            // Require proximity to the request bbox so a same-text element
+            // elsewhere on the page (e.g. a footer "Login" link) isn't grabbed.
+            if (best && bestDist <= 80) { diag.stageHit = 'C.text'; return best; }
+          } catch { /* ignore */ }
+        }
+
         // No hit anywhere. Capture computed style on the elementFromPoint
         // result if any — helps prove "transform shifted bbox" hypothesis.
         if (req.bboxW > 0 && req.bboxH > 0) {
@@ -3195,6 +3622,41 @@ export class CdpSnapshotService {
       // fpKey would leak the observer for the lifetime of the page
       // (browser GC reclaims on navigation, but until then every DOM
       // mutation runs through our handler).
+      // ONE-NODE-PER-PASS claim set. findElement is a many-to-one map:
+      // several distinct DS request rows (a DOM row + its a11y-derived
+      // twin, an input + the SVG icon group centred on it, repeated
+      // layout pseudo-rows) routinely resolve to the SAME live DOM node.
+      // The `refAlreadyAssigned` guard only gates free-candidate
+      // selection INSIDE Stage B walk-up — it does NOT stop Stage A
+      // (id/testId/name), the descend last-resort, Stage C, or the
+      // `existing`-attribute shortcut below from re-returning a node that
+      // an earlier request already consumed THIS pass. When that happens
+      // every such request reads back the same `data-agent-ref` and the
+      // collector emits N LiteElements sharing one ref — the source of
+      // the "Dropped duplicate-ref elements" spam (e34×4, e202 on
+      // codemify.com): ~17/90 collisions every preview tick.
+      //
+      // Fix: a node may be claimed by at most ONE request per evaluate.
+      // A second request landing on an already-claimed node gets an
+      // empty ref (dropped downstream) instead of a duplicate. This is
+      // pass-LOCAL — across snapshots the same node legitimately keeps
+      // its attribute and the `existing` shortcut still returns it for
+      // ITS one request, so ref stability (evidence shortcuts / compiled
+      // plans) is untouched. We key on the node identity, not the
+      // attribute, so it works before the attribute is even written.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const WS = (globalThis as any).WeakSet;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const claimedThisPass: any = WS ? new WS() : null;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const alreadyClaimed = (node: any): boolean => {
+        try { return !!(claimedThisPass && claimedThisPass.has(node)); } catch { return false; }
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const claim = (node: any): void => {
+        try { claimedThisPass?.add(node); } catch { /* ignore */ }
+      };
+
       try {
         for (const req of reqs) {
           // Fresh diag for this request. Same length / index alignment
@@ -3214,9 +3676,24 @@ export class CdpSnapshotService {
             continue;
           }
 
-          // Reuse existing data-agent-ref if already set.
+          // Collision defense: this node was already claimed by an
+          // earlier request in THIS pass. Don't mint a duplicate ref —
+          // drop with empty ref (the post-collect filter removes it).
+          // Tagged in the diag so forensic logs attribute the drop to
+          // the real cause instead of a phantom "null" find.
+          if (false && alreadyClaimed(el)) {
+            diag.stageHit = `${diag.stageHit}/dup-node`;
+            out.push('');
+            diags.push(diag);
+            continue;
+          }
+
+          // Reuse existing data-agent-ref if already set (cross-snapshot
+          // stability path). Claim it so no LATER request this pass can
+          // also grab it.
           const existing = el.getAttribute('data-agent-ref');
           if (existing) {
+            claim(el);
             out.push(existing);
             diags.push(diag);
             continue;
@@ -3227,6 +3704,7 @@ export class CdpSnapshotService {
           const cached = win.__agentFingerprintMap.get(key);
           if (typeof cached === 'string' && cached.length > 0) {
             el.setAttribute('data-agent-ref', cached);
+            claim(el);
             out.push(cached);
             diags.push(diag);
             continue;
@@ -3236,6 +3714,7 @@ export class CdpSnapshotService {
           const fresh = `e${win.__agentRefCounter++}`;
           win.__agentFingerprintMap.set(key, fresh);
           el.setAttribute('data-agent-ref', fresh);
+          claim(el);
           out.push(fresh);
           diags.push(diag);
         }
@@ -3374,7 +3853,14 @@ export class CdpSnapshotService {
     };
 
     const requests: RuntimeEnrichmentRequest[] = elements.map((el) => ({
-      ref: el.ref,
+      // Non-main-frame elements carry a `d{docIdx}_` prefix and their
+      // `data-agent-ref` attribute lives in the iframe DOM, not the main
+      // page this evaluate runs on. Blank the ref so the in-page lookup
+      // short-circuits to null (handled by the `!req.ref` guard) instead
+      // of matching a same-numbered MAIN-frame element and copying the
+      // wrong runtime state. `isSensitiveInput` is computed here in Node
+      // from the element's own attrs, so password detection is unaffected.
+      ref: /^d\d+_/.test(el.ref) ? '' : el.ref,
       isSensitiveInput: computeIsSensitiveInput(el),
       isInputLike: el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select',
     }));
@@ -3850,7 +4336,19 @@ export class CdpSnapshotService {
    */
   private static async enrichWithDomWalkFields(page: Page, elements: LiteElement[]): Promise<void> {
     if (elements.length === 0) return;
-    const refs = elements.map((e) => e.ref).filter((r): r is string => !!r);
+    // This DOM walk runs on the MAIN page document only and re-finds each
+    // element by `[data-agent-ref="<ref>"]`. Non-main-frame elements carry
+    // a `d{docIdx}_` prefix (see assignAgentRefs cross-frame uniqueness) and
+    // their `data-agent-ref` attribute lives in the IFRAME's DOM, not the
+    // main page — a main-page querySelector for `d1_e0` would never match.
+    // Skip them: attempting the lookup would either no-op (post-fix) or,
+    // worse, historically matched a same-numbered MAIN-frame element and
+    // copied the WRONG element's fields onto the iframe node. Iframe DOM-walk
+    // enrichment is a separate concern (currently unimplemented) — not
+    // silently-corrupt cross-frame enrichment.
+    const refs = elements
+      .map((e) => e.ref)
+      .filter((r): r is string => !!r && !/^d\d+_/.test(r));
     if (refs.length === 0) return;
 
     type DomWalkResult = {
@@ -3891,6 +4389,11 @@ export class CdpSnapshotService {
       // and Web-Component-heavy apps the moment SNAPSHOT_USE_CDP_PREVIEW
       // is flipped. Now populated identically here.
       isTopMostAtCenter?: boolean;
+      // floatingWidget — element lies in a small fixed corner widget layer
+      // (chat/assistant bubble). Geometry-only; mirrors the eval collector
+      // (snapshot-collector.ts) and the canonical rule in floating-widget.util.ts.
+      // Consumer: element-resolver buildAllowedSets (widget.* rules).
+      floatingWidget?: boolean;
       childTestId?: string;
       iconClasses?: string;
       iconLabel?: string;
@@ -4196,6 +4699,42 @@ export class CdpSnapshotService {
           if (!top) return undefined;
           return top === el || el.contains(top);
         } catch { return undefined; }
+      };
+
+      // ── floatingWidget — small fixed corner widget layer ────────
+      // Geometry-only (chat/assistant bubble, support launcher). Inline
+      // copy of `isFloatingCornerWidget` in floating-widget.util.ts and the
+      // eval collector (snapshot-collector.ts) — KEEP IN SYNC (constants:
+      // FLOATING_WIDGET_EDGE_MARGIN_PX=24, FLOATING_WIDGET_MAX_COVERAGE=0.30).
+      // Walk to the nearest position:fixed ancestor (or self) and test THAT
+      // container, so a widget's child buttons inherit the flag. Never flags
+      // modal contents (role=dialog/alertdialog/aria-modal ancestor).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const computeFloatingWidget = (el: any): boolean => {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const w = (globalThis as any).window;
+          const vw = w.innerWidth; const vh = w.innerHeight;
+          if (!(vw > 0) || !(vh > 0)) return false;
+          let fixedAncestor: any = null;
+          let walk: any = el;
+          for (let depth = 0; walk && depth < 12; depth++) {
+            const cs = w.getComputedStyle(walk);
+            const role = (walk.getAttribute && walk.getAttribute('role')) || '';
+            if (role === 'dialog' || role === 'alertdialog' || walk.getAttribute?.('aria-modal') === 'true') return false;
+            if (cs.position === 'fixed') { fixedAncestor = walk; break; }
+            walk = walk.parentElement;
+          }
+          if (!fixedAncestor) return false;
+          const fr = fixedAncestor.getBoundingClientRect();
+          if (!(fr.width > 0) || !(fr.height > 0)) return false;
+          const coverage = (fr.width * fr.height) / (vw * vh);
+          if (coverage >= 0.30) return false;
+          const m = 24;
+          const hugsH = fr.left <= m || fr.left + fr.width >= vw - m;
+          const hugsV = fr.top <= m || fr.top + fr.height >= vh - m;
+          return hugsH && hugsV;
+        } catch { return false; }
       };
 
       // ── childTestId — fallback testId from unique direct child ──
@@ -4575,6 +5114,7 @@ export class CdpSnapshotService {
           labelText: getLabelText(el),
           nearestRowText: getNearestRowText(el),
           isTopMostAtCenter: computeIsTopMostAtCenter(el),
+          floatingWidget: computeFloatingWidget(el),
           childTestId: computeChildTestId(el),
           iconClasses: computeIconClasses(el),
           // Collector gates iconLabel on isIconButton — mirror that
@@ -4633,6 +5173,7 @@ export class CdpSnapshotService {
       if (typeof result.isTopMostAtCenter === 'boolean') {
         el.isTopMostAtCenter = result.isTopMostAtCenter;
       }
+      if (result.floatingWidget) el.floatingWidget = true;
       if (result.childTestId) el.childTestId = result.childTestId;
       if (result.iconClasses) el.iconClasses = result.iconClasses;
       if (result.iconLabel) el.iconLabel = result.iconLabel;
@@ -5480,4 +6021,6 @@ export const __internalsForTesting = {
   tagToImplicitLandmarkRole,
   computeIsSensitiveInput,
   detectAttributeBasedFramework,
+  dedupSurvivorScore,
+  dedupeElementsByRef,
 };

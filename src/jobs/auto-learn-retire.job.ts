@@ -6,9 +6,10 @@
  * — retrieval stops serving them immediately, but rows stay in the table
  * for audit.
  *
- * Runs inside the scheduler process alongside TestSchedulerJobHandler.
- * Single-instance (scheduler process is deliberately not horizontally scaled,
- * same as the existing test scheduler), so no distributed lock needed.
+ * Runs inside the scheduler bundle alongside TestSchedulerJobHandler — local
+ * scheduler container, or the prod worker behind the Redis leader lock
+ * (`src/scheduler/leader.ts`). No cross-instance dedupe of its own; the leader
+ * lock keeps it single-instance when the worker scales out.
  */
 
 import { retireStaleAutoLearnChunks } from '@/services/kb/auto-learn.service';

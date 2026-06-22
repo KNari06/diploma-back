@@ -53,7 +53,7 @@ import { CommandExecutor, type CommandExecutorIntegrations } from './command-exe
 import { ExecutorAgent } from './executor-agent';
 import { PlannerAgent } from './planner-agent';
 import { ReviewerAgent } from './reviewer-agent';
-import type { PipelineConfig, TestPipelineResult } from './types';
+import type { PipelineConfig, TestPipelineResult, ExecutionRound } from './types';
 
 /** Pipeline integrations from LiteEngine */
 export interface PipelineIntegrations {
@@ -68,6 +68,14 @@ export interface PipelineIntegrations {
   consoleCollector?: ConsoleCollector;
   /** Browser context for PageWatcher (popup/new-tab detection) */
   browserContext?: BrowserContext;
+  /**
+   * Fired once per round AFTER the executor finishes, with the round just
+   * completed (its `commands[]` carry per-command results). Lets a caller stream
+   * live per-step progress without coupling the pipeline to any transport — the
+   * editor authoring service maps this → `preview:run:step` WS events.
+   * Best-effort: must never throw into the loop. Optional (exploration omits it).
+   */
+  onRoundComplete?: (round: ExecutionRound) => void;
 }
 
 /** Default pipeline limits */
@@ -125,6 +133,16 @@ export class TestPipeline {
     const timeoutMs = config.timeoutMs || PIPELINE_DEFAULTS.timeoutMs;
     this.actualTimeoutMs = timeoutMs;
     this.abortController = new AbortController();
+    // Forward an external abort (e.g. editor preview run-cancel) into the
+    // pipeline's own controller. Already-aborted → abort immediately.
+    if (config.externalAbortSignal) {
+      const ext = config.externalAbortSignal;
+      if (ext.aborted) {
+        this.abortController.abort();
+      } else {
+        ext.addEventListener('abort', () => this.abortController?.abort(), { once: true });
+      }
+    }
     this.entryPointId = config.entryPointId;
 
     // ── Initialize Blackboard (shared state for all agents) ──
@@ -329,6 +347,19 @@ export class TestPipeline {
         // it's burning tokens without making progress → terminate early.
         // ════════════════════════════════════════════════════════════
         const lastRound = this.blackboard.getLastRound();
+
+        // Stream the just-completed round to any live-progress listener
+        // (editor authoring → preview:run:step). Best-effort; never break the loop.
+        if (lastRound && this.integrations.onRoundComplete) {
+          try {
+            this.integrations.onRoundComplete(lastRound);
+          } catch (err) {
+            logger.debug('[PIPELINE] onRoundComplete listener threw (ignored)', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
         if (!lastRound || lastRound.commands.length === 0) {
           this.consecutiveEmptyRounds++;
           if (this.consecutiveEmptyRounds >= TestPipeline.MAX_EMPTY_ROUNDS) {

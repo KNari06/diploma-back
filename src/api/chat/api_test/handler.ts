@@ -232,6 +232,7 @@ export async function handleApiTest(
       projectId: resolvedProjectId,
       workspaceId: workspace_id,
       userMessage: message,
+      abortSignal,
     });
   } catch (error) {
     logger.error('[API_TEST] Error in API test flow', {
