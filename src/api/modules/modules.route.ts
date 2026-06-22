@@ -10,6 +10,7 @@ import {
     deleteModule,
     getModule,
     listModules,
+    reorderModules,
     updateModule,
 } from './modules.controller';
 
@@ -100,6 +101,8 @@ const router = Router();
  */
 router.get('/', requireAuth, listModules);
 router.post('/', requireAuth, createModule);
+// Must be registered before '/:id' so "reorder" isn't captured as an id.
+router.post('/reorder', requireAuth, reorderModules);
 
 /**
  * @swagger
