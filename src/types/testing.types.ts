@@ -215,6 +215,8 @@ export interface TestModule {
   description?: string;
   tags: string[];
   priority?: Priority;
+  /** Manual ordering within the platform (drag-and-drop). Lower = earlier. */
+  orderIndex: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -242,6 +244,8 @@ export interface UpdateTestModuleParams {
   description?: string;
   tags?: string[];
   priority?: Priority;
+  /** Move the module to a manual order position within its platform. */
+  orderIndex?: number;
 }
 
 // ============================================================================
@@ -291,6 +295,8 @@ export interface UpdateTestFlowParams {
   id: string;
   userId: string;
   name?: string;
+  /** Move the flow to a different module (drag-and-drop between folders). */
+  moduleId?: string;
   orderIndex?: number;
   flowType?: FlowType;
   platform?: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';

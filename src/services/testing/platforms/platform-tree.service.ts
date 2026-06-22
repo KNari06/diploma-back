@@ -132,9 +132,10 @@ export class PlatformTreeService {
       sortedPlatforms.map(async (p: any) => {
         const modulesResult = await supabaseAdmin
           .from('test_modules')
-          .select('id, platform_id, name, description, priority', { count: 'exact' })
+          .select('id, platform_id, name, description, priority, order_index, created_at', { count: 'exact' })
           .eq('platform_id', p.id)
           .eq('user_id', userId)
+          .order('order_index', { ascending: true })
           .order('created_at', { ascending: false })
           .range(offset, offset + limit - 1);
 
@@ -157,6 +158,7 @@ export class PlatformTreeService {
               name: m.name,
               description: m.description || undefined,
               priority: m.priority || undefined,
+              orderIndex: typeof m.order_index === 'number' ? m.order_index : 0,
             })),
             pageInfo: {
               limit,

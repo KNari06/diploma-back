@@ -1293,12 +1293,7 @@ export class CommandExecutor {
           await tapLocator.tap({ timeout: timeout || 30000 });
           break;
 
-        case 'swipe':
-          if (!selector) throw new Error('Selector is required for swipe action');
-          const swipeLocator = this.getLocatorInternal(selector);
-          logger.warn('[COMMAND_EXECUTOR] Swipe action not fully supported, using tap');
-          await swipeLocator.tap({ timeout: timeout || 30000 });
-          break;
+        // V18: real swipe handling lives below (mouse-drag simulation from {start,end} coords)
 
         case 'goBack':
           await this.page.goBack({ timeout: timeout || 30000 });
@@ -2563,29 +2558,101 @@ export class CommandExecutor {
           break;
         }
 
-        // V18: Multi-tab switch — switch to target tab by index
+        // V18: Multi-tab switch. Identity-first, index-fallback.
+        //
+        // The recorded step carries BOTH the tab index (`value`) and the URL of
+        // the tab it switched to (`evidence.pageUrl`, stamped when the recorder
+        // auto-emits switch_tab — see preview.handler.ts). Replaying by raw index
+        // is fragile: if the runtime tab order/count diverges from record time
+        // (an ad/tracking popup opened an extra tab, or a tab didn't open) index
+        // N points at the WRONG page and every subsequent step runs in it.
+        //
+        // So we MATCH BY URL first (exact → origin+path → origin), and only fall
+        // back to the index when there's no recorded URL or no tab matches it.
+        // This makes multi-tab regression robust against unplanned popups while
+        // staying backward-compatible with legacy steps that only have an index.
         case 'switchTab': {
           const targetTabIndex = parseInt(String(value || '0'), 10);
-          const allPages = this.page.context().pages();
-          if (targetTabIndex < 0 || targetTabIndex >= allPages.length) {
-            // Wait up to 5s for tab to appear (popup may still be opening)
-            let found = false;
-            for (let w = 0; w < 10; w++) {
-              await new Promise(r => setTimeout(r, 500));
-              const current = this.page.context().pages();
-              if (targetTabIndex < current.length) { found = true; break; }
+          const recordedUrl = intentCommand.intentMeta?.evidence?.pageUrl;
+
+          // normalize for comparison — strip trailing slash + hash; lower-case host
+          const norm = (u: string): { origin: string; originPath: string; full: string } | null => {
+            try {
+              const p = new URL(u);
+              // Only real navigations count. about:blank / data: / chrome: all
+              // collapse to an EMPTY host, so without this every such tab would
+              // false-match any other on the bare-origin tier ("data://" ===
+              // "data://") and switchTab would silently pick the wrong page.
+              if (p.protocol !== 'http:' && p.protocol !== 'https:') return null;
+              const host = p.host.toLowerCase();
+              const path = p.pathname.replace(/\/$/, '') || '/';
+              return { origin: `${p.protocol}//${host}`, originPath: `${p.protocol}//${host}${path}`, full: `${p.protocol}//${host}${path}${p.search}` };
+            } catch { return null; }
+          };
+
+          // Wait up to 5s for the expected tab to exist (popup may still open).
+          // The wait condition is "a URL match exists" when we have a recorded
+          // URL, otherwise "the index is in range" (legacy behaviour).
+          const want = recordedUrl ? norm(recordedUrl) : null;
+          const findByUrl = (): Page | null => {
+            if (!want) return null;
+            const pages = this.page.context().pages();
+            // exact full → origin+path, first match wins. Bare-origin is
+            // intentionally NOT a tier: two tabs of the same app share an origin
+            // but differ by path, so an origin-only match would grab the wrong
+            // same-origin tab. If neither path-bearing tier matches we fall back
+            // to index rather than guess. (Contrast hrefMatchesUrl in the newtab
+            // path, which DOES allow origin — there a same-origin redirect is
+            // still the clicked link's own destination.)
+            for (const tier of ['full', 'originPath'] as const) {
+              const hit = pages.find((pg) => { const n = norm(pg.url()); return n && n[tier] === want[tier]; });
+              if (hit) return hit;
             }
-            if (!found) {
-              throw new Error(`Tab ${targetTabIndex} not available (${this.page.context().pages().length} tabs open)`);
+            return null;
+          };
+
+          let targetPage: Page | null = findByUrl();
+          if (!targetPage) {
+            // No URL match yet (or no recorded URL) — wait for either a URL match
+            // or the index to come into range, then resolve.
+            for (let w = 0; w < 10 && !targetPage; w++) {
+              await new Promise(r => setTimeout(r, 500));
+              targetPage = findByUrl();
+              if (!targetPage) {
+                const current = this.page.context().pages();
+                if (!want && targetTabIndex >= 0 && targetTabIndex < current.length) {
+                  targetPage = current[targetTabIndex];
+                }
+              }
             }
           }
-          const targetPage = this.page.context().pages()[targetTabIndex];
+
+          // Final fallback: index (covers legacy/no-URL and "URL never appeared").
+          if (!targetPage) {
+            const pages = this.page.context().pages();
+            if (targetTabIndex >= 0 && targetTabIndex < pages.length) {
+              targetPage = pages[targetTabIndex];
+              if (want) {
+                logger.warn('[COMMAND_EXECUTOR] switchTab URL not found, fell back to index', {
+                  recordedUrl, targetTabIndex, totalPages: pages.length,
+                });
+              }
+            }
+          }
+
+          if (!targetPage) {
+            throw new Error(`Tab not available (index=${targetTabIndex}, recordedUrl=${recordedUrl || 'none'}, ${this.page.context().pages().length} tabs open)`);
+          }
+
           // Wait for page to be ready before switching
           try { await targetPage.waitForLoadState('load', { timeout: 10_000 }); } catch {
             try { await targetPage.waitForLoadState('domcontentloaded', { timeout: 3_000 }); } catch { /* proceed */ }
           }
           this.page = targetPage;
-          logger.info('[COMMAND_EXECUTOR] Switched to tab', { targetTabIndex, url: targetPage.url() });
+          logger.info('[COMMAND_EXECUTOR] Switched to tab', {
+            matchedBy: want && findByUrl() === targetPage ? 'url' : 'index',
+            targetTabIndex, recordedUrl: recordedUrl || undefined, url: targetPage.url(),
+          });
           break;
         }
 
@@ -2595,6 +2662,12 @@ export class CommandExecutor {
         // intent "this tab should not exist" is already true. We don't fail
         // the step. Hard-fail only when Playwright itself refuses to close
         // (e.g. attempting to close the very last page in the context).
+        //
+        // Deliberately index-based (NOT URL-matched like switchTab): closing
+        // the wrong tab is self-healing here (soft no-op when out of range),
+        // whereas URL-matching could close a legitimately-still-open tab that
+        // happens to share a URL. switchTab needs URL identity because picking
+        // the wrong tab silently redirects EVERY later step; closeTab doesn't.
         case 'closeTab': {
           const targetTabIndex = parseInt(String(value || '0'), 10);
           const pages = this.page.context().pages();

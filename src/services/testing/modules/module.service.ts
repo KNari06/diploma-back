@@ -38,6 +38,18 @@ export class ModuleService {
       name,
     });
 
+    // Append new modules to the end of the platform's manual order (max+1),
+    // mirroring FlowService.create. Newest-created therefore sorts last under
+    // the order_index ASC tree — drag-reorder is what moves it.
+    const { data: maxOrder } = await supabaseAdmin
+      .from('test_modules')
+      .select('order_index')
+      .eq('platform_id', platformId)
+      .order('order_index', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const orderIndex = maxOrder ? (maxOrder.order_index ?? 0) + 1 : 0;
+
     const { data, error } = await supabaseAdmin
       .from('test_modules')
       .insert({
@@ -48,6 +60,7 @@ export class ModuleService {
         description: description || null,
         tags: tags || [],
         priority: priority || null,
+        order_index: orderIndex,
       })
       .select('*, test_platforms!inner(platform_key)')
       .single();
@@ -132,7 +145,7 @@ export class ModuleService {
     // Execute count + data queries in parallel (independent reads)
     const [countResult, itemsResult] = await Promise.all([
       countQuery,
-      itemsQuery.order('created_at', { ascending: false }).range(offset, offset + limit - 1),
+      itemsQuery.order('order_index', { ascending: true }).order('created_at', { ascending: false }).range(offset, offset + limit - 1),
     ]);
 
     const { count, error: countError } = countResult;
@@ -160,13 +173,14 @@ export class ModuleService {
    * @returns Updated module
    */
   static async update(params: UpdateTestModuleParams): Promise<TestModule> {
-    const { id, userId, name, description, tags, priority } = params;
+    const { id, userId, name, description, tags, priority, orderIndex } = params;
 
     const updates: Record<string, any> = {};
     if (name !== undefined) updates.name = name;
     if (description !== undefined) updates.description = description;
     if (tags !== undefined) updates.tags = tags;
     if (priority !== undefined) updates.priority = priority;
+    if (orderIndex !== undefined) updates.order_index = orderIndex;
 
     if (Object.keys(updates).length === 0) {
       throw new Error('No fields to update');
@@ -249,8 +263,49 @@ export class ModuleService {
       description: row.description || undefined,
       tags: row.tags || [],
       priority: row.priority || undefined,
+      orderIndex: typeof row.order_index === 'number' ? row.order_index : 0,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
+  }
+
+  /**
+   * Reorder modules within a platform. Sets each module's order_index to its
+   * position in `moduleIds` (full ordered list for that platform). Mirrors
+   * FlowService.reorder. `projectId` is required to invalidate the platform
+   * tree cache so the new order is visible immediately.
+   */
+  static async reorder(
+    projectId: string,
+    platformId: string,
+    moduleIds: string[],
+    userId: string,
+  ): Promise<void> {
+    logger.info('[MODULE_SERVICE] Reordering modules', {
+      projectId,
+      platformId,
+      count: moduleIds.length,
+    });
+
+    const updates = moduleIds.map((moduleId, index) =>
+      supabaseAdmin
+        .from('test_modules')
+        .update({ order_index: index })
+        .eq('id', moduleId)
+        .eq('platform_id', platformId)
+        .eq('user_id', userId),
+    );
+
+    const results = await Promise.all(updates);
+    const errors = results.filter((r) => r.error);
+    if (errors.length > 0) {
+      logger.error('[MODULE_SERVICE] Failed to reorder some modules', {
+        errors: errors.map((e) => e.error),
+      });
+      throw new Error('Failed to reorder modules');
+    }
+
+    // Module order lives in the base platform tree cache.
+    await cache.delByPattern(`qait:cache:ptree:base:${projectId}:*`);
   }
 }

@@ -198,6 +198,37 @@ export async function updateModule(req: AuthenticatedRequest, res: Response): Pr
 }
 
 /**
+ * Reorder modules within a platform.
+ * POST /api/v1/modules/reorder — body { projectId, platformId, moduleIds }
+ * Sets each module's order_index to its position in moduleIds.
+ */
+export async function reorderModules(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { projectId, platformId, moduleIds } = req.body;
+
+    if (!projectId || !platformId || !moduleIds || !Array.isArray(moduleIds)) {
+      res.status(400).json({
+        success: false,
+        error: 'projectId, platformId and moduleIds array are required',
+      });
+      return;
+    }
+
+    const userId = getUserId(req);
+
+    await ModuleService.reorder(projectId, platformId, moduleIds, userId);
+
+    // Tell the project room the tree changed so clients refetch in the new order.
+    emitModuleMutated({ projectId, action: 'updated', id: platformId });
+
+    res.json({ success: true, message: 'Modules reordered', timestamp: new Date() });
+  } catch (error) {
+    logger.error('[MODULES_API] Failed to reorder modules', { error });
+    handleError(res, error, 'Failed to reorder modules');
+  }
+}
+
+/**
  * Delete a module
  */
 export async function deleteModule(req: AuthenticatedRequest, res: Response): Promise<void> {

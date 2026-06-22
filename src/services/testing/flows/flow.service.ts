@@ -144,6 +144,7 @@ export class FlowService {
       id,
       userId,
       name,
+      moduleId,
       orderIndex,
       flowType,
       platform,
@@ -155,6 +156,7 @@ export class FlowService {
 
     const updates: Record<string, any> = {};
     if (name !== undefined) updates.name = name;
+    if (moduleId !== undefined) updates.module_id = moduleId;
     if (orderIndex !== undefined) updates.order_index = orderIndex;
     if (flowType !== undefined) updates.flow_type = flowType;
     if (platform !== undefined) updates.platform = platform;
@@ -169,15 +171,20 @@ export class FlowService {
 
     // When renaming, read the OLD flow name first so we can cascade the rename
     // to the flow's intent_test_cases that were in lockstep with it (see below).
+    // When moving (moduleId changes), also capture the OLD module_id so we can
+    // bust its cached subtree too — otherwise the source folder keeps showing
+    // the moved flow until its cache expires.
     let previousName: string | undefined;
-    if (name !== undefined) {
+    let previousModuleId: string | undefined;
+    if (name !== undefined || moduleId !== undefined) {
       const { data: prev } = await supabaseAdmin
         .from('test_flows')
-        .select('name')
+        .select('name, module_id')
         .eq('id', id)
         .eq('user_id', userId)
         .single();
       previousName = prev?.name ?? undefined;
+      previousModuleId = prev?.module_id ?? undefined;
     }
 
     logger.info('[FLOW_SERVICE] Updating flow', {
@@ -221,8 +228,12 @@ export class FlowService {
       }
     }
 
-    // Invalidate module mode cache (flow metadata changed)
+    // Invalidate module tree cache (flow metadata changed). On a move, bust the
+    // OLD module too so the source folder drops the flow immediately.
     await cache.delByPattern(`qait:cache:ptree:module:${data.module_id}:*`);
+    if (previousModuleId && previousModuleId !== data.module_id) {
+      await cache.delByPattern(`qait:cache:ptree:module:${previousModuleId}:*`);
+    }
 
     return this.mapToTestFlow(data);
   }
