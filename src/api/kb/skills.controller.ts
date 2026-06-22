@@ -61,6 +61,16 @@ function formatSkillForResponse(memory: any) {
     enabled: memory.metadata?.enabled !== false, // default true
     accessCount: memory.access_count,
     lastAccessedAt: memory.last_accessed_at,
+    // Injection = the skill was placed into the agent's context for a run (the
+    // primary "used" signal). usageCount/lastUsedAt combine both signals so the
+    // UI can show real usage instead of only explicit search-tool hits.
+    injectionCount: memory.injection_count ?? 0,
+    lastInjectedAt: memory.last_injected_at ?? null,
+    usageCount: (memory.access_count ?? 0) + (memory.injection_count ?? 0),
+    lastUsedAt: [memory.last_injected_at, memory.last_accessed_at]
+      .filter(Boolean)
+      .sort()
+      .pop() ?? null,
     createdAt: memory.created_at,
     updatedAt: memory.updated_at,
     metadata: memory.metadata || {},

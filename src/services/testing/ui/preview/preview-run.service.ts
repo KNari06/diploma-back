@@ -2190,7 +2190,10 @@ export class PreviewRunService {
                 previewSessionId,
                 stepIndex: originalStepIndex,
                 stepId: step.id,
-                status: 'failed',
+                // FE DraftRunStep status union is 'fail' (not 'failed') — using
+                // 'failed' here rendered the page-load failure as a grey/pending
+                // step instead of red.
+                status: 'fail',
                 action: step.type,
                 description: step.description,
                 error: postApplyLoadErr.message,
@@ -3295,6 +3298,42 @@ export class PreviewRunService {
   static isRunning(previewSessionId: string): boolean {
     const runState = activeRuns.get(previewSessionId);
     return !!(runState?.running && !runState.cancelled);
+  }
+
+  /**
+   * Acquire the per-session run lock for a NON-runStepsOnPreview driver that
+   * still mutates the live preview (today: the iterative test-authoring service,
+   * which drives TestPipeline directly). Registers in the SAME `activeRuns` map
+   * so `isRunning()` reads true and recording / apply / Run-All correctly
+   * reject (preview invariant #1 — recording/run/pick are mutually exclusive).
+   *
+   * Returns the abort signal (so the driver can honour `cancelRun`) plus a
+   * `release()` that MUST be called in a finally. Returns null when a run is
+   * already in progress — caller must abort.
+   *
+   * PRECONDITION: the caller MUST have already verified session ownership
+   * (`isSessionOwned`) — this primitive takes no userId and does not check, so
+   * calling it unguarded is an IDOR/DoS (locking another user's session).
+   */
+  static acquireRunLock(previewSessionId: string): { signal: AbortSignal; release: () => void } | null {
+    if (activeRuns.has(previewSessionId)) return null;
+    const runState: RunState = {
+      running: true,
+      cancelled: false,
+      startTime: Date.now(),
+      currentStepIndex: 0,
+      abortController: new AbortController(),
+    };
+    activeRuns.set(previewSessionId, runState);
+    return {
+      signal: runState.abortController.signal,
+      release: () => {
+        // Only delete if it's still OUR state (a cancel may have replaced it).
+        if (activeRuns.get(previewSessionId) === runState) {
+          activeRuns.delete(previewSessionId);
+        }
+      },
+    };
   }
 
   /**

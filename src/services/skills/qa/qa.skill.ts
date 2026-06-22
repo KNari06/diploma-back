@@ -41,6 +41,7 @@ import {
   handleUpdateTestCase,
   handleRunTest,
   handleRunDraftSteps,
+  handleAuthorTestIteratively,
   handleCreateTestCase,
   // Write tools — Tier 2
   handleManageRegressionPlan,
@@ -1258,6 +1259,32 @@ const QA_TOOLS: ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'qa_author_test_iteratively',
+      description:
+        '⚠️ WRITE operation — Autonomously BUILD a test case by generating-and-executing each step live on the editor preview, grounded in the real page at every step (snapshot → pick real element → execute → re-snapshot → next). PREFER THIS over qa_run_draft_steps when the user asks to "test <a flow>" on the current page and you do NOT already have explicit steps — it discovers the steps by doing them, so they are verified, not guessed. Requires an active editor preview session. Describe the goal → get approval → call with confirm=true. The result is already-passed steps; the user then says "save" to persist (qa_create_test_case).',
+      parameters: {
+        type: 'object',
+        properties: {
+          goal: {
+            type: 'string',
+            description: 'What the test should accomplish, in plain language, derived from the user request + current page. Examples: "log in with valid credentials", "add the first product to the cart and open checkout", "search for \'shoes\' and apply the price filter".',
+          },
+          suggested_name: {
+            type: 'string',
+            description: 'Short 3-5 word title for the scenario (e.g. "Valid Login Flow"). Used as the default test case name when the user saves.',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing the goal to the user AND receiving explicit approval.',
+          },
+        },
+        required: ['goal', 'confirm'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'qa_create_test_case',
       description:
         '⚠️ WRITE operation — Create a new test case with steps and SAVE to DB. Use this ONLY when the user explicitly asks to save/persist a test case. Describe the test case → get approval → call with confirm=true. Each step needs: id (UUID), type, description.',
@@ -1846,6 +1873,9 @@ export const QASkill: SkillDefinition = {
 
         case 'qa_run_draft_steps':
           return await handleRunDraftSteps(args, context);
+
+        case 'qa_author_test_iteratively':
+          return await handleAuthorTestIteratively(args, context);
 
         case 'qa_create_test_case':
           return await handleCreateTestCase(args, context);

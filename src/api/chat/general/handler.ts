@@ -888,7 +888,10 @@ EDITOR WORKFLOW:
 IMPORTANT RULES:
 - Do NOT call qa_create_test_case unless user explicitly says "save" / "сохрани" / "persist"
 - For SINGLE actions (one click, one type) → this is editor_action, handled automatically
-- For MULTI-STEP flows (login, checkout, search+filter) → generate IntentSteps, ask to run, then qa_run_draft_steps
+- For MULTI-STEP flows (login, checkout, search+filter):
+  • If the user just names a GOAL on the current page and you do NOT already have concrete steps ("test the login flow", "протестируй оформление заказа") → PREFER qa_author_test_iteratively(goal, confirm). It builds the test by doing it live on the page — each step is grounded in the real DOM and already verified, no guessing. Describe the goal, get "yes", then call with confirm=true.
+  • If YOU already produced explicit IntentSteps (the user gave exact steps, or you're re-running a known list) → use qa_run_draft_steps as before.
+  • After either tool returns, the steps are cached — when the user says "save", call qa_create_test_case (the authored steps already passed; no re-run needed).
 
 POST-RUN BEHAVIOR (CRITICAL):
 - qa_run_draft_steps and qa_run_test (run_type="preview") AWAIT the full run. When the tool returns, the run is FINISHED.

@@ -229,6 +229,13 @@ export interface PipelineConfig {
   integrationContext?: string;
   /** Skip DB-based cancellation checks (exploration flows use non-UUID testIds) */
   skipDbCancellationCheck?: boolean;
+  /**
+   * External abort signal. When provided, its abort is forwarded to the
+   * pipeline's internal AbortController so a caller (e.g. the editor preview
+   * run-cancel) can stop an in-flight run that has no `tests` row to cancel via
+   * the DB path. Optional — exploration omits it.
+   */
+  externalAbortSignal?: AbortSignal;
   /** Entry point ID for exploration flows — propagated to pipeline trace events for log correlation */
   entryPointId?: string;
   /**
