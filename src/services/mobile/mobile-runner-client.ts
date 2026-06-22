@@ -18,6 +18,7 @@ import type {
   MobileHealthResponse,
   MobileIntentStep,
   MobileTestMetadata,
+  Trigger,
   MobileUiState,
   MobileForegroundResponse,
   MobileStepHistoryResponse,
@@ -211,6 +212,24 @@ export class MobileRunnerClient {
   ): Promise<void> {
     await this.request('PATCH', `/api/sessions/${sessionId}/permission-policy`, {
       body: { policy },
+      timeoutMs: 5000,
+      userId: opts?.userId,
+    });
+  }
+
+  /**
+   * Set the session's user-defined triggers for an editor run. The editor
+   * applies steps one at a time (NOT the batch run-steps body), so triggers
+   * must ride on the session — set once before the run, like permissionPolicy.
+   * Passing `[]` clears them.
+   */
+  async setTriggers(
+    sessionId: string,
+    triggers: Trigger[],
+    opts?: { userId?: string },
+  ): Promise<void> {
+    await this.request('PATCH', `/api/sessions/${sessionId}/triggers`, {
+      body: { triggers },
       timeoutMs: 5000,
       userId: opts?.userId,
     });
@@ -498,6 +517,9 @@ export class MobileRunnerClient {
       screenshotEachStep?: boolean;
       stopOnFailure?: boolean;
       metadata?: MobileTestMetadata;
+      /** User-defined event→action rules forwarded verbatim to the runner.
+       *  Omitted from the body when absent/empty. */
+      triggers?: Trigger[];
       /** Propagated to the outgoing fetch so client-disconnect aborts
        *  reach the runner and free its session mutex. */
       signal?: AbortSignal;
@@ -509,6 +531,9 @@ export class MobileRunnerClient {
       screenshotEachStep: opts?.screenshotEachStep ?? true,
       stopOnFailure: opts?.stopOnFailure,
       metadata: opts?.metadata,
+      // Only attach when present so a no-trigger run sends a byte-identical
+      // body to pre-trigger behaviour (the runner schema treats it optional).
+      ...(opts?.triggers && opts.triggers.length > 0 ? { triggers: opts.triggers } : {}),
     };
 
     return this.request<MobileRunStepsResponse>(

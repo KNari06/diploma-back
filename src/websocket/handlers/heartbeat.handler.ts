@@ -6,6 +6,7 @@
 import { logger } from '@/utils/core/logger';
 import { Socket } from 'socket.io';
 import { getUserId } from '../middleware/middleware';
+import { refreshWarmupTtl } from '@/services/mobile/mobile-idle.service';
 import {
   ClientToServerEvents,
   ServerToClientEvents,
@@ -67,6 +68,31 @@ export const handleHeartbeat = (socket: TypedSocket): void => {
       });
 
       // Don't disconnect on heartbeat error - just log
+    }
+  });
+
+  // Mobile-runner activity keepalive. Fire-and-forget by design (no ack to
+  // emit). Live device gestures and recording actions go directly to the
+  // mobile runner's socket and bypass the backend; this event lets the
+  // frontend signal that the user is still active.
+  //
+  // Two things must be kept alive for an actively-used mobile session, and
+  // BOTH have a 15-min window that this event refreshes:
+  //   1. The in-memory idle timer (`mobile-idle.service.ts`) — refreshed
+  //      generically by the `socket.use()` activity middleware in
+  //      core/server.ts (this event is not in IDLE_BACKGROUND_EVENTS).
+  //   2. The Redis `mobile_warmup` binding — has a FIXED TTL that nothing
+  //      else extends; `refreshWarmupTtl` re-arms it here (throttled,
+  //      best-effort) so authz/session-resolution don't lapse under an active
+  //      user. Without this, #1 alone keeps the editor open while the binding
+  //      silently expires, breaking chat-driven mobile actions at ~15 min.
+  socket.on('mobile:keepalive', () => {
+    logger.debug('[WebSocket] mobile:keepalive', {
+      socketId: socket.id,
+      userId: userId || 'anonymous',
+    });
+    if (userId) {
+      void refreshWarmupTtl(userId);
     }
   });
 };

@@ -3,6 +3,10 @@
  * Types for realtime step editor and preview functionality
  */
 
+// Canonical cross-repo Trigger contract lives in the mobile runner types
+// (single source of truth, mirrored by qait-mobile-runner's zod schema).
+import type { Trigger } from '@/services/mobile/mobile-runner.types';
+
 // ═══════════════════════════════════════════════════════════════════════════
 // INTERACTIVE NODE (for dom_analysis storage)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1177,6 +1181,13 @@ export interface StepOptions {
   disableStabilityChecks?: boolean;
   /** Force fresh element lookup, skip evidence cache */
   disableCaching?: boolean;
+  /**
+   * User-authored "optional step" flag. When true, a failing step does NOT
+   * fail the overall run — the preview-run loop continues to the next step and
+   * background replay soft-fails it (step_soft_failed). Mirrors the mobile
+   * runner's `options.continueOnError` (see step-result-classifier.ts).
+   */
+  continueOnError?: boolean;
   /** Iframe configuration for actions within iframes */
   iframe?: IframeConfig;
   /**
@@ -1890,6 +1901,11 @@ export interface IntentTestCase {
     resource_id: string;
     required?: boolean;
   }>;
+
+  // User-defined event→action rules forwarded to the mobile runner per run.
+  // Surfaces intent_test_cases.triggers to the UI. CANONICAL cross-repo shape
+  // (`Trigger` in @/services/mobile/mobile-runner.types) — do not diverge.
+  triggers?: Trigger[];
 
   // Provenance (when saved from a completed test)
   sourceTestId?: string;

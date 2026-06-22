@@ -59,6 +59,33 @@ describe('TraceSummaryAggregator — steps', () => {
   });
 });
 
+describe('TraceSummaryAggregator — mobile teardown', () => {
+  it('defaults teardown fields to null when no teardown event is seen', () => {
+    const s = new TraceSummaryAggregator().finalize();
+    expect(s.teardownCause).toBeNull();
+    expect(s.teardownReason).toBeNull();
+  });
+
+  it('surfaces an idle teardown cause with no disconnect reason', () => {
+    const agg = new TraceSummaryAggregator();
+    agg.consume({ eventType: 'mobile_session_teardown', payload: { cause: 'idle' } });
+    const s = agg.finalize();
+    expect(s.teardownCause).toBe('idle');
+    expect(s.teardownReason).toBeNull();
+  });
+
+  it('surfaces a disconnect-grace teardown cause + disconnect reason', () => {
+    const agg = new TraceSummaryAggregator();
+    agg.consume({
+      eventType: 'mobile_session_teardown',
+      payload: { cause: 'disconnect_grace', disconnectReason: 'ping timeout' },
+    });
+    const s = agg.finalize();
+    expect(s.teardownCause).toBe('disconnect_grace');
+    expect(s.teardownReason).toBe('ping timeout');
+  });
+});
+
 describe('TraceSummaryAggregator — resolver health', () => {
   it('tallies resolverPath and fingerprintMatch with defaults', () => {
     const agg = new TraceSummaryAggregator();

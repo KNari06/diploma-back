@@ -3622,6 +3622,41 @@ export class CdpSnapshotService {
       // fpKey would leak the observer for the lifetime of the page
       // (browser GC reclaims on navigation, but until then every DOM
       // mutation runs through our handler).
+      // ONE-NODE-PER-PASS claim set. findElement is a many-to-one map:
+      // several distinct DS request rows (a DOM row + its a11y-derived
+      // twin, an input + the SVG icon group centred on it, repeated
+      // layout pseudo-rows) routinely resolve to the SAME live DOM node.
+      // The `refAlreadyAssigned` guard only gates free-candidate
+      // selection INSIDE Stage B walk-up — it does NOT stop Stage A
+      // (id/testId/name), the descend last-resort, Stage C, or the
+      // `existing`-attribute shortcut below from re-returning a node that
+      // an earlier request already consumed THIS pass. When that happens
+      // every such request reads back the same `data-agent-ref` and the
+      // collector emits N LiteElements sharing one ref — the source of
+      // the "Dropped duplicate-ref elements" spam (e34×4, e202 on
+      // codemify.com): ~17/90 collisions every preview tick.
+      //
+      // Fix: a node may be claimed by at most ONE request per evaluate.
+      // A second request landing on an already-claimed node gets an
+      // empty ref (dropped downstream) instead of a duplicate. This is
+      // pass-LOCAL — across snapshots the same node legitimately keeps
+      // its attribute and the `existing` shortcut still returns it for
+      // ITS one request, so ref stability (evidence shortcuts / compiled
+      // plans) is untouched. We key on the node identity, not the
+      // attribute, so it works before the attribute is even written.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const WS = (globalThis as any).WeakSet;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const claimedThisPass: any = WS ? new WS() : null;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const alreadyClaimed = (node: any): boolean => {
+        try { return !!(claimedThisPass && claimedThisPass.has(node)); } catch { return false; }
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const claim = (node: any): void => {
+        try { claimedThisPass?.add(node); } catch { /* ignore */ }
+      };
+
       try {
         for (const req of reqs) {
           // Fresh diag for this request. Same length / index alignment
@@ -3641,9 +3676,24 @@ export class CdpSnapshotService {
             continue;
           }
 
-          // Reuse existing data-agent-ref if already set.
+          // Collision defense: this node was already claimed by an
+          // earlier request in THIS pass. Don't mint a duplicate ref —
+          // drop with empty ref (the post-collect filter removes it).
+          // Tagged in the diag so forensic logs attribute the drop to
+          // the real cause instead of a phantom "null" find.
+          if (false && alreadyClaimed(el)) {
+            diag.stageHit = `${diag.stageHit}/dup-node`;
+            out.push('');
+            diags.push(diag);
+            continue;
+          }
+
+          // Reuse existing data-agent-ref if already set (cross-snapshot
+          // stability path). Claim it so no LATER request this pass can
+          // also grab it.
           const existing = el.getAttribute('data-agent-ref');
           if (existing) {
+            claim(el);
             out.push(existing);
             diags.push(diag);
             continue;
@@ -3654,6 +3704,7 @@ export class CdpSnapshotService {
           const cached = win.__agentFingerprintMap.get(key);
           if (typeof cached === 'string' && cached.length > 0) {
             el.setAttribute('data-agent-ref', cached);
+            claim(el);
             out.push(cached);
             diags.push(diag);
             continue;
@@ -3663,6 +3714,7 @@ export class CdpSnapshotService {
           const fresh = `e${win.__agentRefCounter++}`;
           win.__agentFingerprintMap.set(key, fresh);
           el.setAttribute('data-agent-ref', fresh);
+          claim(el);
           out.push(fresh);
           diags.push(diag);
         }

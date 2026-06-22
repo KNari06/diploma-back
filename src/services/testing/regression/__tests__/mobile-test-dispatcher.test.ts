@@ -303,3 +303,44 @@ describe('happy path', () => {
     expect(jobData.analyticsExecutionId).toBe('exec-id-123');
   });
 });
+
+// ── Triggers forwarding ───────────────────────────────────────────────────────
+
+describe('triggers forwarding to the job', () => {
+  const permissionTrigger = {
+    id: 'trg-1',
+    condition: { kind: 'permission_dialog' },
+    action: { kind: 'permission', decision: 'allow' },
+  };
+
+  it("copies the test case's triggers into the job data verbatim", async () => {
+    await MobileTestDispatcherService.dispatchMobileTest(
+      baseCase({ triggers: [permissionTrigger] }),
+      'user-1',
+      'manual',
+    );
+    const jobData = QueueManager.addMobileTestRunJob.mock.calls[0][0];
+    expect(jobData.triggers).toEqual([permissionTrigger]);
+  });
+
+  it('omits triggers from the job data when the test case has none', async () => {
+    await MobileTestDispatcherService.dispatchMobileTest(baseCase(), 'user-1', 'manual');
+    const jobData = QueueManager.addMobileTestRunJob.mock.calls[0][0];
+    expect(jobData).not.toHaveProperty('triggers');
+  });
+
+  it('drops malformed stored triggers (sanitize, never crash a run)', async () => {
+    await MobileTestDispatcherService.dispatchMobileTest(
+      baseCase({
+        triggers: [
+          permissionTrigger,
+          { id: 'bad', condition: { kind: 'nope' }, action: { kind: 'back' } },
+        ],
+      }),
+      'user-1',
+      'manual',
+    );
+    const jobData = QueueManager.addMobileTestRunJob.mock.calls[0][0];
+    expect(jobData.triggers).toEqual([permissionTrigger]);
+  });
+});

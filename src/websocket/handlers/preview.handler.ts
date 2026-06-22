@@ -1828,10 +1828,58 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      // For resolved/not_found/error, emit result as usual
+      // [HL-DIAG] Does the resolved result carry a usable highlight bbox? This is
+      // the single chokepoint for every lint result reaching the client. If the
+      // border doesn't draw, this tells us whether the BACKEND omitted the bbox
+      // (vs the frontend losing it). Remove with the other [HL-DIAG] logs.
+      try {
+        const hl = Array.isArray((result as any).highlight) ? (result as any).highlight : [];
+        const bb = hl[0]?.boundingBox;
+        logger.info('[HL-DIAG] lint emit', {
+          status: (result as any).status,
+          stepType: stepDraft.type,
+          resolverPath: (result as any).resolverPath,
+          highlightCount: hl.length,
+          firstHasBbox: !!bb,
+          firstBbox: bb ? { x: Math.round(bb.x), y: Math.round(bb.y), w: Math.round(bb.width), h: Math.round(bb.height) } : null,
+        });
+      } catch { /* diag only */ }
+
+      // Draw the "is this the element you meant?" border IN-PAGE (target
+      // architecture): the outline lives inside the browser, so coordinates are
+      // always correct and it scrolls with the page for free. We try the in-page
+      // highlight by data-agent-ref; `drawn` is false when the element isn't in
+      // the main frame (cross-origin iframe / not in DOM), in which case the FE
+      // falls back to its React-<div>-over-the-video overlay (works regardless of
+      // frame origin). Fire the call but await the `drawn` flag so the FE knows
+      // whether to render the fallback — avoids a double border. Best-effort.
+      let inPageHighlightDrawn = false;
+      try {
+        const firstRef = Array.isArray((result as any).highlight) && (result as any).highlight[0]?.ref
+          ? String((result as any).highlight[0].ref)
+          : null;
+        const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+        const liveSession = getPreviewSessionService().getSession(previewSessionId);
+        const { showLintHighlight, clearLintHighlight } =
+          await import('@/services/testing/ui/preview/preview-lint-highlight.service');
+        if (result.status === 'resolved' && firstRef && liveSession?.page) {
+          const hlType = (result as any).highlight[0]?.type === 'warning' ? 'warning'
+            : (result as any).highlight[0]?.type === 'error' ? 'error' : 'success';
+          const res = await showLintHighlight(previewSessionId, liveSession.page, firstRef, hlType);
+          inPageHighlightDrawn = res.drawn;
+        } else {
+          // not_found / error / no-ref → no element to outline; clear any prior.
+          await clearLintHighlight(previewSessionId);
+        }
+      } catch { /* highlight is advisory — never break lint */ }
+
+      // For resolved/not_found/error, emit result as usual. `inPageHighlightDrawn`
+      // tells the FE whether the border is already painted in-page (skip the React
+      // fallback) or whether it must draw the fallback overlay itself.
       socket.emit('preview:step:lint:result', {
         ...result,
         applyDisabled: result.status !== 'resolved', // V5: Apply only enabled for resolved
+        inPageHighlightDrawn,
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -1988,6 +2036,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       }
 
       const { previewSessionId, stepDraft, pageRef, intentTestCaseId } = data;
+
+      // The "is this the element?" lint border is a pre-execution hint. Once Apply
+      // runs the step is executing, so clear the in-page highlight AND suppress
+      // any late lint result that raced past this point (it would otherwise
+      // repaint a border that never goes away). Released in the apply finally.
+      if (previewSessionId) {
+        import('@/services/testing/ui/preview/preview-lint-highlight.service')
+          .then(({ suppressLintHighlight }) => suppressLintHighlight(previewSessionId))
+          .catch(() => undefined);
+      }
 
       // V9: Guard — cannot manually apply steps while a run is active
       {
@@ -2396,6 +2454,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         error: error instanceof Error ? error.message : 'Apply failed',
         timestamp: new Date().toISOString(),
       });
+    } finally {
+      // Lift lint-highlight suppression now the step finished, so the NEXT
+      // lint can paint its border again. Border for THIS step is already gone.
+      const { previewSessionId } = data || {};
+      if (previewSessionId) {
+        import('@/services/testing/ui/preview/preview-lint-highlight.service')
+          .then(({ releaseLintHighlightSuppression }) => releaseLintHighlightSuppression(previewSessionId))
+          .catch(() => undefined);
+      }
     }
   });
 
@@ -5289,7 +5356,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     // preview:run:completed. Every early exit in this handler must emit a
     // completion-shaped terminator in addition to the diagnostic 'error' event,
     // otherwise the button spins forever even after the action succeeded.
+    // Lift lint-highlight suppression for this run (graced — see service). Called
+    // from every run terminus: early-exit terminators + the async run .finally.
+    const releaseRunLintSuppression = (): void => {
+      if (typeof guardKey === 'string' && guardKey.length > 0) {
+        import('@/services/testing/ui/preview/preview-lint-highlight.service')
+          .then(({ releaseLintHighlightSuppression }) => releaseLintHighlightSuppression(guardKey))
+          .catch(() => undefined);
+      }
+    };
     const emitRunTerminator = (errorMessage: string): void => {
+      releaseRunLintSuppression();
       socket.emit('preview:run:completed', {
         previewSessionId: typeof guardKey === 'string' ? guardKey : '',
         success: false,
@@ -5303,6 +5380,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         timestamp: new Date().toISOString(),
       });
     };
+    // The lint "is this the element?" border is a pre-execution hint — a run is
+    // executing steps, so clear the in-page highlight AND suppress late lint
+    // results for the duration of the run (released when the run settles).
+    if (typeof guardKey === 'string' && guardKey.length > 0) {
+      import('@/services/testing/ui/preview/preview-lint-highlight.service')
+        .then(({ suppressLintHighlight }) => suppressLintHighlight(guardKey))
+        .catch(() => undefined);
+    }
+
     // Guard — pick mode is mutually exclusive with run. Source of truth is
     // the pick service's own active-session map. Done OUTSIDE the
     // `previewRunStartInFlight` synchronous window so the await doesn't
@@ -5515,6 +5601,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         const { getMobileRunnerClient } = await import('@/services/mobile');
         const mobileClient = getMobileRunnerClient();
         const { buildMetadataFromTestCase } = await import('@/services/mobile/mobile-runner.types');
+        const { sanitizeTriggers } = await import('@/services/mobile/trigger-validation.util');
 
         // Emit started AFTER session is validated
         webSocketService.emitToUser(userId, 'preview:run:started', {
@@ -5545,6 +5632,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           screenshotEachStep: true,
           stopOnFailure: true,
           metadata: buildMetadataFromTestCase(testCase),
+          // Forward the test's user-defined triggers (event→action rules) so the
+          // runner honours them mid-run. The editor "Run" path was missing this —
+          // only the regression job (mobile-test-run.job) had it — so triggers
+          // never reached the runner on a preview run.
+          triggers: sanitizeTriggers(testCase.triggers),
           userId,
         }).then((result) => {
           logger.info('[WebSocket] Mobile run completed', {
@@ -5617,6 +5709,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           if (typeof guardKey === 'string' && guardKey.length > 0) {
             previewRunStartInFlight.delete(guardKey);
           }
+          releaseRunLintSuppression();
         });
 
         return; // Mobile path done — skip web flow below
@@ -5725,6 +5818,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           if (typeof guardKey === 'string' && guardKey.length > 0) {
             previewRunStartInFlight.delete(guardKey);
           }
+          releaseRunLintSuppression();
         });
     } catch (error) {
       logger.error('[WebSocket] Error in preview:run:start', {
@@ -7440,6 +7534,18 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             await teardownHoverForSession(previewSessionId);
           } catch (err) {
             logger.debug('[HOVER_OVERLAY] disconnect cleanup failed (non-fatal)', {
+              previewSessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+
+          // Tear down the in-page lint highlight (scroll/resize listeners +
+          // outline div) so they don't outlive the socket on the orphaned page.
+          try {
+            const { clearLintHighlightForSession } = await import('@/services/testing/ui/preview/preview-lint-highlight.service');
+            await clearLintHighlightForSession(previewSessionId);
+          } catch (err) {
+            logger.debug('[LINT_HIGHLIGHT] disconnect cleanup failed (non-fatal)', {
               previewSessionId,
               error: err instanceof Error ? err.message : String(err),
             });

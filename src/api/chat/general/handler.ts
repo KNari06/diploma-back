@@ -28,6 +28,7 @@ import { SUB_AGENT_CONFIG } from './sub-agents/config';
 import { executeTool } from '@/services/skills/tool-executor';
 import { ToolCallTracker } from '@/services/skills/hooks/loop-detection.hook';
 import { humanizeToolName, computeToolProgress } from './sub-agents/agents/executor-agent';
+import { getLocalizedMessages } from '../regression/localization';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPER: Resolve project ID (Tier 1: session → Tier 2: workspace default)
@@ -887,7 +888,10 @@ EDITOR WORKFLOW:
 IMPORTANT RULES:
 - Do NOT call qa_create_test_case unless user explicitly says "save" / "сохрани" / "persist"
 - For SINGLE actions (one click, one type) → this is editor_action, handled automatically
-- For MULTI-STEP flows (login, checkout, search+filter) → generate IntentSteps, ask to run, then qa_run_draft_steps
+- For MULTI-STEP flows (login, checkout, search+filter):
+  • If the user just names a GOAL on the current page and you do NOT already have concrete steps ("test the login flow", "протестируй оформление заказа") → PREFER qa_author_test_iteratively(goal, confirm). It builds the test by doing it live on the page — each step is grounded in the real DOM and already verified, no guessing. Describe the goal, get "yes", then call with confirm=true.
+  • If YOU already produced explicit IntentSteps (the user gave exact steps, or you're re-running a known list) → use qa_run_draft_steps as before.
+  • After either tool returns, the steps are cached — when the user says "save", call qa_create_test_case (the authored steps already passed; no re-run needed).
 
 POST-RUN BEHAVIOR (CRITICAL):
 - qa_run_draft_steps and qa_run_test (run_type="preview") AWAIT the full run. When the tool returns, the run is FINISHED.
@@ -1490,15 +1494,30 @@ You are inside the editor for the test case currently open in the preview. The
       userId,
     });
 
-    // Provide helpful fallback message based on error type
-    let fallbackMessage = 'I apologize, but I\'m currently experiencing technical difficulties. Please try again in a few moments.';
+    // Classify the failure and surface a SPECIFIC, localized message per class
+    // (not one catch-all). Language comes from the intent parser (userLanguage),
+    // so the user reads the hint in their own language.
+    const chatErrors = getLocalizedMessages(params.userLanguage).chatError;
+    const status = openaiError?.status;
+    const code = openaiError?.code;
+    const msg = String(openaiError?.message || '').toLowerCase();
 
-    if (openaiError?.status === 401 || openaiError?.code === 'invalid_api_key') {
-      fallbackMessage = 'I\'m temporarily unavailable due to a configuration issue. Our team has been notified.';
-    } else if (openaiError?.status === 429 || openaiError?.code === 'insufficient_quota') {
-      fallbackMessage = 'I\'m temporarily unavailable due to high demand. Please try again in a few minutes.';
-    } else if (openaiError?.message?.includes('timeout') || openaiError?.message?.includes('took too long')) {
-      fallbackMessage = 'The request took too long to process. Please try again with a shorter message.';
+    let fallbackMessage: string;
+    if (status === 401 || status === 403 || code === 'invalid_api_key') {
+      // Auth/config — user can't fix it; team is notified.
+      fallbackMessage = chatErrors.config;
+    } else if (status === 429 || code === 'insufficient_quota' || code === 'rate_limit_exceeded') {
+      fallbackMessage = chatErrors.rateLimit;
+    } else if (
+      code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'ECONNREFUSED'
+      || msg.includes('fetch failed') || msg.includes('network') || msg.includes('socket hang up')
+    ) {
+      fallbackMessage = chatErrors.network;
+    } else if (msg.includes('timeout') || msg.includes('timed out') || msg.includes('took too long')) {
+      fallbackMessage = chatErrors.timeout;
+    } else {
+      // 500/502/503 or anything unclassified.
+      fallbackMessage = chatErrors.generic;
     }
 
       gptResponse = {

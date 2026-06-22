@@ -1583,6 +1583,12 @@ type ClickPreState = {
   targetDataState: string | null;
   targetDisabled: boolean;
   pageCount: number; // browser-context tab count for new-tab detection
+  // V28: resolved absolute href of the click target when it's an anchor
+  // (`<a href>` / closest `<a>` ancestor — covers icon-in-link). Lets the
+  // post-click verifier decide whether a `target="_blank"` newtab landed on
+  // the link's OWN destination (strong, real navigation) vs an unrelated tab
+  // an ad/tracker popped (weak, fake-success symptom). null for non-anchors.
+  targetHref: string | null;
   // V24: overlay/popup signature captured BEFORE click. Used by parasitic-overlay
   // dismiss helper to distinguish a popup that was already there (legitimate,
   // recorded by user) from one our wrong click just opened. Format: count of
@@ -1661,6 +1667,7 @@ async function captureClickPreState(
     targetDataState: null,
     targetDisabled: false,
     pageCount,
+    targetHref: null,
     overlayPreSig: '',
     downloadDetected: () => downloaded,
     cleanupDownloadListener,
@@ -1723,6 +1730,15 @@ async function captureClickPreState(
       const aeSig = ae ? `${ae.tagName}#${ae.id || ''}.${(ae.getAttribute('class') || '').slice(0, 30)}` : null;
       let targetEl: any = null;
       if (refSel) targetEl = doc.querySelector(`[data-agent-ref="${refSel}"]`);
+      // V28: resolve the anchor destination. The click target may be an icon
+      // or <span> INSIDE the link, so walk up to the closest <a href>. `.href`
+      // (not getAttribute) returns the browser-resolved absolute URL, so a
+      // relative href compares cleanly against the new tab's absolute URL.
+      let targetHref: string | null = null;
+      if (targetEl) {
+        const anchor = targetEl.closest ? targetEl.closest('a[href]') : null;
+        if (anchor && anchor.href) targetHref = String(anchor.href);
+      }
       return {
         activeElementSig: aeSig,
         targetAriaPressed: targetEl ? targetEl.getAttribute('aria-pressed') : null,
@@ -1735,12 +1751,59 @@ async function captureClickPreState(
         targetDisabled: targetEl
           ? (targetEl.hasAttribute('disabled') || targetEl.getAttribute('aria-disabled') === 'true')
           : false,
+        targetHref,
       };
     }, { refSel: safeRef });
     return { ...pageSig, ...elemSig, pageCount, downloadDetected: () => downloaded, cleanupDownloadListener };
   } catch {
     return fallback;
   }
+}
+
+/**
+ * V28: does a tab URL point at the same destination as a clicked anchor's href?
+ * Compares origin+path first, then bare origin (covers tracking query params
+ * the link adds, or a redirect that lands on the same site). Only http/https
+ * count — `about:blank` (brand-new popup not yet navigated) and other schemes
+ * return false, so an ad's blank popup doesn't masquerade as the link's
+ * destination. Pure + exported so it's unit-testable without a browser.
+ */
+export function hrefMatchesUrl(targetHref: string, tabUrl: string): boolean {
+  const norm = (u: string): { origin: string; originPath: string } | null => {
+    try {
+      const p = new URL(u);
+      if (p.protocol !== 'http:' && p.protocol !== 'https:') return null;
+      const host = p.host.toLowerCase();
+      const path = p.pathname.replace(/\/$/, '') || '/';
+      return { origin: `${p.protocol}//${host}`, originPath: `${p.protocol}//${host}${path}` };
+    } catch { return null; }
+  };
+  const want = norm(targetHref);
+  const got = norm(tabUrl);
+  if (!want || !got) return false;
+  return got.originPath === want.originPath || got.origin === want.origin;
+}
+
+/**
+ * V28: does a NEWLY-OPENED tab point at the same destination as the clicked
+ * anchor's href? Synchronous read of `page.context().pages()` — no await,
+ * best-effort. Newest tab is last, so it's checked first.
+ *
+ * CRITICAL: the opener page (`page` itself) is excluded. hrefMatchesUrl allows
+ * an origin-only match, and the opener almost always shares the href's origin —
+ * so without this exclusion an ad/tracker popup to a foreign site would still
+ * "match" the opener and be wrongly promoted to the strong 'url' signal. Only
+ * the tab the click actually spawned counts as the link's destination.
+ */
+function newTabMatchesHref(page: Page, targetHref: string): boolean {
+  try {
+    const pages = page.context().pages();
+    for (const pg of [...pages].reverse()) {
+      if (pg === page) continue; // opener, not the click's new destination
+      if (hrefMatchesUrl(targetHref, pg.url())) return true;
+    }
+  } catch { /* best-effort */ }
+  return false;
 }
 
 async function verifyClickHadEffect(
@@ -1755,7 +1818,9 @@ async function verifyClickHadEffect(
   // path bounded at ~800ms while keeping the fast path effectively free.
   const safeRef = ref ? ref.replace(/[^a-zA-Z0-9_-]/g, '') : '';
   const checkpoints = [0, 800];
-  for (const delay of checkpoints) {
+  for (let ci = 0; ci < checkpoints.length; ci++) {
+    const delay = checkpoints[ci];
+    const isLastCheckpoint = ci === checkpoints.length - 1;
     if (delay > 0) await page.waitForTimeout(delay).catch(() => {});
 
     // V23: download detection — checked first because download events fire
@@ -1777,8 +1842,29 @@ async function verifyClickHadEffect(
     try {
       const nowPageCount = page.context().pages().length;
       if (nowPageCount > pre.pageCount) {
-        pre.cleanupDownloadListener?.();
-        return { effected: true, signal: 'newtab' };
+        // V28: a new tab opened. Decide STRONG vs WEAK by comparing the new
+        // tab's destination against the clicked anchor's own href. A link with
+        // target="_blank" landing on ITS OWN destination is a real navigation
+        // (strong → 'url'), not a fake-success. Only when the new tab is
+        // unrelated (ad/tracker popup, or the click target wasn't even an
+        // anchor) do we keep the weak 'newtab' signal so the fake-success
+        // guard still rejects it. This stops the editor from discarding the
+        // compiled plan on legitimate "opens in new tab" links — the bug that
+        // made the orange "Needs apply" dot stick on passing steps.
+        if (pre.targetHref && newTabMatchesHref(page, pre.targetHref)) {
+          pre.cleanupDownloadListener?.();
+          return { effected: true, signal: 'url' };
+        }
+        // No href match yet. The popup may still be on about:blank mid-open —
+        // on an early checkpoint, keep waiting so its URL can resolve and match
+        // (and so a download that opens via a transient tab can still fire and
+        // be caught by the download listener, which we therefore DON'T clean up
+        // here). Only at the FINAL checkpoint do we commit to the weak 'newtab'
+        // signal (unrelated popup, or non-anchor click → fake-success guard).
+        if (isLastCheckpoint) {
+          pre.cleanupDownloadListener?.();
+          return { effected: true, signal: 'newtab' };
+        }
       }
     } catch { /* best-effort */ }
 
@@ -1829,13 +1915,37 @@ async function verifyClickHadEffect(
       // own `page.url()` (no in-page eval needed) and only claim 'url' when
       // we can prove navigation happened. Otherwise drop to a 'detach' /
       // 'dom' signal so the post-click guard can actually do its job.
-      pre.cleanupDownloadListener?.();
       try {
         const liveUrl = page.url();
         if (liveUrl && liveUrl !== pre.url) {
+          pre.cleanupDownloadListener?.();
           return { effected: true, signal: 'url' };
         }
       } catch { /* page closed — fall through */ }
+      // V28: the evaluate often throws on `target="_blank"` clicks because the
+      // popup-open briefly busies the opener's JS context — and that race fired
+      // BEFORE the top-of-loop tab-count check could see the new tab. Re-check
+      // here so a legit "opens in new tab" link isn't mislabelled 'detach'
+      // (weak → stale orange dot). Same decision: href match → strong 'url',
+      // else weak 'newtab'.
+      try {
+        if (page.context().pages().length > pre.pageCount) {
+          if (pre.targetHref && newTabMatchesHref(page, pre.targetHref)) {
+            pre.cleanupDownloadListener?.();
+            return { effected: true, signal: 'url' };
+          }
+          // Tab present but no href match yet. On an early checkpoint the popup
+          // may still be on about:blank — fall through to the loop's next pass
+          // so its URL can resolve. Only commit to weak 'newtab' at the last
+          // checkpoint. (Skip the 'detach' return below in either case.)
+          if (isLastCheckpoint) {
+            pre.cleanupDownloadListener?.();
+            return { effected: true, signal: 'newtab' };
+          }
+          continue;
+        }
+      } catch { /* best-effort */ }
+      pre.cleanupDownloadListener?.();
       // Eval threw and URL is unchanged. Treat as a DOM-shake signal — it
       // IS an effect (something destroyed our eval context) but it isn't
       // a navigation. 'detach' is in the WEAK set, so the fake-success
@@ -1877,6 +1987,24 @@ async function verifyClickHadEffect(
         return { signal: 'none' as const };
       }, { refSel: safeRef, prev: pre });
     } catch {
+      // V28: same target="_blank" race as the page-eval catch above — the
+      // popup-open can busy/destroy the element eval context AFTER the
+      // top-of-loop tab check already passed. Re-check for a new tab before
+      // settling on 'detach' so a legit "opens in new tab" link gets the
+      // strong 'url' signal (href match) or weak 'newtab', not 'detach'.
+      try {
+        if (page.context().pages().length > pre.pageCount) {
+          if (pre.targetHref && newTabMatchesHref(page, pre.targetHref)) {
+            pre.cleanupDownloadListener?.();
+            return { effected: true, signal: 'url' };
+          }
+          if (isLastCheckpoint) {
+            pre.cleanupDownloadListener?.();
+            return { effected: true, signal: 'newtab' };
+          }
+          continue; // early checkpoint — let the popup URL resolve next pass
+        }
+      } catch { /* best-effort */ }
       // Frame detached / navigating — count as effect.
       return { effected: true, signal: 'detach' };
     }
@@ -1892,6 +2020,22 @@ async function verifyClickHadEffect(
   pre.cleanupDownloadListener?.();
   if (downloadFinal) return { effected: true, signal: 'download' };
   return { effected: false, signal: 'none' };
+}
+
+/**
+ * Test-only: run the real pre-state → click → verify pipeline against a live
+ * Playwright page, so integration tests exercise the actual V28 newtab logic
+ * (targetHref capture + checkpoint-aware newtab branch + newTabMatchesHref)
+ * end-to-end instead of re-implementing it. Not used by production code.
+ */
+export async function __test__captureClickAndVerify(
+  page: Page,
+  ref: string,
+  doClick: () => Promise<void>,
+): Promise<{ effected: boolean; signal: ClickEffectSignal }> {
+  const pre = await captureClickPreState(page, ref, null);
+  await doClick();
+  return verifyClickHadEffect(page, pre, ref, null);
 }
 
 /**
@@ -2645,6 +2789,7 @@ async function executeAction(
       case 'click': {
         if (!locator) throw new Error('No selector for click action');
         const humanLike = step.options?.humanLike === true;
+
 
         // V13: Build Playwright modifiers array from step options
         const clickModifiers: ('Shift' | 'Control' | 'Alt' | 'Meta')[] = [];
@@ -5052,6 +5197,76 @@ export class PreviewStepApplyService {
         forceFreshSnapshot: true,
         auditTrigger: 'apply_prelint',
       });
+      // HIDDEN-CANDIDATE RETARGET (codemify #submenu, June 2026 — proven root).
+      // The CDP snapshot does NOT compute real visibility, so the resolver can
+      // hand back a HIDDEN copy of the target (e.g. a nav item duplicated into a
+      // collapsed dropdown submenu) whose recorded identity ALSO matches a
+      // VISIBLE element elsewhere on the page. The collector marks both
+      // "visible", so an in-snapshot filter can't tell them apart — only the
+      // live browser can. So we ask PLAYWRIGHT (the source of truth): if the
+      // chosen candidate is hidden, find a VISIBLE element sharing the SAME
+      // recorded identity and retarget to it. This stops the ~70-80s stall
+      // (click waiting out its full "element is not visible" timeout ×retries).
+      //
+      // Universal across sites: we try identity signals in strength order —
+      // testId → id → href → name → exact visible text — so it works for
+      // links (href), framework menus (data-testid), id-anchored items, form
+      // controls (name), and plain text buttons/divs alike, not just <a href>.
+      // Click-class only; fully fail-open (any miss → keep original candidate).
+      try {
+        const isClickClass = stepDraft.type === 'click' || stepDraft.type === 'hover' || stepDraft.type === 'select';
+        const chosen0 = lintResult.status === 'resolved' ? lintResult.candidates?.[0] : undefined;
+        const fp = stepDraft.recordedFingerprint;
+        if (isClickClass && chosen0?.ref && fp) {
+          const chosenLoc = page.locator(`[data-agent-ref="${chosen0.ref}"]`).first();
+          const chosenVisible = await chosenLoc.isVisible({ timeout: 1000 }).catch(() => true);
+          if (!chosenVisible) {
+            const cssEsc = (v: string) => v.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+            // Build :visible candidate locators in identity-strength order.
+            // Each entry: a Playwright Locator already scoped to :visible.
+            const tries: Array<{ by: string; loc: import('playwright').Locator }> = [];
+            if (fp.testIdAttr) {
+              const v = cssEsc(fp.testIdAttr);
+              tries.push({ by: 'testid', loc: page.locator(`[data-testid="${v}"]:visible, [data-test="${v}"]:visible, [data-qa="${v}"]:visible`).first() });
+            }
+            if (fp.elementId) {
+              // Attribute form (not `#id`) so React useId() colons / special
+              // chars don't need CSS.escape (unavailable in Node).
+              tries.push({ by: 'id', loc: page.locator(`[id="${cssEsc(fp.elementId)}"]:visible`).first() });
+            }
+            if (fp.href) {
+              tries.push({ by: 'href', loc: page.locator(`a[href="${cssEsc(fp.href)}"]:visible`).first() });
+            }
+            if (fp.name) {
+              tries.push({ by: 'name', loc: page.locator(`[name="${cssEsc(fp.name)}"]:visible`).first() });
+            }
+            // Exact visible text — last resort, len>=2 (short strings
+            // substring-collide). Prefer firstTextFragment (a real single
+            // text-node match) over the joined `text` which getByText can't
+            // match. `.filter({ visible: true })` keeps only the visible node.
+            const recText = (fp.firstTextFragment || fp.text || '').trim();
+            if (recText.length >= 2) {
+              tries.push({ by: 'text', loc: page.getByText(recText, { exact: true }).filter({ visible: true }).first() });
+            }
+
+            for (const t of tries) {
+              const ok = await t.loc.isVisible({ timeout: 800 }).catch(() => false);
+              if (!ok) continue;
+              const altRef = await t.loc.getAttribute('data-agent-ref').catch(() => null);
+              logger.info('[PREVIEW_APPLY] Retargeted hidden candidate → visible same-identity element', {
+                previewSessionId, stepId: stepDraft.id,
+                hiddenRef: chosen0.ref, matchedBy: t.by, visibleRef: altRef,
+              });
+              if (altRef) {
+                lintResult.candidates = [{ ...chosen0, ref: altRef }];
+                lintResult.highlight = [{ ref: altRef, type: 'success' }];
+              }
+              break; // first visible same-identity match wins
+            }
+          }
+        }
+      } catch { /* retarget is best-effort — never blocks apply */ }
+
       // V23: lint phase finished — record path + LLM diagnostics. resolverPath
       // here may be 'identity_*' / 'evidence_shortcut' / 'compiled' (rare from
       // lint) / 'llm' / 'vision' / 'rule_fallback'.

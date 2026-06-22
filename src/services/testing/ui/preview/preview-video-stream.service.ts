@@ -630,7 +630,14 @@ export class PreviewVideoStreamService {
     this.recordFrameTimestamp(now);
 
     try {
-      this.emitFrame(frameBuffer, params.metadata.deviceWidth, params.metadata.deviceHeight);
+      // Forward the per-frame scroll + zoom (CDP screencast metadata) so the
+      // editor can convert document-relative highlight bboxes to viewport space
+      // for THIS exact frame — see emitFrame / PreviewVideoFramePayload.
+      this.emitFrame(frameBuffer, params.metadata.deviceWidth, params.metadata.deviceHeight, {
+        scrollX: params.metadata.scrollOffsetX,
+        scrollY: params.metadata.scrollOffsetY,
+        pageScaleFactor: params.metadata.pageScaleFactor,
+      });
 
       // Success - reset circuit breaker
       this.consecutiveFailures = 0;
@@ -718,7 +725,12 @@ export class PreviewVideoStreamService {
    * at 45fps for a timeout that never actually bounded real work. `publishTimeoutMs`
    * is repurposed as a soft latency budget tracked via `pendingFrames` instead.
    */
-  private emitFrame(frame: Buffer, width: number, height: number): void {
+  private emitFrame(
+    frame: Buffer,
+    width: number,
+    height: number,
+    view?: { scrollX: number; scrollY: number; pageScaleFactor: number },
+  ): void {
     if (!this.nsp) {
       throw new Error('Socket.IO namespace not available');
     }
@@ -733,6 +745,11 @@ export class PreviewVideoStreamService {
       domVersion: this.currentDomVersion,
       timestamp: new Date().toISOString(),
       byteLength: frame.byteLength,
+      // Per-frame scroll + zoom (CDP screencast metadata). The editor subtracts
+      // scrollX/Y from document-relative highlight bboxes to place the border on
+      // THIS frame's viewport; absent on screenshot-injected frames (defaults to
+      // the last known scroll on the client — acceptable for a static page).
+      ...(view ? { scrollX: view.scrollX, scrollY: view.scrollY, pageScaleFactor: view.pageScaleFactor } : {}),
     };
 
     // volatile: drop the frame for any client whose transport buffer hasn't

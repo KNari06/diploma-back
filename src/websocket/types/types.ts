@@ -175,6 +175,17 @@ export interface ClientToServerEvents {
 
   // Heartbeat
   ping: () => void;
+
+  // Mobile-runner activity keepalive. Live device interactions (tap/swipe/
+  // typing) and recording actions are forwarded straight to the mobile
+  // runner's own socket and never reach the backend, so an actively-used
+  // session would otherwise be torn down at ~15 min. The frontend emits this
+  // (throttled) on each such action; on the server it keeps BOTH 15-min
+  // windows alive: the in-memory idle timers (via the `socket.use()` activity
+  // middleware in core/server.ts — this event is intentionally NOT in
+  // IDLE_BACKGROUND_EVENTS) and the Redis `mobile_warmup` binding (via
+  // `refreshWarmupTtl` in heartbeat.handler.ts). See mobile-idle.service.ts.
+  'mobile:keepalive': () => void;
 }
 
 // ============================================================================
@@ -1667,6 +1678,18 @@ export interface PreviewVideoFramePayload {
   timestamp: string;
   /** V20: byte length of the binary frame (set when binary transport is used) */
   byteLength?: number;
+  /**
+   * Per-frame viewport scroll + zoom from CDP screencast metadata
+   * (`scrollOffsetX/Y`, `pageScaleFactor`). The editor subtracts scrollX/Y from
+   * document-relative highlight bboxes (LiteElement.bounds, invariant #18) to
+   * position the "is this the element?" border on THIS frame's visible viewport,
+   * so the border tracks live scrolling. Absent on screenshot-injected frames
+   * (first-frame / idle watchdog / run-sync) — the client keeps the last known
+   * scroll, which is correct for a static page.
+   */
+  scrollX?: number;
+  scrollY?: number;
+  pageScaleFactor?: number;
 }
 
 /**
@@ -1715,6 +1738,14 @@ export interface PreviewStepLintResultPayload {
     totalMs?: number;
     domNodeCount?: number;
   };
+  /**
+   * True when the "is this the element?" border was already painted IN-PAGE
+   * (inside the browser, by data-agent-ref). The FE then SKIPS its React-<div>
+   * fallback overlay to avoid a double border. False when the element wasn't in
+   * the main frame (cross-origin iframe / not in DOM) — the FE draws the React
+   * fallback (which works over the video regardless of frame origin).
+   */
+  inPageHighlightDrawn?: boolean;
   timestamp: string;
 }
 

@@ -206,13 +206,15 @@ class SkillRegistryClass {
       const sessionId = context.chatSessionId;
 
       if (args.confirm === true) {
-        // Exception: editor mode tools — user explicitly runs from editor, skip confirm roundtrip
-        const isEditorBypass =
-          (toolName === 'qa_run_test' || toolName === 'qa_run_draft_steps')
-          && context.mode === 'editor'
-          && !!context.previewSessionId;
-
-        if (!isEditorBypass && sessionId) {
+        // User approval is enforced by the SYSTEM, not the prompt — including in
+        // editor mode. A confirm=true is only honoured when a prior confirm=false
+        // preview turn was recorded for this (session, tool); otherwise it is
+        // overridden to false so the handler returns its preview and the LLM must
+        // describe the steps and wait for the user's "yes" first. The editor
+        // previously bypassed this (live preview treated as implicit consent),
+        // which let the LLM run generated steps on turn 1 with no explicit user
+        // approval — removed so "confirmed by user" is a guarantee, not best-effort.
+        if (sessionId) {
           const previewKey = `${sessionId}:${toolName}`;
           const previewTs = this.confirmPreviews.get(previewKey);
 
@@ -221,6 +223,7 @@ class SkillRegistryClass {
             logger.warn('[SKILL_REGISTRY] Confirm guard: overriding confirm=true (no prior preview)', {
               toolName,
               chatSessionId: sessionId,
+              mode: context.mode,
             });
             args.confirm = false;
           } else {

@@ -47,6 +47,22 @@ interface LocalizedMessages {
     ) => string;
     error: string;
   };
+  /**
+   * General-chat fallback when the LLM call fails. One message PER error class
+   * (not a single catch-all) so the user gets an actionable hint, localized.
+   */
+  chatError: {
+    /** Generic / unclassified LLM failure (500/502/503, unknown). */
+    generic: string;
+    /** Network / connection drop (ECONNRESET, fetch failed). */
+    network: string;
+    /** Rate limit or quota (429 / insufficient_quota). */
+    rateLimit: string;
+    /** Auth / config (401 / invalid_api_key) — user can't fix; team notified. */
+    config: string;
+    /** Request timed out / took too long. */
+    timeout: string;
+  };
 }
 
 const messages: Record<Language, LocalizedMessages> = {
@@ -84,6 +100,13 @@ const messages: Record<Language, LocalizedMessages> = {
         `---\n\n**Gaps:**\n\n${gapList}`,
       error: 'Failed to analyze coverage. Please try again.',
     },
+    chatError: {
+      generic: 'Something went wrong on our side while generating a reply. Please try again in a moment.',
+      network: 'I couldn\'t reach the AI service — looks like a connection issue. Please check your network and try again.',
+      rateLimit: 'The AI service is busy right now (rate limit reached). Please wait a minute and try again.',
+      config: 'The AI service is temporarily unavailable due to a configuration issue. Our team has been notified.',
+      timeout: 'The request took too long to process. Please try again, ideally with a shorter message.',
+    },
   },
   ru: {
     saveTest: {
@@ -118,6 +141,13 @@ const messages: Record<Language, LocalizedMessages> = {
         `---\n\n${summary}\n\n` +
         `---\n\n**Пробелы в покрытии:**\n\n${gapList}`,
       error: 'Не удалось проанализировать покрытие. Пожалуйста, попробуйте снова.',
+    },
+    chatError: {
+      generic: 'Что-то пошло не так на нашей стороне при генерации ответа. Пожалуйста, попробуйте ещё раз через минуту.',
+      network: 'Не удалось связаться с AI-сервисом — похоже на проблему с соединением. Проверьте сеть и попробуйте снова.',
+      rateLimit: 'AI-сервис сейчас перегружен (превышен лимит запросов). Подождите минуту и попробуйте снова.',
+      config: 'AI-сервис временно недоступен из-за проблемы с конфигурацией. Наша команда уже уведомлена.',
+      timeout: 'Запрос обрабатывался слишком долго. Пожалуйста, попробуйте снова, желательно более коротким сообщением.',
     },
   },
   kk: {
@@ -154,6 +184,13 @@ const messages: Record<Language, LocalizedMessages> = {
         `---\n\n**Қамтудағы олқылықтар:**\n\n${gapList}`,
       error: 'Қамтуды талдау мүмкін болмады. Қайталап көріңіз.',
     },
+    chatError: {
+      generic: 'Жауап жасау кезінде біздің жағымызда бірдеңе дұрыс болмады. Сәлден соң қайталап көріңіз.',
+      network: 'AI-қызметіне қосыла алмадым — байланыс мәселесі сияқты. Желіні тексеріп, қайталап көріңіз.',
+      rateLimit: 'AI-қызметі қазір бос емес (сұраныс лимиті асып кетті). Бір минут күтіп, қайталап көріңіз.',
+      config: 'AI-қызметі конфигурация мәселесіне байланысты уақытша қолжетімсіз. Командамыз хабардар етілді.',
+      timeout: 'Сұраныс өңдеуге тым ұзақ уақыт алды. Қысқарақ хабарламамен қайталап көріңіз.',
+    },
   },
   neutral: {
     saveTest: {
@@ -188,6 +225,13 @@ const messages: Record<Language, LocalizedMessages> = {
         `---\n\n${summary}\n\n` +
         `---\n\n**Gaps:**\n\n${gapList}`,
       error: 'Failed to analyze coverage. Please try again.',
+    },
+    chatError: {
+      generic: 'Something went wrong on our side while generating a reply. Please try again in a moment.',
+      network: 'I couldn\'t reach the AI service — looks like a connection issue. Please check your network and try again.',
+      rateLimit: 'The AI service is busy right now (rate limit reached). Please wait a minute and try again.',
+      config: 'The AI service is temporarily unavailable due to a configuration issue. Our team has been notified.',
+      timeout: 'The request took too long to process. Please try again, ideally with a shorter message.',
     },
   },
 };

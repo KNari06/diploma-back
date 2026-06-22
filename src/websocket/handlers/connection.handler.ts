@@ -41,7 +41,7 @@ const disconnectGraceTimers = new Map<string, NodeJS.Timeout>();
  * user, then delete the Redis warmup keys, then cancel any pending idle
  * timer. Best-effort — failures are logged but not surfaced.
  */
-async function performDisconnectCleanup(userId: string): Promise<void> {
+async function performDisconnectCleanup(userId: string, disconnectReason?: string): Promise<void> {
   try {
     const sessionIds = await getUserWarmupSessionIds(userId);
 
@@ -63,6 +63,18 @@ async function performDisconnectCleanup(userId: string): Promise<void> {
           // open and the file never reached Supabase. Dev mode keeps the
           // file local (uploadEditorTrace skips the upload).
           try {
+            // Record WHY the session is being torn down (browser socket
+            // dropped past the grace window → destroy) into the trace BEFORE
+            // it's closed + uploaded, so prod sees disconnect-grace teardowns
+            // in Supabase (Storage + trace_files). getOrCreate so even a
+            // lint-less session still uploads a minimal teardown trace.
+            EditorTraceService.getOrCreate(`mobile-${sid}`, userId).writeMobileSessionTeardown({
+              cause: 'disconnect_grace',
+              sessionId: sid,
+              disconnectReason,
+              graceMs: DISCONNECT_GRACE_MS,
+              emulatorPreserved: false,
+            });
             const meta = await EditorTraceService.close(`mobile-${sid}`);
             if (meta) {
               uploadEditorTrace({
@@ -253,7 +265,7 @@ export const handleConnection = async (socket: TypedSocket): Promise<void> => {
 
     const timer = setTimeout(() => {
       disconnectGraceTimers.delete(uid);
-      void performDisconnectCleanup(uid);
+      void performDisconnectCleanup(uid, reason);
     }, DISCONNECT_GRACE_MS);
 
     disconnectGraceTimers.set(uid, timer);

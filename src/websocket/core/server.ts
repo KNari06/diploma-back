@@ -25,6 +25,10 @@ import {
  */
 const IDLE_BACKGROUND_EVENTS = new Set<string>([
   'ping', // app-level latency probe — see socketClient.startLatencyPing()
+  // NOTE: `mobile:keepalive` is deliberately NOT listed here. It is the
+  // counterpart to `ping` — an explicit "user is interacting with the mobile
+  // runner" signal that MUST refresh the idle timers. See ClientToServerEvents
+  // in ../types/types.ts and heartbeat.handler.ts.
 ]);
 
 let io: SocketIOServer<ClientToServerEvents, ServerToClientEvents, object, SocketData> | null = null;

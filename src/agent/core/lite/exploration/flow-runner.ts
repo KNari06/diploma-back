@@ -21,7 +21,7 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { AI_MODELS } from '@/config/ai/ai-models.config';
 
 import { TestPipeline, type PipelineIntegrations } from '../pipeline/test-pipeline';
-import type { PipelineConfig, TestPipelineResult, ExecutedCommand } from '../pipeline/types';
+import type { PipelineConfig, TestPipelineResult } from '../pipeline/types';
 import { ActionExecutor } from '../execution/action-executor';
 import { NetworkTracker } from '../collectors/network-tracker';
 import { GoalDetector } from '../analysis/goal-detector';
@@ -31,14 +31,12 @@ import { OverlayDismisser } from './overlay-dismisser';
 import { VisualStability } from '../collectors/visual-stability';
 
 import {
-  ACTION_TO_INTENT_TYPE,
   type ExplorationConfig,
   type EntryPoint,
   type FlowExplorationTask,
   type FlowExplorationStatus,
   type FlowRunnerCheckpoint,
   type DiscoveredStep,
-  type CapturedApiCall,
   type FlowError,
   type ErrorClassification,
   type BlockerType,
@@ -46,10 +44,7 @@ import {
 } from './types';
 import type { NetworkSuccess } from '../lite-types';
 import { attributeCallsToSteps } from './network-assertions';
-import { LocatorPlanBuilder } from '@/services/testing/ui/preview/locator-plan-builder.service';
-import { adaptLiteElementsToInteractiveNodes } from '@/agent/execution/background-dom-collector';
-import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
-import type { TestAction } from '../test-case/types';
+import { extractDiscoveredSteps } from './pipeline-step-extractor';
 import { FlowQueue } from './flow-queue';
 import { BudgetTracker } from './budget-tracker';
 import { StateManager } from './state-manager';
@@ -61,7 +56,7 @@ import {
 import { ClarificationService } from '@/agent/utils/context/clarification.service';
 import type { ExplorationTraceService } from './exploration-trace.service';
 import { Scout } from './agents/scout';
-import type { ScoutInput, ScoutOutput, ExplorationBlackboard, CartographerInsight } from './agents/agent-types';
+import type { ScoutInput, ExplorationBlackboard, CartographerInsight } from './agents/agent-types';
 import { normalizeUrlWithPattern } from './url-pattern';
 
 /**
@@ -78,27 +73,11 @@ const FLOW_NAV_TIMEOUT_MS = 15_000;
  */
 const FLOW_NAV_WAIT_UNTIL = 'load' as const;
 
-/**
- * Element-targeting actions that earn a compiled locator plan (frozen from the
- * element the executor resolved at action time). Excludes non-targeting steps
- * (navigate/press/scroll/scrollToElement) and synthetic verify steps — those
- * have no durable element target. `clear` maps to a `click` intent type
- * upstream (ACTION_TO_INTENT_TYPE), but its LOCATOR is still the field, so the
- * frozen plan is correct; the action-type quirk is pre-existing and orthogonal.
- */
-export const PLAN_WORTHY_ACTIONS: ReadonlySet<TestAction> = new Set<TestAction>([
-  'click', 'fill', 'select', 'hover', 'toggle', 'setRange', 'selectDate', 'clear',
-]);
-
-/**
- * Subset whose `value` is meaningful to replay and safe to freeze into the
- * plan: typed text (fill), chosen option (select), range number (setRange),
- * date string (selectDate). Sensitive values are still excluded at call time.
- * click/hover/toggle/clear carry no value.
- */
-export const VALUE_CARRYING_ACTIONS: ReadonlySet<TestAction> = new Set<TestAction>([
-  'fill', 'select', 'setRange', 'selectDate',
-]);
+// Step-extraction (rounds → DiscoveredStep + compiled plans) now lives in the
+// shared pipeline-step-extractor so the editor iterative-authoring service
+// builds steps identically. Re-export the gate constants for backward compat
+// (exploration-qa.test.ts imports them from here).
+export { PLAN_WORTHY_ACTIONS, VALUE_CARRYING_ACTIONS } from './pipeline-step-extractor';
 
 /** Semaphore for bounding concurrent flows */
 class Semaphore {
@@ -643,7 +622,7 @@ export class FlowRunner {
       //    NetworkTracker has been running since `new NetworkTracker(page)`
       //    above, so everything captured since `pipelineStartTime` belongs
       //    to this flow.
-      const { steps: baseSteps, stepsByRound } = await this.extractSteps(pipelineResult, page);
+      const { steps: baseSteps, stepsByRound } = await extractDiscoveredSteps(pipelineResult, page);
       const successfulCalls = this.collectSuccessfulCalls(networkTracker, pipelineStartTime);
       const discoveredSteps = attributeCallsToSteps({
         steps: baseSteps,
@@ -824,7 +803,7 @@ export class FlowRunner {
                   canUserHelp = undefined;
                   // Merge steps — reuse the same attribution pipeline so
                   // network calls captured during the retry get attached too.
-                  const { steps: retrySteps, stepsByRound: retryStepsByRound } = await this.extractSteps(retryResult, page);
+                  const { steps: retrySteps, stepsByRound: retryStepsByRound } = await extractDiscoveredSteps(retryResult, page);
                   const retryCalls = this.collectSuccessfulCalls(retryNetworkTracker, retryStartTime);
                   const retryAttributed = attributeCallsToSteps({
                     steps: retrySteps,
@@ -1076,118 +1055,6 @@ export class FlowRunner {
    * assertion pipeline to attribute captured API calls back to the action
    * that triggered them.
    */
-  private async extractSteps(result: TestPipelineResult, page?: Page): Promise<{
-    steps: DiscoveredStep[];
-    stepsByRound: Array<number | null>;
-  }> {
-    const steps: DiscoveredStep[] = [];
-    const stepsByRound: Array<number | null> = [];
-    let stepNumber = 0;
-
-    for (const round of result.rounds) {
-      // Use the page URL from the round's snapshot context
-      // The snapshot URL is captured before actions execute
-      const roundPageUrl = this.extractUrlFromSnapshot(round.pageSnapshotBefore);
-      let lastStepIdxInRound: number | null = null;
-
-      for (const executed of round.commands) {
-        // Skip failed commands — they produce noise in the final test case
-        if (!executed.result.success) continue;
-
-        const step = this.commandToStep(executed, stepNumber + 1, roundPageUrl);
-        if (step) {
-          step.stepNumber = ++stepNumber;
-          // Freeze a compiled locator plan from the element the executor
-          // actually acted on. Best-effort: a failure here must never drop
-          // the step or fail the flow — the step simply falls back to
-          // runtime resolution on first replay (the pre-change behavior).
-          await this.attachCompiledPlan(step, executed, roundPageUrl, page);
-          steps.push(step);
-          lastStepIdxInRound = steps.length - 1;
-        }
-      }
-
-      stepsByRound.push(lastStepIdxInRound);
-    }
-
-    return { steps, stepsByRound };
-  }
-
-  /**
-   * Build a compiled locator plan for a targeting step from the element the
-   * executor resolved at action time (`result.resolvedElement`) and attach it
-   * to `step.compiled`. Reuses the same `LocatorPlanBuilder` the preview
-   * Run-All and mobile paths use, so exploration-discovered cases hit replay's
-   * stage-1 fast path on their first regression run instead of re-resolving
-   * every element through the LLM.
-   *
-   * Passing the live `page` validates each locator (live `count()`), flipping
-   * the plan to `unverified: false` and dropping dead locators. With no page
-   * the plan is still built but marked `unverified`.
-   *
-   * Best-effort by contract: any throw is swallowed (step keeps working,
-   * just without a frozen plan). PoC scope: click + fill only.
-   */
-  private async attachCompiledPlan(
-    step: DiscoveredStep,
-    executed: ExecutedCommand,
-    pageUrl: string,
-    page?: Page,
-  ): Promise<void> {
-    const resolvedElement = executed.result.resolvedElement;
-    if (!resolvedElement) return;
-    // Only element-targeting actions get a compiled locator plan. Non-targeting
-    // (navigate/press/scroll) and synthetic (verify) steps have no durable
-    // target — they never set `resolvedElement` anyway, but gate explicitly so
-    // a future executor change can't silently start compiling them.
-    if (!PLAN_WORTHY_ACTIONS.has(step.action)) return;
-
-    try {
-      const [node] = adaptLiteElementsToInteractiveNodes([resolvedElement]);
-      if (!node) return;
-
-      const intentType = ACTION_TO_INTENT_TYPE[step.action] || 'click';
-      // Carry the value only for actions whose value is meaningful to replay
-      // (select option / range number / date string / typed text) AND not a
-      // credential — secrets must never be frozen into a persisted plan.
-      const carriesValue =
-        VALUE_CARRYING_ACTIONS.has(step.action) && !step.isSensitive && !!step.value;
-      const planStep: IntentStep = {
-        id: `step-${step.stepNumber}`,
-        type: intentType,
-        description: step.description,
-        ...(carriesValue ? { value: step.value } : {}),
-      };
-
-      const compiled = await LocatorPlanBuilder.buildCompiledPlan({
-        step: planStep,
-        resolvedNode: node,
-        pageUrl,
-        page, // live page → validated plan (unverified: false)
-      });
-
-      // Only keep a plan that actually carries at least one locator.
-      if (compiled?.locatorPlan?.length) {
-        step.compiled = compiled;
-      }
-    } catch (err) {
-      logger.debug('[FLOW_RUNNER] Compiled-plan capture skipped', {
-        action: step.action,
-        ref: step.ref,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  /**
-   * Extract URL from formatted snapshot text.
-   * Format is typically: "URL: https://... \n Title: ..."
-   */
-  private extractUrlFromSnapshot(snapshot: string): string {
-    const match = snapshot.match(/URL:\s*(\S+)/i);
-    return match?.[1] || '';
-  }
-
   /**
    * Pull the successful-responses list from NetworkTracker. Wrapped so a
    * tracker missing the getter (e.g. a partial test mock) degrades to an
@@ -1202,148 +1069,6 @@ export class FlowRunner {
       return tracker.getSuccessfulResponsesSince(sinceMs) ?? [];
     } catch {
       return [];
-    }
-  }
-
-  /**
-   * Convert a single executed command to a DiscoveredStep.
-   * Returns null for infrastructure commands.
-   */
-  private commandToStep(executed: ExecutedCommand, stepNumber: number, pageUrl: string): DiscoveredStep | null {
-    const cmd = executed.command;
-    // Use result.output for human-readable descriptions (e.g. 'Clicked "CONTACT" (a)')
-    // Strip [POST-ACTION: ...] suffix — it's internal context, not user-facing
-    const output = (executed.result.output || '').replace(/\s*\[POST-ACTION:.*$/s, '').trim();
-
-    switch (cmd.name) {
-      case 'fill_field':
-        return {
-          stepNumber,
-          description: output || `Fill "${cmd.args.ref}" with ${cmd.args.is_sensitive ? '[credential]' : `"${cmd.args.value}"`}`,
-          action: 'fill',
-          ref: cmd.args.ref,
-          value: cmd.args.is_sensitive ? undefined : cmd.args.value,
-          isSensitive: cmd.args.is_sensitive,
-          pageUrl,
-          expectedOutcome: 'Field is filled with the value',
-        };
-
-      case 'click_element':
-        return {
-          stepNumber,
-          description: output || `Click "${cmd.args.ref}"`,
-          action: 'click',
-          ref: cmd.args.ref,
-          pageUrl,
-          expectedOutcome: executed.result.success ? 'Element clicked successfully' : undefined,
-        };
-
-      case 'select_option':
-        return {
-          stepNumber,
-          description: output || `Select option "${cmd.args.value}" in "${cmd.args.ref}"`,
-          action: 'select',
-          ref: cmd.args.ref,
-          value: cmd.args.value,
-          pageUrl,
-        };
-
-      case 'press_key':
-        return {
-          stepNumber,
-          description: output || `Press key "${cmd.args.key}"`,
-          action: 'press',
-          value: cmd.args.key,
-          pageUrl,
-        };
-
-      case 'hover_element':
-        return {
-          stepNumber,
-          description: output || `Hover over "${cmd.args.ref}"`,
-          action: 'hover',
-          ref: cmd.args.ref,
-          pageUrl,
-        };
-
-      case 'scroll_page':
-      case 'scroll_to_element':
-        return {
-          stepNumber,
-          description: output || (cmd.name === 'scroll_to_element'
-            ? `Scroll to element "${cmd.args.ref}"`
-            : `Scroll ${cmd.args.direction || 'down'}`),
-          action: 'scroll',
-          ref: cmd.args.ref,
-          pageUrl,
-        };
-
-      case 'navigate_to':
-        return {
-          stepNumber,
-          description: output || `Navigate to ${cmd.args.url}`,
-          action: 'navigate',
-          value: cmd.args.url,
-          pageUrl,
-        };
-
-      case 'toggle_element':
-        return {
-          stepNumber,
-          description: output || `Toggle "${cmd.args.ref}"`,
-          action: 'toggle',
-          ref: cmd.args.ref,
-          pageUrl,
-          expectedOutcome: 'Element toggled successfully',
-        };
-
-      case 'set_range':
-        return {
-          stepNumber,
-          description: output || `Set range "${cmd.args.ref}" to "${cmd.args.value}"`,
-          action: 'setRange',
-          ref: cmd.args.ref,
-          value: cmd.args.value,
-          pageUrl,
-        };
-
-      case 'select_date':
-        return {
-          stepNumber,
-          description: output || `Set date "${cmd.args.ref}" to "${cmd.args.value}"`,
-          action: 'selectDate',
-          ref: cmd.args.ref,
-          value: cmd.args.value,
-          pageUrl,
-        };
-
-      case 'clear_field':
-        return {
-          stepNumber,
-          description: output || `Clear field "${cmd.args.ref}"`,
-          action: 'clear',
-          ref: cmd.args.ref,
-          pageUrl,
-        };
-
-      case 'mark_done':
-        return {
-          stepNumber,
-          description: `Verify: ${cmd.args.evidence || 'Goal achieved'}`,
-          action: 'verify',
-          pageUrl,
-          expectedOutcome: cmd.args.evidence,
-        };
-
-      // Skip infrastructure commands
-      case 'observe_page':
-      case 'wait_for_page':
-      case 'report_blocked':
-        return null;
-
-      default:
-        logger.debug('[FLOW_RUNNER] Unmapped command, skipping', { command: cmd.name });
-        return null;
     }
   }
 

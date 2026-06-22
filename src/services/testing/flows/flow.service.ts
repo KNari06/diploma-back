@@ -42,27 +42,16 @@ export class FlowService {
       name,
     });
 
-    // Get max order_index if not provided
-    let finalOrderIndex = orderIndex;
-    if (finalOrderIndex === undefined) {
-      const { data: maxOrder } = await supabaseAdmin
-        .from('test_flows')
-        .select('order_index')
-        .eq('module_id', moduleId)
-        .order('order_index', { ascending: false })
-        .limit(1)
-        .single();
-
-      finalOrderIndex = maxOrder ? maxOrder.order_index + 1 : 0;
-    }
-
+    // order_index stays NULL unless the caller explicitly sets one. NULL means
+    // "not manually ordered" → the flow sorts by created_at DESC (newest-first).
+    // It only gets a value when the user drags to reorder (FlowService.reorder).
     const { data, error } = await supabaseAdmin
       .from('test_flows')
       .insert({
         module_id: moduleId,
         user_id: userId,
         name,
-        order_index: finalOrderIndex,
+        order_index: orderIndex ?? null,
         flow_type: flowType || 'ui',
         platform: platform || null,
         tags: tags || [],
@@ -119,12 +108,15 @@ export class FlowService {
     moduleId: string,
     userId: string
   ): Promise<TestFlow[]> {
+    // Manually-ordered flows (non-NULL order_index) first, ascending; the rest
+    // (NULL) newest-first by created_at. nullsFirst:false puts NULLs last.
     const { data, error } = await supabaseAdmin
       .from('test_flows')
       .select('*')
       .eq('module_id', moduleId)
       .eq('user_id', userId)
-      .order('order_index', { ascending: true });
+      .order('order_index', { ascending: true, nullsFirst: false })
+      .order('created_at', { ascending: false });
 
     if (error) {
       logger.error('[FLOW_SERVICE] Failed to list flows', { error, moduleId });
@@ -144,6 +136,7 @@ export class FlowService {
       id,
       userId,
       name,
+      moduleId,
       orderIndex,
       flowType,
       platform,
@@ -155,6 +148,7 @@ export class FlowService {
 
     const updates: Record<string, any> = {};
     if (name !== undefined) updates.name = name;
+    if (moduleId !== undefined) updates.module_id = moduleId;
     if (orderIndex !== undefined) updates.order_index = orderIndex;
     if (flowType !== undefined) updates.flow_type = flowType;
     if (platform !== undefined) updates.platform = platform;
@@ -169,15 +163,20 @@ export class FlowService {
 
     // When renaming, read the OLD flow name first so we can cascade the rename
     // to the flow's intent_test_cases that were in lockstep with it (see below).
+    // When moving (moduleId changes), also capture the OLD module_id so we can
+    // bust its cached subtree too — otherwise the source folder keeps showing
+    // the moved flow until its cache expires.
     let previousName: string | undefined;
-    if (name !== undefined) {
+    let previousModuleId: string | undefined;
+    if (name !== undefined || moduleId !== undefined) {
       const { data: prev } = await supabaseAdmin
         .from('test_flows')
-        .select('name')
+        .select('name, module_id')
         .eq('id', id)
         .eq('user_id', userId)
         .single();
       previousName = prev?.name ?? undefined;
+      previousModuleId = prev?.module_id ?? undefined;
     }
 
     logger.info('[FLOW_SERVICE] Updating flow', {
@@ -221,8 +220,12 @@ export class FlowService {
       }
     }
 
-    // Invalidate module mode cache (flow metadata changed)
+    // Invalidate module tree cache (flow metadata changed). On a move, bust the
+    // OLD module too so the source folder drops the flow immediately.
     await cache.delByPattern(`qait:cache:ptree:module:${data.module_id}:*`);
+    if (previousModuleId && previousModuleId !== data.module_id) {
+      await cache.delByPattern(`qait:cache:ptree:module:${previousModuleId}:*`);
+    }
 
     return this.mapToTestFlow(data);
   }

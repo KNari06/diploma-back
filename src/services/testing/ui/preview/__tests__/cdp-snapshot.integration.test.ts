@@ -211,6 +211,92 @@ describe('CdpSnapshotService — real Chromium integration', () => {
         expect(ref).toMatch(/^e\d+$/);
       }
     }, PER_TEST_TIMEOUT_MS);
+
+    // ──────────────────────────────────────────────────────────────────
+    // Regression: June 2026 codemify.com "Dropped duplicate-ref elements"
+    //   spam. findElement is a many-to-one map — an <input>, the SVG icon
+    //   group centred on it, and assorted pseudo/layout rows all resolve
+    //   to the SAME live DOM node. The first request set data-agent-ref;
+    //   every later request read the SAME attribute back and the collector
+    //   emitted N LiteElements sharing one ref (observed e34×4, e202 on a
+    //   form-with-icons page). dedupeElementsByRef then dropped 17/90 each
+    //   tick — quality-aware so the visible input usually survived, but it
+    //   was pure log spam + a signal of source-level collisions.
+    //
+    //   Fix: one-node-per-pass claim WeakSet in runRefAssignmentInFrame —
+    //   a node may back at most ONE ref per evaluate. These tests assert
+    //   the SOURCE invariant (no element shares a ref BEFORE dedup would
+    //   run), i.e. beforeDedup ≈ afterDedup.
+    it('never mints the same ref for two distinct elements (input + overlapping icon)', async () => {
+      // An input field overlaid by an absolutely-positioned SVG icon whose
+      // center sits on the input — the canonical many-to-one collapse:
+      // the input request and the icon-group request both center on the
+      // input's bbox and Stage B returns the same node for the loser.
+      await page.setContent(`
+        <div style="position:relative; width:320px;">
+          <input type="text" name="email" placeholder="Email"
+                 style="width:320px; height:44px; box-sizing:border-box;" />
+          <svg style="position:absolute; right:8px; top:10px; width:24px; height:24px;"
+               viewBox="0 0 24 24" aria-label="email icon">
+            <rect x="0" y="0" width="24" height="24"></rect>
+            <rect x="4" y="4" width="16" height="16"></rect>
+          </svg>
+        </div>
+        <button id="go">Go</button>
+      `);
+
+      const snapshot = await CdpSnapshotService.collect(page);
+
+      const refs = snapshot.elements.map((e) => e.ref).filter(Boolean) as string[];
+      const seen = new Set<string>();
+      const dups: string[] = [];
+      for (const r of refs) {
+        if (seen.has(r)) dups.push(r);
+        seen.add(r);
+      }
+      expect(dups).toEqual([]);
+      // Sanity: the input itself still made it through with a ref (the
+      // fix drops the COLLIDING twin, never the real field).
+      const input = snapshot.elements.find((e) => e.tag === 'input');
+      expect(input?.ref).toMatch(/^e\d+$/);
+    }, PER_TEST_TIMEOUT_MS);
+
+    it('keeps every emitted ref unique on a dense modal-style form (no dedup needed)', async () => {
+      // Modal with multiple labelled inputs + icon buttons — the shape
+      // that produced e34×4 in production. Assert the ref space is
+      // collision-free at the SOURCE so dedupeElementsByRef has nothing
+      // to drop.
+      await page.setContent(`
+        <div role="dialog" style="position:fixed; inset:80px; background:#fff;">
+          <h2>Get a free lesson</h2>
+          <label>Name
+            <span style="position:relative; display:inline-block;">
+              <input type="text" name="name" style="width:280px; height:40px;" />
+              <svg style="position:absolute; right:6px; top:8px; width:20px; height:20px;" viewBox="0 0 20 20">
+                <rect x="0" y="0" width="20" height="20"></rect>
+              </svg>
+            </span>
+          </label>
+          <label>Email
+            <span style="position:relative; display:inline-block;">
+              <input type="email" name="email" style="width:280px; height:40px;" />
+              <svg style="position:absolute; right:6px; top:8px; width:20px; height:20px;" viewBox="0 0 20 20">
+                <rect x="0" y="0" width="20" height="20"></rect>
+              </svg>
+            </span>
+          </label>
+          <button type="submit">Send</button>
+        </div>
+      `);
+
+      const snapshot = await CdpSnapshotService.collect(page);
+
+      const refs = snapshot.elements.map((e) => e.ref).filter(Boolean) as string[];
+      expect(refs.length).toBeGreaterThan(0);
+      expect(new Set(refs).size).toBe(refs.length);
+      // Both inputs survive (each backs its own ref).
+      expect(snapshot.elements.filter((e) => e.tag === 'input' && e.ref).length).toBe(2);
+    }, PER_TEST_TIMEOUT_MS);
   });
 
   // ──────────────────────────────────────────────────────────────────
