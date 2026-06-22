@@ -4019,6 +4019,12 @@ export async function resolveElement(params: {
 
   // Combine allowed sets (hardAllowed first, then softAllowed)
   const allAllowed = [...hardAllowed, ...softAllowed];
+  // NOTE: an in-snapshot visibility filter was tried here and removed — the CDP
+  // snapshot does NOT compute real visibility (every node comes back as
+  // "visible"), so it couldn't distinguish a hidden submenu copy from the
+  // visible trigger. The hidden-candidate problem is instead handled at apply
+  // time in preview-step-apply.service.ts, where Playwright (the real source of
+  // visibility truth) retargets a hidden pick to the visible same-href element.
   const allowedCount = allAllowed.length;
 
   // Honesty-guard L1+L2+L3 dependencies, built ONCE per resolve over the full

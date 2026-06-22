@@ -2790,6 +2790,7 @@ async function executeAction(
         if (!locator) throw new Error('No selector for click action');
         const humanLike = step.options?.humanLike === true;
 
+
         // V13: Build Playwright modifiers array from step options
         const clickModifiers: ('Shift' | 'Control' | 'Alt' | 'Meta')[] = [];
         if (step.options?.modifiers) {
@@ -5196,6 +5197,76 @@ export class PreviewStepApplyService {
         forceFreshSnapshot: true,
         auditTrigger: 'apply_prelint',
       });
+      // HIDDEN-CANDIDATE RETARGET (codemify #submenu, June 2026 — proven root).
+      // The CDP snapshot does NOT compute real visibility, so the resolver can
+      // hand back a HIDDEN copy of the target (e.g. a nav item duplicated into a
+      // collapsed dropdown submenu) whose recorded identity ALSO matches a
+      // VISIBLE element elsewhere on the page. The collector marks both
+      // "visible", so an in-snapshot filter can't tell them apart — only the
+      // live browser can. So we ask PLAYWRIGHT (the source of truth): if the
+      // chosen candidate is hidden, find a VISIBLE element sharing the SAME
+      // recorded identity and retarget to it. This stops the ~70-80s stall
+      // (click waiting out its full "element is not visible" timeout ×retries).
+      //
+      // Universal across sites: we try identity signals in strength order —
+      // testId → id → href → name → exact visible text — so it works for
+      // links (href), framework menus (data-testid), id-anchored items, form
+      // controls (name), and plain text buttons/divs alike, not just <a href>.
+      // Click-class only; fully fail-open (any miss → keep original candidate).
+      try {
+        const isClickClass = stepDraft.type === 'click' || stepDraft.type === 'hover' || stepDraft.type === 'select';
+        const chosen0 = lintResult.status === 'resolved' ? lintResult.candidates?.[0] : undefined;
+        const fp = stepDraft.recordedFingerprint;
+        if (isClickClass && chosen0?.ref && fp) {
+          const chosenLoc = page.locator(`[data-agent-ref="${chosen0.ref}"]`).first();
+          const chosenVisible = await chosenLoc.isVisible({ timeout: 1000 }).catch(() => true);
+          if (!chosenVisible) {
+            const cssEsc = (v: string) => v.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+            // Build :visible candidate locators in identity-strength order.
+            // Each entry: a Playwright Locator already scoped to :visible.
+            const tries: Array<{ by: string; loc: import('playwright').Locator }> = [];
+            if (fp.testIdAttr) {
+              const v = cssEsc(fp.testIdAttr);
+              tries.push({ by: 'testid', loc: page.locator(`[data-testid="${v}"]:visible, [data-test="${v}"]:visible, [data-qa="${v}"]:visible`).first() });
+            }
+            if (fp.elementId) {
+              // Attribute form (not `#id`) so React useId() colons / special
+              // chars don't need CSS.escape (unavailable in Node).
+              tries.push({ by: 'id', loc: page.locator(`[id="${cssEsc(fp.elementId)}"]:visible`).first() });
+            }
+            if (fp.href) {
+              tries.push({ by: 'href', loc: page.locator(`a[href="${cssEsc(fp.href)}"]:visible`).first() });
+            }
+            if (fp.name) {
+              tries.push({ by: 'name', loc: page.locator(`[name="${cssEsc(fp.name)}"]:visible`).first() });
+            }
+            // Exact visible text — last resort, len>=2 (short strings
+            // substring-collide). Prefer firstTextFragment (a real single
+            // text-node match) over the joined `text` which getByText can't
+            // match. `.filter({ visible: true })` keeps only the visible node.
+            const recText = (fp.firstTextFragment || fp.text || '').trim();
+            if (recText.length >= 2) {
+              tries.push({ by: 'text', loc: page.getByText(recText, { exact: true }).filter({ visible: true }).first() });
+            }
+
+            for (const t of tries) {
+              const ok = await t.loc.isVisible({ timeout: 800 }).catch(() => false);
+              if (!ok) continue;
+              const altRef = await t.loc.getAttribute('data-agent-ref').catch(() => null);
+              logger.info('[PREVIEW_APPLY] Retargeted hidden candidate → visible same-identity element', {
+                previewSessionId, stepId: stepDraft.id,
+                hiddenRef: chosen0.ref, matchedBy: t.by, visibleRef: altRef,
+              });
+              if (altRef) {
+                lintResult.candidates = [{ ...chosen0, ref: altRef }];
+                lintResult.highlight = [{ ref: altRef, type: 'success' }];
+              }
+              break; // first visible same-identity match wins
+            }
+          }
+        }
+      } catch { /* retarget is best-effort — never blocks apply */ }
+
       // V23: lint phase finished — record path + LLM diagnostics. resolverPath
       // here may be 'identity_*' / 'evidence_shortcut' / 'compiled' (rare from
       // lint) / 'llm' / 'vision' / 'rule_fallback'.
