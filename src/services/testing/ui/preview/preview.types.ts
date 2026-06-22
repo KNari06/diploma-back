@@ -1181,6 +1181,13 @@ export interface StepOptions {
   disableStabilityChecks?: boolean;
   /** Force fresh element lookup, skip evidence cache */
   disableCaching?: boolean;
+  /**
+   * User-authored "optional step" flag. When true, a failing step does NOT
+   * fail the overall run — the preview-run loop continues to the next step and
+   * background replay soft-fails it (step_soft_failed). Mirrors the mobile
+   * runner's `options.continueOnError` (see step-result-classifier.ts).
+   */
+  continueOnError?: boolean;
   /** Iframe configuration for actions within iframes */
   iframe?: IframeConfig;
   /**

@@ -279,6 +279,10 @@ export function convertIntentStepToCommand(
     description: step.description,
     timeout: step.options?.timeout || 30000,
     continueOnError: step.isAutoInjected === true
+      // User-authored "optional step" flag — a failing step is soft-failed by
+      // the executor (step_soft_failed) instead of aborting the run. Same flag
+      // the live preview-run loop honors, so editor Run and background replay agree.
+      || step.options?.continueOnError === true
       || (step.type === 'wait_for' && !!step.options?.urlMatcher?.changedFrom)
       // Teardown steps never fail the overall verdict — they run
       // best-effort after the body. If a teardown step throws, we want

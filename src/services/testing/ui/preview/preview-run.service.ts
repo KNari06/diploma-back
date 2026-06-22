@@ -530,6 +530,8 @@ export interface PreviewRunSummary {
   totalSteps: number;
   passedSteps: number;
   failedSteps: number;
+  /** Steps that failed but were marked optional (options.continueOnError) — do NOT fail the run */
+  failedOptionalSteps: number;
   skippedSteps: number;
   cancelled: boolean;
   timedOut: boolean;
@@ -800,6 +802,9 @@ export class PreviewRunService {
 
     let passedSteps = 0;
     let failedSteps = 0;
+    // Optional-step failures (options.continueOnError) — tallied apart from
+    // failedSteps so they don't flip the run verdict but are still surfaced.
+    let failedOptionalSteps = 0;
     let skippedSteps = 0;
 
     // Capture per-failure details for the returned summary (used by chat tools/AI)
@@ -2526,6 +2531,11 @@ export class PreviewRunService {
               },
             });
 
+            // Optional step (user flag options.continueOnError): a failure here
+            // does NOT abort the run — tally it apart and continue to the next
+            // step. Mirrors the mobile runner + background executor soft-fail.
+            const isOptionalStep = step.options?.continueOnError === true;
+
             // Emit fail (with augmented error + screenshot for better UX)
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
@@ -2537,47 +2547,60 @@ export class PreviewRunService {
               error: errorWithContext,
               timestamp: new Date().toISOString(),
               ...(retried ? { retried: true } : {}),
+              ...(isOptionalStep ? { optional: true } : {}),
               ...(failScreenshotBase64 ? { failScreenshot: failScreenshotBase64 } : {}),
             });
-            failedSteps++;
-            // Capture for summary (truncate to first 5 to bound payload size)
-            if (failedStepDetails.length < 5) {
-              failedStepDetails.push({
-                stepIndex: originalStepIndex,
-                description: step.description || '',
-                action: step.type,
-                error: errorWithContext,
-              });
-            }
 
-            // V14: Record step telemetry (fail)
+            // V14: Record step telemetry (fail) — same for optional + hard fails
             telemetryCollector?.markStepEnd('fail', session.page.url(), {
               error: result.error,
               retried,
               attempts: result.attempts,
             });
 
-            // Stop on first failure - emit remaining steps as skipped
-            logger.info('[PreviewRun] Stopping due to failure, skipping remaining steps', {
-              previewSessionId,
-              failedStep: i,
-              remainingSteps: stepsToExecute.length - i - 1,
-            });
-
-            for (let j = i + 1; j < stepsToExecute.length; j++) {
-              const remainingStep = stepsToExecute[j];
-              webSocketService.emitToUser(userId, 'preview:run:step', {
+            if (isOptionalStep) {
+              failedOptionalSteps++;
+              logger.info('[PreviewRun] Optional step failed — continuing run', {
                 previewSessionId,
-                stepIndex: startFromIndex + j,
-                stepId: remainingStep.id,
-                status: 'skipped',
-                action: remainingStep.type,
-                description: remainingStep.description,
-                timestamp: new Date().toISOString(),
+                stepIndex: originalStepIndex,
+                stepId: step.id,
+                error: result.error,
               });
-              skippedSteps++;
+              // No skip / no break — fall through to the next step.
+            } else {
+              failedSteps++;
+              // Capture for summary (truncate to first 5 to bound payload size)
+              if (failedStepDetails.length < 5) {
+                failedStepDetails.push({
+                  stepIndex: originalStepIndex,
+                  description: step.description || '',
+                  action: step.type,
+                  error: errorWithContext,
+                });
+              }
+
+              // Stop on first hard failure - emit remaining steps as skipped
+              logger.info('[PreviewRun] Stopping due to failure, skipping remaining steps', {
+                previewSessionId,
+                failedStep: i,
+                remainingSteps: stepsToExecute.length - i - 1,
+              });
+
+              for (let j = i + 1; j < stepsToExecute.length; j++) {
+                const remainingStep = stepsToExecute[j];
+                webSocketService.emitToUser(userId, 'preview:run:step', {
+                  previewSessionId,
+                  stepIndex: startFromIndex + j,
+                  stepId: remainingStep.id,
+                  status: 'skipped',
+                  action: remainingStep.type,
+                  description: remainingStep.description,
+                  timestamp: new Date().toISOString(),
+                });
+                skippedSteps++;
+              }
+              break; // Stop execution
             }
-            break; // Stop execution
           }
         } catch (stepError) {
           // AbortError from raceAbort — run was cancelled, skip remaining steps
@@ -2865,6 +2888,9 @@ export class PreviewRunService {
             },
           });
 
+          // Optional step: an exception here is soft — continue the run.
+          const isOptionalStepEx = step.options?.continueOnError === true;
+
           // Emit fail (with screenshot for visual debugging)
           webSocketService.emitToUser(userId, 'preview:run:step', {
             previewSessionId,
@@ -2876,18 +2902,9 @@ export class PreviewRunService {
             error: errorWithContext,
             timestamp: new Date().toISOString(),
             ...(exceptionRetried ? { retried: true } : {}),
+            ...(isOptionalStepEx ? { optional: true } : {}),
             ...(exFailScreenshot ? { failScreenshot: exFailScreenshot } : {}),
           });
-          failedSteps++;
-          // Capture for summary (truncate to first 5)
-          if (failedStepDetails.length < 5) {
-            failedStepDetails.push({
-              stepIndex: originalStepIndex,
-              description: step.description || '',
-              action: step.type,
-              error: errorWithContext,
-            });
-          }
 
           // V14: Record step telemetry (exception)
           try {
@@ -2897,21 +2914,43 @@ export class PreviewRunService {
             });
           } catch { /* page may be closed */ }
 
-          // Stop and skip remaining
-          for (let j = i + 1; j < stepsToExecute.length; j++) {
-            const remainingStep = stepsToExecute[j];
-            webSocketService.emitToUser(userId, 'preview:run:step', {
+          if (isOptionalStepEx) {
+            failedOptionalSteps++;
+            logger.info('[PreviewRun] Optional step threw — continuing run', {
               previewSessionId,
-              stepIndex: startFromIndex + j,
-              stepId: remainingStep.id,
-              status: 'skipped',
-              action: remainingStep.type,
-              description: remainingStep.description,
-              timestamp: new Date().toISOString(),
+              stepIndex: originalStepIndex,
+              stepId: step.id,
+              error: originalError,
             });
-            skippedSteps++;
+            // No skip / no break — fall through to the next step.
+          } else {
+            failedSteps++;
+            // Capture for summary (truncate to first 5)
+            if (failedStepDetails.length < 5) {
+              failedStepDetails.push({
+                stepIndex: originalStepIndex,
+                description: step.description || '',
+                action: step.type,
+                error: errorWithContext,
+              });
+            }
+
+            // Stop and skip remaining
+            for (let j = i + 1; j < stepsToExecute.length; j++) {
+              const remainingStep = stepsToExecute[j];
+              webSocketService.emitToUser(userId, 'preview:run:step', {
+                previewSessionId,
+                stepIndex: startFromIndex + j,
+                stepId: remainingStep.id,
+                status: 'skipped',
+                action: remainingStep.type,
+                description: remainingStep.description,
+                timestamp: new Date().toISOString(),
+              });
+              skippedSteps++;
+            }
+            break;
           }
-          break;
         }
       }
 
@@ -2962,6 +3001,7 @@ export class PreviewRunService {
         success: failedSteps === 0 && !cancelled && !timedOut,
         passedSteps,
         failedSteps,
+        failedOptionalSteps,
         skippedSteps,
         cancelled,
         timedOut,
@@ -3115,6 +3155,7 @@ export class PreviewRunService {
         totalSteps: steps.length,
         passedSteps,
         failedSteps,
+        failedOptionalSteps,
         skippedSteps,
         cancelled,
         timedOut,
@@ -3135,6 +3176,7 @@ export class PreviewRunService {
         totalSteps: steps.length,
         passedSteps,
         failedSteps,
+        failedOptionalSteps,
         skippedSteps,
         cancelled,
         timedOut,
@@ -3203,6 +3245,7 @@ export class PreviewRunService {
         totalSteps: steps.length,
         passedSteps,
         failedSteps,
+        failedOptionalSteps,
         skippedSteps,
         cancelled: true,
         timedOut,
