@@ -1667,6 +1667,18 @@ export interface PreviewVideoFramePayload {
   timestamp: string;
   /** V20: byte length of the binary frame (set when binary transport is used) */
   byteLength?: number;
+  /**
+   * Per-frame viewport scroll + zoom from CDP screencast metadata
+   * (`scrollOffsetX/Y`, `pageScaleFactor`). The editor subtracts scrollX/Y from
+   * document-relative highlight bboxes (LiteElement.bounds, invariant #18) to
+   * position the "is this the element?" border on THIS frame's visible viewport,
+   * so the border tracks live scrolling. Absent on screenshot-injected frames
+   * (first-frame / idle watchdog / run-sync) — the client keeps the last known
+   * scroll, which is correct for a static page.
+   */
+  scrollX?: number;
+  scrollY?: number;
+  pageScaleFactor?: number;
 }
 
 /**

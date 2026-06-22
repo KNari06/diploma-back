@@ -28,6 +28,7 @@ import { SUB_AGENT_CONFIG } from './sub-agents/config';
 import { executeTool } from '@/services/skills/tool-executor';
 import { ToolCallTracker } from '@/services/skills/hooks/loop-detection.hook';
 import { humanizeToolName, computeToolProgress } from './sub-agents/agents/executor-agent';
+import { getLocalizedMessages } from '../regression/localization';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPER: Resolve project ID (Tier 1: session → Tier 2: workspace default)
@@ -1490,15 +1491,30 @@ You are inside the editor for the test case currently open in the preview. The
       userId,
     });
 
-    // Provide helpful fallback message based on error type
-    let fallbackMessage = 'I apologize, but I\'m currently experiencing technical difficulties. Please try again in a few moments.';
+    // Classify the failure and surface a SPECIFIC, localized message per class
+    // (not one catch-all). Language comes from the intent parser (userLanguage),
+    // so the user reads the hint in their own language.
+    const chatErrors = getLocalizedMessages(params.userLanguage).chatError;
+    const status = openaiError?.status;
+    const code = openaiError?.code;
+    const msg = String(openaiError?.message || '').toLowerCase();
 
-    if (openaiError?.status === 401 || openaiError?.code === 'invalid_api_key') {
-      fallbackMessage = 'I\'m temporarily unavailable due to a configuration issue. Our team has been notified.';
-    } else if (openaiError?.status === 429 || openaiError?.code === 'insufficient_quota') {
-      fallbackMessage = 'I\'m temporarily unavailable due to high demand. Please try again in a few minutes.';
-    } else if (openaiError?.message?.includes('timeout') || openaiError?.message?.includes('took too long')) {
-      fallbackMessage = 'The request took too long to process. Please try again with a shorter message.';
+    let fallbackMessage: string;
+    if (status === 401 || status === 403 || code === 'invalid_api_key') {
+      // Auth/config — user can't fix it; team is notified.
+      fallbackMessage = chatErrors.config;
+    } else if (status === 429 || code === 'insufficient_quota' || code === 'rate_limit_exceeded') {
+      fallbackMessage = chatErrors.rateLimit;
+    } else if (
+      code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'ECONNREFUSED'
+      || msg.includes('fetch failed') || msg.includes('network') || msg.includes('socket hang up')
+    ) {
+      fallbackMessage = chatErrors.network;
+    } else if (msg.includes('timeout') || msg.includes('timed out') || msg.includes('took too long')) {
+      fallbackMessage = chatErrors.timeout;
+    } else {
+      // 500/502/503 or anything unclassified.
+      fallbackMessage = chatErrors.generic;
     }
 
       gptResponse = {

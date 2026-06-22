@@ -991,6 +991,11 @@ export class IntentStepLintService {
           secretValues: auditSecretValues,
         });
       } catch { /* never break lint on diagnostics */ }
+      // NOTE: highlight bboxes are DOCUMENT-relative (LiteElement.bounds, invariant
+      // #18). The editor converts them to viewport space using the per-frame
+      // scrollX/scrollY shipped on `preview:video:frame` (screencastFrame metadata)
+      // — NOT here. That keeps the scroll consistent with the exact frame the user
+      // sees AND lets the border track live scrolling, with zero extra evaluate.
       return result;
     } catch (err) {
       const auditSecretValuesErr = (() => {
@@ -1830,6 +1835,7 @@ export class IntentStepLintService {
    * 
    * Does NOT select elements - just helps user refine their description.
    */
+
   /**
    * V23: Generate context-aware clarification message.
    *

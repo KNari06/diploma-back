@@ -1828,7 +1828,27 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      // For resolved/not_found/error, emit result as usual
+      // [HL-DIAG] Does the resolved result carry a usable highlight bbox? This is
+      // the single chokepoint for every lint result reaching the client. If the
+      // border doesn't draw, this tells us whether the BACKEND omitted the bbox
+      // (vs the frontend losing it). Remove with the other [HL-DIAG] logs.
+      try {
+        const hl = Array.isArray((result as any).highlight) ? (result as any).highlight : [];
+        const bb = hl[0]?.boundingBox;
+        logger.info('[HL-DIAG] lint emit', {
+          status: (result as any).status,
+          stepType: stepDraft.type,
+          resolverPath: (result as any).resolverPath,
+          highlightCount: hl.length,
+          firstHasBbox: !!bb,
+          firstBbox: bb ? { x: Math.round(bb.x), y: Math.round(bb.y), w: Math.round(bb.width), h: Math.round(bb.height) } : null,
+        });
+      } catch { /* diag only */ }
+
+      // For resolved/not_found/error, emit result as usual. Highlight bboxes are
+      // DOCUMENT-relative (LiteElement.bounds, invariant #18); the editor converts
+      // them to viewport space using the per-frame scrollX/scrollY on
+      // preview:video:frame so the border tracks live scroll.
       socket.emit('preview:step:lint:result', {
         ...result,
         applyDisabled: result.status !== 'resolved', // V5: Apply only enabled for resolved
