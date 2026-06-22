@@ -1727,6 +1727,14 @@ export interface PreviewStepLintResultPayload {
     totalMs?: number;
     domNodeCount?: number;
   };
+  /**
+   * True when the "is this the element?" border was already painted IN-PAGE
+   * (inside the browser, by data-agent-ref). The FE then SKIPS its React-<div>
+   * fallback overlay to avoid a double border. False when the element wasn't in
+   * the main frame (cross-origin iframe / not in DOM) — the FE draws the React
+   * fallback (which works over the video regardless of frame origin).
+   */
+  inPageHighlightDrawn?: boolean;
   timestamp: string;
 }
 
