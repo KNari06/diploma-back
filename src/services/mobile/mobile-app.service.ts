@@ -233,7 +233,7 @@ export async function finalizeMobileAppUpload(
     finalVersionCode,
   });
 
-  const metadata = MobileAppStorageService.finaliseDirectUpload({
+  const metadata = await MobileAppStorageService.finaliseDirectUpload({
     workspaceId: project.workspace_id,
     projectId,
     platform,

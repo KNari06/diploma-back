@@ -255,7 +255,9 @@ ecosystem.config.js
 gcp
 gcp-*
 aws-*
-azure-*
+# Root-anchored so it only catches credential dumps at the repo root
+# (e.g. azure-credentials.json), not source files like src/.../azure-blob-store.ts
+/azure-*
 id_rsa*
 id_ed25519*
 
