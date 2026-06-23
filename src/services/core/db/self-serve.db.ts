@@ -77,6 +77,28 @@ export async function markWorkspaceOnboardingCompleted(workspaceId: string): Pro
 }
 
 /**
+ * Cheap existence check: does this user own a workspace OR have an active
+ * membership? Used by the /auth/me self-heal to decide whether a provisioning
+ * pass is needed, WITHOUT pulling full workspace rows. Note the type split:
+ * `workspaces.user_id` is text, `workspace_members.user_id` is uuid.
+ */
+export async function userHasAnyWorkspace(userId: string): Promise<boolean> {
+  const [owned, member] = await Promise.all([
+    supabaseAdmin.from('workspaces').select('id').eq('user_id', userId).limit(1),
+    supabaseAdmin
+      .from('workspace_members')
+      .select('workspace_id')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .limit(1),
+  ]);
+
+  if (owned.error) throw owned.error;
+  if (member.error) throw member.error;
+  return (owned.data?.length ?? 0) > 0 || (member.data?.length ?? 0) > 0;
+}
+
+/**
  * Verify a project belongs to a workspace. Returns true when a matching row
  * exists. Used to reject cross-workspace projectId values before they reach
  * the exploration queue (IDOR guard).

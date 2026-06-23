@@ -461,6 +461,14 @@ export const me = async (req: Request, res: Response): Promise<void> => {
 
     const user = await getCurrentUser(token);
 
+    // Safety net: guarantee an approved user always has a workspace/project so
+    // the frontend never hangs on an empty workspace list. Cheap (Redis-cached)
+    // and idempotent; awaited so a first-load heal completes before the client
+    // fetches workspaces. Never throws.
+    if (user?.id) {
+      await SelfServeProvisioningService.selfHealIfApproved(user.id, user.status);
+    }
+
     res.json({
       success: true,
       data: user,
@@ -764,6 +772,20 @@ export const updateUserStatus = async (req: Request, res: Response): Promise<voi
 
     // Invalidate auth cache so the user's next request picks up the new status
     await invalidateAuthCacheForUser(userId);
+
+    // When admin approves a user, ensure they get the full new-user setup
+    // (free plan + welcome credits + workspace + default project) — otherwise
+    // the frontend gets stuck on an infinite loading shimmer (empty workspace
+    // list → null currentWorkspace → all data hooks stall). Idempotent and
+    // independent of AUTO_APPROVE_SIGNUP, so manual approval ALWAYS provisions.
+    if (status === 'approved' && prevUser?.status !== 'approved') {
+      SelfServeProvisioningService.ensureFullyProvisioned(userId).catch((err) =>
+        logger.error('[AUTH] Failed to provision user on approval', {
+          userId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      );
+    }
 
     // Fire-and-forget status notification emails.
     // Guarded by the previous status so repeated PATCHes don't spam the user.
