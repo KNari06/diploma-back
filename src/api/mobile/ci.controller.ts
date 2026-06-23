@@ -13,6 +13,7 @@ import { QueueManager, redisConnection } from '@/config/infrastructure/queues';
 import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { isPaidUser } from '@/services/core/plan-access.service';
+import { PAID_FEATURE_LABELS } from '@/config/features/feature-labels';
 import type { MobileIntentStep, MobilePlatform, MobileTestJobData, MobileTestMetadata } from '@/services/mobile/mobile-runner.types';
 import {
   MobileAppStorageService,
@@ -54,7 +55,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
       success: false,
       error: 'Upgrade required',
       code: 'UPGRADE_REQUIRED',
-      message: 'Mobile testing is available on the Pro plan. Upgrade to run mobile tests via CI.',
+      message: `${PAID_FEATURE_LABELS.MOBILE_TESTING} is available on the Pro plan. Upgrade to run mobile tests via CI.`,
     });
     return;
   }

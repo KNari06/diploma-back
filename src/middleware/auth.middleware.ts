@@ -397,6 +397,9 @@ export const requireCredits = (requiredCredits: number = 1) => {
         res.status(402).json({
           success: false,
           error: 'Insufficient credits',
+          // Same machine-readable code the workspace-credits path emits, so the
+          // frontend detects user-credit exhaustion identically (it keys off code).
+          code: 'INSUFFICIENT_CREDITS',
           message: `You need at least ${requiredCredits} credits to perform this action. Current: ${currentCredits}`,
           currentCredits,
           requiredCredits,

@@ -9,6 +9,7 @@ import type { MobileTestJobData, MobilePlatform } from '@/services/mobile/mobile
 import { sanitizeTriggers } from '@/services/mobile/trigger-validation.util';
 import { env } from '@/config/environment/env';
 import { isPaidUser } from '@/services/core/plan-access.service';
+import { PAID_FEATURE_LABELS } from '@/config/features/feature-labels';
 import { ValidationError } from '@/types';
 import { v4 as uuidv4 } from 'uuid';
 import { applyParameters } from '@/utils/testing/parameter-substitution.utils';
@@ -59,7 +60,7 @@ export class MobileTestDispatcherService {
     // point for every mobile dispatch path (single-case run, plan/module
     // orchestrator, CI), so free users can't queue mobile jobs from any route.
     if (!(await isPaidUser(userId))) {
-      throw new ValidationError('Mobile testing is available on the Pro plan. Upgrade to run mobile tests.');
+      throw new ValidationError(`${PAID_FEATURE_LABELS.MOBILE_TESTING} is available on the Pro plan. Upgrade to run mobile tests.`);
     }
 
     // 1. Resolve platform and browser

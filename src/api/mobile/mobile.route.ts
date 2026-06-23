@@ -10,6 +10,7 @@
  */
 
 import { requireAuth, requirePaidPlan } from '@/middleware/auth.middleware';
+import { PAID_FEATURE_LABELS } from '@/config/features/feature-labels';
 import { requireCiApiKey } from '@/middleware/api-key.middleware';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { logger } from '@/utils/core/logger';
@@ -42,7 +43,7 @@ const router = Router();
 // upload, emulator warmup, exploration, test runs) so free users can't consume
 // mobile capacity. Read-only GETs and in-session gestures (tap/swipe/type) are
 // implicitly gated: without a warmed session they're unreachable.
-const requireMobilePlan = requirePaidPlan('Mobile testing');
+const requireMobilePlan = requirePaidPlan(PAID_FEATURE_LABELS.MOBILE_TESTING);
 
 // Observability for the editor's "start session" (warmup) path. This is mounted
 // in index.ts BEFORE the app-level `requireAuth, requireApproved` gate (see the
