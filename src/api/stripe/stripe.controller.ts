@@ -437,7 +437,10 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
 
   if (isActive && plan?.id) {
     userUpdateData.plan_id = plan.id;
-  } else if (!isActive) {
+  } else if (!isActive && (subscription.status === 'canceled' || subscription.status === 'incomplete_expired')) {
+    // Only wipe plan_id on terminal states. Transient dunning states (past_due,
+    // unpaid) keep the plan intact so the user retains access during the retry
+    // window; Stripe will send another event if it ultimately cancels.
     userUpdateData.plan_id = null;
   }
 

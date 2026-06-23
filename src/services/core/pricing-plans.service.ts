@@ -289,6 +289,25 @@ export class PricingPlansService {
         return false;
       }
 
+      // Never downgrade a paid plan to free via this path. This prevents
+      // self-serve provisioning (ensureTrialCreditsAndPlan) from silently
+      // resetting a manually-granted or Stripe-purchased plan on re-login.
+      if (planSlug === 'free') {
+        const { data: currentUser } = await supabaseAdmin
+          .from('users')
+          .select('plan_id, pricing_plans!plan_id(slug)')
+          .eq('id', userId)
+          .maybeSingle();
+        const currentSlug = (currentUser?.pricing_plans as { slug?: string } | null)?.slug;
+        if (currentSlug && currentSlug !== 'free') {
+          logger.info('[PRICING_PLANS] Skipping free plan assignment — user already on paid plan', {
+            userId: userId.substring(0, 8) + '...',
+            currentSlug,
+          });
+          return true;
+        }
+      }
+
       // Update user's plan
       const { error } = await supabaseAdmin
         .from('users')
