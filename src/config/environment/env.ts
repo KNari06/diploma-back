@@ -72,6 +72,17 @@ const envSchema = z.object({
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1, 'SUPABASE_SERVICE_ROLE_KEY is required'),
   SUPABASE_BUCKET_NAME: z.string().default('qai-assets'),
 
+  // Azure Blob Storage — mobile app binaries (APK/IPA/AAB). Replaces Supabase
+  // Storage for the `mobile-apps` container only. See DECISIONS.md ADR-0008.
+  // `supabase` keeps the legacy behaviour; `azure` reads/writes Azure with a
+  // Supabase read-fallback for not-yet-migrated objects (dual-read).
+  MOBILE_APP_STORAGE_PROVIDER: z.enum(['supabase', 'azure']).default('supabase'),
+  AZURE_STORAGE_ACCOUNT: z.string().optional(),
+  AZURE_STORAGE_CONTAINER: z.string().default('mobile-apps'),
+  // User-assigned Managed Identity client-id, so DefaultAzureCredential picks
+  // the right identity on Azure Container Apps (multiple identities exist).
+  AZURE_CLIENT_ID: z.string().optional(),
+
   // Redis
   REDIS_URL: z.string().default('redis://localhost:6379'),
   REDIS_HOST: z.string().default('localhost'),

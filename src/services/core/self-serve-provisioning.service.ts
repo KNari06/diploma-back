@@ -6,10 +6,12 @@ import { ProjectService } from '@/services/core/project.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
 import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
+import { cache } from '@/utils/core/redis-cache';
 import {
   approvePendingUser,
   fetchUserStatus,
   markWorkspaceOnboardingCompleted,
+  userHasAnyWorkspace,
 } from '@/services/core/db/self-serve.db';
 
 /**
@@ -163,6 +165,95 @@ export class SelfServeProvisioningService {
       workspace_id: workspaceId,
     });
     logger.info('[SELF_SERVE] Default project created', { userId, workspaceId });
+  }
+
+  /** Redis key marking a user as recently self-heal-checked (skip the DB probe). */
+  private static healCheckedKey(userId: string): string {
+    return `qait:selfheal:checked:${userId}`;
+  }
+  /** How long a "checked, has workspace" verdict stays cached. */
+  private static readonly HEAL_CHECK_TTL_SECONDS = 6 * 60 * 60; // 6h
+
+  /**
+   * Last-resort safety net, called from GET /auth/me (which the frontend hits
+   * on every load). Guarantees an APPROVED user is never left without a
+   * workspace — no matter HOW they became approved or which auth endpoint they
+   * came through (repeat OAuth login, direct Supabase session, legacy account,
+   * or a flag that was off at signup time).
+   *
+   * Cheap by design: a Redis flag short-circuits the common case (already
+   * healthy) so we hit the DB at most once per HEAL_CHECK_TTL per user. Only
+   * runs the (idempotent) full provisioning when the user is approved AND has
+   * no workspace. Never throws — a self-heal failure must not break /auth/me.
+   *
+   * Independent of AUTO_APPROVE_SIGNUP: this heals users who are ALREADY
+   * approved; it never approves anyone (that's provision()'s job at signup).
+   */
+  static async selfHealIfApproved(userId: string, status?: string | null): Promise<void> {
+    if (!userId) return;
+    try {
+      // Fast path: we verified this user has a workspace recently.
+      if (await cache.get<boolean>(this.healCheckedKey(userId))) return;
+
+      // Only heal approved users. If status wasn't passed in, read it once.
+      const effectiveStatus = status ?? (await fetchUserStatus(userId));
+      if (effectiveStatus !== 'approved') return;
+
+      if (await userHasAnyWorkspace(userId)) {
+        // Healthy — cache the verdict so we skip the probe for a while.
+        await cache.set(this.healCheckedKey(userId), true, this.HEAL_CHECK_TTL_SECONDS);
+        return;
+      }
+
+      logger.warn('[SELF_SERVE] Approved user without workspace — self-healing', { userId });
+      await this.ensureFullyProvisioned(userId);
+      await cache.set(this.healCheckedKey(userId), true, this.HEAL_CHECK_TTL_SECONDS);
+    } catch (error) {
+      logger.warn('[SELF_SERVE] selfHealIfApproved failed (non-critical)', {
+        error: error instanceof Error ? error.message : String(error),
+        userId,
+      });
+    }
+  }
+
+  /**
+   * Ensure an ALREADY-APPROVED user has everything needed to use the app:
+   * free plan + welcome credits + workspace + default project. Unlike
+   * `provision()` this does NOT gate on AUTO_APPROVE_SIGNUP and does NOT run
+   * the approval step — the caller has already established the user is approved
+   * (admin PATCH, or a backfill of legacy users). Every step is idempotent and
+   * independently guarded, mirroring provision()'s ordering (credits before
+   * workspace) so a partial failure still leaves the user usable.
+   *
+   * This is the shared "make the user whole" routine. Use it anywhere a user
+   * becomes approved OUTSIDE the self-serve auth flow, so they never land on
+   * an infinite loading shimmer (empty workspace list → null currentWorkspace).
+   */
+  static async ensureFullyProvisioned(userId: string): Promise<void> {
+    if (!userId) return;
+
+    try {
+      await this.ensureTrialCreditsAndPlan(userId);
+    } catch (error) {
+      logger.warn('[SELF_SERVE] ensureFullyProvisioned: credits/plan failed', {
+        error: error instanceof Error ? error.message : String(error),
+        userId,
+      });
+    }
+
+    try {
+      const workspaceId = await this.ensureWorkspace(userId);
+      if (workspaceId) {
+        await this.ensureDefaultProject(userId, workspaceId);
+      }
+    } catch (error) {
+      logger.warn('[SELF_SERVE] ensureFullyProvisioned: workspace/project failed', {
+        error: error instanceof Error ? error.message : String(error),
+        userId,
+      });
+    }
+
+    logger.info('[SELF_SERVE] User fully provisioned (out-of-band)', { userId });
   }
 
   /**

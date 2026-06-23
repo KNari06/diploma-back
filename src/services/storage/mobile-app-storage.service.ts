@@ -9,9 +9,9 @@
  */
 
 import { supabaseAdmin } from '@/db/supabase';
-import { env } from '@/config/environment/env';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { detectBuildInfoFromBuffer } from '@/services/mobile/archive-platform-detect';
+import { getBlobStore } from './blob';
 import { logger } from '@/utils/core/logger';
 import path from 'path';
 
@@ -19,7 +19,6 @@ import path from 'path';
 
 const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500MB
 const ALLOWED_EXTENSIONS = ['.apk', '.ipa', '.aab'];
-const BUCKET = env.SUPABASE_BUCKET_NAME; // 'qai-assets'
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -192,27 +191,24 @@ export class MobileAppStorageService {
       : ext === '.ipa' ? 'application/octet-stream'
         : 'application/octet-stream';
 
-    const { error } = await supabaseAdmin.storage
-      .from(BUCKET)
-      .upload(storagePath, file.buffer, {
+    const blob = getBlobStore();
+    try {
+      await blob.upload(storagePath, file.buffer, {
         contentType,
-        upsert: false,
         cacheControl: '31536000', // 1 year (immutable, new file per upload)
       });
-
-    if (error) {
+    } catch (error) {
       logger.error('[MOBILE_APP_STORAGE] Upload failed', {
-        error,
+        error: error instanceof Error ? error.message : String(error),
         projectId,
         storagePath,
       });
-      throw new Error(`Failed to upload app: ${error.message}`);
+      throw error instanceof Error ? error : new Error('Failed to upload app');
     }
 
-    // Get public URL
-    const { data: urlData } = supabaseAdmin.storage
-      .from(BUCKET)
-      .getPublicUrl(storagePath);
+    // Display URL — Supabase: public URL; Azure (private container): '' (UI
+    // mints a signed download URL on demand). See ADR-0008.
+    const publicUrl = await blob.getDisplayUrl(storagePath);
 
     // Run framework + Flutter-build-mode detection on the in-memory buffer
     // BEFORE building the metadata. We do it here (inside uploadApp) so the
@@ -231,7 +227,7 @@ export class MobileAppStorageService {
       platform,
       packageName,
       storagePath,
-      publicUrl: urlData.publicUrl,
+      publicUrl,
       originalName: file.originalname,
       fileSize: file.size,
       uploadedAt: new Date().toISOString(),
@@ -243,7 +239,7 @@ export class MobileAppStorageService {
       projectId,
       platform,
       storagePath,
-      publicUrl: urlData.publicUrl,
+      publicUrl,
     });
 
     return metadata;
@@ -290,17 +286,7 @@ export class MobileAppStorageService {
   }): Promise<{ uploadUrl: string; token: string; storagePath: string }> {
     const { storagePath } = this.buildStoragePath(params);
 
-    const { data, error } = await supabaseAdmin.storage
-      .from(BUCKET)
-      .createSignedUploadUrl(storagePath);
-
-    if (error || !data?.signedUrl || !data?.token) {
-      logger.error('[MOBILE_APP_STORAGE] createSignedUploadUrl failed', {
-        error: error?.message,
-        storagePath,
-      });
-      throw new Error(`Failed to create signed upload URL: ${error?.message || 'Unknown error'}`);
-    }
+    const target = await getBlobStore().createSignedUploadUrl(storagePath);
 
     logger.info('[MOBILE_APP_STORAGE] Issued signed upload URL', {
       projectId: params.projectId,
@@ -308,11 +294,7 @@ export class MobileAppStorageService {
       storagePath,
     });
 
-    return {
-      uploadUrl: data.signedUrl,
-      token: data.token,
-      storagePath,
-    };
+    return target;
   }
 
   /**
@@ -324,28 +306,8 @@ export class MobileAppStorageService {
    * Returns null when the object is not present.
    */
   static async statObject(storagePath: string): Promise<{ sizeBytes: number; contentType: string | null } | null> {
-    // Supabase JS SDK doesn't expose HEAD directly; list the parent prefix
-    // filtered by the basename. Cheap (one row) and avoids downloading.
-    const parent = storagePath.includes('/') ? storagePath.slice(0, storagePath.lastIndexOf('/')) : '';
-    const name = storagePath.includes('/') ? storagePath.slice(storagePath.lastIndexOf('/') + 1) : storagePath;
-
-    const { data, error } = await supabaseAdmin.storage
-      .from(BUCKET)
-      .list(parent, { search: name, limit: 1 });
-
-    if (error) {
-      logger.warn('[MOBILE_APP_STORAGE] statObject list failed', {
-        error: error.message,
-        storagePath,
-      });
-      return null;
-    }
-    const row = (data || []).find((r) => r.name === name);
-    if (!row) return null;
-
-    const sizeBytes = Number((row.metadata as any)?.size ?? 0);
-    const contentType = ((row.metadata as any)?.mimetype as string | undefined) ?? null;
-    return { sizeBytes, contentType };
+    const stat = await getBlobStore().stat(storagePath);
+    return stat ? { sizeBytes: stat.sizeBytes, contentType: stat.contentType } : null;
   }
 
   /**
@@ -353,7 +315,7 @@ export class MobileAppStorageService {
    * the client via a signed URL — i.e. the backend never saw the buffer.
    * Mirrors what `uploadApp` returns so downstream consumers stay identical.
    */
-  static finaliseDirectUpload(params: {
+  static async finaliseDirectUpload(params: {
     workspaceId: string;
     projectId: string;
     platform: MobilePlatform;
@@ -366,16 +328,14 @@ export class MobileAppStorageService {
     detectedFramework?: 'android' | 'ios' | 'flutter' | 'react-native';
     flutterBuildMode?: 'debug' | 'aot';
     debuggable?: boolean;
-  }): MobileAppMetadata {
-    const { data: urlData } = supabaseAdmin.storage
-      .from(BUCKET)
-      .getPublicUrl(params.storagePath);
+  }): Promise<MobileAppMetadata> {
+    const publicUrl = await getBlobStore().getDisplayUrl(params.storagePath);
 
     return {
       platform: params.platform,
       packageName: params.packageName,
       storagePath: params.storagePath,
-      publicUrl: urlData.publicUrl,
+      publicUrl,
       originalName: params.originalName,
       fileSize: params.fileSize,
       uploadedAt: new Date().toISOString(),
@@ -395,15 +355,8 @@ export class MobileAppStorageService {
     if (!storagePath) return;
 
     try {
-      const { error } = await supabaseAdmin.storage
-        .from(BUCKET)
-        .remove([storagePath]);
-
-      if (error) {
-        logger.warn('[MOBILE_APP_STORAGE] Delete failed', { error, storagePath });
-      } else {
-        logger.info('[MOBILE_APP_STORAGE] Deleted app', { storagePath });
-      }
+      await getBlobStore().remove([storagePath]);
+      logger.info('[MOBILE_APP_STORAGE] Deleted app', { storagePath });
     } catch (err) {
       logger.warn('[MOBILE_APP_STORAGE] Delete error', {
         error: err instanceof Error ? err.message : String(err),
@@ -417,31 +370,14 @@ export class MobileAppStorageService {
    * Signed URLs expire — use for short-lived access during test execution.
    */
   static async getSignedUrl(storagePath: string, expiresInSeconds = 600): Promise<string> {
-    const { data, error } = await supabaseAdmin.storage
-      .from(BUCKET)
-      .createSignedUrl(storagePath, expiresInSeconds);
-
-    if (error || !data?.signedUrl) {
-      throw new Error(`Failed to create signed URL: ${error?.message || 'Unknown error'}`);
-    }
-
-    return data.signedUrl;
+    return getBlobStore().createSignedDownloadUrl(storagePath, expiresInSeconds);
   }
 
   /**
    * Download app file as Buffer (for proxying to runner).
    */
   static async downloadApp(storagePath: string): Promise<Buffer> {
-    const { data, error } = await supabaseAdmin.storage
-      .from(BUCKET)
-      .download(storagePath);
-
-    if (error || !data) {
-      throw new Error(`Failed to download app: ${error?.message || 'Unknown error'}`);
-    }
-
-    const arrayBuffer = await data.arrayBuffer();
-    return Buffer.from(arrayBuffer);
+    return getBlobStore().download(storagePath);
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -586,18 +522,10 @@ export class MobileAppStorageService {
       const ids = toDelete.map((r) => r.id);
 
       if (storagePaths.length > 0) {
-        const { error: storageErr } = await supabaseAdmin.storage
-          .from(BUCKET)
-          .remove(storagePaths);
-        if (storageErr) {
-          logger.warn('[MOBILE_APP_STORAGE] pruneOldBuilds storage remove partial', {
-            error: storageErr.message,
-            count: storagePaths.length,
-          });
-          // Continue — DB rows still get pruned. Orphan storage objects
-          // are recoverable later; orphan DB rows pointing at deleted
-          // files are not.
-        }
+        // Best-effort — the store logs its own partial failures. DB rows still
+        // get pruned: orphan storage objects are recoverable later; orphan DB
+        // rows pointing at deleted files are not.
+        await getBlobStore().remove(storagePaths);
       }
 
       const { error: rowErr } = await supabaseAdmin
