@@ -13,11 +13,26 @@ import { persistLLMCall } from '../logging/llm-io-persistence';
  * - timeout: 60s (prevents hanging requests)
  * - maxRetries: 2 (retry failed requests)
  * - Must be less than server.timeout (180s) to allow proper error handling
+ *
+ * ⚠️ PROD INCIDENT FIX (ERR_STREAM_PREMATURE_CLOSE):
+ * The openai SDK v4 prefers a hoisted `node-fetch@2` (a transitive dep) over the
+ * runtime's native fetch. On prod (Node 22, behind the container network)
+ * node-fetch@2's gzip stream (Gunzip) tears down mid-response — EVERY OpenAI
+ * call (chat + embeddings) failed with `ERR_STREAM_PREMATURE_CLOSE`, so chat
+ * returned the generic fallback on every message. Forcing the SDK to use Node
+ * 22's native fetch (undici) — which handles compressed-stream teardown
+ * correctly — sidesteps node-fetch entirely. `globalThis.fetch` exists on Node
+ * 18+; we guard so a hypothetical older runtime still falls back to the SDK's
+ * default. Native undici also keeps connections alive more reliably.
  */
+const _nativeFetch: typeof fetch | undefined =
+  typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : undefined;
+
 const _rawOpenai = new OpenAI({
   apiKey: env.OPENAI_API_KEY,
   timeout: 60000, // 60 seconds
   maxRetries: 2, // Retry up to 2 times on failure
+  ...(_nativeFetch ? { fetch: _nativeFetch } : {}),
 });
 
 /**

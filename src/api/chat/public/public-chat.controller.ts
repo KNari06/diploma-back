@@ -169,9 +169,12 @@ export async function handlePublicChat(req: Request, res: Response): Promise<voi
       assistantMessage: replyForStorage,
     });
   } catch (err) {
-    logger.error('[PUBLIC_CHAT] LLM call failed', {
-      error: err instanceof Error ? err.message : String(err),
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error('[PUBLIC_CHAT] LLM call failed', { error: errMsg });
+    res.status(502).json({
+      success: false,
+      error: 'Assistant is temporarily unavailable',
+      debug: errMsg,
     });
-    res.status(502).json({ success: false, error: 'Assistant is temporarily unavailable' });
   }
 }
