@@ -62,6 +62,15 @@ export type ProgressEmitter = (
  * Fetch existing test case names for a project in a single query.
  * Used for deduplication (skip tests whose name already exists).
  */
+/**
+ * Canonical key for test-case name dedup. Trim THEN lowercase so that
+ * "Login", " login " and "LOGIN" collapse to one key — the old code only
+ * lowercased, so leading/trailing whitespace produced phantom non-duplicates.
+ */
+function normalizeName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
 async function getExistingTestCaseNames(
   projectId: string,
   userId: string,
@@ -80,7 +89,7 @@ async function getExistingTestCaseNames(
         offset,
       });
 
-      for (const tc of items) names.add(tc.name.toLowerCase());
+      for (const tc of items) names.add(normalizeName(tc.name));
 
       if (items.length < pageSize) break;
       offset += pageSize;
@@ -301,10 +310,14 @@ export async function processAllureImport(
     try {
       const platformTreeId = await getPlatformTreeId(projectId, userId, options.platform);
 
-      // Fetch existing test names for dedup
+      // Pre-import names (already in the project) vs names seen during THIS
+      // batch. A skip against a pre-existing name is an expected re-import; a
+      // skip against a same-batch name means two distinct imported tests share
+      // a name → one is silently lost, which we surface as a warning.
       const existingNames = options.deduplicateTests
         ? await getExistingTestCaseNames(projectId, userId)
         : new Set<string>();
+      const batchNames = new Set<string>();
 
       for (let i = 0; i < parsedData.results.length; i++) {
         const result = parsedData.results[i];
@@ -315,11 +328,20 @@ export async function processAllureImport(
           // Dedup check — skip entirely without resolving hierarchy.
           // We must NOT call resolveHierarchy here because it would create
           // modules/flows for tests that won't actually be imported.
-          if (options.deduplicateTests && existingNames.has(result.name.toLowerCase())) {
+          const key = normalizeName(result.name);
+          if (options.deduplicateTests && (existingNames.has(key) || batchNames.has(key))) {
+            const sameBatch = batchNames.has(key);
             logger.debug('[AllureImport] Skipping duplicate test case', {
               name: result.name,
+              reason: sameBatch ? 'same-batch name collision' : 'already exists in project',
             });
             stats.testsSkipped++;
+            if (sameBatch) {
+              stats.errors.push(
+                `Skipped "${result.name}" — another imported test has the same name. ` +
+                `Distinct tests with identical names can't both be imported; rename to keep both.`,
+              );
+            }
             continue;
           }
 
@@ -400,8 +422,8 @@ export async function processAllureImport(
             }
           }
 
-          // Register name in dedup set to avoid same-batch duplicates
-          existingNames.add(result.name.toLowerCase());
+          // Register name so a later same-batch collision is detected.
+          batchNames.add(normalizeName(result.name));
           stats.testsImported++;
           if (mapped.stepsDegraded) stats.testsWithDegradedSteps++;
 
@@ -644,6 +666,7 @@ async function processCsvPdfImport(
       const existingNames = options.deduplicateTests
         ? await getExistingTestCaseNames(projectId, userId)
         : new Set<string>();
+      const batchNames = new Set<string>();
 
       for (let i = 0; i < parsedTestCases.length; i++) {
         const tc = parsedTestCases[i];
@@ -651,9 +674,17 @@ async function processCsvPdfImport(
         emitPhase('tests', i, parsedTestCases.length, `Creating: ${tc.name}`);
 
         try {
-          // Dedup check
-          if (options.deduplicateTests && existingNames.has(tc.name.toLowerCase())) {
+          // Dedup check (see ZIP branch for the same-batch vs pre-existing split)
+          const key = normalizeName(tc.name);
+          if (options.deduplicateTests && (existingNames.has(key) || batchNames.has(key))) {
+            const sameBatch = batchNames.has(key);
             stats.testsSkipped++;
+            if (sameBatch) {
+              stats.errors.push(
+                `Skipped "${tc.name}" — another imported test has the same name. ` +
+                `Distinct tests with identical names can't both be imported; rename to keep both.`,
+              );
+            }
             continue;
           }
 
@@ -713,9 +744,14 @@ async function processCsvPdfImport(
             platform: options.platform,
             priority,
             ...(preconditions.length > 0 && { preconditions }),
-            // Import provenance. CSV/PDF are design-time exports with no run
-            // verdict, so sourceStatus stays unset (NULL) — only importId +
-            // the degraded flag apply here.
+            // Import provenance. `source_status` is defined as the SOURCE RUN
+            // VERDICT (passed/failed/broken/skipped). CSV/PDF are design-time
+            // TestOps exports with no run, so it stays NULL here — consistent
+            // with the ZIP path, not a gap. NOTE: the TestOps lifecycle status
+            // (Active/Draft/Deprecated, parsed into `tc.status`) is a DIFFERENT
+            // concept and is intentionally NOT written to source_status — it
+            // would corrupt the verdict semantics. It is currently not mapped
+            // anywhere (imported tests are always lifecycle 'draft' by design).
             importId,
             stepsDegraded,
           });
@@ -742,7 +778,7 @@ async function processCsvPdfImport(
             }
           }
 
-          existingNames.add(tc.name.toLowerCase());
+          batchNames.add(normalizeName(tc.name));
           stats.testsImported++;
           if (stepsDegraded) stats.testsWithDegradedSteps++;
 

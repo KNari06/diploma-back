@@ -330,6 +330,22 @@ export class PricingPlansService {
         return false;
       }
 
+      // Keep user_credits.subscription_plan in sync so frontend reads the
+      // correct plan from /api/user/credits (it reads subscription_plan, not
+      // users.plan_id). Best-effort — never fails the main grant path.
+      const subscriptionStatus = planSlug === 'free' ? 'inactive' : 'active';
+      const { error: creditsError } = await supabaseAdmin
+        .from('user_credits')
+        .update({ subscription_plan: planSlug, subscription_status: subscriptionStatus })
+        .eq('user_id', userId);
+      if (creditsError) {
+        logger.warn('[PRICING_PLANS] Failed to sync user_credits.subscription_plan', {
+          userId: userId.substring(0, 8) + '...',
+          planSlug,
+          error: creditsError.message,
+        });
+      }
+
       logger.info('[PRICING_PLANS] Plan assigned successfully', {
         userId: userId.substring(0, 8) + '...',
         planSlug,
