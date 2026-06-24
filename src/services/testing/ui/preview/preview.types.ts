@@ -1870,6 +1870,8 @@ export interface IntentTestCase {
   status: IntentTestCaseStatus;
   kind: IntentTestCaseKind;
   platform?: IntentTestCasePlatform;
+  /** Mobile per-test variant override. null = inherit (plan → project default → 'default'). */
+  mobileVariantLabel?: string | null;
 
   // Replay data (populated when saved from completed test or published)
   replayStrategy?: ReplayStrategy;

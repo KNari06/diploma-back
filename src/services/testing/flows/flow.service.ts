@@ -11,6 +11,7 @@ import type {
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
+import { normaliseVariantOverride } from '@/services/mobile/project-mobile-app.helper';
 
 /**
  * Service for managing test flows
@@ -34,7 +35,9 @@ export class FlowService {
       priority,
       preconditions,
       expectedResult,
+      mobileVariantLabel,
     } = params;
+    const normalizedVariant = normaliseVariantOverride(mobileVariantLabel);
 
     logger.info('[FLOW_SERVICE] Creating flow', {
       moduleId,
@@ -58,6 +61,7 @@ export class FlowService {
         priority: priority || null,
         preconditions: preconditions || [],
         expected_result: expectedResult || null,
+        mobile_variant_label: normalizedVariant,
       })
       .select('*')
       .single();
@@ -144,6 +148,7 @@ export class FlowService {
       priority,
       preconditions,
       expectedResult,
+      mobileVariantLabel,
     } = params;
 
     const updates: Record<string, any> = {};
@@ -156,6 +161,9 @@ export class FlowService {
     if (priority !== undefined) updates.priority = priority;
     if (preconditions !== undefined) updates.preconditions = preconditions;
     if (expectedResult !== undefined) updates.expected_result = expectedResult;
+    if (mobileVariantLabel !== undefined) {
+      updates.mobile_variant_label = normaliseVariantOverride(mobileVariantLabel);
+    }
 
     if (Object.keys(updates).length === 0) {
       throw new Error('No fields to update');
@@ -482,8 +490,27 @@ export class FlowService {
       priority: row.priority || undefined,
       preconditions: row.preconditions || [],
       expectedResult: row.expected_result || undefined,
+      mobileVariantLabel: row.mobile_variant_label ?? null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
+  }
+
+  /**
+   * Read a flow's mobile variant override (or null). Used by the mobile
+   * dispatcher to apply flow-level variant inheritance to its test cases.
+   */
+  static async getMobileVariantLabel(flowId: string): Promise<string | null> {
+    const { data, error } = await supabaseAdmin
+      .from('test_flows')
+      .select('mobile_variant_label')
+      .eq('id', flowId)
+      .maybeSingle();
+    if (error) {
+      logger.warn('[FLOW_SERVICE] getMobileVariantLabel failed', { error: error.message, flowId });
+      return null;
+    }
+    const label = (data as { mobile_variant_label?: string | null } | null)?.mobile_variant_label;
+    return typeof label === 'string' && label.trim() ? label.trim() : null;
   }
 }

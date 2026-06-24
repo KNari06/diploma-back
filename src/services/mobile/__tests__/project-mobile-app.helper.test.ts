@@ -1,4 +1,9 @@
-import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
+import {
+  getProjectMobileApp,
+  getProjectMobileVariants,
+  buildMobileAppSettingsPatch,
+  DEFAULT_VARIANT_LABEL,
+} from '@/services/mobile/project-mobile-app.helper';
 import type { MobileAppMetadata } from '@/services/storage/mobile-app-storage.service';
 
 const app = (platform: MobileAppMetadata['platform'], storagePath: string): MobileAppMetadata =>
@@ -66,5 +71,80 @@ describe('getProjectMobileApp', () => {
       expect(getProjectMobileApp(undefined, 'android')).toBeUndefined();
       expect(getProjectMobileApp({}, 'flutter')).toBeUndefined();
     });
+  });
+
+  describe('named-variant read', () => {
+    it('returns the named lane latest when requested', () => {
+      const settings = {
+        mobileAppVariants: { android: [{ label: 'Staging', isDefault: false, latest: app('android', 's.apk') }] },
+      };
+      expect(getProjectMobileApp(settings, 'android', 'Staging')?.storagePath).toBe('s.apk');
+    });
+
+    it('returns undefined for a named lane with no builds (no silent default substitution)', () => {
+      const settings = { mobileApps: { android: app('android', 'd.apk') } };
+      expect(getProjectMobileApp(settings, 'android', 'Staging')).toBeUndefined();
+    });
+
+    it('default request still resolves the legacy/shard slot', () => {
+      const settings = { mobileApps: { android: app('android', 'd.apk') } };
+      expect(getProjectMobileApp(settings, 'android', DEFAULT_VARIANT_LABEL)?.storagePath).toBe('d.apk');
+    });
+  });
+});
+
+describe('buildMobileAppSettingsPatch', () => {
+  const m = (storagePath: string): MobileAppMetadata =>
+    ({ platform: 'android', storagePath } as MobileAppMetadata);
+
+  it('default lane writes legacy + shard + registry', () => {
+    const patch = buildMobileAppSettingsPatch(undefined, 'android', m('d.apk'), DEFAULT_VARIANT_LABEL) as Record<string, any>;
+    expect(patch.mobileApp.storagePath).toBe('d.apk');
+    expect(patch.mobileApps.android.storagePath).toBe('d.apk');
+    expect(patch.mobileAppVariants.android).toEqual([
+      { label: DEFAULT_VARIANT_LABEL, isDefault: true, latest: m('d.apk') },
+    ]);
+  });
+
+  it('named lane leaves legacy/shard untouched and only upserts the registry', () => {
+    const base = buildMobileAppSettingsPatch(undefined, 'android', m('d.apk'), DEFAULT_VARIANT_LABEL);
+    const patch = buildMobileAppSettingsPatch(base, 'android', m('s.apk'), 'Staging') as Record<string, any>;
+    expect(patch.mobileApp).toBeUndefined();
+    expect(patch.mobileApps).toBeUndefined();
+    const labels = (patch.mobileAppVariants.android as Array<{ label: string }>).map((l) => l.label).sort();
+    expect(labels).toEqual([DEFAULT_VARIANT_LABEL, 'Staging'].sort());
+  });
+
+  it('re-upload to a lane replaces (does not duplicate) its entry', () => {
+    const first = buildMobileAppSettingsPatch(undefined, 'android', m('s1.apk'), 'Staging');
+    const patch = buildMobileAppSettingsPatch(first, 'android', m('s2.apk'), 'Staging') as Record<string, any>;
+    const lanes = patch.mobileAppVariants.android as Array<{ latest: MobileAppMetadata }>;
+    expect(lanes).toHaveLength(1);
+    expect(lanes[0].latest.storagePath).toBe('s2.apk');
+  });
+});
+
+describe('getProjectMobileVariants', () => {
+  it('virtual-fills a default lane from the legacy slot when no registry exists', () => {
+    const lanes = getProjectMobileVariants({ mobileApp: app('android', 'd.apk') }, 'android');
+    expect(lanes).toHaveLength(1);
+    expect(lanes[0]).toMatchObject({ label: DEFAULT_VARIANT_LABEL, isDefault: true });
+    expect(lanes[0].latest.storagePath).toBe('d.apk');
+  });
+
+  it('returns [] when nothing is uploaded', () => {
+    expect(getProjectMobileVariants({}, 'android')).toEqual([]);
+    expect(getProjectMobileVariants(undefined, 'android')).toEqual([]);
+  });
+
+  it('flutter reads the android lanes (flutter ships the android .apk)', () => {
+    const settings = {
+      mobileAppVariants: { android: [{ label: 'Staging', isDefault: false, latest: app('android', 's.apk') }] },
+    };
+    // flutter has no lanes of its own, but must see android's.
+    const lanes = getProjectMobileVariants(settings, 'flutter');
+    expect(lanes.map((l) => l.label)).toEqual(['Staging']);
+    // and a named flutter variant read resolves to the android build.
+    expect(getProjectMobileApp(settings, 'flutter', 'Staging')?.storagePath).toBe('s.apk');
   });
 });

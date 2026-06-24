@@ -82,6 +82,10 @@ const envSchema = z.object({
   // User-assigned Managed Identity client-id, so DefaultAzureCredential picks
   // the right identity on Azure Container Apps (multiple identities exist).
   AZURE_CLIENT_ID: z.string().optional(),
+  // Max named APK variants (Production/Staging/Dev …) per project+platform.
+  // Read only via getMaxMobileVariants() so the source can later become a
+  // per-project/admin setting without touching call sites.
+  MAX_MOBILE_VARIANTS: z.string().transform(Number).default('3'),
 
   // Redis
   REDIS_URL: z.string().default('redis://localhost:6379'),

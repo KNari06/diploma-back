@@ -114,12 +114,20 @@ export function sendMobileAppError(res: Response, err: MobileAppError): void {
       });
       return;
 
-    case 'build_record_failed':
-      res.status(409).json({
+    case 'build_record_failed': {
+      // Surface the REAL database reason instead of guessing. A unique
+      // violation (23505) only happens when the same commit is re-uploaded
+      // into the same variant; anything else (e.g. a missing column when the
+      // migration hasn't run) is reported verbatim so it's diagnosable.
+      const isDup = err.code === '23505';
+      res.status(isDup ? 409 : 500).json({
         success: false,
-        error: 'Failed to record build in version history (likely duplicate commit_sha for this project+platform).',
+        error: isDup
+          ? 'A build for this commit already exists in this variant. Re-uploading the same commit is a no-op.'
+          : `Failed to record build in version history: ${err.message || 'unknown database error'}`,
       });
       return;
+    }
 
     case 'app_not_uploaded':
       res.status(404).json({
@@ -134,6 +142,32 @@ export function sendMobileAppError(res: Response, err: MobileAppError): void {
         success: true,
         message: err.platform ? `No ${err.platform} app to delete` : 'No app to delete',
       });
+      return;
+
+    case 'variant_limit':
+      res.status(409).json({
+        success: false,
+        error: `Variant limit reached: a ${err.platform} app can have at most ${err.max} variants. Delete one before adding another.`,
+      });
+      return;
+
+    case 'invalid_variant_name':
+      res.status(400).json({ success: false, error: 'Variant name is required (non-empty string)' });
+      return;
+
+    case 'cannot_modify_default_variant':
+      res.status(400).json({
+        success: false,
+        error: 'The default variant cannot be renamed or deleted here. Use DELETE /app to clear the default slot.',
+      });
+      return;
+
+    case 'variant_not_found':
+      res.status(404).json({ success: false, error: `Variant "${err.label}" not found for this project+platform` });
+      return;
+
+    case 'variant_name_taken':
+      res.status(409).json({ success: false, error: `A variant named "${err.label}" already exists` });
       return;
   }
 }

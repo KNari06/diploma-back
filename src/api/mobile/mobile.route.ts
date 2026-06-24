@@ -18,12 +18,15 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import {
   createMobileAppUploadUrl,
   deleteMobileApp,
+  deleteMobileAppVariant,
   finalizeMobileAppUpload,
   getMobileApp,
   getProjectPermissionPolicy,
   listMobileAppBuilds,
   patchMobileApp,
   probeDriverExtension,
+  renameMobileAppVariant,
+  setDefaultMobileAppVariant,
   setProjectPermissionPolicy,
 } from './mobile.controller';
 import { generateCiKey, revokeCiKey, getCiKeyStatus } from './ci-key.controller';
@@ -151,6 +154,37 @@ router.delete(
   '/projects/:projectId/app',
   requireAuth,
   asyncHandler(deleteMobileApp),
+);
+
+/**
+ * PATCH  /api/v1/mobile/projects/:projectId/app/variants/:label?platform=android
+ *   Rename a named variant lane. Body: { name, platform? }.
+ * DELETE /api/v1/mobile/projects/:projectId/app/variants/:label?platform=android
+ *   Delete a named variant lane (its builds + storage). The default lane is
+ *   not manageable here — use DELETE /app to clear the default platform slot.
+ */
+router.patch(
+  '/projects/:projectId/app/variants/:label',
+  requireAuth,
+  requireMobilePlan,
+  asyncHandler(renameMobileAppVariant),
+);
+router.delete(
+  '/projects/:projectId/app/variants/:label',
+  requireAuth,
+  requireMobilePlan,
+  asyncHandler(deleteMobileAppVariant),
+);
+
+/**
+ * PUT /api/v1/mobile/projects/:projectId/app/variants/:label/default?platform=android
+ * Promote a variant to the platform's default (used when no test/plan picks one).
+ */
+router.put(
+  '/projects/:projectId/app/variants/:label/default',
+  requireAuth,
+  requireMobilePlan,
+  asyncHandler(setDefaultMobileAppVariant),
 );
 
 /**
