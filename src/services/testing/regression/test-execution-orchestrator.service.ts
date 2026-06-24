@@ -61,7 +61,7 @@ export class TestExecutionOrchestratorService {
      * by the mobile branch of the per-case dispatch (see line where
      * `dispatchMobileTest` is called); web Playwright runs ignore it.
      */
-    triggerContext?: { branch?: string; commitSha?: string; buildId?: string },
+    triggerContext?: { branch?: string; commitSha?: string; buildId?: string; variantLabel?: string },
     /**
      * When true, the loop sets a `failFastTriggered` flag on the first
      * failure and stops dispatching further tests. Mirrors the existing

@@ -31,6 +31,106 @@
 
 import type { MobileAppMetadata } from '@/services/storage/mobile-app-storage.service';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { env } from '@/config/environment/env';
+
+/**
+ * Canonical label for the default variant lane. A project's first upload
+ * (and every upload that doesn't name a variant) lands here. The label is
+ * deliberately version-independent — a variant accumulates many builds over
+ * time, so encoding app name / version / mode would mint a new variant per
+ * upload and blow the cap.
+ */
+export const DEFAULT_VARIANT_LABEL = 'default';
+
+/**
+ * Normalise a variant OVERRIDE field (a flow / test-case / plan's
+ * `mobile_variant_label`), where the absence of a value means "inherit".
+ * Blank/non-string → `null`. This is distinct from the upload/resolve-side
+ * `normaliseVariantLabel` (which folds blank → the literal `'default'` lane).
+ * Use this anywhere null means inherit so the five call sites can't drift.
+ */
+export function normaliseVariantOverride(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const t = raw.trim();
+  return t.length > 0 ? t : null;
+}
+
+/**
+ * Max named variants per (project, platform). Sourced from the
+ * MAX_MOBILE_VARIANTS env var (default 3). Read ONLY through this accessor
+ * so the source can later become a per-project / admin setting by changing
+ * this body — never reference the env value at call sites.
+ */
+export function getMaxMobileVariants(): number {
+  const n = env.MAX_MOBILE_VARIANTS;
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 3;
+}
+
+/**
+ * One named variant lane as mirrored into `project.settings` for fast UI
+ * reads. `latest` is the newest build's metadata in that lane; the durable
+ * source of truth is the `mobile_app_builds` table (`variant_label`).
+ */
+export interface MobileAppVariantEntry {
+  label: string;
+  isDefault: boolean;
+  latest: MobileAppMetadata;
+}
+
+/** Per-platform variant registry: `settings.mobileAppVariants[platform]`. */
+export interface MobileAppVariantsByPlatform {
+  android?: MobileAppVariantEntry[];
+  ios?: MobileAppVariantEntry[];
+  flutter?: MobileAppVariantEntry[];
+}
+
+/**
+ * Per-platform "which variant is the default" pointer:
+ * `settings.mobileDefaultVariant[platform]`. The default variant is the one a
+ * run uses when nothing (test case / plan) specifies a variant. Absent = the
+ * literal `'default'` lane (the main upload).
+ */
+export interface MobileDefaultVariantByPlatform {
+  android?: string;
+  ios?: string;
+  flutter?: string;
+}
+
+/**
+ * The variant a run resolves to when no test/plan variant is set. Reads the
+ * per-platform pointer, falling back to the `'default'` lane.
+ */
+export function getDefaultVariantLabel(
+  settings: ProjectSettings | undefined | null,
+  platform: MobilePlatform,
+): string {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const ptr = (settings as any)?.mobileDefaultVariant as MobileDefaultVariantByPlatform | undefined;
+  const label = ptr?.[variantStoragePlatform(platform)];
+  return typeof label === 'string' && label.trim() ? label : DEFAULT_VARIANT_LABEL;
+}
+
+/**
+ * Which platform a variant's builds physically live under. Flutter apps are
+ * uploaded as a native Android `.apk` (there is no separate flutter binary),
+ * so their variant lanes are stored under `android`. Every variant read /
+ * default / resolution for flutter must therefore look at the android lane.
+ */
+export function variantStoragePlatform(platform: MobilePlatform): MobilePlatform {
+  return platform === 'flutter' ? 'android' : platform;
+}
+
+/** Build the settings patch that sets the default variant for a platform. */
+export function buildSetDefaultVariantPatch(
+  currentSettings: ProjectSettings | undefined | null,
+  platform: MobilePlatform,
+  label: string,
+): Record<string, unknown> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const existing = (currentSettings ?? {}) as any;
+  const ptr = (existing.mobileDefaultVariant as MobileDefaultVariantByPlatform | undefined) ?? {};
+  return { mobileDefaultVariant: { ...ptr, [platform]: label } };
+}
 
 /**
  * Loosely typed shape of `project.settings`. ProjectService doesn't
@@ -80,8 +180,24 @@ export interface MobileAppsByPlatform {
 export function getProjectMobileApp(
   settings: ProjectSettings | undefined | null,
   platform: MobilePlatform,
+  variantLabel?: string,
 ): MobileAppMetadata | undefined {
   if (!settings) return undefined;
+
+  // Which lane to read: an explicit variant wins; otherwise the project's
+  // configured default-variant pointer (which may itself be a named lane). An
+  // explicit 'default' means the literal default lane, not the pointer.
+  const effectiveLabel = (variantLabel && variantLabel.trim())
+    ? variantLabel
+    : getDefaultVariantLabel(settings, platform);
+
+  // Named lane → read its latest from the registry. No silent substitution —
+  // an absent lane returns undefined so callers don't install the wrong flavor.
+  if (effectiveLabel !== DEFAULT_VARIANT_LABEL) {
+    const entry = getProjectMobileVariants(settings, platform)
+      .find((v) => v.label === effectiveLabel);
+    return entry?.latest;
+  }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const apps = (settings as any).mobileApps as MobileAppsByPlatform | undefined;
@@ -144,30 +260,116 @@ export function getAllProjectMobileApps(
 }
 
 /**
- * Build the settings patch for a new upload.
+ * Read the variant registry for a platform: `settings.mobileAppVariants[platform]`.
  *
- * Always writes the platform-sharded slot. ALSO mirrors into the legacy
- * singular slot during the transition period — callers that still read
- * `settings.mobileApp` directly continue to see the latest upload (with
- * the same "last write wins across platforms" behaviour they had
- * before, which is a graceful degradation rather than a new bug).
+ * This is the per-platform list of named lanes mirrored for fast UI reads.
+ * The durable source of truth is `mobile_app_builds.variant_label`; the
+ * registry is rebuilt on every upload / rename / delete. When the registry
+ * is absent (projects that pre-date variants) we synthesise a single
+ * `'default'` entry from the legacy/shard slot so the Settings UI shows one
+ * lane without a data migration.
+ */
+export function getProjectMobileVariants(
+  settings: ProjectSettings | undefined | null,
+  platform: MobilePlatform,
+): MobileAppVariantEntry[] {
+  if (!settings) return [];
+
+  // `isDefault` follows the project's default-variant pointer (set-default),
+  // NOT a stored flag — so promoting a lane updates every badge consistently.
+  const defaultLabel = getDefaultVariantLabel(settings, platform);
+  // Flutter variants live under the android lane (shared .apk).
+  const lanePlatform = variantStoragePlatform(platform);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const registry = (settings as any).mobileAppVariants as MobileAppVariantsByPlatform | undefined;
+  const fromRegistry = registry?.[lanePlatform];
+  if (fromRegistry && fromRegistry.length > 0) {
+    return fromRegistry.map((v) => ({ ...v, isDefault: v.label === defaultLabel }));
+  }
+
+  // Virtual-fill: synthesise a default lane from the legacy/shard slot.
+  const slot = getProjectMobileApp(settings, platform, DEFAULT_VARIANT_LABEL);
+  return slot ? [{ label: DEFAULT_VARIANT_LABEL, isDefault: DEFAULT_VARIANT_LABEL === defaultLabel, latest: slot }] : [];
+}
+
+/**
+ * Build a settings patch that REMOVES a variant lane from the registry.
+ * Only touches `mobileAppVariants[platform]` — the legacy/shard slot is left
+ * alone (callers must not delete the default lane, which mirrors it).
+ */
+export function buildRemoveMobileVariantPatch(
+  currentSettings: ProjectSettings | undefined | null,
+  platform: MobilePlatform,
+  variantLabel: string,
+): Record<string, unknown> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const existing = (currentSettings ?? {}) as any;
+  const registry = (existing.mobileAppVariants as MobileAppVariantsByPlatform | undefined) ?? {};
+  const laneList = (registry[platform] ?? []).filter((v) => v.label !== variantLabel);
+  return { mobileAppVariants: { ...registry, [platform]: laneList } };
+}
+
+/**
+ * Build a settings patch that RELABELS a variant lane (`from` → `to`) in the
+ * registry, preserving its `latest`/`isDefault`. No-op fields for other lanes.
+ */
+export function buildRenameMobileVariantPatch(
+  currentSettings: ProjectSettings | undefined | null,
+  platform: MobilePlatform,
+  from: string,
+  to: string,
+): Record<string, unknown> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const existing = (currentSettings ?? {}) as any;
+  const registry = (existing.mobileAppVariants as MobileAppVariantsByPlatform | undefined) ?? {};
+  const laneList = (registry[platform] ?? []).map((v) =>
+    v.label === from ? { ...v, label: to } : v,
+  );
+  return { mobileAppVariants: { ...registry, [platform]: laneList } };
+}
+
+/**
+ * Build the settings patch for a new upload into `variantLabel`.
  *
- * The mirror can be removed once a grep confirms every read goes
- * through `getProjectMobileApp` / `getAllProjectMobileApps`.
+ * - DEFAULT lane: writes the legacy singular slot AND the platform shard (so
+ *   every existing reader keeps seeing the project's active app), plus the
+ *   registry entry.
+ * - NAMED lane: leaves the legacy/shard slot untouched (those mirror the
+ *   default lane) and only upserts this variant's registry entry, so a
+ *   Staging upload never changes what a default-lane resolve returns.
+ *
+ * The registry (`mobileAppVariants[platform]`) is a derived mirror — the
+ * durable source of truth is the `mobile_app_builds` table.
  */
 export function buildMobileAppSettingsPatch(
   currentSettings: ProjectSettings | undefined | null,
   platform: MobilePlatform,
   metadata: MobileAppMetadata,
+  variantLabel: string = DEFAULT_VARIANT_LABEL,
 ): Record<string, unknown> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const existing = (currentSettings ?? {}) as any;
-  const mobileApps: MobileAppsByPlatform = {
-    ...(existing.mobileApps as MobileAppsByPlatform | undefined),
-    [platform]: metadata,
-  };
-  return {
-    mobileApp: metadata,    // legacy mirror (TODO: remove after readers migrate)
-    mobileApps,             // new authoritative
-  };
+  const isDefaultLane = variantLabel === DEFAULT_VARIANT_LABEL;
+
+  // Upsert this lane into the per-platform registry.
+  const registry = (existing.mobileAppVariants as MobileAppVariantsByPlatform | undefined) ?? {};
+  const laneList = [...(registry[platform] ?? [])];
+  const idx = laneList.findIndex((v) => v.label === variantLabel);
+  const entry: MobileAppVariantEntry = { label: variantLabel, isDefault: isDefaultLane, latest: metadata };
+  if (idx >= 0) laneList[idx] = { ...laneList[idx], ...entry };
+  else laneList.push(entry);
+  const mobileAppVariants: MobileAppVariantsByPlatform = { ...registry, [platform]: laneList };
+
+  const patch: Record<string, unknown> = { mobileAppVariants };
+
+  if (isDefaultLane) {
+    patch.mobileApp = metadata; // legacy mirror (TODO: remove after readers migrate)
+    patch.mobileApps = {
+      ...(existing.mobileApps as MobileAppsByPlatform | undefined),
+      [platform]: metadata,
+    } satisfies MobileAppsByPlatform;
+  }
+
+  return patch;
 }

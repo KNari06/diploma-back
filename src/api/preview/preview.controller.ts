@@ -187,7 +187,7 @@ export async function createIntentTestCase(req: Request, res: Response): Promise
       return;
     }
 
-    const { projectId, name, description, startUrl, steps, flowId } = req.body;
+    const { projectId, name, description, startUrl, steps, flowId, mobileVariantLabel } = req.body;
 
     logger.info('[PREVIEW_CONTROLLER] Creating intent test case', {
       userId,
@@ -225,6 +225,7 @@ export async function createIntentTestCase(req: Request, res: Response): Promise
       startUrl: safeStartUrl,
       steps: steps || [],
       flowId,
+      ...(mobileVariantLabel !== undefined ? { mobileVariantLabel } : {}),
     });
 
     res.status(201).json({
@@ -383,7 +384,7 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
     }
 
     const { id } = req.params;
-    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers } = req.body;
+    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers, mobileVariantLabel } = req.body;
 
     logger.info('[PREVIEW_CONTROLLER] Updating intent test case', {
       intentTestCaseId: id,
@@ -557,6 +558,8 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       // Trigger contract and throws a ValidationError (→ 400) on a bad shape.
       // `undefined` leaves the column untouched; `[]` clears all triggers.
       triggers,
+      // Mobile per-test variant override. `undefined` leaves it; `null`/'' clears.
+      ...(mobileVariantLabel !== undefined ? { mobileVariantLabel } : {}),
     });
 
     logger.info('[PREVIEW_CONTROLLER] Successfully updated intent test case', {

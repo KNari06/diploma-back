@@ -597,6 +597,8 @@ export class RegressionRunService {
       commitSha?: string;
       /** Explicit mobile build pin from plan/run settings (wins over branch/commit). */
       buildId?: string;
+      /** Variant lane to resolve within (default lane when absent). */
+      variantLabel?: string;
     };
   }): Promise<RunResult> {
     const { planId, userId, trigger, parameters = {}, triggerContext: rawTriggerContext } = params;
@@ -635,14 +637,28 @@ export class RegressionRunService {
           });
         }
       }
-      const triggerContext =
-        plan.mobileBuildMode === 'pinned' && plan.pinnedMobileAppBuildId
-          ? { buildId: plan.pinnedMobileAppBuildId, ...(rawTriggerContext ?? {}) }
-          : rawTriggerContext;
-      if (triggerContext?.buildId) {
-        logger.info('[REGRESSION_RUN] triggerContext.buildId active', {
+      // Merge plan-level mobile selection (pin + variant) into the trigger
+      // context. Explicit caller context (webhook branch/commit/buildId) still
+      // wins — it's more specific than a plan default — so plan values only
+      // fill fields the caller left unset. `variantLabel` scopes the resolver
+      // to a named lane; pin still wins WITHIN that lane.
+      const triggerContext = (() => {
+        const base: { branch?: string; commitSha?: string; buildId?: string; variantLabel?: string } = {
+          ...(rawTriggerContext ?? {}),
+        };
+        if (plan.mobileBuildMode === 'pinned' && plan.pinnedMobileAppBuildId && base.buildId === undefined) {
+          base.buildId = plan.pinnedMobileAppBuildId;
+        }
+        if (plan.mobileVariantLabel && base.variantLabel === undefined) {
+          base.variantLabel = plan.mobileVariantLabel;
+        }
+        return Object.keys(base).length > 0 ? base : undefined;
+      })();
+      if (triggerContext?.buildId || triggerContext?.variantLabel) {
+        logger.info('[REGRESSION_RUN] mobile trigger context active', {
           planId,
           buildId: triggerContext.buildId,
+          variantLabel: triggerContext.variantLabel,
           fromPlanPin: plan.mobileBuildMode === 'pinned' && plan.pinnedMobileAppBuildId === triggerContext.buildId,
         });
       }

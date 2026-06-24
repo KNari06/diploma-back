@@ -31,7 +31,7 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function createFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { moduleId, name, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings } = req.body;
+    const { moduleId, name, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings, mobileVariantLabel } = req.body;
 
     // Validate moduleId required
     if (!moduleId) {
@@ -112,6 +112,7 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
       priority,
       preconditions,
       expectedResult,
+      ...(mobileVariantLabel !== undefined ? { mobileVariantLabel } : {}),
     });
 
     // Create initial test case
@@ -333,7 +334,7 @@ export async function listFlows(req: AuthenticatedRequest, res: Response): Promi
 export async function updateFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { name, moduleId, flowType, tags, priority, preconditions, expectedResult, orderIndex } = req.body;
+    const { name, moduleId, flowType, tags, priority, preconditions, expectedResult, orderIndex, mobileVariantLabel } = req.body;
     const userId = getUserId(req);
 
     const flow = await FlowService.update({
@@ -347,6 +348,7 @@ export async function updateFlow(req: AuthenticatedRequest, res: Response): Prom
       preconditions,
       expectedResult,
       orderIndex,
+      ...(mobileVariantLabel !== undefined ? { mobileVariantLabel } : {}),
     });
 
     const projectId = await resolveFlowProjectId(flow.moduleId, userId);

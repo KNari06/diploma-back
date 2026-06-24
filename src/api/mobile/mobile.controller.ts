@@ -18,6 +18,7 @@ import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
 import * as MobileAppService from '@/services/mobile/mobile-app.service';
+import * as MobileAppVariantService from '@/services/mobile/mobile-app-variant.service';
 import { MobileAppStorageService, trimMobileBuildField } from '@/services/storage/mobile-app-storage.service';
 import { VALID_PERMISSION_POLICIES } from '@/services/mobile/permission-policy.service';
 import {
@@ -65,6 +66,7 @@ export async function createMobileAppUploadUrl(req: Request, res: Response): Pro
     filename,
     platform: pickPlatform(req.body?.platform),
     declaredSize: parseContentLength(req.body?.contentLength),
+    variantLabel: trimmedString(req.body?.variant),
   });
 
   if ('kind' in result) {
@@ -116,6 +118,7 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
     commitSha: trimMobileBuildField(req.body?.commitSha),
     buildNumber: trimMobileBuildField(req.body?.buildNumber),
     ciRunId: trimMobileBuildField(req.body?.ciRunId),
+    variantLabel: trimmedString(req.body?.variant),
   });
 
   if ('kind' in result) {
@@ -127,13 +130,16 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
     success: true,
     mobileApp: result.mobileApp,
     build: result.build,
+    variant: result.variantLabel,
   });
 
-  // Fire-and-forget side-effects — must not block the response.
-  MobileAppStorageService.pruneOldBuilds(projectId, result.platform).catch((err) => {
+  // Fire-and-forget side-effects — must not block the response. Prune the
+  // SAME variant lane the build landed in (lanes prune independently).
+  MobileAppStorageService.pruneOldBuilds(projectId, result.platform, result.variantLabel).catch((err) => {
     logger.warn('[MOBILE_API] pruneOldBuilds failed (non-fatal)', {
       projectId,
       platform: result.platform,
+      variant: result.variantLabel,
       error: err instanceof Error ? err.message : String(err),
     });
   });
@@ -170,6 +176,9 @@ export async function getMobileApp(req: Request, res: Response): Promise<void> {
     success: true,
     mobileApp: result.mobileApp,
     ...(result.mobileApps ? { mobileApps: result.mobileApps } : {}),
+    ...(result.variants ? { variants: result.variants } : {}),
+    ...(result.defaultVariant ? { defaultVariant: result.defaultVariant } : {}),
+    maxVariants: result.maxVariants,
   });
 }
 
@@ -216,6 +225,7 @@ export async function listMobileAppBuilds(req: Request, res: Response): Promise<
     userId,
     pickPlatform(req.query.platform),
     limit,
+    trimmedString(req.query.variant),
   );
 
   if ('kind' in result) {
@@ -254,6 +264,77 @@ export async function patchMobileApp(req: Request, res: Response): Promise<void>
   }
 
   res.json({ success: true, mobileApp: result.mobileApp });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VARIANT MANAGEMENT (named lanes)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** DELETE /api/v1/mobile/projects/:projectId/app/variants/:label?platform=android */
+export async function deleteMobileAppVariant(req: Request, res: Response): Promise<void> {
+  const userId = requireUserId(req, res);
+  if (!userId) return;
+
+  const result = await MobileAppVariantService.deleteMobileAppVariant(
+    req.params.projectId,
+    userId,
+    pickPlatform(req.query.platform),
+    req.params.label,
+  );
+
+  if ('kind' in result) {
+    sendMobileAppError(res, result);
+    return;
+  }
+
+  res.json({ success: true, deletedBuilds: result.deletedBuilds });
+}
+
+/** PATCH /api/v1/mobile/projects/:projectId/app/variants/:label  Body: { name, platform? } */
+export async function renameMobileAppVariant(req: Request, res: Response): Promise<void> {
+  const userId = requireUserId(req, res);
+  if (!userId) return;
+
+  const name = trimmedString(req.body?.name);
+  if (!name) {
+    res.status(400).json({ success: false, error: 'name is required (non-empty string)' });
+    return;
+  }
+
+  const result = await MobileAppVariantService.renameMobileAppVariant(
+    req.params.projectId,
+    userId,
+    pickPlatform((req.query.platform as string) || req.body?.platform),
+    req.params.label,
+    name,
+  );
+
+  if ('kind' in result) {
+    sendMobileAppError(res, result);
+    return;
+  }
+
+  res.json({ success: true, variant: result.label, renamedBuilds: result.renamedBuilds });
+}
+
+/** PUT /api/v1/mobile/projects/:projectId/app/variants/:label/default  Body/query: { platform } */
+export async function setDefaultMobileAppVariant(req: Request, res: Response): Promise<void> {
+  const userId = requireUserId(req, res);
+  if (!userId) return;
+
+  const result = await MobileAppVariantService.setDefaultMobileVariant(
+    req.params.projectId,
+    userId,
+    pickPlatform((req.query.platform as string) || req.body?.platform),
+    req.params.label,
+  );
+
+  if ('kind' in result) {
+    sendMobileAppError(res, result);
+    return;
+  }
+
+  res.json({ success: true, defaultVariant: result.defaultVariant });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -8,6 +8,7 @@ import {
   PERMISSIONS,
   WorkspaceAccessService,
 } from '@/services/core/workspace-access.service';
+import { DEFAULT_VARIANT_LABEL, normaliseVariantOverride } from '@/services/mobile/project-mobile-app.helper';
 import { GitIntegrationService } from '@/services/integrations/git-integration.service';
 import { ScheduleService } from '@/services/testing/schedules/schedule.service';
 import { ValidationError } from '@/types';
@@ -27,6 +28,18 @@ import type {
     UpdateRegressionPlanParams,
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+
+/**
+ * Normalise a plan's mobile variant selection for storage. Blank / absent →
+ * null (the default lane). The literal 'default' lane is also stored as null
+ * so the run path has a single "no explicit variant" representation.
+ */
+function normalisePlanVariantLabel(raw: string | null | undefined): string | null {
+  // Same trim-to-null as flow / test-case overrides, but a plan additionally
+  // treats the literal 'default' lane as "inherit" (null).
+  const v = normaliseVariantOverride(raw);
+  return v === DEFAULT_VARIANT_LABEL ? null : v;
+}
 
 type RunStatus = RegressionPlanWithStats['lastRun'] extends { status: infer S } | null ? S : never;
 
@@ -50,7 +63,7 @@ export class RegressionPlanService {
    * @returns Created plan
    */
   static async create(params: CreateRegressionPlanParams): Promise<RegressionPlan> {
-    const { projectId, userId, name, description, isDefault, tags, automationConfig, notificationsEnabled, mobileBuildMode, pinnedMobileAppBuildId, items } = params;
+    const { projectId, userId, name, description, isDefault, tags, automationConfig, notificationsEnabled, mobileBuildMode, pinnedMobileAppBuildId, mobileVariantLabel, items } = params;
 
     logger.info('[REGRESSION_PLAN_SERVICE] Creating plan', {
       projectId,
@@ -90,6 +103,7 @@ export class RegressionPlanService {
         notifications_enabled: notificationsEnabled !== undefined ? notificationsEnabled : true,
         mobile_build_mode: resolvedBuildMode,
         pinned_mobile_app_build_id: resolvedBuildMode === 'pinned' ? pinnedMobileAppBuildId : null,
+        mobile_variant_label: normalisePlanVariantLabel(mobileVariantLabel),
       })
       .select('*')
       .single();
@@ -693,6 +707,7 @@ export class RegressionPlanService {
       notificationsEnabled,
       mobileBuildMode,
       pinnedMobileAppBuildId,
+      mobileVariantLabel,
     } = params;
 
     const updates: Record<string, any> = {};
@@ -734,6 +749,11 @@ export class RegressionPlanService {
       if (mobileBuildMode === undefined) {
         updates.mobile_build_mode = pinnedMobileAppBuildId ? 'pinned' : 'latest';
       }
+    }
+    // Variant selection — independent of the pin. `null` resets to the
+    // default lane; `undefined` leaves the saved variant untouched.
+    if (mobileVariantLabel !== undefined) {
+      updates.mobile_variant_label = normalisePlanVariantLabel(mobileVariantLabel);
     }
 
     // Handle is_default separately
@@ -1618,6 +1638,7 @@ export class RegressionPlanService {
       // so the run path doesn't have to handle absent values.
       mobileBuildMode: (row.mobile_build_mode as 'latest' | 'pinned') ?? 'latest',
       pinnedMobileAppBuildId: row.pinned_mobile_app_build_id ?? null,
+      mobileVariantLabel: row.mobile_variant_label ?? null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };

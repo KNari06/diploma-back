@@ -16,14 +16,18 @@ import { ProjectService } from '@/services/core/project.service';
 import {
   getProjectMobileApp,
   getAllProjectMobileApps,
+  getProjectMobileVariants,
+  getDefaultVariantLabel,
   buildMobileAppSettingsPatch,
+  getMaxMobileVariants,
+  DEFAULT_VARIANT_LABEL,
 } from '@/services/mobile/project-mobile-app.helper';
 import {
   MobileAppStorageService,
   MobileAppMetadata,
   type MobileAppBuildRecord,
 } from '@/services/storage/mobile-app-storage.service';
-import type { MobileAppsByPlatform } from '@/services/mobile/project-mobile-app.helper';
+import type { MobileAppsByPlatform, MobileAppVariantEntry } from '@/services/mobile/project-mobile-app.helper';
 import { MobileAppParserService, type ParsedAppInfo } from '@/services/mobile/mobile-app-parser.service';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { logger } from '@/utils/core/logger';
@@ -40,9 +44,40 @@ export type MobileAppError =
   | { kind: 'object_missing' }
   | { kind: 'object_empty' }
   | { kind: 'package_name_required' }
-  | { kind: 'build_record_failed' }
+  | { kind: 'build_record_failed'; code?: string; message?: string }
   | { kind: 'app_not_uploaded' }
-  | { kind: 'no_app_to_delete'; platform?: MobilePlatform };
+  | { kind: 'no_app_to_delete'; platform?: MobilePlatform }
+  | { kind: 'variant_limit'; max: number; platform: MobilePlatform }
+  | { kind: 'invalid_variant_name' }
+  | { kind: 'cannot_modify_default_variant' }
+  | { kind: 'variant_not_found'; label: string }
+  | { kind: 'variant_name_taken'; label: string };
+
+/**
+ * Guard the per-platform variant cap. The default lane and any already-existing
+ * label are always allowed; a brand-new label is refused once the platform is
+ * at `getMaxMobileVariants()` distinct labels. Returns an error tag or null.
+ */
+async function ensureVariantAllowed(
+  projectId: string,
+  platform: MobilePlatform,
+  variantLabel: string,
+): Promise<MobileAppError | null> {
+  if (variantLabel === DEFAULT_VARIANT_LABEL) return null;
+  const labels = await MobileAppStorageService.listVariantLabels(projectId, platform);
+  if (labels.includes(variantLabel)) return null;
+  if (labels.length >= getMaxMobileVariants()) {
+    return { kind: 'variant_limit', max: getMaxMobileVariants(), platform };
+  }
+  return null;
+}
+
+/** Normalise a client-supplied variant label; blank/absent → the default lane. */
+export function normaliseVariantLabel(raw: unknown): string {
+  if (typeof raw !== 'string') return DEFAULT_VARIANT_LABEL;
+  const t = raw.trim();
+  return t.length > 0 ? t : DEFAULT_VARIANT_LABEL;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // UPLOAD URL
@@ -54,6 +89,8 @@ export interface CreateUploadUrlInput {
   filename: string;
   platform: MobilePlatform;
   declaredSize: number | null;
+  /** Target variant lane; absent/blank → the default lane. */
+  variantLabel?: string;
 }
 
 export interface CreateUploadUrlOutput {
@@ -71,6 +108,7 @@ export async function createMobileAppUploadUrl(
   input: CreateUploadUrlInput,
 ): Promise<CreateUploadUrlOutput | MobileAppError> {
   const { projectId, userId, filename, platform, declaredSize } = input;
+  const variantLabel = normaliseVariantLabel(input.variantLabel);
 
   const ext = filename.toLowerCase().slice(filename.lastIndexOf('.'));
   if (!(ALLOWED_UPLOAD_EXTENSIONS as readonly string[]).includes(ext)) {
@@ -83,16 +121,22 @@ export async function createMobileAppUploadUrl(
   const project = await ProjectService.getProject(projectId, userId);
   if (!project) return { kind: 'project_not_found' };
 
+  // Fail fast before issuing an upload URL for a variant we'd reject anyway.
+  const capError = await ensureVariantAllowed(projectId, platform, variantLabel);
+  if (capError) return capError;
+
   const signed = await MobileAppStorageService.createSignedUploadUrl({
     workspaceId: project.workspace_id,
     projectId,
     platform,
     originalName: filename,
+    variantLabel,
   });
 
   logger.info('[MOBILE_APP_SERVICE] Issued signed upload URL', {
     projectId,
     platform,
+    variantLabel,
     storagePath: signed.storagePath,
     declaredSize,
     userId,
@@ -122,6 +166,8 @@ export interface FinalizeUploadInput {
   commitSha?: string;
   buildNumber?: string;
   ciRunId?: string;
+  /** Target variant lane; absent/blank → the default lane. */
+  variantLabel?: string;
 }
 
 export interface FinalizeUploadOutput {
@@ -130,6 +176,8 @@ export interface FinalizeUploadOutput {
   /** Whether `autoBootAndInstall` should be kicked off by the caller. Always true on success — kept as a flag so the HTTP layer owns side-effects. */
   shouldAutoBoot: true;
   platform: MobilePlatform;
+  /** Variant the build landed in — the HTTP layer prunes this lane. */
+  variantLabel: string;
 }
 
 /**
@@ -164,9 +212,15 @@ export async function finalizeMobileAppUpload(
     buildNumber,
     ciRunId,
   } = input;
+  const variantLabel = normaliseVariantLabel(input.variantLabel);
 
   const project = await ProjectService.getProject(projectId, userId);
   if (!project) return { kind: 'project_not_found' };
+
+  // Authoritative cap re-check (upload-url checked too, but the set may have
+  // changed between the two calls).
+  const capError = await ensureVariantAllowed(projectId, platform, variantLabel);
+  if (capError) return capError;
 
   // Defence in depth: refuse paths outside the project's tree. The
   // signed-URL issuer always emits `mobile-apps/{workspaceId}/{projectId}/…`,
@@ -250,24 +304,30 @@ export async function finalizeMobileAppUpload(
 
   // 1. Build row FIRST — if this fails the legacy slot must not point
   // at a binary with no audit-trail row.
-  const buildRow = await MobileAppStorageService.recordBuild(
+  const recorded = await MobileAppStorageService.recordBuild(
     metadata,
     { branch, commitSha, buildNumber, ciRunId, source: 'manual' },
-    { projectId, workspaceId: project.workspace_id, uploadedBy: userId },
+    { projectId, workspaceId: project.workspace_id, uploadedBy: userId, variantLabel },
   );
-  if (!buildRow) return { kind: 'build_record_failed' };
+  if ('error' in recorded) {
+    return { kind: 'build_record_failed', code: recorded.error.code, message: recorded.error.message };
+  }
+  const buildRow = recorded;
 
-  // 2. Merge into project.settings — keeps the OTHER platform's slot intact.
+  // 2. Merge into project.settings — keeps the OTHER platform's slot intact and
+  // only touches the legacy/shard mirror for the default lane.
   const settingsPatch = buildMobileAppSettingsPatch(
     project.settings as Record<string, unknown> | undefined,
     platform,
     metadata as unknown as MobileAppMetadata,
+    variantLabel,
   );
   await ProjectService.updateProject(projectId, userId, { settings: settingsPatch });
 
   logger.info('[MOBILE_APP_SERVICE] App finalized', {
     projectId,
     platform,
+    variantLabel,
     detectedFramework: parsed.framework ?? null,
     buildId: buildRow.id,
     storagePath: metadata.storagePath,
@@ -281,6 +341,7 @@ export async function finalizeMobileAppUpload(
     build: buildRow,
     shouldAutoBoot: true,
     platform,
+    variantLabel,
   };
 }
 
@@ -293,7 +354,15 @@ export interface GetMobileAppResult {
   mobileApp: MobileAppMetadata | null;
   /** Full per-platform dict. `undefined` when a single-platform filter was applied. */
   mobileApps?: MobileAppsByPlatform;
+  /** Named variant lanes. Single-platform array when filtered, else per-platform dict. */
+  variants?: MobileAppVariantEntry[] | Partial<Record<MobilePlatform, MobileAppVariantEntry[]>>;
+  /** Per-platform cap on named variants (echoed so the UI never hardcodes it). */
+  maxVariants: number;
+  /** The configured default variant label. Single string when filtered, else per-platform. */
+  defaultVariant?: string | Partial<Record<MobilePlatform, string>>;
 }
+
+const VARIANT_PLATFORMS: MobilePlatform[] = ['android', 'ios', 'flutter'];
 
 export async function getMobileApp(
   projectId: string,
@@ -303,14 +372,28 @@ export async function getMobileApp(
   const project = await ProjectService.getProject(projectId, userId);
   if (!project) return { kind: 'project_not_found' };
 
+  const maxVariants = getMaxMobileVariants();
+
   if (filterPlatform) {
     const slot = getProjectMobileApp(project.settings, filterPlatform) ?? null;
-    return { mobileApp: slot };
+    return {
+      mobileApp: slot,
+      variants: getProjectMobileVariants(project.settings, filterPlatform),
+      defaultVariant: getDefaultVariantLabel(project.settings, filterPlatform),
+      maxVariants,
+    };
   }
 
   const all = getAllProjectMobileApps(project.settings);
   const legacy = (project.settings?.mobileApp as MobileAppMetadata | undefined) ?? null;
-  return { mobileApp: legacy, mobileApps: all };
+  const variants: Partial<Record<MobilePlatform, MobileAppVariantEntry[]>> = {};
+  const defaultVariant: Partial<Record<MobilePlatform, string>> = {};
+  for (const p of VARIANT_PLATFORMS) {
+    const lanes = getProjectMobileVariants(project.settings, p);
+    if (lanes.length > 0) variants[p] = lanes;
+    defaultVariant[p] = getDefaultVariantLabel(project.settings, p);
+  }
+  return { mobileApp: legacy, mobileApps: all, variants, defaultVariant, maxVariants };
 }
 
 export async function listMobileAppBuilds(
@@ -318,11 +401,12 @@ export async function listMobileAppBuilds(
   userId: string,
   platform: MobilePlatform,
   limit: number,
+  variantLabel?: string,
 ): Promise<{ builds: unknown[] } | MobileAppError> {
   const project = await ProjectService.getProject(projectId, userId);
   if (!project) return { kind: 'project_not_found' };
 
-  const builds = await MobileAppStorageService.listBuilds(projectId, platform, limit);
+  const builds = await MobileAppStorageService.listBuilds(projectId, platform, limit, variantLabel);
   return { builds };
 }
 
@@ -383,7 +467,12 @@ export async function deleteMobileApp(
   if (!project) return { kind: 'project_not_found' };
 
   if (targetPlatform) {
-    const slot = getProjectMobileApp(project.settings, targetPlatform);
+    // DELETE /app clears the MAIN app (the default lane / legacy slot). Pass
+    // DEFAULT_VARIANT_LABEL explicitly so a project that promoted a named
+    // variant to default doesn't have its variant binary deleted here (the
+    // pointer would otherwise make getProjectMobileApp return that lane's
+    // build). Named variants are removed via DELETE /app/variants/:label.
+    const slot = getProjectMobileApp(project.settings, targetPlatform, DEFAULT_VARIANT_LABEL);
     if (!slot) return { kind: 'no_app_to_delete', platform: targetPlatform };
 
     await MobileAppStorageService.deleteApp(slot.storagePath);

@@ -236,19 +236,23 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
         // Record in `mobile_app_builds` BEFORE updating the legacy slot —
         // if the insert fails we don't want a legacy pointer to a build
         // that isn't audit-traceable.
-        const buildRow = await MobileAppStorageService.recordBuild(
+        const recorded = await MobileAppStorageService.recordBuild(
           metadata,
           { branch, commitSha, buildNumber, ciRunId, source: 'ci' },
           { projectId, workspaceId, uploadedBy: userId },
         );
-        if (!buildRow) {
+        if ('error' in recorded) {
           await redisConnection.del(lockKey);
-          res.status(409).json({
+          const isDup = recorded.error.code === '23505';
+          res.status(isDup ? 409 : 500).json({
             success: false,
-            error: 'Failed to record build in version history (likely duplicate commit_sha for this project+platform).',
+            error: isDup
+              ? 'A build for this commit already exists in this project+platform+variant.'
+              : `Failed to record build in version history: ${recorded.error.message || 'unknown database error'}`,
           });
           return;
         }
+        const buildRow = recorded;
 
         // Update project settings (legacy slot — points at the newest
         // upload so the editor warm-up resolves to the right binary).
@@ -310,17 +314,24 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
       }
     } else {
       // No fresh upload — use the Phase 5 resolver to pick the existing build.
+      // Resolve WITHIN the project's configured default variant lane (same as
+      // the regression dispatcher's project-default fallback) so a project that
+      // promoted e.g. 'Production' as its default gets that flavor, not the
+      // bare 'default' lane. Returns 'default' when no variant is promoted, so
+      // behaviour is unchanged for projects without named variants.
       // Precedence inside the resolver (same as webhook / manual runs):
       //   ctx.commitSha > ctx.branch > legacy project.settings.mobileApp
       // This lets "CI kicks off a run without uploading but with git context"
       // reuse a previously-uploaded build for the same commit / branch. When
       // no git metadata is supplied the resolver falls through to the legacy
       // slot, matching the pre-Phase-5 behaviour for this branch of the flow.
+      const variantLabel = await MobileAppStorageService.getProjectDefaultVariant(projectId, platform);
       const resolved = await MobileAppStorageService.resolveAppForRun({
         projectId,
         platform,
         branch,
         commitSha,
+        variantLabel,
       });
       if (resolved?.storagePath) {
         appStoragePath = resolved.storagePath;
