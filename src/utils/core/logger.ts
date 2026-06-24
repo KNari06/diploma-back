@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import winston from 'winston';
 import Transport from 'winston-transport';
+import LokiTransport from 'winston-loki';
 import { logBuffer } from './log-buffer';
 import { PROCESS_KIND, publishLogEntry } from './log-bridge';
 
@@ -250,6 +251,22 @@ const transports: winston.transport[] = [
       })
     ),
   }),
+  // Grafana Loki push — only when LOKI_HOST is configured (prod). Labels let us
+  // split streams by process (api / worker / scheduler) in Grafana. The transport
+  // batches and ships over HTTP; a connection error is logged once to the console
+  // and never breaks the app (telemetry must never take down the host process).
+  ...(process.env.LOKI_HOST
+    ? [
+        new LokiTransport({
+          host: process.env.LOKI_HOST,
+          basicAuth: process.env.LOKI_BASIC_AUTH,
+          labels: { app: PROCESS_KIND, env: 'prod' },
+          json: true,
+          replaceTimestamp: true,
+          onConnectionError: (e) => console.error('[loki]', e),
+        }),
+      ]
+    : []),
 ];
 
 // Always create error.log file (critical for production monitoring)
