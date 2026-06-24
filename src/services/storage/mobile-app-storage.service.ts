@@ -11,6 +11,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { detectBuildInfoFromBuffer } from '@/services/mobile/archive-platform-detect';
+import { DEFAULT_VARIANT_LABEL, getDefaultVariantLabel, variantStoragePlatform } from '@/services/mobile/project-mobile-app.helper';
 import { getBlobStore } from './blob';
 import { logger } from '@/utils/core/logger';
 import path from 'path';
@@ -94,7 +95,19 @@ export interface MobileAppBuildRecord extends MobileAppMetadata {
   buildNumber: string | null;
   ciRunId: string | null;
   source: 'manual' | 'ci' | 'webhook';
+  /** Named variant lane this build belongs to (default = 'default'). */
+  variantLabel: string;
 }
+
+/**
+ * Result of `recordBuild`. Either the created row, or the REAL database error
+ * (Postgres code + message) so callers surface an accurate reason instead of
+ * guessing. `code === '23505'` is a unique violation (duplicate commit in a
+ * variant). Discriminate with `'error' in result`.
+ */
+export type RecordBuildResult =
+  | MobileAppBuildRecord
+  | { error: { code?: string; message: string } };
 
 /**
  * Context passed to `resolveAppForRun`. The resolver walks precedence:
@@ -104,6 +117,11 @@ export interface MobileAppBuildRecord extends MobileAppMetadata {
  * regression against build X regardless of git"). The fallback to
  * latest-on-project means a manually-uploaded APK without any git
  * metadata is still picked up automatically.
+ *
+ * `variantLabel` scopes the commit / branch / latest stages to a single
+ * named variant lane. Omitted (or 'default') = the default lane, which after
+ * backfill is every pre-variant build — so an unset variant resolves exactly
+ * as before. The explicit `buildId` pin still wins over the variant.
  */
 export interface MobileAppResolveContext {
   projectId: string;
@@ -114,6 +132,8 @@ export interface MobileAppResolveContext {
   commitSha?: string;
   /** Branch to match latest-on-branch. */
   branch?: string;
+  /** Variant lane to resolve within. Defaults to the 'default' lane. */
+  variantLabel?: string;
 }
 
 /**
@@ -139,6 +159,18 @@ export const trimMobileBuildField = (v: unknown): string | undefined => {
   return t.length > 0 ? t : undefined;
 };
 
+/**
+ * Path segment for a variant lane. The default lane gets NO segment so its
+ * objects keep the exact path they had before variants existed (a named lane
+ * gets a sanitised `<label>/` subfolder). Sanitisation mirrors the filename
+ * rule so a free-text label can't escape the project tree.
+ */
+function variantPathSegment(variantLabel?: string): string {
+  if (!variantLabel || variantLabel === DEFAULT_VARIANT_LABEL) return '';
+  const safe = variantLabel.replace(/[^a-zA-Z0-9_-]/g, '_');
+  return `${safe}/`;
+}
+
 // ── Service ────────────────────────────────────────────────────────
 
 export class MobileAppStorageService {
@@ -153,9 +185,10 @@ export class MobileAppStorageService {
       projectId: string;
       platform: MobilePlatform;
       packageName?: string;
+      variantLabel?: string;
     },
   ): Promise<MobileAppMetadata> {
-    const { workspaceId, projectId, platform, packageName } = params;
+    const { workspaceId, projectId, platform, packageName, variantLabel } = params;
 
     // Validate file size
     if (file.size > MAX_FILE_SIZE) {
@@ -176,7 +209,7 @@ export class MobileAppStorageService {
     const timestamp = Date.now();
     const safeName = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
     const fileName = `${safeName}_${timestamp}${ext}`;
-    const storagePath = `mobile-apps/${workspaceId}/${projectId}/${platform}/${fileName}`;
+    const storagePath = `mobile-apps/${workspaceId}/${projectId}/${platform}/${variantPathSegment(variantLabel)}${fileName}`;
 
     logger.info('[MOBILE_APP_STORAGE] Uploading app', {
       projectId,
@@ -256,6 +289,7 @@ export class MobileAppStorageService {
     projectId: string;
     platform: MobilePlatform;
     originalName: string;
+    variantLabel?: string;
   }): { storagePath: string; ext: string } {
     const ext = path.extname(params.originalName).toLowerCase();
     if (!ALLOWED_EXTENSIONS.includes(ext)) {
@@ -265,7 +299,7 @@ export class MobileAppStorageService {
     }
     const safeName = path.basename(params.originalName, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
     const fileName = `${safeName}_${Date.now()}${ext}`;
-    const storagePath = `mobile-apps/${params.workspaceId}/${params.projectId}/${params.platform}/${fileName}`;
+    const storagePath = `mobile-apps/${params.workspaceId}/${params.projectId}/${params.platform}/${variantPathSegment(params.variantLabel)}${fileName}`;
     return { storagePath, ext };
   }
 
@@ -283,6 +317,7 @@ export class MobileAppStorageService {
     projectId: string;
     platform: MobilePlatform;
     originalName: string;
+    variantLabel?: string;
   }): Promise<{ uploadUrl: string; token: string; storagePath: string }> {
     const { storagePath } = this.buildStoragePath(params);
 
@@ -400,8 +435,8 @@ export class MobileAppStorageService {
   static async recordBuild(
     metadata: MobileAppMetadata,
     buildMeta: MobileAppBuildMetadata,
-    ctx: { projectId: string; workspaceId?: string; uploadedBy?: string },
-  ): Promise<MobileAppBuildRecord | null> {
+    ctx: { projectId: string; workspaceId?: string; uploadedBy?: string; variantLabel?: string },
+  ): Promise<RecordBuildResult> {
     try {
       const { data, error } = await supabaseAdmin
         .from('mobile_app_builds')
@@ -410,6 +445,7 @@ export class MobileAppStorageService {
           workspace_id: ctx.workspaceId ?? null,
           uploaded_by: ctx.uploadedBy ?? null,
           platform: metadata.platform,
+          variant_label: ctx.variantLabel ?? DEFAULT_VARIANT_LABEL,
           branch: buildMeta.branch ?? null,
           commit_sha: buildMeta.commitSha ?? null,
           build_number: buildMeta.buildNumber ?? null,
@@ -436,13 +472,14 @@ export class MobileAppStorageService {
         logger[isDup ? 'info' : 'error']('[MOBILE_APP_STORAGE] recordBuild failed', {
           projectId: ctx.projectId,
           platform: metadata.platform,
+          variantLabel: ctx.variantLabel ?? DEFAULT_VARIANT_LABEL,
           commitSha: buildMeta.commitSha,
           versionName: metadata.versionName,
           versionCode: metadata.versionCode,
           isDuplicate: isDup,
           error: error?.message,
         });
-        return null;
+        return { error: { code: error?.code, message: error?.message || 'Insert returned no row' } };
       }
 
       logger.info('[MOBILE_APP_STORAGE] Recorded build', {
@@ -458,10 +495,9 @@ export class MobileAppStorageService {
 
       return this.mapBuildRow(data);
     } catch (err) {
-      logger.error('[MOBILE_APP_STORAGE] recordBuild threw', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return null;
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error('[MOBILE_APP_STORAGE] recordBuild threw', { error: message });
+      return { error: { message } };
     }
   }
 
@@ -488,7 +524,9 @@ export class MobileAppStorageService {
   }
 
   /**
-   * Delete builds beyond `BUILD_HISTORY_LIMIT` for a (project, platform).
+   * Delete builds beyond `BUILD_HISTORY_LIMIT` for a (project, platform,
+   * variant). Pruning is PER VARIANT so a Staging upload never evicts a
+   * Production build — each lane keeps its own `BUILD_HISTORY_LIMIT` newest.
    * Storage objects are removed first, then the rows. `ON DELETE SET NULL`
    * on `test_executions.mobile_app_build_id` means historical runs survive
    * — they just lose the hard pointer to the binary.
@@ -499,6 +537,7 @@ export class MobileAppStorageService {
   static async pruneOldBuilds(
     projectId: string,
     platform: MobilePlatform,
+    variantLabel: string = DEFAULT_VARIANT_LABEL,
   ): Promise<void> {
     try {
       const { data, error } = await supabaseAdmin
@@ -506,12 +545,14 @@ export class MobileAppStorageService {
         .select('id, storage_path, uploaded_at')
         .eq('project_id', projectId)
         .eq('platform', platform)
+        .eq('variant_label', variantLabel)
         .order('uploaded_at', { ascending: false });
       if (error || !data) {
         logger.warn('[MOBILE_APP_STORAGE] pruneOldBuilds list failed', {
           error: error?.message,
           projectId,
           platform,
+          variantLabel,
         });
         return;
       }
@@ -543,6 +584,7 @@ export class MobileAppStorageService {
       logger.info('[MOBILE_APP_STORAGE] Pruned old builds', {
         projectId,
         platform,
+        variantLabel,
         deletedCount: ids.length,
         retained: BUILD_HISTORY_LIMIT,
       });
@@ -573,6 +615,17 @@ export class MobileAppStorageService {
   static async resolveAppForRun(
     ctx: MobileAppResolveContext,
   ): Promise<MobileAppBuildRecord | null> {
+    // Variant lane to resolve within. Unset = 'default', which after backfill
+    // is every pre-variant build, so an unset variant resolves as before. The
+    // legacy/shard fallbacks below only apply to the default lane (a named
+    // variant with no builds must NOT install the default flavor).
+    const variant = ctx.variantLabel ?? DEFAULT_VARIANT_LABEL;
+    const isDefaultLane = variant === DEFAULT_VARIANT_LABEL;
+    // Named flutter variants live under the android lane (shared .apk), so the
+    // variant-scoped stages query android for them. The DEFAULT lane keeps the
+    // existing flutter→android fallback chain (stages 5/6) untouched.
+    const variantPlatform = !isDefaultLane ? variantStoragePlatform(ctx.platform) : ctx.platform;
+
     // 1. Explicit buildId pin (project-scoped so callers can't reach
     // builds belonging to another project).
     if (ctx.buildId) {
@@ -593,31 +646,34 @@ export class MobileAppStorageService {
       });
     }
 
-    // 2. Commit pin — unique index guarantees at most one row.
+    // 2. Commit pin — unique index (per variant) guarantees at most one row.
     if (ctx.commitSha) {
       const { data } = await supabaseAdmin
         .from('mobile_app_builds')
         .select('*')
         .eq('project_id', ctx.projectId)
-        .eq('platform', ctx.platform)
+        .eq('platform', variantPlatform)
+        .eq('variant_label', variant)
         .eq('commit_sha', ctx.commitSha)
         .maybeSingle();
       if (data) {
         logger.debug('[MOBILE_APP_STORAGE] resolver matched commit', {
           projectId: ctx.projectId,
           commitSha: ctx.commitSha,
+          variant,
         });
         return this.mapBuildRow(data);
       }
     }
 
-    // 3. Latest on branch.
+    // 3. Latest on branch (within the variant).
     if (ctx.branch) {
       const { data } = await supabaseAdmin
         .from('mobile_app_builds')
         .select('*')
         .eq('project_id', ctx.projectId)
-        .eq('platform', ctx.platform)
+        .eq('platform', variantPlatform)
+        .eq('variant_label', variant)
         .eq('branch', ctx.branch)
         .order('uploaded_at', { ascending: false })
         .limit(1)
@@ -626,21 +682,23 @@ export class MobileAppStorageService {
         logger.debug('[MOBILE_APP_STORAGE] resolver matched branch', {
           projectId: ctx.projectId,
           branch: ctx.branch,
+          variant,
         });
         return this.mapBuildRow(data);
       }
     }
 
-    // 4. Latest build for the project + platform. Now that every upload
-    // (manual + CI) creates a `mobile_app_builds` row, this stage covers
-    // the "user uploaded an APK from the UI without any git context"
-    // case that previously fell through to the legacy slot.
+    // 4. Latest build for the (project, platform, variant). Now that every
+    // upload (manual + CI) creates a `mobile_app_builds` row, this stage covers
+    // the "user uploaded an APK from the UI without any git context" case that
+    // previously fell through to the legacy slot.
     {
       const { data } = await supabaseAdmin
         .from('mobile_app_builds')
         .select('*')
         .eq('project_id', ctx.projectId)
-        .eq('platform', ctx.platform)
+        .eq('platform', variantPlatform)
+        .eq('variant_label', variant)
         .order('uploaded_at', { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -648,10 +706,22 @@ export class MobileAppStorageService {
         logger.debug('[MOBILE_APP_STORAGE] resolver matched latest-on-project', {
           projectId: ctx.projectId,
           platform: ctx.platform,
+          variant,
           buildId: data.id,
         });
         return this.mapBuildRow(data);
       }
+    }
+
+    // Named variants stop here: no legacy/shard/flutter fallback (those mirror
+    // the DEFAULT lane — substituting them would install the wrong flavor).
+    if (!isDefaultLane) {
+      logger.debug('[MOBILE_APP_STORAGE] resolver found no build in variant', {
+        projectId: ctx.projectId,
+        platform: ctx.platform,
+        variant,
+      });
+      return null;
     }
 
     // 5. Legacy fallback — `projects.settings.mobileApp`. Read and adapt
@@ -678,6 +748,7 @@ export class MobileAppStorageService {
         buildNumber: null,
         ciRunId: null,
         source: 'manual',
+        variantLabel: DEFAULT_VARIANT_LABEL,
       } as unknown as MobileAppBuildRecord;
     }
 
@@ -730,12 +801,17 @@ export class MobileAppStorageService {
     projectId: string,
     platform: MobilePlatform,
     limit = 20,
+    variantLabel: string = DEFAULT_VARIANT_LABEL,
   ): Promise<MobileAppBuildRecord[]> {
+    // Always scope to a single lane. An absent variant means the default lane,
+    // NOT "every lane" — otherwise the build picker would intermix Production /
+    // Staging / Dev builds and let a user pin a build from the wrong flavor.
     const { data, error } = await supabaseAdmin
       .from('mobile_app_builds')
       .select('*')
       .eq('project_id', projectId)
       .eq('platform', platform)
+      .eq('variant_label', variantLabel)
       .order('uploaded_at', { ascending: false })
       .limit(Math.min(Math.max(limit, 1), 200));
     if (error) {
@@ -743,6 +819,116 @@ export class MobileAppStorageService {
       return [];
     }
     return (data || []).map((row) => this.mapBuildRow(row));
+  }
+
+  /**
+   * Distinct variant labels that have at least one build for a
+   * (project, platform). Used to enforce the per-platform variant cap and to
+   * build the variant registry. Rows are bounded (pruned per lane), so the
+   * in-memory dedupe is cheap.
+   */
+  static async listVariantLabels(
+    projectId: string,
+    platform: MobilePlatform,
+  ): Promise<string[]> {
+    const { data, error } = await supabaseAdmin
+      .from('mobile_app_builds')
+      .select('variant_label')
+      .eq('project_id', projectId)
+      .eq('platform', platform);
+    if (error) {
+      logger.warn('[MOBILE_APP_STORAGE] listVariantLabels failed', { error: error.message, projectId, platform });
+      return [];
+    }
+    const labels = new Set<string>();
+    for (const row of data ?? []) labels.add((row as { variant_label?: string }).variant_label ?? DEFAULT_VARIANT_LABEL);
+    return [...labels];
+  }
+
+  /**
+   * Delete EVERY build in a variant lane: storage objects first, then rows.
+   * Used when a user removes a named variant. Returns the number of rows
+   * deleted. Best-effort on storage (orphan objects are recoverable; orphan
+   * rows are not), authoritative on rows.
+   */
+  static async deleteVariantBuilds(
+    projectId: string,
+    platform: MobilePlatform,
+    variantLabel: string,
+  ): Promise<number> {
+    const { data, error } = await supabaseAdmin
+      .from('mobile_app_builds')
+      .select('id, storage_path')
+      .eq('project_id', projectId)
+      .eq('platform', platform)
+      .eq('variant_label', variantLabel);
+    if (error) {
+      logger.warn('[MOBILE_APP_STORAGE] deleteVariantBuilds list failed', { error: error.message, projectId, platform, variantLabel });
+      return 0;
+    }
+    const rows = data ?? [];
+    if (rows.length === 0) return 0;
+
+    const storagePaths = rows.map((r) => (r as { storage_path?: string }).storage_path).filter(Boolean) as string[];
+    if (storagePaths.length > 0) {
+      await getBlobStore().remove(storagePaths); // store logs its own partial failures
+    }
+    const ids = rows.map((r) => (r as { id: string }).id);
+    const { error: delErr } = await supabaseAdmin.from('mobile_app_builds').delete().in('id', ids);
+    if (delErr) {
+      logger.warn('[MOBILE_APP_STORAGE] deleteVariantBuilds row delete failed', { error: delErr.message, projectId, platform, variantLabel });
+      return 0;
+    }
+    logger.info('[MOBILE_APP_STORAGE] Deleted variant builds', { projectId, platform, variantLabel, deletedCount: ids.length });
+    return ids.length;
+  }
+
+  /**
+   * Relabel every build in a lane (`from` → `to`). Storage objects keep their
+   * paths (the path is opaque — read from the row, never recomputed). Returns
+   * the number of rows updated.
+   */
+  static async renameVariantBuilds(
+    projectId: string,
+    platform: MobilePlatform,
+    from: string,
+    to: string,
+  ): Promise<number> {
+    const { data, error } = await supabaseAdmin
+      .from('mobile_app_builds')
+      .update({ variant_label: to })
+      .eq('project_id', projectId)
+      .eq('platform', platform)
+      .eq('variant_label', from)
+      .select('id');
+    if (error) {
+      logger.warn('[MOBILE_APP_STORAGE] renameVariantBuilds failed', { error: error.message, projectId, platform, from, to });
+      return 0;
+    }
+    const count = (data ?? []).length;
+    logger.info('[MOBILE_APP_STORAGE] Renamed variant builds', { projectId, platform, from, to, count });
+    return count;
+  }
+
+  /**
+   * The default variant label configured for a (project, platform) — the lane a
+   * run uses when neither the test case nor the plan specifies a variant. Reads
+   * the `projects.settings.mobileDefaultVariant` pointer; 'default' when unset.
+   */
+  static async getProjectDefaultVariant(
+    projectId: string,
+    platform: MobilePlatform,
+  ): Promise<string> {
+    const { data, error } = await supabaseAdmin
+      .from('projects')
+      .select('settings')
+      .eq('id', projectId)
+      .maybeSingle();
+    if (error) {
+      logger.warn('[MOBILE_APP_STORAGE] getProjectDefaultVariant failed', { error: error.message, projectId });
+      return DEFAULT_VARIANT_LABEL;
+    }
+    return getDefaultVariantLabel(data?.settings as Record<string, unknown> | undefined, platform);
   }
 
   /**
@@ -790,6 +976,7 @@ export class MobileAppStorageService {
       buildNumber: row.build_number ?? null,
       ciRunId: row.ci_run_id ?? null,
       source: row.source ?? 'manual',
+      variantLabel: row.variant_label ?? DEFAULT_VARIANT_LABEL,
     };
   }
 }

@@ -47,6 +47,7 @@ interface FlowSummary {
   platform?: string;
   priority?: string;
   orderIndex: number | null;
+  mobileVariantLabel?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -200,7 +201,7 @@ export class PlatformTreeService {
     // Get paginated flows + count in single query
     const flowsResult = await supabaseAdmin
       .from('test_flows')
-      .select('id, module_id, name, flow_type, platform, priority, order_index, created_at, updated_at', { count: 'exact' })
+      .select('id, module_id, name, flow_type, platform, priority, order_index, created_at, updated_at, mobile_variant_label', { count: 'exact' })
       .eq('module_id', moduleId)
       .eq('user_id', userId)
       .order('order_index', { ascending: true, nullsFirst: false })
@@ -230,6 +231,7 @@ export class PlatformTreeService {
           platform: f.platform || undefined,
           priority: f.priority || undefined,
           orderIndex: f.order_index,
+          mobileVariantLabel: f.mobile_variant_label ?? null,
           createdAt: f.created_at,
           updatedAt: f.updated_at || f.created_at,
         })),
@@ -263,7 +265,7 @@ export class PlatformTreeService {
       // 1. Flow itself
       supabaseAdmin
         .from('test_flows')
-        .select('id, module_id, name, flow_type, platform, priority, order_index, created_at, updated_at')
+        .select('id, module_id, name, flow_type, platform, priority, order_index, created_at, updated_at, mobile_variant_label')
         .eq('id', flowId)
         .eq('user_id', userId)
         .single(),
@@ -332,6 +334,7 @@ export class PlatformTreeService {
         platform: flowData.platform || undefined,
         priority: flowData.priority || undefined,
         orderIndex: flowData.order_index,
+        mobileVariantLabel: flowData.mobile_variant_label ?? null,
         createdAt: flowData.created_at,
         updatedAt: flowData.updated_at || flowData.created_at,
       },

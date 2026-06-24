@@ -1,5 +1,6 @@
 import * as regressionDb from './db/regression.db';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
+import { FlowService } from '@/services/testing/flows/flow.service';
 import { logger } from '@/utils/core/logger';
 import { dbAdminService } from '@/db/supabase';
 import { IntelligentTestStorageService } from '../results/intelligent-test-storage.service';
@@ -40,7 +41,7 @@ export class MobileTestDispatcherService {
      * Undefined for manual / scheduled runs → resolver falls back to
      * legacy `projects.settings.mobileApp`.
      */
-    triggerContext?: { branch?: string; commitSha?: string; buildId?: string },
+    triggerContext?: { branch?: string; commitSha?: string; buildId?: string; variantLabel?: string },
     /**
      * Phase 6: runtime parameters from the caller (e.g. `runPlan({ parameters })`).
      * Applied to `intentCase.steps_json` before stitching so placeholders in
@@ -111,9 +112,33 @@ export class MobileTestDispatcherService {
       );
     }
 
-    // Phase 5: resolve which APK to install.
-    // Precedence inside the resolver:
-    //   triggerContext.commitSha > triggerContext.branch > legacy project.settings.mobileApp
+    // Effective variant lane, by precedence:
+    //   test-case override > flow override > plan variant > project
+    //   default-variant pointer > 'default'. Each lower tier is consulted only
+    //   when the higher ones are unset (avoids extra reads on the common path).
+    const testVariant = typeof intentCase.mobile_variant_label === 'string' && intentCase.mobile_variant_label.trim()
+      ? intentCase.mobile_variant_label.trim()
+      : undefined;
+    let flowVariant: string | undefined;
+    if (!testVariant && intentCase.flow_id) {
+      flowVariant = (await FlowService.getMobileVariantLabel(intentCase.flow_id)) ?? undefined;
+    }
+    let variantLabel = testVariant ?? flowVariant ?? triggerContext?.variantLabel;
+    let variantSource = testVariant ? 'test' : flowVariant ? 'flow' : (triggerContext?.variantLabel ? 'plan' : 'project-default');
+    if (!variantLabel) {
+      variantLabel = await MobileAppStorageService.getProjectDefaultVariant(intentCase.project_id, platform);
+      variantSource = 'project-default';
+    }
+    if (variantLabel) {
+      logger.debug('[MOBILE-DISPATCH] resolved variant lane', {
+        testCaseId: intentCase.id,
+        variantLabel,
+        source: variantSource,
+      });
+    }
+
+    // Phase 5: resolve which APK to install. Precedence inside the resolver:
+    //   buildId pin > commitSha > branch > latest-in-variant > legacy.
     // Returns null only when the project has NEVER had an APK uploaded —
     // `appStoragePath` stays undefined and the mobile job handler runs
     // steps without installing anything (pre-Phase-5 behaviour for empty
@@ -125,6 +150,7 @@ export class MobileTestDispatcherService {
       buildId: triggerContext?.buildId,
       branch: triggerContext?.branch,
       commitSha: triggerContext?.commitSha,
+      variantLabel,
     });
 
     // 3. Extract intent steps from steps_json via the shared IntentStep

@@ -12,6 +12,7 @@ import type { CompiledStepPlan, IntentStep, IntentTestCase, StepEvidence } from 
 import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 import { emitTestCaseMutated } from '@/websocket/helpers/project-mutation-emit';
 import { validateTriggers, sanitizeTriggers } from '@/services/mobile/trigger-validation.util';
+import { normaliseVariantOverride } from '@/services/mobile/project-mobile-app.helper';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Per-testCase in-memory mutex (prevents concurrent read-modify-write races)
@@ -116,12 +117,19 @@ export class IntentTestCaseService {
     importId?: string;
     sourceStatus?: string;
     stepsDegraded?: boolean;
+    /**
+     * Mobile-only per-test variant override. Blank/undefined → inherit
+     * (plan → project default → 'default'). When set, this test always runs
+     * against the named variant lane regardless of the plan.
+     */
+    mobileVariantLabel?: string | null;
   }): Promise<IntentTestCase> {
     const {
       projectId, userId, name, description, startUrl, steps, flowId,
       status = 'draft', kind = 'standalone', platform = 'web',
       preconditions, importId, sourceStatus, stepsDegraded,
     } = params;
+    const mobileVariantLabel = normaliseVariantOverride(params.mobileVariantLabel);
     // Explicit `null` from the caller means "no opinion" → store NULL.
     // Anything else (undefined / valid enum) falls back to 'medium'.
     const priority: 'critical' | 'high' | 'medium' | 'low' | null =
@@ -199,6 +207,8 @@ export class IntentTestCaseService {
       ...(importId !== undefined && { import_id: importId }),
       ...(sourceStatus !== undefined && { source_status: sourceStatus }),
       ...(stepsDegraded !== undefined && { steps_degraded: stepsDegraded }),
+      // Mobile per-test variant override (null = inherit).
+      mobile_variant_label: mobileVariantLabel,
       resource_bindings: resourceBindings,
     });
 
@@ -463,6 +473,8 @@ export class IntentTestCaseService {
      * a malformed entry throws and surfaces as a 400.
      */
     triggers?: unknown;
+    /** Mobile per-test variant override. `null` clears it (inherit); `undefined` leaves it untouched. */
+    mobileVariantLabel?: string | null;
   }): Promise<IntentTestCase> {
     // Serialize concurrent writes to the same test case via the same in-process
     // mutex used by updateStepFromPreviewApply / updateStepAfterHeal /
@@ -471,11 +483,15 @@ export class IntentTestCaseService {
     // that the runner just wrote. No reentrancy risk — none of the already-
     // mutex'd methods call update() internally.
     return withTestCaseMutex(params.id, async () => {
-      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers } = params;
+      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers, mobileVariantLabel } = params;
 
       const updates: Record<string, any> = {};
       if (name !== undefined) updates.name = name;
       if (description !== undefined) updates.description = description;
+      if (mobileVariantLabel !== undefined) {
+        // `null` (or blank) clears the override → inherit. A non-blank string pins it.
+        updates.mobile_variant_label = normaliseVariantOverride(mobileVariantLabel);
+      }
       if (startUrl !== undefined) updates.start_url = startUrl;
       if (url !== undefined) updates.url = url;
       if (resourceBindings !== undefined) {
@@ -792,6 +808,7 @@ export class IntentTestCaseService {
       status: row.status || 'draft',
       kind: row.kind || 'standalone',
       platform: row.platform || 'web',
+      mobileVariantLabel: row.mobile_variant_label ?? null,
 
       // Replay data
       replayStrategy: row.replay_strategy || undefined,

@@ -268,6 +268,8 @@ export interface TestFlow {
   priority?: Priority;
   preconditions: any[];
   expectedResult?: string;
+  /** Mobile-only flow variant override. null = inherit (plan → project default → 'default'). */
+  mobileVariantLabel?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -286,6 +288,8 @@ export interface CreateTestFlowParams {
   priority?: Priority;
   preconditions?: any[];
   expectedResult?: string;
+  /** Mobile-only flow variant override. null/blank = inherit. */
+  mobileVariantLabel?: string | null;
 }
 
 /**
@@ -304,6 +308,8 @@ export interface UpdateTestFlowParams {
   priority?: Priority;
   preconditions?: any[];
   expectedResult?: string;
+  /** null clears (inherit); undefined leaves untouched. */
+  mobileVariantLabel?: string | null;
 }
 
 // ============================================================================
@@ -631,6 +637,12 @@ export interface RegressionPlan {
   mobileBuildMode?: 'latest' | 'pinned';
   /** Build id when `mobileBuildMode === 'pinned'`. Null/undefined otherwise. */
   pinnedMobileAppBuildId?: string | null;
+  /**
+   * Mobile-only: which named variant lane this plan's runs resolve against
+   * (matched per platform at dispatch). Null/undefined → the default lane.
+   * `mobileBuildMode` / `pinnedMobileAppBuildId` apply WITHIN this variant.
+   */
+  mobileVariantLabel?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -684,6 +696,8 @@ export interface CreateRegressionPlanParams {
   mobileBuildMode?: 'latest' | 'pinned';
   /** Build id when `mobileBuildMode === 'pinned'`. */
   pinnedMobileAppBuildId?: string | null;
+  /** Named variant lane this plan resolves against (default lane when null/absent). */
+  mobileVariantLabel?: string | null;
   /**
    * Optional initial items to add to the plan in the same atomic call.
    *
@@ -716,6 +730,8 @@ export interface UpdateRegressionPlanParams {
   mobileBuildMode?: 'latest' | 'pinned';
   /** Pass `null` to clear an existing pin. `undefined` leaves it alone. */
   pinnedMobileAppBuildId?: string | null;
+  /** Named variant lane. Pass `null` to reset to default; `undefined` leaves it alone. */
+  mobileVariantLabel?: string | null;
 }
 
 // ============================================================================
