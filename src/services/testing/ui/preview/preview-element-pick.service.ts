@@ -55,6 +55,7 @@ import type {
   IntentActionType,
 } from './preview.types';
 import { buildOverlayResolverHelpers } from './overlay-resolver-helpers';
+import { computeSelectorRobustness } from './selector-robustness.util';
 
 /**
  * We accept a Socket.IO Namespace rather than a single socket. Emits target
@@ -516,6 +517,11 @@ async function finishPick(
     recordedFingerprint: fingerprint,
     bindingHints,
     suggestedAction,
+    // #4 — synchronous, advisory robustness score. Derived from the
+    // fingerprint only; never affects resolution (UI-facing hint).
+    robustness: fingerprint
+      ? computeSelectorRobustness(fingerprint, { crossOriginIframe: probed.crossOriginIframe })
+      : undefined,
     timestamp: new Date().toISOString(),
   };
 

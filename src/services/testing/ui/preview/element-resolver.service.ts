@@ -5272,6 +5272,22 @@ export async function resolveElement(params: {
                     totalLatencyMs: Date.now() - startTime,
                   });
 
+                  // #6 — Visual-anchor FOUNDATION. Capture-only: harvest the
+                  // geometry of elements that needed vision rescue (canvas /
+                  // image-baked / closed-shadow targets) so the visual-anchor
+                  // approach can be validated on real traffic. NO persistence,
+                  // NO new selector type, NO change to the resolver waterfall —
+                  // those are deferred. Debug level to avoid info-log noise.
+                  logger.debug('[ELEMENT_RESOLVER] Visual anchor captured (foundation — not yet consumed)', {
+                    event: 'visual_anchor_captured',
+                    previewSessionId,
+                    ref: visionNode.node.ref,
+                    tag: visionNode.node.tag,
+                    boundingBox: visionNode.node.boundingBox,
+                    confidence: visionResult.confidence,
+                    intentText: intentText.slice(0, 80),
+                  });
+
                   const lintCandidate: LintCandidate = {
                     ref: visionNode.node.ref,
                     label: getEffectiveLabel(visionNode.node) || `<${visionNode.node.tag}>`,

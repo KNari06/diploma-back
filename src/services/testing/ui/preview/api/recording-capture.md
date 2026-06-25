@@ -304,12 +304,12 @@ write editor trace
 4. **Dynamic-id filtering.** Inline regex must mirror [dynamic-id.util.ts](../dynamic-id.util.ts). Drift causes wrong-element bugs.
 5. **Wrapper → icon descent.** Generic wrapper with single icon child + click inside icon's bbox (±2px) → descend.
 6. **Symmetry contract.** `PROBE_AT_POINT_FN` and `dom-analysis-extractor` MUST use the same selection criteria + same dynamic-id regex. Divergence = "wrong element clicked" class of bugs (see [.claude/rules/wrong-element-debugging.md](../../../../../../.claude/rules/wrong-element-debugging.md)).
-7. **Iframe descent.** Coordinates translated to child-frame viewport. Cross-origin → `crossOriginIframe: true`.
+7. **Iframe descent.** Coordinates translated to child-frame viewport. Cross-origin → `crossOriginIframe: true`. **#2 rescue:** when the index-based `childFrames()[i]` probe throws, `probeViaContentFrame` re-resolves the frame element-based (`$(sel).contentFrame()`, origin-agnostic) and probes inside it. Runs ONLY after the existing path fails (non-regressing); on any failure it falls through to the same `crossOriginIframe` marker. The executor already replays it via `frameLocator(iframeSelector)`.
 8. **Debounce + throttle interaction.** Typing 1500 / scroll 500 / scroll-merge 3000 / hover 200 — different on purpose to avoid cross-event stutter.
 9. **Auto-stop.** `RECORDING_MAX_STEPS=50` and `RECORDING_MAX_TIME_MS=30min`. Apply or commit before re-recording.
 10. **`firstTextFragment` symmetry (V26).** Implementation MUST stay byte-equivalent with the `snapshot-collector.ts` extractor. Divergence = wrong-element bugs (the resolver wouldn't see the same single-unit text the recorder captured).
 11. **State-class regex symmetry (V26).** BEM suffix regex and standalone state regex are duplicated across two sites in `PROBE_AT_POINT_FN`. Keep them in lockstep.
-12. **`hitStack` / `probeAmbiguity` are diagnostic-only (V26).** They never change target selection — they exist so postmortem can prioritize replays where the click landed in a noisy stack.
+12. **`hitStack` / `probeAmbiguity` are diagnostic-only (V26).** They never change target selection — they exist so postmortem can prioritize replays where the click landed in a noisy stack. **#12:** the recorder appends `page_unsettled` to `probeAmbiguity` when a step is recorded on a still-loading / mid-hydration page (sparse DOM). Advisory only — same diagnostic channel, no behaviour change.
 
 ## Skipped / not covered
 
