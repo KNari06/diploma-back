@@ -1036,14 +1036,20 @@ export class MobileRunnerClient {
           // iOS") instead of a confusing 501.
           let runnerCode: string | undefined;
           let runnerMessage: string | undefined;
+          let runnerReason: string | undefined;
           if (errorBody) {
             try {
-              const parsed = JSON.parse(errorBody) as { code?: string; error?: string };
+              const parsed = JSON.parse(errorBody) as { code?: string; error?: string; reason?: string };
               if (typeof parsed.code === 'string' && parsed.code) {
                 runnerCode = parsed.code;
               }
               if (typeof parsed.error === 'string' && parsed.error) {
                 runnerMessage = parsed.error;
+              }
+              // Cause for a reclaimed session (idle_ttl / evicted / …) — used by
+              // the editor expiry trace to record WHY the session vanished.
+              if (typeof parsed.reason === 'string' && parsed.reason) {
+                runnerReason = parsed.reason;
               }
             } catch {
               // Body wasn't JSON — fall back to raw text below.
@@ -1071,6 +1077,7 @@ export class MobileRunnerClient {
             // Use the runner's typed code when available, otherwise the
             // bucket. Frontend can branch on this for actionable copy.
             runnerCode ?? (response.status >= 500 ? 'SERVER_ERROR' : 'CLIENT_ERROR'),
+            runnerReason,
           );
         }
 

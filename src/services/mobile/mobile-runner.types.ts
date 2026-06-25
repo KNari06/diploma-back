@@ -744,6 +744,12 @@ export class MobileRunnerError extends Error {
     message: string,
     public readonly statusCode?: number,
     public readonly code?: string,
+    /**
+     * Runner-supplied cause for a reclaimed session (`idle_ttl` / `evicted` /
+     * `device_disconnected` / `rest_delete` / …), parsed from the 404 body.
+     * Used to trace WHY the editor's "session expired" fired.
+     */
+    public readonly reason?: string,
   ) {
     super(message);
     this.name = 'MobileRunnerError';

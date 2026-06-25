@@ -95,6 +95,16 @@ export interface TraceSummary {
    * or when unknown.
    */
   teardownReason: string | null;
+  /**
+   * Which editor action surfaced a `404 session not found` → 410 SESSION_EXPIRED
+   * (`apply` | `lint`), from the `mobile_session_expired_surfaced` event. This is
+   * the runner-RECLAIMED expiry: the runner dropped the session on its own (its
+   * 25-min TTL / pool eviction / redeploy), so NO backend teardown ran and
+   * `teardownCause` is null. A row with `expirySurfacedBy` set AND `teardownCause`
+   * null is exactly the case that was invisible before. null when no expiry was
+   * surfaced. Filter prod via `trace_files.parsed_data->>'expirySurfacedBy'`.
+   */
+  expirySurfacedBy: string | null;
 }
 
 /**
@@ -119,6 +129,7 @@ export class TraceSummaryAggregator {
   private resolveLatencies: number[] = [];
   private teardownCause: string | null = null;
   private teardownReason: string | null = null;
+  private expirySurfacedBy: string | null = null;
 
   /**
    * Consume a single parsed JSONL event. Safe to call with any shape —
@@ -169,6 +180,10 @@ export class TraceSummaryAggregator {
       // Last-writer-wins: a session records one teardown, but be defensive.
       if (typeof payload.cause === 'string') this.teardownCause = payload.cause;
       if (typeof payload.disconnectReason === 'string') this.teardownReason = payload.disconnectReason;
+    }
+
+    if (evtType === 'mobile_session_expired_surfaced') {
+      if (typeof payload.surfacedBy === 'string') this.expirySurfacedBy = payload.surfacedBy;
     }
 
     if (evtType === 'step_apply_result') {
@@ -253,6 +268,7 @@ export class TraceSummaryAggregator {
       latencyP95Ms: percentile(sorted, 0.95),
       teardownCause: this.teardownCause,
       teardownReason: this.teardownReason,
+      expirySurfacedBy: this.expirySurfacedBy,
     };
   }
 }
