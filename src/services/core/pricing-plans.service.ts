@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { PlanService } from '@/services/core/plan.service';
 
 export interface PricingPlan {
   id: string;
@@ -278,73 +279,22 @@ export class PricingPlansService {
   }
 
   /**
-   * Assign plan to user
+   * Assign plan to user.
+   *
+   * Thin wrapper kept for existing callers (self-serve provisioning, admin
+   * grant). The real write — keeping users.{plan_id,plan,plan_status} and
+   * user_credits.{subscription_plan,subscription_status,grace_limit} in sync —
+   * is owned by the single funnel {@link PlanService.setUserPlan}. The
+   * "never silently downgrade a paid plan to free" guard now lives there.
    */
   static async assignPlanToUser(userId: string, planSlug: string): Promise<boolean> {
-    try {
-      // Get plan by slug
-      const plan = await this.getPlanBySlug(planSlug);
-      if (!plan) {
-        logger.error('[PRICING_PLANS] Plan not found', { planSlug });
-        return false;
-      }
-
-      // Never downgrade a paid plan to free via this path. This prevents
-      // self-serve provisioning (ensureTrialCreditsAndPlan) from silently
-      // resetting a manually-granted or Stripe-purchased plan on re-login.
-      if (planSlug === 'free') {
-        const { data: currentUser } = await supabaseAdmin
-          .from('users')
-          .select('plan_id, pricing_plans!plan_id(slug)')
-          .eq('id', userId)
-          .maybeSingle();
-        const currentSlug = (currentUser?.pricing_plans as { slug?: string } | null)?.slug;
-        if (currentSlug && currentSlug !== 'free') {
-          logger.info('[PRICING_PLANS] Skipping free plan assignment — user already on paid plan', {
-            userId: userId.substring(0, 8) + '...',
-            currentSlug,
-          });
-          return true;
-        }
-      }
-
-      // Update user's plan
-      const { error } = await supabaseAdmin
-        .from('users')
-        .update({
-          plan_id: plan.id,
-          plan_started_at: new Date().toISOString(),
-          credits_used_today: 0,
-          credits_used_this_month: 0,
-          last_credit_reset_date: new Date().toISOString().split('T')[0],
-          monthly_reset_date: new Date().toISOString().split('T')[0],
-        })
-        .eq('id', userId);
-
-      if (error) {
-        logger.error('[PRICING_PLANS] Error assigning plan to user', {
-          error: error.message,
-          userId: userId.substring(0, 8) + '...',
-          planSlug,
-        });
-        return false;
-      }
-
-      logger.info('[PRICING_PLANS] Plan assigned successfully', {
-        userId: userId.substring(0, 8) + '...',
-        planSlug,
-        planName: plan.name,
-      });
-
-      return true;
-    } catch (error) {
-      logger.error('[PRICING_PLANS] Exception in assignPlanToUser', {
-        error: error instanceof Error ? error.message : String(error),
-        userId: userId.substring(0, 8) + '...',
-        planSlug,
-      });
-      return false;
-    }
+    // Real plan grant (admin / self-serve) → reset per-period usage counters,
+    // matching the legacy assignPlanToUser behavior. Stripe mirror-sync calls
+    // go through setUserPlan directly and deliberately do NOT reset counters.
+    return PlanService.setUserPlan(userId, planSlug, {
+      source: 'assignPlanToUser',
+      resetUsageCounters: true,
+    });
   }
 
   /**

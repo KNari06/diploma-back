@@ -40,6 +40,14 @@ interface FlattenedRawStep {
   status?: string;
   value?: string; // from first visible parameter
   parentName?: string; // parent grouping step name for context
+  /**
+   * Expected-result text derived from the Allure step's statusDetails
+   * (failure message / expected-vs-actual). Parity with the CSV path's
+   * per-step `expected[]`: the AI converter emits one assert per entry right
+   * after the action step, so ZIP assertions aren't lost. See the ZIP-parity
+   * audit (statusDetails was previously dropped entirely).
+   */
+  expected?: string[];
 }
 
 /**
@@ -62,11 +70,22 @@ function flattenRawSteps(allureSteps: AllureStep[], parentName?: string): Flatte
         (p) => p.mode !== 'masked' && p.mode !== 'hidden' && p.value,
       );
 
+      // statusDetails.message carries the failure / expected-vs-actual text on
+      // a non-passed step — the closest thing the ZIP format has to an
+      // "expected result". Capture it (NOT `trace`, which is a stacktrace).
+      // Skip empty and obvious stacktrace-only blobs (multi-line with file:line
+      // noise) so we don't feed garbage to the assert generator.
+      const msg = step.statusDetails?.message?.trim();
+      const expected = msg && msg.length > 0 && msg.length <= MAX_EXPECTED_SOURCE_CHARS && !/\n\s*at\s/.test(msg)
+        ? [msg]
+        : undefined;
+
       result.push({
         name: step.name,
         status: step.status,
         value: visibleParam?.value,
         parentName,
+        ...(expected && { expected }),
       });
     }
   }
@@ -105,6 +124,22 @@ export interface AIStepConversionResult {
   degraded: boolean;
 }
 
+/**
+ * Max length of a generated step `description`. Applied to every step the
+ * converter emits (action + assert, AI + fallback) and surfaced to the model
+ * in the prompt so the two never drift. Exported so the CSV scenario parser
+ * caps its action descriptions the same way (single source of truth).
+ */
+export const MAX_STEP_DESC_CHARS = 120;
+
+/**
+ * Max length of an Allure `statusDetails.message` we accept as an expected
+ * result on the ZIP path. Longer blobs are almost always stacktraces / dumps,
+ * not human-readable expectations — skipped so we don't feed garbage to the
+ * assert generator.
+ */
+const MAX_EXPECTED_SOURCE_CHARS = 300;
+
 const STEP_CONVERSION_SYSTEM_PROMPT = `You convert Allure test report steps into UI test actions for a web testing platform.
 
 ## Input
@@ -136,15 +171,16 @@ Convert each MEANINGFUL step into a UI test action.
 ## Rules
 1. SKIP non-UI steps: API calls, database queries, internal assertions about response codes, screenshot captures, log statements, "Given/When/Then" wrappers that contain no action
 2. SKIP redundant steps: if "Click Login" and "Login button clicked" both exist, keep only one
-3. SPLIT composite steps: "Enter email and click Submit" → two separate actions (type + click)
+3. SPLIT composite ACTIONS only: "Enter email and click Submit" → two actions (type + click). Do NOT split a single assertion sentence into multiple asserts.
 4. For "type" actions: put the typed value in "value" field. If step says 'Type "hello"' → value: "hello"
 5. For "navigate" actions: put the URL in "value" field if present
 6. For "press" actions: put the key name in "value" field (e.g. "Enter", "Tab", "Escape")
 7. For "assert" actions: write what should be verified as the description (e.g. "Verify error message is displayed")
-8. Description should be clear, concise, human-readable (not code). Max 80 chars.
-9. If a step is ambiguous but seems like a UI action, include it as "click" with a descriptive description
-10. Return empty array [] if there are NO meaningful UI steps
-11. Preserve the logical order of steps
+8. EXPECTED RESULTS: when a step lists "expected results", emit exactly ONE assert per expected-result item, and place those asserts IMMEDIATELY AFTER that step's action (before the next step). Never merge several expected results into one assert, never drop one, and never move them away from their step. The action step keeps its own type (click/type/...).
+9. Description should be clear, concise, human-readable (not code). Max ${MAX_STEP_DESC_CHARS} chars.
+10. If a step is ambiguous but seems like a UI action, include it as "click" with a descriptive description
+11. Return empty array [] if there are NO meaningful UI steps
+12. Preserve the logical order of steps
 
 ## Response format
 Return a JSON object with a "steps" array:
@@ -190,6 +226,14 @@ async function convertStepsWithAI(
         if (s.value) parts.push(`value="${s.value}"`);
         if (s.parentName) parts.push(`(in: "${s.parentName}")`);
         if (s.status && s.status !== 'passed') parts.push(`[${s.status}]`);
+        // Parity with the CSV path: expected results under their step so the
+        // model emits one assert per item, right after the action.
+        if (s.expected?.length) {
+          parts.push(
+            '\n   expected results (emit one assert each, right after this step):\n' +
+            s.expected.map((e) => `     - ${e}`).join('\n'),
+          );
+        }
         return parts.join(' ');
       })
       .join('\n');
@@ -251,7 +295,7 @@ async function convertStepsWithAI(
         allResults.push({
           id: randomUUID(),
           type: actionType,
-          description: desc.slice(0, 120),
+          description: desc.slice(0, MAX_STEP_DESC_CHARS),
           ...(step.value !== undefined && step.value !== null && step.value !== '' && {
             value: String(step.value),
           }),
@@ -272,9 +316,18 @@ async function convertStepsWithAI(
         allResults.push({
           id: randomUUID(),
           type: 'click', // safe default
-          description: raw.name.slice(0, 120),
+          description: raw.name.slice(0, MAX_STEP_DESC_CHARS),
           ...(raw.value !== undefined && { value: raw.value }),
         });
+        // Preserve expected results as asserts right after their step, even on
+        // the degraded path (parity with the CSV converter).
+        for (const exp of raw.expected ?? []) {
+          allResults.push({
+            id: randomUUID(),
+            type: 'assert',
+            description: exp.slice(0, MAX_STEP_DESC_CHARS),
+          });
+        }
       }
     }
   }
@@ -299,7 +352,7 @@ async function convertStepsWithAI(
  */
 export async function convertImportedStepsWithAI(
   testName: string,
-  rawSteps: Array<{ type: string; description: string; value?: string }>,
+  rawSteps: Array<{ type: string; description: string; value?: string; expected?: string[] }>,
 ): Promise<AIStepConversionResult> {
   if (rawSteps.length === 0) return { steps: [], degraded: false };
 
@@ -316,6 +369,14 @@ export async function convertImportedStepsWithAI(
       .map((s, idx) => {
         const parts = [`${i + idx + 1}. "${s.description}"`];
         if (s.value) parts.push(`value="${s.value}"`);
+        // Expected results are listed under their step so the model emits one
+        // assert per item, right after the action — preserving the link.
+        if (s.expected?.length) {
+          parts.push(
+            '\n   expected results (emit one assert each, right after this step):\n' +
+            s.expected.map((e) => `     - ${e}`).join('\n'),
+          );
+        }
         return parts.join(' ');
       })
       .join('\n');
@@ -362,7 +423,7 @@ export async function convertImportedStepsWithAI(
           type: VALID_ACTION_TYPES.includes(s.type as IntentActionType)
             ? (s.type as IntentActionType)
             : 'click',
-          description: desc.slice(0, 120),
+          description: desc.slice(0, MAX_STEP_DESC_CHARS),
           ...(s.value != null && s.value !== '' && { value: String(s.value) }),
         });
       }
@@ -376,14 +437,24 @@ export async function convertImportedStepsWithAI(
 
       // Fallback for this batch only — keep original descriptions, default type.
       // Mark degraded: step types are now unreliable ('click' for everything).
+      // Expected results still become asserts placed right after their step so
+      // they're not lost even on the degraded path (action TYPE is unreliable;
+      // the assertions themselves are preserved and linked).
       degraded = true;
       for (const s of batch) {
         allResults.push({
           id: randomUUID(),
           type: 'click',
-          description: (s.description ?? '').slice(0, 120),
+          description: (s.description ?? '').slice(0, MAX_STEP_DESC_CHARS),
           ...(s.value ? { value: s.value } : {}),
         });
+        for (const exp of s.expected ?? []) {
+          allResults.push({
+            id: randomUUID(),
+            type: 'assert',
+            description: exp.slice(0, MAX_STEP_DESC_CHARS),
+          });
+        }
       }
     }
   }

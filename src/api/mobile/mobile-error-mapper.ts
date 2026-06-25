@@ -27,6 +27,20 @@ const MB = 1024 * 1024;
  * Keeps `message` too (same string) for any client that reads it. Callers
  * still do their own logging/tracing — this only shapes the HTTP response.
  */
+/**
+ * True when a mobile-runner error means the device session is gone — the runner
+ * returns `404 session not found` after its own 25-min TTL, a pool eviction, or
+ * a redeploy. Single source of this check: `sendMobileRunnerError` uses it to
+ * emit the typed 410, and the editor controllers use it to TRACE the expiry
+ * (otherwise a runner-reclaimed session leaves no `mobile_session_teardown`
+ * event and the expiry is invisible in Supabase).
+ */
+export function isSessionGoneError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const statusCode = (error as { statusCode?: number })?.statusCode;
+  return statusCode === 404 && /session not found/i.test(message);
+}
+
 export function sendMobileRunnerError(res: Response, error: unknown, fallback: string): void {
   const message = error instanceof Error ? error.message : String(error);
   const runnerErr = error as { statusCode?: number; code?: string };
@@ -48,7 +62,7 @@ export function sendMobileRunnerError(res: Response, error: unknown, fallback: s
   // A session the runner no longer has (idle TTL / pool reset / redeploy) →
   // typed 410 so the editor routes it through its session-expiry flow instead
   // of showing a dead-end error that only a reload "fixes".
-  const sessionGone = runnerErr?.statusCode === 404 && /session not found/i.test(message);
+  const sessionGone = isSessionGoneError(error);
   if (sessionGone) {
     res.status(410).json({
       success: false,

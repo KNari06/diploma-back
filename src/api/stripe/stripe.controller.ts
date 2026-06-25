@@ -3,6 +3,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { EmailService } from '@/services/core/email.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { WorkspaceCreditsService } from '@/services/core/workspace-credits.service';
+import { PlanService } from '@/services/core/plan.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import Stripe from 'stripe';
@@ -410,10 +411,10 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
     onConflict: 'stripe_subscription_id',
   });
 
-  // Update user plan
+  // Update Stripe-specific user columns. The plan/tier mirrors
+  // (plan_id / plan / plan_status + user_credits) are owned by the single
+  // funnel PlanService.setUserPlan, called below — NOT written inline here.
   const userUpdateData: Record<string, any> = {
-    plan: isActive ? 'pro' : 'free',
-    plan_status: isActive ? 'paid' : null,
     current_period_end: currentPeriodEnd,
     cancel_at_period_end: subscription.cancel_at_period_end ?? false,
     stripe_price_id: priceId,
@@ -435,19 +436,27 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
     updated_at: new Date().toISOString(),
   };
 
-  if (isActive && plan?.id) {
-    userUpdateData.plan_id = plan.id;
-  } else if (!isActive && (subscription.status === 'canceled' || subscription.status === 'incomplete_expired')) {
-    // Only wipe plan_id on terminal states. Transient dunning states (past_due,
-    // unpaid) keep the plan intact so the user retains access during the retry
-    // window; Stripe will send another event if it ultimately cancels.
-    userUpdateData.plan_id = null;
-  }
-
   await supabaseAdmin
     .from('users')
     .update(userUpdateData)
     .eq('id', user.id);
+
+  // Funnel the plan/tier mirror through PlanService so users.{plan_id,plan,
+  // plan_status} and user_credits.{subscription_plan,subscription_status,
+  // grace_limit} stay in sync. Active → 'pro' (paid). Inactive only downgrades
+  // to 'free' on a TERMINAL state (canceled / incomplete_expired); transient
+  // dunning (past_due / unpaid) keeps the plan intact so the user retains
+  // access during the retry window — Stripe sends another event if it
+  // ultimately cancels.
+  if (isActive) {
+    await PlanService.setUserPlan(user.id, 'pro', { status: 'paid', source: 'stripe:subscription' });
+  } else if (subscription.status === 'canceled' || subscription.status === 'incomplete_expired') {
+    await PlanService.setUserPlan(user.id, 'free', {
+      status: null,
+      skipDowngradeGuard: true,
+      source: 'stripe:subscription:terminal',
+    });
+  }
 
   const planCode = plan?.code || 'unknown';
 
@@ -862,6 +871,8 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     .update({ credits_granted: true })
     .eq('stripe_invoice_id', invoice.id);
 
+  // Stripe-specific user columns only. The plan/tier mirror is funneled
+  // through PlanService.setUserPlan below for the personal (non-B2B) case.
   const userUpdateData: Record<string, any> = {
     last_credits_invoice_id: invoice.id,
     updated_at: new Date().toISOString(),
@@ -872,17 +883,25 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     },
   };
 
-  if (plan?.id) {
-    userUpdateData.plan_id = plan.id;
-    userUpdateData.plan = isBusinessPlan ? (workspacePlanSlug || 'business') : 'pro';
-    userUpdateData.plan_status = 'paid';
-  }
-
   if (priceId) {
     userUpdateData.stripe_price_id = priceId;
   }
 
+  // B2B plans are gated at the workspace level (workspace_credits, provisioned
+  // above) — pricing_plans only knows free/pro/ultra, so a B2B slug can't be
+  // resolved by the facade. Keep the legacy users.{plan,plan_status} text
+  // mirror inline for B2B; route the personal 'pro' plan through the single
+  // funnel so plan_id + user_credits.subscription_plan stay in sync.
+  if (plan && isBusinessPlan) {
+    userUpdateData.plan = workspacePlanSlug || 'business';
+    userUpdateData.plan_status = 'paid';
+  }
+
   await supabaseAdmin.from('users').update(userUpdateData).eq('id', user.id);
+
+  if (plan && !isBusinessPlan) {
+    await PlanService.setUserPlan(user.id, 'pro', { status: 'paid', source: 'stripe:invoice' });
+  }
 
   // Branded purchase confirmation — fire-and-forget so a mail failure never
   // breaks webhook processing (Stripe still sends its own receipt).
@@ -947,6 +966,13 @@ async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {
     return;
   }
 
+  // Payment failure is dunning, NOT a plan change: deliberately clear ONLY the
+  // plan_status flag (and the subscription JSON) while leaving users.plan_id and
+  // the user_credits mirror intact, so the user retains access during Stripe's
+  // retry window. A genuine cancellation arrives later as a subscription event
+  // (handleSubscriptionEvent → PlanService.setUserPlan('free')). This is NOT
+  // routed through the plan facade on purpose — the facade owns full plan/tier
+  // transitions, not a transient status flag flip.
   await supabaseAdmin
     .from('users')
     .update({

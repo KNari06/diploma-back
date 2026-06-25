@@ -197,3 +197,34 @@ export async function uploadEditorTrace(params: UploadEditorTraceParams): Promis
     });
   }
 }
+
+/**
+ * Close an open editor trace and upload it in one step. Single source for the
+ * "write a terminal lifecycle event → close → upload" sequence the mobile
+ * session-end paths need (idle timer, disconnect grace, runner-reclaimed 410).
+ * Best-effort — never throws. Returns true when a trace was found and the
+ * upload was attempted, false when there was nothing open under this id.
+ */
+export async function closeAndUploadEditorTrace(
+  previewSessionId: string,
+  traceType: UploadEditorTraceParams['traceType'] = 'editor',
+): Promise<boolean> {
+  try {
+    const { EditorTraceService } = await import('./editor-trace.service');
+    const meta = await EditorTraceService.close(previewSessionId);
+    if (!meta) return false;
+    await uploadEditorTrace({
+      filePath: meta.filePath,
+      userId: meta.userId,
+      previewSessionId,
+      traceType,
+    });
+    return true;
+  } catch (err) {
+    logger.warn(`${TAG} closeAndUploadEditorTrace failed (non-fatal)`, {
+      previewSessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}

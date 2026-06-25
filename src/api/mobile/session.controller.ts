@@ -20,9 +20,9 @@ import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { ProjectService } from '@/services/core/project.service';
 import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
-import { sendMobileRunnerError } from './mobile-error-mapper';
+import { sendMobileRunnerError, isSessionGoneError } from './mobile-error-mapper';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
-import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
+import { uploadEditorTrace, closeAndUploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
 import { refreshIdle, cancelIdle } from '@/services/mobile/mobile-idle.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { getIO } from '@/websocket/core/server';
@@ -88,6 +88,37 @@ function currentRunnerSocketUrl(): string {
  */
 export const PENDING_INSTALL_PREFIX = 'mobile_pending_install:';
 const PENDING_INSTALL_TTL = 3600; // 1 hour
+
+/**
+ * Record a runner-RECLAIMED session expiry into the editor trace.
+ *
+ * When an editor action returns 410 SESSION_EXPIRED because the runner no
+ * longer has the session, the runner reclaimed it on its own (its 25-min TTL,
+ * a pool eviction, or a redeploy) — the backend teardown paths (idle timer /
+ * disconnect grace) never ran, so `mobile_session_teardown` is absent and the
+ * expiry leaves NO trace (only an ephemeral local `[MOBILE_SESSION]` log line).
+ * That's why these expiries are invisible in Supabase. Write the event under
+ * the same `mobile-${sessionId}` key the action used, then flush the trace so
+ * it actually reaches storage. Fire-and-forget: callers `void` this AFTER
+ * responding so it never delays the 410. Best-effort — never throws.
+ */
+async function traceMobileSessionExpiry(
+  sessionId: string,
+  userId: string,
+  surfacedBy: 'apply' | 'lint',
+  runnerCode?: string,
+): Promise<void> {
+  try {
+    EditorTraceService.getOrCreate(`mobile-${sessionId}`, userId)
+      .writeMobileSessionExpiredSurfaced({ sessionId, surfacedBy, runnerCode });
+    await closeAndUploadEditorTrace(`mobile-${sessionId}`);
+  } catch (err) {
+    logger.warn('[MOBILE_SESSION] expiry trace write failed (non-fatal)', {
+      sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 export interface WarmupData {
   sessionId: string;
@@ -1308,6 +1339,7 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
         error: 'Session expired',
         message: 'The device session is no longer available (it was reclaimed after inactivity or a restart). Reopen the test case to continue.',
       });
+      void traceMobileSessionExpiry(sessionId, req.user.id, 'lint', 'liveness_precheck');
       return;
     }
 
@@ -1472,6 +1504,10 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
     // maps a session that died mid-lint (TOCTOU past the up-front guard) to a
     // typed 410 SESSION_EXPIRED.
     sendMobileRunnerError(res, error, 'Lint failed');
+    if (isSessionGoneError(error)) {
+      const e = error as { reason?: string; code?: string };
+      void traceMobileSessionExpiry(sessionId, req.user.id, 'lint', e.reason ?? e.code);
+    }
   }
 }
 
@@ -1654,6 +1690,10 @@ export async function applySession(req: Request, res: Response): Promise<void> {
       error: error instanceof Error ? error.message : String(error),
     });
     sendMobileRunnerError(res, error, 'Apply failed');
+    if (isSessionGoneError(error)) {
+      const e = error as { reason?: string; code?: string };
+      void traceMobileSessionExpiry(sessionId, req.user!.id, 'apply', e.reason ?? e.code);
+    }
   }
 }
 

@@ -25,6 +25,7 @@
 import { parse } from 'csv-parse/sync';
 import { logger } from '@/utils/core/logger';
 import type { ParsedTestCaseFromLLM } from './allure-import.types';
+import { MAX_STEP_DESC_CHARS } from './allure-mapper';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Known column names (case-insensitive lookup)
@@ -159,6 +160,15 @@ function col(fields: string[], colMap: ColumnMap, logical: string): string {
 interface ParsedStep {
   type: string;
   description: string;
+  /**
+   * Expected-result sub-lines that belong to THIS step (TestOps nests them
+   * under their owning step). Kept as a separate list — NOT glued into
+   * `description` — so they survive (no truncation) and stay linked to their
+   * step. The AI step converter turns each into an `assert` placed right after
+   * this step. See the "#13 IN_PROGRESS" regression (expected results were
+   * truncated at 120 chars and split into orphan asserts).
+   */
+  expected?: string[];
 }
 
 /**
@@ -197,8 +207,18 @@ function parseScenario(scenario: string): ParsedStep[] {
     /^\t+(.+)/,                                       // Tab-indented content
   ];
 
+  // Recognises an "Expected result" sub-line (EN / RU / KZ), with optional
+  // leading "- "/numbering and a trailing ":". The captured group is the
+  // actual expected text (may be empty when the label is on its own line and
+  // the value follows on the next indented line).
+  const EXPECTED_LABEL = /^(?:expected\s*result|ожидаемый\s*результат|күтілетін\s*нәтиже)\s*:?\s*(.*)$/i;
+
   let currentStep: ParsedStep | null = null;
   const attachmentDescs: string[] = [];
+  const expectedDescs: string[] = [];
+  // When true, plain indented continuation lines feed the LAST expected entry
+  // (handles "Expected result:" on one line, value(s) on the next).
+  let expectedOpen = false;
 
   const flushStep = (): void => {
     if (!currentStep) return;
@@ -215,9 +235,18 @@ function parseScenario(scenario: string): ParsedStep[] {
       currentStep.description += ' (' + meaningfulAttachments.join('; ') + ')';
     }
 
-    currentStep.description = currentStep.description.slice(0, 120);
+    // Cap the ACTION description only — expected results live in their own
+    // field and are never truncated here (the old code sliced the whole
+    // step+expected blob to 120 chars, silently dropping later assertions).
+    currentStep.description = currentStep.description.slice(0, MAX_STEP_DESC_CHARS);
+
+    const expected = expectedDescs.map((e) => e.trim()).filter(Boolean);
+    if (expected.length > 0) currentStep.expected = expected;
+
     steps.push(currentStep);
     attachmentDescs.length = 0;
+    expectedDescs.length = 0;
+    expectedOpen = false;
   };
 
   for (const rawLine of lines) {
@@ -236,11 +265,34 @@ function parseScenario(scenario: string): ParsedStep[] {
     }
     if (matched) continue;
 
+    // Expected-result lines (tab-indented OR plain) belong to the current
+    // step's `expected` list, NOT the action description. Checked before the
+    // attachment patterns so an "Expected result:" line isn't swallowed as an
+    // attachment.
+    if (currentStep) {
+      const expMatch = line.trim().match(EXPECTED_LABEL);
+      if (expMatch) {
+        const value = expMatch[1].trim();
+        if (value) {
+          expectedDescs.push(value);
+          expectedOpen = false; // a value on the same line closes the open slot
+        } else {
+          // "Expected result:" label alone → following indented lines feed it
+          expectedOpen = true;
+        }
+        continue;
+      }
+    }
+
     // Try attachment patterns
     for (const pattern of attachmentPatterns) {
       const m = line.match(pattern);
       if (m) {
-        attachmentDescs.push(m[1].trim());
+        const text = m[1].trim();
+        // If we're inside an open "Expected result:" block, indented lines are
+        // the expected values; otherwise they're step attachments.
+        if (expectedOpen) expectedDescs.push(text);
+        else attachmentDescs.push(text);
         matched = true;
         break;
       }
@@ -253,8 +305,9 @@ function parseScenario(scenario: string): ParsedStep[] {
       // First content before any [step N] — treat as a step
       currentStep = { type: 'click', description: trimmed };
     } else if (trimmed && currentStep) {
-      // Continuation of current step context
-      attachmentDescs.push(trimmed);
+      // Continuation: feed the open expected block if any, else attachments.
+      if (expectedOpen) expectedDescs.push(trimmed);
+      else attachmentDescs.push(trimmed);
     }
   }
 
