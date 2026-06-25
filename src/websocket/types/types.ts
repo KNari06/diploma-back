@@ -2143,6 +2143,19 @@ export interface PreviewPickResultPayload {
    */
   suggestedAction?: 'click' | 'type' | 'select' | 'hover';
   /**
+   * #4 — Authoring-time selector robustness advisory (synchronous, derived
+   * from the recorded fingerprint). Distinct from `lint` (the live resolver
+   * verdict). Advisory only — never affects resolution. Shape mirrors
+   * `SelectorRobustness` from `selector-robustness.util.ts` (kept structural to
+   * avoid a cross-layer import into the websocket types).
+   */
+  robustness?: {
+    level: 'strong' | 'medium' | 'weak';
+    score: number;
+    risks: string[];
+    hint: string;
+  };
+  /**
    * Dry-run lint result against the picked element. UI surfaces warnings.
    *
    * @deprecated since May 2026 — kept for backwards compatibility with FE
