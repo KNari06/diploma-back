@@ -288,7 +288,13 @@ export class PricingPlansService {
    * "never silently downgrade a paid plan to free" guard now lives there.
    */
   static async assignPlanToUser(userId: string, planSlug: string): Promise<boolean> {
-    return PlanService.setUserPlan(userId, planSlug, { source: 'assignPlanToUser' });
+    // Real plan grant (admin / self-serve) → reset per-period usage counters,
+    // matching the legacy assignPlanToUser behavior. Stripe mirror-sync calls
+    // go through setUserPlan directly and deliberately do NOT reset counters.
+    return PlanService.setUserPlan(userId, planSlug, {
+      source: 'assignPlanToUser',
+      resetUsageCounters: true,
+    });
   }
 
   /**

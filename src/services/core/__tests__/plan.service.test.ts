@@ -71,6 +71,7 @@ describe('PlanService.setUserPlan', () => {
       planId: 'plan-pro',
       planSlug: 'pro',
       planStatus: 'paid',
+      resetUsageCounters: false,
     });
     expect(updateSubscriptionMock).toHaveBeenCalledWith(USER, 'pro', 'active');
   });
@@ -84,6 +85,7 @@ describe('PlanService.setUserPlan', () => {
       planId: 'plan-free',
       planSlug: 'free',
       planStatus: 'free',
+      resetUsageCounters: false,
     });
     expect(updateSubscriptionMock).toHaveBeenCalledWith(USER, 'free', 'inactive');
   });
@@ -112,8 +114,27 @@ describe('PlanService.setUserPlan', () => {
       planId: 'plan-free',
       planSlug: 'free',
       planStatus: null, // explicit status wins
+      resetUsageCounters: false,
     });
     expect(updateSubscriptionMock).toHaveBeenCalledWith(USER, 'free', 'inactive');
+  });
+
+  it('resets usage counters only when resetUsageCounters is set (real grant)', async () => {
+    await PlanService.setUserPlan(USER, 'pro', { resetUsageCounters: true });
+    expect(writeUserPlanMock).toHaveBeenCalledWith({
+      userId: USER,
+      planId: 'plan-pro',
+      planSlug: 'pro',
+      planStatus: 'paid',
+      resetUsageCounters: true,
+    });
+  });
+
+  it('does NOT reset usage counters by default (Stripe mirror-sync path)', async () => {
+    await PlanService.setUserPlan(USER, 'pro', { source: 'stripe:subscription' });
+    expect(writeUserPlanMock).toHaveBeenCalledWith(
+      expect.objectContaining({ resetUsageCounters: false })
+    );
   });
 
   it('rejects an unknown plan slug without writing anything', async () => {

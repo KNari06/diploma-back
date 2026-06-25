@@ -22,6 +22,15 @@ export interface SetUserPlanOptions {
    * drop the user back to free.
    */
   skipDowngradeGuard?: boolean;
+  /**
+   * Reset the per-period usage counters (credits_used_today / _this_month +
+   * reset dates) and plan_started_at. TRUE only for a real plan grant
+   * (admin / self-serve). FALSE for Stripe mirror-sync: customer.subscription.updated
+   * fires for many non-renewal reasons, so zeroing the live counters there
+   * would hand the user a fresh daily+monthly allowance mid-period. Defaults
+   * to false — callers that grant a plan opt in explicitly.
+   */
+  resetUsageCounters?: boolean;
 }
 
 /**
@@ -92,12 +101,14 @@ export class PlanService {
       const planStatus: 'paid' | 'free' | null =
         opts.status !== undefined ? opts.status : isFreeTarget ? 'free' : 'paid';
 
-      // 1) Authoritative users mirror (plan_id / plan / plan_status + counters).
+      // 1) Authoritative users mirror (plan_id / plan / plan_status). Usage
+      //    counters reset only for real grants (opts.resetUsageCounters).
       const wroteUser = await writeUserPlan({
         userId,
         planId: plan.id,
         planSlug,
         planStatus,
+        resetUsageCounters: opts.resetUsageCounters === true,
       });
       if (!wroteUser) {
         return false;
