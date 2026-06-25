@@ -91,3 +91,27 @@ export async function writeUserPlan(params: {
   }
   return true;
 }
+
+/**
+ * Clear the user's plan to free WITHOUT depending on a pricing_plans 'free'
+ * row: writes `plan_id = null` (which getUserPlanSlug treats as free) + the
+ * text/status mirrors. Fallback for a terminal downgrade (Stripe cancellation)
+ * when the free plan row is missing/inactive — preserves the old guarantee
+ * that a cancellation always downgrades, instead of silently no-op'ing.
+ * Never resets usage counters (a cancellation is not a fresh grant).
+ */
+export async function clearUserPlanToFree(userId: string): Promise<boolean> {
+  const { error } = await supabaseAdmin
+    .from('users')
+    .update({ plan_id: null, plan: 'free', plan_status: null })
+    .eq('id', userId);
+
+  if (error) {
+    logger.error('[PLAN_DB] Error clearing user plan to free', {
+      error: error.message,
+      userId,
+    });
+    return false;
+  }
+  return true;
+}

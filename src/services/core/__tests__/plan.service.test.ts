@@ -24,18 +24,27 @@ let currentSlugImpl: () => Promise<string | null> = async () => null;
 let writeUserPlanResult = true;
 let updateSubscriptionResult = true;
 
+let clearUserPlanResult = true;
+
 const writeUserPlanMock = jest.fn(
-  async (_p: { userId: string; planId: string; planSlug: string; planStatus: 'paid' | 'free' | null }) =>
-    writeUserPlanResult
+  async (_p: {
+    userId: string;
+    planId: string;
+    planSlug: string;
+    planStatus: 'paid' | 'free' | null;
+    resetUsageCounters: boolean;
+  }) => writeUserPlanResult
 );
 const updateSubscriptionMock = jest.fn(
   async (_userId: string, _plan: string, _status: string) => updateSubscriptionResult
 );
+const clearUserPlanMock = jest.fn(async (_userId: string) => clearUserPlanResult);
 
 jest.mock('@/services/core/db/plan.db', () => ({
   getPlanBySlug: jest.fn(async (slug: string) => planRows[slug] ?? null),
   getCurrentPlanSlug: jest.fn(async () => currentSlugImpl()),
   writeUserPlan: jest.fn((p: any) => writeUserPlanMock(p)),
+  clearUserPlanToFree: jest.fn((userId: string) => clearUserPlanMock(userId)),
 }));
 
 jest.mock('@/services/core/user-credits.service', () => ({
@@ -59,6 +68,8 @@ beforeEach(() => {
   currentSlugImpl = async () => null;
   writeUserPlanResult = true;
   updateSubscriptionResult = true;
+  clearUserPlanResult = true;
+  planRows.free = { id: 'plan-free', name: 'Free Plan', slug: 'free' };
 });
 
 describe('PlanService.setUserPlan', () => {
@@ -143,6 +154,32 @@ describe('PlanService.setUserPlan', () => {
     expect(ok).toBe(false);
     expect(writeUserPlanMock).not.toHaveBeenCalled();
     expect(updateSubscriptionMock).not.toHaveBeenCalled();
+  });
+
+  it('falls back to clearing plan_id when the free row is missing on a terminal downgrade', async () => {
+    planRows.free = null; // free pricing_plans row absent / inactive
+    currentSlugImpl = async () => 'pro';
+
+    const ok = await PlanService.setUserPlan(USER, 'free', {
+      status: null,
+      skipDowngradeGuard: true,
+      source: 'stripe:subscription:terminal',
+    });
+
+    expect(ok).toBe(true);
+    expect(clearUserPlanMock).toHaveBeenCalledWith(USER);
+    expect(writeUserPlanMock).not.toHaveBeenCalled(); // no resolvable row to write
+    expect(updateSubscriptionMock).toHaveBeenCalledWith(USER, 'free', 'inactive');
+  });
+
+  it('does NOT fall back to clearing for a non-terminal free target when the free row is missing', async () => {
+    planRows.free = null;
+
+    const ok = await PlanService.setUserPlan(USER, 'free'); // no skipDowngradeGuard
+
+    expect(ok).toBe(false);
+    expect(clearUserPlanMock).not.toHaveBeenCalled();
+    expect(writeUserPlanMock).not.toHaveBeenCalled();
   });
 
   it('returns false when the authoritative users mirror write fails (no credit write)', async () => {

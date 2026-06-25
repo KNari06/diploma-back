@@ -1,6 +1,11 @@
 import { logger } from '@/utils/core/logger';
 import { UserCreditsService } from '@/services/core/user-credits.service';
-import { getCurrentPlanSlug, getPlanBySlug, writeUserPlan } from '@/services/core/db/plan.db';
+import {
+  clearUserPlanToFree,
+  getCurrentPlanSlug,
+  getPlanBySlug,
+  writeUserPlan,
+} from '@/services/core/db/plan.db';
 import { isFreeSlug } from '@/services/core/db/plan-access.db';
 
 /** Subscription plans understood by user_credits.subscription_plan. */
@@ -72,13 +77,34 @@ export class PlanService {
         return false;
       }
 
+      const isFreeTarget = isFreeSlug(planSlug);
+
       const plan = await getPlanBySlug(planSlug);
       if (!plan) {
+        // A terminal downgrade to free must ALWAYS succeed, even if the free
+        // pricing_plans row is missing/inactive — fall back to plan_id = null
+        // (getUserPlanSlug treats null as free, so the gate is unaffected).
+        // This preserves the old unconditional-downgrade guarantee instead of
+        // silently leaving a canceled user on their paid plan.
+        if (isFreeTarget && opts.skipDowngradeGuard) {
+          logger.warn('[PLAN_SERVICE] Free plan row unresolved — clearing plan_id to null', {
+            userId: userId.substring(0, 8) + '...',
+            source: opts.source,
+          });
+          const cleared = await clearUserPlanToFree(userId);
+          if (!cleared) return false;
+          const fallbackCreditOk = await UserCreditsService.updateSubscription(userId, 'free', 'inactive');
+          if (!fallbackCreditOk) {
+            logger.warn('[PLAN_SERVICE] Credit-side mirror failed after plan_id clear', {
+              userId: userId.substring(0, 8) + '...',
+              source: opts.source,
+            });
+          }
+          return true;
+        }
         logger.error('[PLAN_SERVICE] Plan not found', { planSlug, source: opts.source });
         return false;
       }
-
-      const isFreeTarget = isFreeSlug(planSlug);
 
       // Never silently downgrade a paid plan to free. This protects against
       // self-serve provisioning (ensureTrialCreditsAndPlan) resetting a
