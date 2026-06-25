@@ -6,6 +6,10 @@
  * - Steps with `isAutoInjected: true` — runner-injected infrastructure helpers
  * - Steps whose `stepId` is not in the original intent list — runner-added steps
  *
+ * Also detects a TRUNCATED run — the runner returning fewer results than were
+ * requested (early abort / timeout) — and forces the verdict to fail, so an
+ * incomplete run never shows a false-green short count.
+ *
  * Mirrors the verdict logic in `mobile-test-run.job.ts` Phase 4 and the runner's
  * `shouldContinue` rule in qait-mobile-runner `run.routes.ts:553`.
  */
@@ -26,6 +30,22 @@ export interface StepClassificationResult {
    */
   aggregateMismatch: boolean;
   /**
+   * True when the runner returned FEWER step results than were requested —
+   * i.e. some intent step has no result at all (`steps.length` short of the
+   * intent count, or short of the runner's own reported `totalSteps`). Happens
+   * when the runner aborts early / times out without pushing placeholder
+   * failures. The missing steps are unknown, so we cannot prove the test
+   * completed — the verdict is forced to fail (`testPassed=false`) regardless
+   * of how the returned steps fared.
+   */
+  incompleteRun: boolean;
+  /** Intent step IDs that the runner returned no result for (drives `incompleteRun`). */
+  missingStepIds: string[];
+  /** Expected step count (max of intent count and runner-reported `totalSteps`). */
+  expectedStepCount: number;
+  /** Number of step results the runner actually returned. */
+  returnedStepCount: number;
+  /**
    * Predicate built from the intent list.
    * Reusable during the per-step WS emission loop to badge soft-fails
    * differently from hard fails — keeps the caller from re-deriving it.
@@ -37,6 +57,7 @@ export function classifyStepResults(
   steps: MobileStepResult[],
   intentSteps: MobileIntentStep[],
   runnerStatus: string,
+  runnerTotalSteps?: number,
 ): StepClassificationResult {
   const tolerableFailureStepIds = new Set<string>();
   const knownStepIds = new Set<string>();
@@ -57,14 +78,35 @@ export function classifyStepResults(
 
   const mandatoryFailures = steps.filter((s) => !s.success && !isTolerableFailure(s.stepId));
   const optionalFailures = steps.filter((s) => !s.success && isTolerableFailure(s.stepId));
-  const testPassed = mandatoryFailures.length === 0;
   const aggregateMismatch = runnerStatus === 'passed' && steps.some((s) => !s.success);
+
+  // ── Truncated-run detection ───────────────────────────────────────
+  // The runner can abort early / time out and return FEWER results than
+  // were requested WITHOUT pushing placeholder failures. Inspecting only
+  // the returned steps would then mark an incomplete run as passed (a
+  // false-green short count, e.g. 3/5). Cross-check coverage two ways:
+  // every intent step must have a result, and the count must not fall
+  // short of the runner's own reported total.
+  const returnedStepIds = new Set(steps.map((s) => s.stepId));
+  const missingStepIds = intentSteps.filter((s) => !returnedStepIds.has(s.id)).map((s) => s.id);
+  const expectedStepCount = Math.max(intentSteps.length, runnerTotalSteps ?? 0);
+  const returnedStepCount = steps.length;
+  const incompleteRun = missingStepIds.length > 0 || returnedStepCount < expectedStepCount;
+
+  // An incomplete run cannot be trusted as passed — steps that never ran
+  // might have failed. Force the verdict to fail even if no returned step
+  // failed.
+  const testPassed = mandatoryFailures.length === 0 && !incompleteRun;
 
   return {
     testPassed,
     mandatoryFailures,
     optionalFailures,
     aggregateMismatch,
+    incompleteRun,
+    missingStepIds,
+    expectedStepCount,
+    returnedStepCount,
     isTolerableFailure,
   };
 }

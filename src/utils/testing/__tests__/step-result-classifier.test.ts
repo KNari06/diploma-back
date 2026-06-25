@@ -140,6 +140,62 @@ describe('classifyStepResults', () => {
     });
   });
 
+  describe('incompleteRun (truncated runner response)', () => {
+    it('fails the run when the runner returns fewer steps than requested', () => {
+      // Requested 5 steps, runner aborted after 3 — all 3 returned passed.
+      // Without truncation detection this would be a false-green 3/5.
+      const result = classifyStepResults(
+        [step('s1', true), step('s2', true), step('s3', true)],
+        [intent('s1'), intent('s2'), intent('s3'), intent('s4'), intent('s5')],
+        'passed',
+        5,
+      );
+      expect(result.incompleteRun).toBe(true);
+      expect(result.testPassed).toBe(false);
+      expect(result.missingStepIds).toEqual(['s4', 's5']);
+      expect(result.returnedStepCount).toBe(3);
+      expect(result.expectedStepCount).toBe(5);
+      expect(result.mandatoryFailures).toHaveLength(0);
+    });
+
+    it('fails when steps fall short of the runner-reported total even if intent count matches', () => {
+      // Returned a result per intent step, but the runner itself reports it
+      // expected more — trust the larger of the two counts.
+      const result = classifyStepResults(
+        [step('s1', true), step('s2', true)],
+        [intent('s1'), intent('s2')],
+        'passed',
+        4,
+      );
+      expect(result.incompleteRun).toBe(true);
+      expect(result.testPassed).toBe(false);
+      expect(result.expectedStepCount).toBe(4);
+    });
+
+    it('does not flag a complete run with runner-injected extra steps', () => {
+      // Every intent step has a result; runner added an extra helper step.
+      const result = classifyStepResults(
+        [step('s1', true), step('auto_wait', true), step('s2', true)],
+        [intent('s1'), intent('s2')],
+        'passed',
+        2,
+      );
+      expect(result.incompleteRun).toBe(false);
+      expect(result.testPassed).toBe(true);
+      expect(result.missingStepIds).toHaveLength(0);
+    });
+
+    it('does not flag truncation when runnerTotalSteps is omitted and all intent steps ran', () => {
+      const result = classifyStepResults(
+        [step('s1', true), step('s2', true)],
+        [intent('s1'), intent('s2')],
+        'passed',
+      );
+      expect(result.incompleteRun).toBe(false);
+      expect(result.testPassed).toBe(true);
+    });
+  });
+
   describe('edge cases', () => {
     it('handles empty steps and intentSteps', () => {
       const result = classifyStepResults([], [], 'passed');

@@ -790,8 +790,29 @@ export class MobileTestRunJobHandler {
         mandatoryFailures: realFailures,
         optionalFailures,
         aggregateMismatch,
+        incompleteRun,
+        missingStepIds,
+        expectedStepCount,
+        returnedStepCount,
         isTolerableFailure,
-      } = classifyStepResults(runResult.steps, intentSteps, runResult.status);
+      } = classifyStepResults(runResult.steps, intentSteps, runResult.status, runResult.totalSteps);
+      if (incompleteRun) {
+        // The runner returned fewer results than were requested (early abort /
+        // timeout without placeholder failures). Steps that never ran might
+        // have failed, so the verdict is forced to fail — guards against a
+        // false-green short count (e.g. 3/5 reported as passed).
+        logger.error('[MOBILE-TEST] Runner returned a truncated step set — failing the run', {
+          testId,
+          sessionId,
+          runnerStatus: runResult.status,
+          runnerTotalSteps: runResult.totalSteps,
+          requestedSteps: intentSteps.length,
+          returnedStepCount,
+          expectedStepCount,
+          missingStepCount: missingStepIds.length,
+          missingStepIds,
+        });
+      }
       if (aggregateMismatch) {
         logger.error('[MOBILE-TEST] Runner aggregate disagrees with per-step truth — downgrading', {
           testId,
@@ -960,7 +981,8 @@ export class MobileTestRunJobHandler {
       // `tolerableFailureStepIds` above. The runner's aggregate
       // `runResult.status` is treated as advisory because it does not
       // special-case optional steps and would flip the test to failed
-      // on any optional failure.
+      // on any optional failure. A truncated run (`incompleteRun`) also
+      // forces failure here — see classifyStepResults.
       const testPassed = allStepsActuallyPassed;
 
       try {
@@ -982,7 +1004,7 @@ export class MobileTestRunJobHandler {
       await this.updateTestStatus(testId, finalStatus, browser);
 
       // Create test result record
-      const testResultId = await this.createTestResult(testId, browser, runResult, userId, workspaceId, testPassed);
+      const testResultId = await this.createTestResult(testId, browser, runResult, userId, workspaceId, testPassed, missingStepIds.length);
 
       // ── Phase 5.5: Finalize analytics linkage ────────────────
       await MobileTestRunJobHandler.finalizeAnalyticsLinkage({
@@ -1386,6 +1408,7 @@ export class MobileTestRunJobHandler {
     userId: string,
     workspaceId: string,
     testPassed: boolean,
+    incompleteMissingCount = 0,
   ): Promise<string | null> {
     try {
       // Find last screenshot for the test result (prefer failed step, fallback to last step)
@@ -1411,6 +1434,24 @@ export class MobileTestRunJobHandler {
       // no artifacts/screenshots are ever persisted. Map to the device value:
       // only native iOS is 'mobile-ios'; android/flutter/etc. → 'mobile-android'.
       const deviceBrowser = browser === 'mobile-ios' ? 'mobile-ios' : 'mobile-android';
+
+      // Truncated run: the classifier forced `testPassed=false` because the
+      // runner returned fewer results than requested (see classifyStepResults
+      // `incompleteRun`). The runner's own stats only account for the steps it
+      // returned, so the never-run steps are absent from `failedSteps` and its
+      // `passRate` (computed over returned steps only). Persisting them raw
+      // would store a 'failed' row reading "0 failed / 100% pass" that
+      // contradicts the verdict. Count the missing steps as failures so the
+      // persisted totals reconcile with `steps_total` and the status.
+      const stepsFailed = runResult.failedSteps + incompleteMissingCount;
+      // `executed` excludes skipped — mirrors the runner's passRate denominator
+      // (run.routes.ts: `passed / executed * 100`). Missing steps were expected
+      // to execute, so they belong in the denominator.
+      const executed = runResult.passedSteps + stepsFailed;
+      const passRate = incompleteMissingCount > 0
+        ? (executed > 0 ? Math.round((runResult.passedSteps / executed) * 100) : 0)
+        : runResult.passRate;
+
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result: any = await dbAdminService.createMobileTestResult({
         test_id: testId,
@@ -1430,8 +1471,8 @@ export class MobileTestRunJobHandler {
         duration: Math.round(runResult.durationMs / 1000),
         steps_total: runResult.totalSteps,
         steps_passed: runResult.passedSteps,
-        steps_failed: runResult.failedSteps,
-        pass_rate: runResult.passRate,
+        steps_failed: stepsFailed,
+        pass_rate: passRate,
         user_id: userId,
         workspace_id: workspaceId,
         metadata: {
