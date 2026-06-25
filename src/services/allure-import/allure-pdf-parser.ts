@@ -18,6 +18,7 @@ import { PDFParse } from 'pdf-parse';
 import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
+import { MAX_STEP_DESC_CHARS } from './allure-mapper';
 import type { ParsedTestCaseFromLLM } from './allure-import.types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +68,8 @@ Steps:
 1. Step title
 1.1. Attachment: description (image/png)
 2. Another step
+   Expected result: what should be true after this step
+   Expected result: a second expectation for the same step
 2.1. Attachment: description (image/png)
 \`\`\`
 
@@ -85,7 +88,12 @@ Convert each numbered step (1., 2., etc.) into a test step:
 - Infer action type from step text (navigate/click/type/select/assert/wait/hover/scroll/press/check/uncheck/upload/dblclick)
 - If ambiguous → "click"
 - Attachment descriptions provide context for the step — incorporate into step description
-- Keep descriptions concise (max 120 chars), in the SAME LANGUAGE as the source
+- Keep descriptions concise (max ${MAX_STEP_DESC_CHARS} chars), in the SAME LANGUAGE as the source
+
+### Expected results (per step)
+- A step may have one or more "Expected result" sub-lines (the verification(s) for that step).
+- Put them in that step's "expected" array (one string per expectation), in order.
+- Do NOT turn them into separate steps and do NOT merge them into the action description — keep them in the "expected" field so they stay linked to their step.
 
 ### Status
 - Active → "active", Draft → "draft", Deprecated → "deprecated"
@@ -107,7 +115,8 @@ Extract any Jira issue keys (e.g. MFT-1003, MGOSAPP-4268) and convert to full UR
       "description": "Markdown description",
       "preconditions": ["Precondition 1"],
       "steps": [
-        { "type": "click", "description": "Step description" }
+        { "type": "click", "description": "Step description" },
+        { "type": "click", "description": "Step with checks", "expected": ["First expectation", "Second expectation"] }
       ],
       "moduleName": "From Epic/Story/Suite",
       "flowName": "From Feature",
@@ -242,6 +251,18 @@ async function parseChunkWithLLM(
       if (!tc || typeof tc !== 'object') return false;
       if (!tc.name || typeof tc.name !== 'string') return false;
       tc.steps = Array.isArray(tc.steps) ? tc.steps : [];
+      // Normalize each step's `expected` to a clean string[] (the model may
+      // return a string, mixed types, or omit it). Drop the field when empty so
+      // downstream sees `undefined`, matching the CSV path's shape.
+      for (const step of tc.steps) {
+        if (!step || typeof step !== 'object') continue;
+        const raw = (step as { expected?: unknown }).expected;
+        const list = (Array.isArray(raw) ? raw : raw != null ? [raw] : [])
+          .map((e) => (typeof e === 'string' ? e.trim() : String(e ?? '').trim()))
+          .filter(Boolean);
+        if (list.length > 0) (step as { expected?: string[] }).expected = list;
+        else delete (step as { expected?: string[] }).expected;
+      }
       tc.preconditions = Array.isArray(tc.preconditions) ? tc.preconditions : [];
       tc.tags = Array.isArray(tc.tags) ? tc.tags : [];
       tc.links = Array.isArray(tc.links) ? tc.links : [];

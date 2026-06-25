@@ -534,6 +534,12 @@ export interface ParsedTestCaseFromLLM {
     type: string;         // LLM picks from IntentActionType values
     description: string;
     value?: string;
+    /**
+     * Expected-result sub-lines that belong to this step (TestOps nests them
+     * under their owning step). The AI step converter emits one `assert` per
+     * entry, placed immediately after this step, preserving the link.
+     */
+    expected?: string[];
   }>;
   /** Module name — resolved from Epic > Story > Suite fallback chain. */
   moduleName?: string;
