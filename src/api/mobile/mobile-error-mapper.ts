@@ -64,10 +64,15 @@ export function sendMobileRunnerError(res: Response, error: unknown, fallback: s
   // of showing a dead-end error that only a reload "fixes".
   const sessionGone = isSessionGoneError(error);
   if (sessionGone) {
+    // Forward the runner's reclaim cause (device_disconnected / idle_ttl /
+    // evicted / rest_delete / …, parsed from the 404 body) so the editor can
+    // show a TRUTHFUL message instead of a blanket "inactivity".
+    const reclaimReason = (error as { reason?: string })?.reason;
     res.status(410).json({
       success: false,
       code: 'SESSION_EXPIRED',
       error: 'Session expired',
+      ...(reclaimReason ? { reason: reclaimReason } : {}),
       message: 'The device session is no longer available (reclaimed after inactivity or a restart). Reopen the test case to continue.',
     });
     return;
