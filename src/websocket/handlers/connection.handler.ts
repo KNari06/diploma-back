@@ -28,18 +28,32 @@ import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-up
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
 
 /**
- * Per-user grace timer for "user has gone away — destroy their mobile
- * emulator soon." Set on disconnect when this is the user's last socket;
- * cancelled on a fresh connect (refresh / brief reconnect doesn't pay the
- * cost of a re-warmup). 15s grace tolerates a quick reload.
+ * Per-user grace timer before disconnect cleanup runs. Set on disconnect when
+ * this is the user's last socket; cancelled on a fresh connect so a refresh /
+ * brief reconnect skips cleanup ENTIRELY. Widened 15s → 60s (June 2026): a
+ * reconnect within the window cancels the timer (see `cancelDisconnectGrace`
+ * on connect), so a backgrounded tab / reload / short network blip keeps its
+ * warm session instead of being torn down and bounced with "session expired".
+ * Paired with the 25s `pingTimeout` (server.ts), the socket also tolerates a
+ * ~25s stall before it even drops. Together they absorb the transient
+ * disconnects that caused the bounce WITHOUT leaking sessions — a genuine
+ * departure past the window is still destroyed below, freeing the runner slot.
  */
-const DISCONNECT_GRACE_MS = 15_000;
+const DISCONNECT_GRACE_MS = 60_000;
 const disconnectGraceTimers = new Map<string, NodeJS.Timeout>();
 
 /**
- * Run the actual cleanup: destroy each warmed runner session for this
- * user, then delete the Redis warmup keys, then cancel any pending idle
- * timer. Best-effort — failures are logged but not surfaced.
+ * Run the actual cleanup after the disconnect-grace window elapses (the user
+ * really is gone — a reconnect would have cancelled this timer). Destroy each
+ * warmed runner session, delete the Redis warmup keys, cancel the idle timers.
+ *
+ * Why DESTROY (not preserve): pooled runner sessions are excluded from the
+ * runner's idle-TTL cleanup AND its capacity eviction, so a preserved-but-
+ * orphaned session would strand its pool slot indefinitely → new warmups 503.
+ * This destroy (the runner DELETE path) is the only thing that frees the slot
+ * on browser-close. Transient disconnects are handled by the WIDE grace +
+ * pingTimeout above (a reconnect cancels this before it runs), NOT by skipping
+ * the teardown. Best-effort — failures are logged but not surfaced.
  */
 async function performDisconnectCleanup(userId: string, disconnectReason?: string): Promise<void> {
   try {
@@ -57,17 +71,11 @@ async function performDisconnectCleanup(userId: string, disconnectReason?: strin
               error: err instanceof Error ? err.message : String(err),
             });
           }
-          // Close + upload the mobile editor trace, same as the explicit
-          // DELETE /sessions/:id path and the web editor's recording:stop.
-          // Without this, a browser-close teardown left the trace writer
-          // open and the file never reached Supabase. Dev mode keeps the
-          // file local (uploadEditorTrace skips the upload).
+          // Record the teardown into the editor trace BEFORE close + upload so
+          // prod sees disconnect-grace teardowns in Supabase (Storage +
+          // trace_files). getOrCreate so even a lint-less session uploads a
+          // minimal teardown trace.
           try {
-            // Record WHY the session is being torn down (browser socket
-            // dropped past the grace window → destroy) into the trace BEFORE
-            // it's closed + uploaded, so prod sees disconnect-grace teardowns
-            // in Supabase (Storage + trace_files). getOrCreate so even a
-            // lint-less session still uploads a minimal teardown trace.
             EditorTraceService.getOrCreate(`mobile-${sid}`, userId).writeMobileSessionTeardown({
               cause: 'disconnect_grace',
               sessionId: sid,
@@ -101,7 +109,7 @@ async function performDisconnectCleanup(userId: string, disconnectReason?: strin
     // fire `preview:session:expired` against a reconnect on a fresh socket.
     cancelPreviewIdle(userId);
 
-    logger.info('[WebSocket] Cleanup fired — destroyed sessions + cleared Redis', {
+    logger.info('[WebSocket] Disconnect cleanup — destroyed sessions + cleared Redis', {
       userId: userId.substring(0, 8) + '...',
       destroyedSessions: sessionIds.length,
       deletedKeys,
