@@ -99,15 +99,11 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
       },
       // Connection options
       // ⚠️ pingInterval affects polling frequency. Lower = more requests
-      // (~6/min/client) but faster dead-connection detection.
-      // pingTimeout widened to 25s (June 2026): a backgrounded tab, a brief
-      // event-loop stall, or a wedged host that misses one heartbeat no longer
-      // drops the socket at all — that spurious drop was tripping the mobile
-      // editor's disconnect cleanup and surfacing "session expired". Paired
-      // with the wider 60s disconnect-grace (connection.handler), a transient
-      // drop+reconnect now cancels cleanup and keeps its warm session instead
-      // of being torn down.
-      pingTimeout: 25000, // 25s — disconnect window after a missed pong
+      // (~6/min/client) but faster dead-connection detection (~10–20s).
+      // We need fast detection so the editor's session-cleanup logic
+      // (Fix A: destroy mobile emulator on browser close, with 15s grace)
+      // and the per-user idle timer reach the user promptly.
+      pingTimeout: 10000, // 10s — disconnect window after a missed pong
       pingInterval: 10000, // 10s — heartbeat cadence
       connectTimeout: 45000, // 45 seconds
       // Transport options
