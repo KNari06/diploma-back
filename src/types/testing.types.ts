@@ -902,6 +902,8 @@ export interface NegativeMeta {
   originalValue: string;
   mutatedValue: string;
   expectedBehavior: string;
+  /** Why the generator chose this step + attack (quality signal / audit trail). */
+  reasoning?: string;
 }
 
 export interface NegativeSummary {

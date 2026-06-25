@@ -77,6 +77,11 @@ export class NegativeToggleResolverService {
         moduleId: parent?.moduleId,
         flowId: neg.flow_id || parent?.flowId,
         name: neg.name,
+        // Inherit the parent's platform so a mobile source's negatives route to
+        // the mobile runner. Without it the negative has no platform and the
+        // orchestrator's `platform?.startsWith('mobile_')` check dispatches it
+        // as web — it then fails on a fresh browser instead of the device.
+        platform: parent?.platform,
         isNegative: true,
         sourceTestCaseId: neg.source_intent_test_case_id,
         negativeMeta: neg.negative_meta as NegativeMeta | undefined,

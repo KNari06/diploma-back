@@ -1,4 +1,4 @@
-import { AI_MODELS } from '@/config/ai/ai-models.config';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { CANONICAL_XSS_PAYLOAD } from '@/services/testing/api/fuzzing/fuzzing-config';
 import type { NegativeMeta, NegativeMutationType } from '@/types/testing.types';
@@ -14,6 +14,26 @@ const VALID_MUTATION_TYPES: NegativeMutationType[] = [
   'skip_step',
   'wrong_credentials',
 ];
+
+/**
+ * Step types that carry a user-supplied `value` we can mutate (clear, replace
+ * with a bad format / canonical payload). Value-injecting mutation types
+ * (empty_field, invalid_format, xss, overflow, wrong_credentials) only make
+ * sense on these. Mobile-only action types (open_app, swipe, biometric, otp,
+ * permission, go_back, …) and clicks have no input value — mutating their
+ * `value` produces a garbage step the runner can't execute, so the LLM's
+ * choice is dropped rather than silently corrupting the step.
+ */
+const VALUE_MUTABLE_STEP_TYPES = new Set<string>([
+  'type',
+  'fill',
+  'select',
+  'check',
+  'uncheck',
+]);
+
+/** Click-class types a double_submit (duplicate-and-resubmit) makes sense on. */
+const CLICKABLE_STEP_TYPES = new Set<string>(['click', 'tap', 'double_tap', 'press']);
 
 /**
  * Server-owned canonical payloads. The LLM decides WHICH step to mutate; the
@@ -33,33 +53,52 @@ interface GeneratedMutation {
   originalValue: string;
   mutatedValue: string;
   expectedBehavior: string;
+  /** Why this step + attack is high-value. Quality signal + audit trail. */
+  reasoning?: string;
 }
 
-const SYSTEM_PROMPT = `You are an expert QA engineer specializing in negative and boundary testing of web applications.
+const SYSTEM_PROMPT = `You are a senior QA engineer specializing in negative and boundary testing of web AND mobile applications.
 
-GOAL: Given the happy-path steps of ONE test case, decide which input steps are worth attacking and how, so that each mutation provokes a distinct failure-handling path in the app.
+GOAL: Given the happy-path steps of ONE test case, choose a SMALL set of HIGH-VALUE attacks — each one provoking a distinct failure-handling path the app should guard. Quality over quantity. You are not here to tick a box; a weak negative that always passes is worse than none.
 
-Each step carries hints about the field it touches: \`inputType\` (HTML type), \`autocomplete\`, \`name\`, \`label\`, \`placeholder\`, \`elementDescription\`, and the recorded \`value\`. Use them to understand the field's PURPOSE before mutating — an email field, a password, a phone, a free-text name behave differently under bad input.
+UNDERSTAND THE FIELD FIRST. Each step carries identity signals: \`type\` (action), \`inputType\`, \`role\`, \`autocomplete\`, \`name\`, \`label\`, \`placeholder\`, \`nearText\`, \`elementDescription\` (an authored natural-language description — the strongest purpose hint), and the recorded \`value\`. Read them before mutating: an email, a password, a phone, an OTP, a free-text name each behave differently under bad input.
 
-MUTATION TYPES (pick the ones that fit the field):
+MUTATION TYPES:
 - empty_field: clear a required field (mutatedValue = "")
-- invalid_format: wrong format for the field's purpose (e.g. "not-an-email" for an email field, letters in a phone field)
-- xss: probe for reflected XSS — the SERVER supplies the payload, you only choose the step (leave mutatedValue = "")
-- overflow: extremely long input — the SERVER supplies the payload (leave mutatedValue = "")
+- invalid_format: wrong format for the field's purpose (e.g. "not-an-email" for email, letters in a phone)
+- xss: probe for reflected XSS — the SERVER supplies the payload, leave mutatedValue = "" (low value on native mobile inputs)
+- overflow: extremely long input — the SERVER supplies the payload, leave mutatedValue = "" (low value on native mobile inputs)
 - wrong_credentials: plausible-but-wrong value for an auth field (password/token/login)
-- double_submit: submit/confirm clicked twice rapidly (choose a click step on a submit/confirm control)
+- double_submit: a submit/confirm CLICK step clicked twice rapidly (idempotency)
 - skip_step: remove a required step entirely
 
+WHERE YOU MAY ATTACK (hard constraint):
+- Value mutations (empty_field/invalid_format/xss/overflow/wrong_credentials) target ONLY steps that hold an input value: \`type\`/\`fill\`/\`select\`/\`check\`/\`uncheck\`. NEVER target navigation, taps, swipes, open_app, permission, scroll, or wait steps — they have no value and the mutation will be discarded.
+- double_submit targets ONLY a click/tap/press step (a submit/confirm control).
+- skip_step targets a required step whose removal should break the flow.
+
+PRIORITIZATION (highest value first):
+1. Authentication & security fields (password, token, login, OTP).
+2. Validated inputs (email, phone, required fields, numeric/amount, payment).
+3. Idempotency-sensitive submits (double_submit on a final confirm/pay).
+Do NOT attack a field with no apparent validation just to produce a mutation. If nothing is worth attacking, return fewer — even zero — mutations.
+
+SECURITY / BOUNDARY COVERAGE: on WEB, when a free-text field is likely reflected back or rendered (search query, name, comment, free-text field) include ONE xss probe; for any field with a length/format limit (codes, card, amount, names) include ONE overflow probe. These catch a different bug class than validation. On native MOBILE inputs xss/overflow are usually low value (no JS execution, hard client caps) — skip them unless the field is clearly a WebView or free-text area. Do not force xss/overflow where they make no sense.
+
 RULES:
-1. Mutate exactly ONE step per mutation (isolated testing). stepIndex must be a real index from the input.
-2. Prefer steps whose field clearly has validation (auth fields, email, required inputs). Skip purely navigational steps (goto, scroll, wait).
-3. No duplicate mutations (same mutationType + same stepIndex).
-4. expectedBehavior describes what the app SHOULD do (reject input, show a validation/error message, stay on the page). Write expectedBehavior in the SAME LANGUAGE as the UI of the source test case — infer the language from the steps' value/label/description text. If unclear, use the language those texts are written in.
-5. Aim for the highest-value 3–6 mutations, not exhaustive coverage.
+1. Mutate exactly ONE step per mutation. stepIndex must be a real index from the input.
+2. No duplicate mutations (same mutationType + same stepIndex).
+3. expectedBehavior must describe an OBSERVABLE error state the app should SHOW: a validation/error message visible on screen, staying on the same page, login NOT succeeding. The assertion checks the screen for this — do NOT describe the happy path.
+4. LANGUAGE (strict): write expectedBehavior AND reasoning in the SAME human language the source UI uses — infer it from the steps' label / placeholder / value / description text. If that text is English, write in English. NEVER introduce a third language (e.g. do not answer in Spanish for an English/Russian app). When the language is genuinely ambiguous, default to English.
+5. reasoning: one short sentence — why this step + attack is high-value.
+6. Aim for the highest-value 3–6 mutations, not exhaustive coverage. Fewer strong negatives beat many weak ones.
 
 OUTPUT: a single JSON object: { "mutations": [ ... ] }. No markdown, no prose.`;
 
-const USER_PROMPT_TEMPLATE = `Happy-path steps for the test case:
+const USER_PROMPT_TEMPLATE = `Test case: "{testCaseName}"
+{platform}
+
+Happy-path steps:
 
 \`\`\`json
 {steps}
@@ -73,7 +112,8 @@ Return the mutations as a JSON object in this exact shape:
       "stepIndex": 2,
       "originalValue": "user@example.com",
       "mutatedValue": "",
-      "expectedBehavior": "Поле email обязательно — должно показать ошибку валидации"
+      "expectedBehavior": "Поле email обязательно — должна показаться ошибка валидации, форма не отправляется",
+      "reasoning": "Email обязателен; пустое значение должно блокировать отправку"
     }
   ]
 }`;
@@ -105,8 +145,19 @@ export class NegativeTestGeneratorService {
       return [];
     }
 
+    // Mobile negatives diverge in step-shape (no recordedInputType, mobile-only
+    // action types) and in the ai_check verification source (a11y tree vs DOM).
+    const isMobile = (sourceCase.platform ?? 'web').startsWith('mobile_');
+    // Inherit the source's replay_strategy so the negative dispatches the same
+    // way; fall back to the platform default if the source somehow lacks one.
+    const replayStrategy =
+      sourceCase.replay_strategy || (isMobile ? 'mobile_steps' : 'steps_editor');
+
     // 2. Generate mutations via AI
-    const mutations = await this.generateMutations(steps);
+    const mutations = await this.generateMutations(steps, {
+      isMobile,
+      testCaseName: sourceCase.name,
+    });
     if (mutations.length === 0) {
       logger.info('[NEGATIVE_GEN] No mutations generated', { sourceTestCaseId });
       return [];
@@ -122,7 +173,7 @@ export class NegativeTestGeneratorService {
           ...rawMutation,
           mutatedValue: this.resolveMutatedValue(rawMutation),
         };
-        const negativeSteps = this.buildNegativeSteps(steps, mutation);
+        const negativeSteps = this.buildNegativeSteps(steps, mutation, isMobile);
         const name = `[NEG] ${sourceCase.name}: ${mutation.mutationType} on step ${mutation.stepIndex + 1}`;
 
         const createdId = await negativeDb.insertNegativeTestCase({
@@ -141,7 +192,18 @@ export class NegativeTestGeneratorService {
             originalValue: mutation.originalValue,
             mutatedValue: mutation.mutatedValue,
             expectedBehavior: mutation.expectedBehavior,
+            ...(mutation.reasoning && { reasoning: mutation.reasoning }),
           } satisfies NegativeMeta,
+          // Inherit source identity so the negative dispatches + runs like the
+          // source (web vs mobile routing, param resolution, login setup, app
+          // variant). Without these a mobile negative fails on setup, not on
+          // the mutation. depends_on is omitted — mobile ignores it.
+          platform: sourceCase.platform ?? 'web',
+          replayStrategy,
+          parametersSchema: sourceCase.parameters_schema,
+          resourceBindings: sourceCase.resource_bindings,
+          mobileVariantLabel: sourceCase.mobile_variant_label,
+          triggers: sourceCase.triggers,
         });
 
         if (createdId) {
@@ -175,11 +237,17 @@ export class NegativeTestGeneratorService {
   /**
    * Call AI to generate mutation list from happy-path steps.
    */
-  private static async generateMutations(steps: any[]): Promise<GeneratedMutation[]> {
-    // Simplify steps for AI prompt — surface the field-identity signals the
-    // recorder actually captures so the model understands each field's purpose.
-    // (The old `bindingHints.fieldType` never existed — dead path. Real signals
-    // are recordedInputType + bindingHints.{type,autocomplete,name,label,placeholder}.)
+  private static async generateMutations(
+    steps: any[],
+    ctx: { isMobile: boolean; testCaseName: string },
+  ): Promise<GeneratedMutation[]> {
+    // Simplify steps for AI prompt — surface every field-identity signal the
+    // recorder captures so the model understands each field's PURPOSE before
+    // choosing an attack. Web steps carry recordedInputType; mobile steps do
+    // not, so fall back to the a11y signals (role / label / placeholder /
+    // nearText) the mobile recorder captures. recordedDescription is an
+    // LLM-authored NL description ("password field in the login form") — the
+    // single strongest purpose signal for icon-only / label-poor elements.
     const simplifiedSteps = steps.map((s, i) => {
       const hints = s.bindingHints || {};
       const inputType = s.recordedInputType || hints.type;
@@ -189,15 +257,23 @@ export class NegativeTestGeneratorService {
         description: s.description,
         value: s.value,
         ...(inputType && { inputType }),
+        ...(hints.role && { role: hints.role }),
         ...(hints.autocomplete && { autocomplete: hints.autocomplete }),
         ...(hints.name && { name: hints.name }),
         ...(hints.label && { label: hints.label }),
         ...(hints.placeholder && { placeholder: hints.placeholder }),
+        ...(hints.nearText && { nearText: hints.nearText }),
         ...(s.recordedDescription && { elementDescription: s.recordedDescription }),
       };
     });
 
-    const userPrompt = USER_PROMPT_TEMPLATE.replace('{steps}', JSON.stringify(simplifiedSteps, null, 2));
+    const platformLine = ctx.isMobile
+      ? 'PLATFORM: mobile app (native/Flutter). Fields are identified by role / label / placeholder / nearText, not HTML input types. XSS/overflow rarely matter on native inputs — prefer empty/invalid/wrong-credentials and validation attacks. Only "type" steps hold an input value; do not target swipe/tap/open_app/permission steps with value mutations.'
+      : 'PLATFORM: web. Standard HTML form semantics apply.';
+
+    const userPrompt = USER_PROMPT_TEMPLATE.replace('{platform}', platformLine)
+      .replace('{testCaseName}', ctx.testCaseName)
+      .replace('{steps}', JSON.stringify(simplifiedSteps, null, 2));
 
     try {
       const response = await getChatCompletionWithMessages(
@@ -206,7 +282,7 @@ export class NegativeTestGeneratorService {
           { role: 'user', content: userPrompt },
         ],
         {
-          model: AI_MODELS.fast,
+          model: AI_TASK_MODELS.negativeGeneration,
           temperature: 0.3,
           max_tokens: 4000,
           response_format: { type: 'json_object' },
@@ -250,6 +326,7 @@ export class NegativeTestGeneratorService {
   private static buildNegativeSteps(
     originalSteps: any[],
     mutation: GeneratedMutation,
+    isMobile: boolean,
   ): any[] {
     // Deep copy steps
     const steps = JSON.parse(JSON.stringify(originalSteps));
@@ -258,21 +335,52 @@ export class NegativeTestGeneratorService {
       // Remove the step entirely
       steps.splice(mutation.stepIndex, 1);
     } else if (mutation.mutationType === 'double_submit') {
-      // Duplicate the click step
+      // Duplicate the click step. The duplicate is the one that should provoke
+      // the rejection (idempotency / "already submitted"), so it carries the
+      // expected-error marker.
       const step = steps[mutation.stepIndex];
-      if (step) {
-        const duplicate = { ...step, id: `neg_dup_${Date.now().toString(36)}` };
-        steps.splice(mutation.stepIndex + 1, 0, duplicate);
+      if (!step) {
+        throw new Error(`double_submit target step ${mutation.stepIndex} missing`);
       }
+      // Guard: duplicating a swipe / open_app / type produces a meaningless
+      // "double submit". Only click-class steps model a real double-submit.
+      if (!CLICKABLE_STEP_TYPES.has(step.type)) {
+        throw new Error(
+          `double_submit on non-clickable step type '${step.type}' — dropping mutation`,
+        );
+      }
+      const duplicate = {
+        ...step,
+        id: `neg_dup_${Date.now().toString(36)}`,
+        expectedOutcome: 'error' as const,
+      };
+      steps.splice(mutation.stepIndex + 1, 0, duplicate);
     } else {
-      // Mutate the value. mutation.mutatedValue is already normalized by the
+      // Value-injecting mutation (empty_field / invalid_format / xss / overflow
+      // / wrong_credentials). mutation.mutatedValue is already normalized by the
       // caller (canonical server payload for xss/overflow, LLM value otherwise).
       const step = steps[mutation.stepIndex];
-      if (step) {
-        step.value = mutation.mutatedValue;
-        // Update description to reflect mutation
-        step.description = `[MUTATED: ${mutation.mutationType}] ${step.description || ''}`;
+      if (!step) {
+        throw new Error(`mutation target step ${mutation.stepIndex} missing`);
       }
+      // Guard (#A): only steps with an actual input value can be mutated.
+      // The LLM occasionally targets a non-input step (esp. mobile-only types
+      // like swipe / open_app / permission); mutating their `value` yields a
+      // step the runner can't execute. Drop the mutation instead of corrupting.
+      if (!VALUE_MUTABLE_STEP_TYPES.has(step.type)) {
+        throw new Error(
+          `${mutation.mutationType} on non-input step type '${step.type}' — dropping mutation`,
+        );
+      }
+      step.value = mutation.mutatedValue;
+      // Update description to reflect mutation
+      step.description = `[MUTATED: ${mutation.mutationType}] ${step.description || ''}`;
+      // Mark the mutated input as expecting an error outcome so the executor's
+      // 4xx-aware branch (test-executor.ts) treats a same-origin validation
+      // 4xx as a PASS, not a regression failure. Without this, an app that
+      // CORRECTLY rejects the bad input flips allSuccess=false and the
+      // negative fails for the wrong reason (inverted pass/fail).
+      step.expectedOutcome = 'error';
     }
 
     // Append ai_check assertion step. assertionText is REQUIRED by both
@@ -280,13 +388,28 @@ export class NegativeTestGeneratorService {
     // the assertion fail validation, so the negative never actually verifies.
     // aiContextMode html+a11y is enough for validation/error-message checks and
     // avoids the screenshot token cost of the default html+a11y+screenshot.
+    // expectedOutcome:'error' carries the negative intent to the UI-level
+    // assertion: this step verifies the app SHOWED an error / rejected the
+    // input, it is NOT a positive happy-path assertion. For skip_step (no
+    // mutated value step) this is the sole carrier of the negative expectation.
+    // Platform-aware verification source:
+    //  - web   → aiContextMode 'html+a11y' (DOM + a11y, no screenshot cost).
+    //  - mobile → aiCheckSource 'tree': the runner's intent-step-converter maps
+    //    ai_check + aiCheckSource to an `ai_visual_check` against the a11y tree
+    //    (Gemini, OpenAI fallback). Without a source the runner degrades to a
+    //    plain assert_text/assert_visible (no AI). 'tree' avoids the screenshot
+    //    token cost while still doing a semantic check of the error state.
+    const aiCheckOptions = isMobile
+      ? { aiCheckSource: 'tree' as const }
+      : { aiContextMode: 'html+a11y' as const };
     steps.push({
       id: `neg_check_${Date.now().toString(36)}`,
       type: 'ai_check',
       description: mutation.expectedBehavior,
       assertionText: mutation.expectedBehavior,
       value: mutation.expectedBehavior,
-      options: { aiContextMode: 'html+a11y' },
+      expectedOutcome: 'error' as const,
+      options: aiCheckOptions,
     });
 
     return steps;

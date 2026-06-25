@@ -1692,7 +1692,20 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   socket.on('preview:step:lint', async (data) => {
     try {
       const ensuredUserId = requireUser();
-      if (!ensuredUserId) return;
+      if (!ensuredUserId) {
+        // Invariant #2: always emit the channel terminator. requireUser emits a
+        // generic 'error', but the FE lint button only clears its 'Detecting…'
+        // spinner on preview:step:lint:result — a bare return hangs it forever.
+        socket.emit('preview:step:lint:result', {
+          status: 'error',
+          message: 'Authentication required',
+          confidence: 0,
+          candidates: [],
+          highlight: [],
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
 
       // V2: Rate limit check
       if (!checkRateLimit(socket.id, 'lint')) {
@@ -1903,7 +1916,19 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   socket.on('preview:step:clarify:select', async (data) => {
     try {
       const ensuredUserId = requireUser();
-      if (!ensuredUserId) return;
+      if (!ensuredUserId) {
+        // Invariant #2: this handler resolves via preview:step:lint:result
+        // (same channel as lint). A bare return hangs the clarify UI.
+        socket.emit('preview:step:lint:result', {
+          status: 'error',
+          message: 'Authentication required',
+          confidence: 0,
+          candidates: [],
+          highlight: [],
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
 
       const { previewSessionId, stepId, selectedRef } = data;
 
@@ -2475,7 +2500,18 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   socket.on('mobile:step:apply', async (data) => {
     try {
       const ensuredUserId = requireUser();
-      if (!ensuredUserId) return;
+      if (!ensuredUserId) {
+        // Invariant #2: emit the channel terminator. The mobile editor's Apply
+        // button only clears its loading state on mobile:step:apply:result;
+        // requireUser's generic 'error' does not reach it (matches the
+        // preview:step:apply fix).
+        socket.emit('mobile:step:apply:result', {
+          success: false,
+          error: 'Authentication required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
 
       if (!checkRateLimit(socket.id, 'apply')) {
         socket.emit('mobile:step:apply:result', {

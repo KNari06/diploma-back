@@ -97,6 +97,10 @@ const envSchema = z.object({
   OPENAI_API_KEY: z.string().min(1, 'OPENAI_API_KEY is required'),
   OPENAI_MODEL: z.string().default('gpt-5.4-mini'),
   OPENAI_MODEL_FAST: z.string().default('gpt-4.1-mini'),
+  // Negative-test mutation generation. Reasoning-heavy (understand each field's
+  // purpose, pick the highest-value attack) — defaults to the smart tier, NOT
+  // the fast tier. Override only to pin a specific model for this task.
+  OPENAI_MODEL_NEGATIVE_GEN: z.string().optional(),
   OPENAI_MAX_TOKENS: z.string().transform(Number).default('4000'),
 
   // Google Gemini

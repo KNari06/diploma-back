@@ -102,6 +102,25 @@ describe('expandNegatives', () => {
     expect(result).toEqual([]);
     expect(negativeDb.getFreshNegativesBySources).not.toHaveBeenCalled();
   });
+
+  it('copies the parent platform onto the negative so it routes to the mobile runner', async () => {
+    // A real mobile test case is testType:'ui' (platform distinguishes web vs
+    // mobile), so it is NOT skipped by the testType gate — it gets negatives.
+    (negativeDb.getPlanItemsForToggle as jest.Mock).mockResolvedValue([
+      item({ item_type: 'test_case', test_case_id: 'tcMob', negative_testing_enabled: true }),
+    ]);
+    (negativeDb.getFreshNegativesBySources as jest.Mock).mockResolvedValue([
+      { id: 'negMob', name: '[NEG] mobile', flow_id: 'fM', source_intent_test_case_id: 'tcMob', negative_meta: {} },
+    ]);
+
+    const result = await NegativeToggleResolverService.expandNegatives('p', [
+      { testCaseId: 'tcMob', testType: 'ui', platform: 'mobile_android', flowId: 'fM', moduleId: 'mM', name: 'mobile login' } as any,
+    ]);
+
+    expect(result).toHaveLength(1);
+    // Without this, the negative has no platform → dispatched as web → fails.
+    expect(result[0].platform).toBe('mobile_android');
+  });
 });
 
 describe('getEnabledTestCaseIds', () => {
