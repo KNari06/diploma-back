@@ -1650,4 +1650,29 @@ export class EditorTraceService {
       payload: { previewSessionId: this.previewSessionId, userId: this.userId, ...data },
     });
   }
+
+  /**
+   * Mobile editor "session expired" surfaced to the user — written when an
+   * editor action (apply / lint) hits a runner `404 session not found` and we
+   * return a 410 SESSION_EXPIRED. This is the ONLY on-trace signal for a session
+   * the RUNNER reclaimed on its own (its 25-min TTL, pool eviction, redeploy):
+   * the backend teardown paths (idle timer / disconnect grace) never ran, so
+   * `mobile_session_teardown` is absent and the expiry would otherwise leave no
+   * trace at all — invisible in Supabase. The aggregator lifts `surfacedBy` into
+   * `trace_files.parsed_data` so prod can filter these without reading the
+   * JSONL. Payload carries no user content.
+   */
+  writeMobileSessionExpiredSurfaced(data: {
+    sessionId: string;
+    /** Which editor action surfaced the 410: 'apply' | 'lint'. */
+    surfacedBy: string;
+    /** Runner's typed code if any — usually 'none' (the runner just 404s). */
+    runnerCode?: string;
+  }): void {
+    this.writer.write({
+      stage: 'mobile_lifecycle',
+      eventType: 'mobile_session_expired_surfaced',
+      payload: { previewSessionId: this.previewSessionId, userId: this.userId, ...data },
+    });
+  }
 }

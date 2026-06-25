@@ -86,6 +86,33 @@ describe('TraceSummaryAggregator — mobile teardown', () => {
   });
 });
 
+describe('TraceSummaryAggregator — mobile session expired (runner-reclaimed)', () => {
+  it('defaults expirySurfacedBy to null when no expiry event is seen', () => {
+    expect(new TraceSummaryAggregator().finalize().expirySurfacedBy).toBeNull();
+  });
+
+  it('surfaces which action hit the 410 when the runner reclaimed the session', () => {
+    const agg = new TraceSummaryAggregator();
+    agg.consume({
+      eventType: 'mobile_session_expired_surfaced',
+      payload: { sessionId: 'session_x', surfacedBy: 'apply', runnerCode: 'none' },
+    });
+    const s = agg.finalize();
+    expect(s.expirySurfacedBy).toBe('apply');
+    // This is the case that used to be invisible: no backend teardown ran,
+    // so teardownCause stays null while expirySurfacedBy marks the cause.
+    expect(s.teardownCause).toBeNull();
+  });
+
+  it('aggregates the expiry event through aggregateJsonl (upload-side recompute)', () => {
+    const jsonl = JSON.stringify({
+      eventType: 'mobile_session_expired_surfaced',
+      payload: { sessionId: 'session_y', surfacedBy: 'lint' },
+    });
+    expect(aggregateJsonl(jsonl).expirySurfacedBy).toBe('lint');
+  });
+});
+
 describe('TraceSummaryAggregator — resolver health', () => {
   it('tallies resolverPath and fingerprintMatch with defaults', () => {
     const agg = new TraceSummaryAggregator();
