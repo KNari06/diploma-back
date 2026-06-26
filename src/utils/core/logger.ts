@@ -422,6 +422,7 @@ try {
 try {
   const MOBILE_TAGS = [
     '[MOBILE_SESSION]',
+    '[MOBILE_APP_PREP]',
     '[MOBILE-TEST]',
     '[MOBILE_TEST_WORKER]',
     '[MOBILE_STREAM]',

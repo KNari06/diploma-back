@@ -285,7 +285,20 @@ export function getProjectMobileVariants(
   const registry = (settings as any).mobileAppVariants as MobileAppVariantsByPlatform | undefined;
   const fromRegistry = registry?.[lanePlatform];
   if (fromRegistry && fromRegistry.length > 0) {
-    return fromRegistry.map((v) => ({ ...v, isDefault: v.label === defaultLabel }));
+    const mapped = fromRegistry.map((v) => ({ ...v, isDefault: v.label === defaultLabel }));
+    // The registry stores only NAMED lanes; the base/default build lives in the
+    // legacy/shard slot. Surface it as a `default` lane too so build-variant
+    // pickers can offer the base build (otherwise a project with named variants
+    // hides its base app from the picker entirely). The Settings UI renders the
+    // default lane from the slot and filters `default` out of its named list, so
+    // this adds no double-listing there.
+    if (!mapped.some((v) => v.label === DEFAULT_VARIANT_LABEL)) {
+      const slot = getProjectMobileApp(settings, platform, DEFAULT_VARIANT_LABEL);
+      if (slot) {
+        mapped.unshift({ label: DEFAULT_VARIANT_LABEL, isDefault: DEFAULT_VARIANT_LABEL === defaultLabel, latest: slot });
+      }
+    }
+    return mapped;
   }
 
   // Virtual-fill: synthesise a default lane from the legacy/shard slot.
