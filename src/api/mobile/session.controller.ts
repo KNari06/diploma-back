@@ -220,6 +220,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     appPackage,
     deviceSelector: rawDeviceSelector,
     prelaunch: rawPrelaunch,
+    variantLabel: rawVariantLabel,
   } = req.body as {
     projectId?: string;
     platform?: string;
@@ -233,8 +234,19 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
      * for callers that haven't opted in.
      */
     prelaunch?: boolean;
+    /**
+     * Named build-variant lane to install (e.g. 'Staging'). When set, prep
+     * installs that lane's resolved build instead of the project default, so
+     * the editor preview matches the build the flow is pinned to. Absent →
+     * project default lane (pre-variant behaviour).
+     */
+    variantLabel?: string;
   };
   const prelaunch = rawPrelaunch !== false; // default true
+  // Trim to a non-empty label; '' / whitespace means "no variant" (default lane).
+  const variantLabel = typeof rawVariantLabel === 'string' && rawVariantLabel.trim()
+    ? rawVariantLabel.trim()
+    : undefined;
 
   if (!projectId) {
     logger.warn('[MOBILE_SESSION] warmup rejected: projectId is required', {
@@ -394,6 +406,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     projectId,
     platform,
     appPackage: appPackage ?? null,
+    variantLabel: variantLabel ?? null,
     runnerUrl: env.MOBILE_RUNNER_URL,
     runnerAuthEnabled: !!env.MOBILE_RUNNER_API_KEY,
   });
@@ -619,6 +632,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
                 userId,
                 appPackage,
                 platform,
+                variantLabel,
                 skipLaunch: !prelaunch,
                 onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
               }));
@@ -823,6 +837,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         userId,
         appPackage,
         platform,
+        variantLabel,
         skipLaunch: isFlutter ? true : !prelaunch,
         onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
       }));

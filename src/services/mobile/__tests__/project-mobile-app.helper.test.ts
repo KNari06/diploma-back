@@ -147,4 +147,27 @@ describe('getProjectMobileVariants', () => {
     // and a named flutter variant read resolves to the android build.
     expect(getProjectMobileApp(settings, 'flutter', 'Staging')?.storagePath).toBe('s.apk');
   });
+
+  it('surfaces the base default lane alongside named lanes (so pickers can offer the base build)', () => {
+    const settings = {
+      mobileApp: app('android', 'base.apk'),
+      mobileAppVariants: { android: [{ label: 'Staging', isDefault: false, latest: app('android', 's.apk') }] },
+    };
+    const lanes = getProjectMobileVariants(settings, 'android');
+    expect(lanes.map((l) => l.label)).toEqual([DEFAULT_VARIANT_LABEL, 'Staging']);
+    expect(lanes[0].latest.storagePath).toBe('base.apk');
+  });
+
+  it('does not duplicate an explicit default entry already in the registry', () => {
+    const settings = {
+      mobileApp: app('android', 'base.apk'),
+      mobileAppVariants: { android: [
+        { label: DEFAULT_VARIANT_LABEL, isDefault: true, latest: app('android', 'reg.apk') },
+        { label: 'Staging', isDefault: false, latest: app('android', 's.apk') },
+      ] },
+    };
+    const lanes = getProjectMobileVariants(settings, 'android');
+    expect(lanes.map((l) => l.label)).toEqual([DEFAULT_VARIANT_LABEL, 'Staging']);
+    expect(lanes[0].latest.storagePath).toBe('reg.apk'); // registry's own, not synthesized
+  });
 });
