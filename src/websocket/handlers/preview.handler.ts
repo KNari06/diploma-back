@@ -6100,6 +6100,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         if (recPage) {
           const { setHoverOverlayMode } = await import('@/services/testing/ui/preview/preview-hover-overlay.service');
           void setHoverOverlayMode(previewSessionId, recPage, 'recording').catch(() => undefined);
+
+          // #11 — Lazy warmup + carousel pause. Fire-and-forget: materialize
+          // lazy content and freeze autoplaying carousels so targets don't move
+          // between record and replay. Never blocks recording start.
+          const { warmupPageForCapture } = await import('@/services/testing/ui/preview/warmup-capture.util');
+          void warmupPageForCapture(recPage).catch(() => undefined);
         }
       } catch { /* non-fatal */ }
 

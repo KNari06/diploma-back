@@ -354,6 +354,8 @@ export interface ProbedElement {
    *   - `canvas_at_top`             — no DOM identity, vision needed
    *   - `overlay_above_target`      — modal/backdrop above target
    *   - `deep_stack`                — 6+ elements at one pixel
+   *   - `page_unsettled`            — #12: recorded while the page was still
+   *                                   loading / mid-hydration (sparse DOM)
    */
   probeAmbiguity?: string[];
 }
@@ -2386,6 +2388,29 @@ export class RecordingCaptureService {
         if (result.tag === 'webview' && result.resolvedVia === 'directHit') {
           return { tag: 'webview', unsupportedHost: 'webview', crossOriginIframe: false };
         }
+        // #12 — Record-time readiness advisory. Reuses the diagnostic
+        // `probeAmbiguity` channel (invariant #12: never changes target
+        // selection) to flag steps recorded while the page is still settling /
+        // hydrating — exactly the state that makes a recorded step flap at
+        // replay (the documentolog Step-0 class of bug). Cheap, fail-open, no
+        // persisted field; replay-side readiness is unchanged.
+        try {
+          const unsettled = await page.evaluate(() => {
+            // @ts-expect-error - browser context
+            const d = document;
+            if (d.readyState !== 'complete') return true;
+            // Sparse interactive DOM ⇒ likely mid-hydration (mirrors the
+            // resolver's waitForDomDensitySettle heuristic, cheap variant).
+            const interactive = d.querySelectorAll(
+              'a,button,input,select,textarea,[role="button"],[role="link"]',
+            ).length;
+            return interactive < 3;
+          });
+          if (unsettled) {
+            const prior = ((result as any).probeAmbiguity as string[] | undefined) ?? [];
+            (result as any).probeAmbiguity = [...prior, 'page_unsettled'];
+          }
+        } catch { /* advisory only — never block the probe return */ }
         // V26 #1+#2: emit warning ONLY when probe flagged ambiguity.
         // Quiet on the 99% happy path (no log spam) — visible signal
         // when the recorder caught a click that the resolver may struggle
@@ -2524,6 +2549,16 @@ export class RecordingCaptureService {
               return probed;
             }
           } catch (frameErr) {
+            // #2 — cross-origin per-frame rescue. The index-based
+            // `childFrames()[rect.index]` probe above throws on some
+            // cross-origin / sandboxed frames (index drift, detached context).
+            // Playwright's element-based `contentFrame()` resolves the SAME
+            // frame origin-agnostically, so retry through it before giving up.
+            // This ONLY runs after the existing path already failed, so it can
+            // never regress a working capture; on any failure it falls through
+            // to the same marker as before.
+            const rescued = await this.probeViaContentFrame(page, rect, x, y);
+            if (rescued) return rescued;
             // V14: Log cross-origin iframe detection so the handler can warn the user
             logger.warn('[RECORDING] Cross-origin iframe detected — element inside cannot be recorded', {
               iframeSelector: rect.selector,
@@ -2541,6 +2576,57 @@ export class RecordingCaptureService {
     }
 
     return null;
+  }
+
+  /**
+   * #2 — Element-based cross-origin frame rescue.
+   *
+   * Resolves the frame from the iframe ELEMENT (`$(selector).contentFrame()`)
+   * instead of the fragile positional `childFrames()[index]`, then runs the
+   * same in-frame probe. `contentFrame()` is origin-agnostic, so this reaches
+   * into cross-origin frames the index path gave up on (e.g. an embedded OAuth
+   * / chat widget). Returns the probed element (with viewport-corrected bbox +
+   * `iframeSelector` for replay scoping) or null. Fail-open: any throw → null,
+   * so the caller falls back to the `crossOriginIframe` marker unchanged.
+   */
+  private static async probeViaContentFrame(
+    page: Page,
+    rect: { x: number; y: number; selector: string },
+    x: number,
+    y: number,
+  ): Promise<ProbedElement | null> {
+    try {
+      const handle = await page.$(rect.selector);
+      const frame = handle ? await handle.contentFrame() : null;
+      if (!frame) return null;
+
+      const localX = x - rect.x;
+      const localY = y - rect.y;
+      const probed = await frame.evaluate(
+        `${PROBE_AT_POINT_FN}(${localX}, ${localY})`,
+      ) as ProbedElement | null;
+      if (!probed) return null;
+
+      if (probed.boundingBox) {
+        probed.boundingBox.x += Math.round(rect.x);
+        probed.boundingBox.y += Math.round(rect.y);
+      }
+      probed.iframeSelector = rect.selector;
+
+      logger.info('[RECORDING] Cross-origin frame rescued via contentFrame()', {
+        iframeSelector: rect.selector,
+        tag: probed.tag,
+        role: probed.role,
+        text: probed.text ? probed.text.slice(0, 60) : undefined,
+      });
+      return probed;
+    } catch (e) {
+      logger.debug('[RECORDING] contentFrame() rescue failed', {
+        iframeSelector: rect.selector,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return null;
+    }
   }
 
   /**

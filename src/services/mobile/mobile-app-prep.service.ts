@@ -46,7 +46,7 @@ import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.s
 import { ProjectService } from '@/services/core/project.service';
 import { logger } from '@/utils/core/logger';
 import { WARMUP_PREFIX, WARMUP_TTL, PENDING_INSTALL_PREFIX, type WarmupData } from '@/api/mobile/session.controller';
-import { getProjectMobileApp, buildMobileAppSettingsPatch } from '@/services/mobile/project-mobile-app.helper';
+import { getProjectMobileApp, buildMobileAppSettingsPatch, DEFAULT_VARIANT_LABEL } from '@/services/mobile/project-mobile-app.helper';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 
 /**
@@ -117,6 +117,16 @@ export interface PrepAppArgs {
    * it explicitly going forward.
    */
   platform?: MobilePlatform;
+  /**
+   * Named build-variant lane to install (e.g. 'Staging'). When set and no
+   * explicit `appStoragePathOverride` was supplied, prep resolves that lane's
+   * build via `MobileAppStorageService.resolveAppForRun` and installs IT
+   * instead of the project default — the same resolver the regression
+   * dispatcher uses, so an editor preview installs the build the flow is
+   * pinned to. Absent → the project default lane (pre-variant behaviour).
+   * A variant with no build falls back to the default lane (logged).
+   */
+  variantLabel?: string;
 }
 
 /**
@@ -162,13 +172,19 @@ export class MobileAppPrepService {
       sessionId,
       projectId,
       userId,
-      appPackage: appPackageOverride,
-      appStoragePathOverride,
-      appOriginalNameOverride,
+      appPackage: appPackageOverrideArg,
+      appStoragePathOverride: appStoragePathOverrideArg,
+      appOriginalNameOverride: appOriginalNameOverrideArg,
       skipLaunch,
       onProgress,
       platform,
+      variantLabel,
     } = args;
+    // Mutable so a resolved variant build (below) can fill these in as the
+    // install source when the caller didn't pass explicit overrides.
+    let appPackageOverride = appPackageOverrideArg;
+    let appStoragePathOverride = appStoragePathOverrideArg;
+    let appOriginalNameOverride = appOriginalNameOverrideArg;
 
     // A Flutter(-on-Android) build is delivered AS an Android APK: upload
     // stores it under the `android` slot (mobile-app.service finalize) and the
@@ -179,6 +195,103 @@ export class MobileAppPrepService {
     // the app is never reinstalled after the emulator is wiped.
     const appSlotPlatform: MobilePlatform | undefined =
       platform === 'flutter' ? 'android' : platform;
+
+    // True once a named variant resolves to a concrete build. Two builds of
+    // the same app share a packageName, so the package-presence dedup (Branch
+    // 2 below) can't tell 421 from 426 — when a specific build is demanded we
+    // must NOT trust package-only presence and have to reinstall the exact APK
+    // unless Branch 1 (Redis storagePath match) already confirmed it.
+    let exactBuildRequested = false;
+
+    // Effective lane to install, by precedence: explicit pin → the project's
+    // default-variant POINTER (the same lane a regression run installs via
+    // getProjectDefaultVariant). A 'default'/absent pointer means the base slot,
+    // handled by the default-lane read below. This makes editor warmup and
+    // regression runs install the SAME build for an "inherit" flow — without
+    // this, inherit warmups installed the base slot while regression installed
+    // the pointer. The caller-supplied storagePath override (regression worker)
+    // short-circuits all of this. Resolver gets the original `platform` so it
+    // applies its own flutter→android lane mapping.
+    if (platform && !appStoragePathOverride) {
+      let effectiveVariant: string | undefined = variantLabel;
+      let variantSource = 'explicit';
+      if (!effectiveVariant) {
+        effectiveVariant = await MobileAppStorageService.getProjectDefaultVariant(projectId, platform);
+        variantSource = 'project-default-pointer';
+      }
+      if (effectiveVariant && effectiveVariant !== DEFAULT_VARIANT_LABEL) {
+        const variantBuild = await MobileAppStorageService.resolveAppForRun({
+          projectId,
+          platform,
+          variantLabel: effectiveVariant,
+        });
+        if (variantBuild?.storagePath) {
+          appStoragePathOverride = variantBuild.storagePath;
+          appOriginalNameOverride = appOriginalNameOverride ?? variantBuild.originalName;
+          appPackageOverride = appPackageOverride ?? variantBuild.packageName;
+          exactBuildRequested = true;
+          logger.info('[MOBILE_APP_PREP] variant build resolved for install', {
+            projectId,
+            platform,
+            variantLabel: effectiveVariant,
+            variantSource,
+            buildId: variantBuild.id,
+            originalName: variantBuild.originalName,
+            packageName: variantBuild.packageName,
+            versionCode: variantBuild.versionCode,
+            storagePath: variantBuild.storagePath,
+          });
+        } else {
+          logger.warn('[MOBILE_APP_PREP] variant lane has no build, using default lane', {
+            projectId,
+            platform,
+            variantLabel: effectiveVariant,
+            variantSource,
+          });
+        }
+      } else if (variantLabel) {
+        // Base/default lane, EXPLICITLY pinned (variantLabel === 'default', e.g.
+        // the user picked the base build to get off a named variant). Read the
+        // LITERAL base SLOT (settings.mobileApps[platform] / legacy), NOT:
+        //   - the project read below: getProjectMobileApp WITHOUT a variant
+        //     resolves the default-variant POINTER (a named lane here), and
+        //   - NOT resolveAppForRun('default'): for flutter its default lane has
+        //     no rows, so it falls through to "latest android build" — which is
+        //     the newest variant upload, i.e. exactly the build we're escaping.
+        // The slot is the original main upload and is left untouched by named-
+        // variant uploads, so it's the real base build. Pass the original
+        // `platform` so getProjectMobileApp applies its own flutter→android
+        // fallback. Force the full install for the same reasons as a variant.
+        const proj = await ProjectService.getProject(projectId, userId);
+        const baseBuild = getProjectMobileApp(proj?.settings, platform, DEFAULT_VARIANT_LABEL);
+        if (baseBuild?.storagePath) {
+          appStoragePathOverride = baseBuild.storagePath;
+          appOriginalNameOverride = appOriginalNameOverride ?? baseBuild.originalName;
+          appPackageOverride = appPackageOverride ?? baseBuild.packageName;
+          // Only force the install once we have the REAL base build. If the base
+          // slot is empty (project uploaded only named variants), do NOT set
+          // exactBuildRequested — otherwise the effectiveStoragePath fallback
+          // (the default-variant POINTER build) would be force-installed, i.e.
+          // the very build the user pinned 'default' to escape.
+          exactBuildRequested = true;
+          logger.info('[MOBILE_APP_PREP] base build resolved for explicit default pin', {
+            projectId,
+            platform,
+            originalName: baseBuild.originalName,
+            packageName: baseBuild.packageName,
+            versionCode: baseBuild.versionCode,
+            storagePath: baseBuild.storagePath,
+          });
+        } else {
+          logger.warn('[MOBILE_APP_PREP] explicit default pin but no base build resolved', {
+            projectId,
+            platform,
+          });
+        }
+      } else {
+        logger.debug('[MOBILE_APP_PREP] inherit → base default lane', { projectId, platform });
+      }
+    }
 
     const emit = (stage: AppPrepStage, progress: number): void => {
       if (onProgress) onProgress(stage, progress);
@@ -277,6 +390,24 @@ export class MobileAppPrepService {
       && warmup?.installedPackage
       && appPackageOverride !== warmup.installedPackage);
 
+    // The warm emulator may hold a DIFFERENT build of the SAME package — e.g.
+    // the user switched the flow's pinned build (426 → base 421). Redis tracks
+    // the installed build's storagePath (per project+user, so it persists even
+    // when the runner hands back a different pooled session). When it differs
+    // from the build we're about to install, the package-only device dedup
+    // (Branch 2) would wrongly keep the stale build — so force a full install.
+    // This covers every switch direction (named↔named, named↔base, base↔named),
+    // not just the named-variant resolve that sets `exactBuildRequested`.
+    const buildMismatch = !!(warmup?.appStoragePath && warmup.appStoragePath !== effectiveStoragePath);
+    if (buildMismatch) {
+      logger.info('[MOBILE_APP_PREP] installed build differs from target — forcing full install', {
+        sessionId,
+        projectId,
+        installed: warmup?.appStoragePath,
+        target: effectiveStoragePath,
+      });
+    }
+
     // ── Branch 1: Cached fast-path (Redis hit + same APK) ──────────────
     if (
       !hasPendingInstall
@@ -342,12 +473,25 @@ export class MobileAppPrepService {
       });
     }
 
+    // A demanded exact build (named variant) that Branch 1 didn't confirm:
+    // the device may hold a DIFFERENT build of the same package, which the
+    // package-only check below cannot detect. Force the full install.
+    if (exactBuildRequested) {
+      logger.info('[MOBILE_APP_PREP] exact build requested but not confirmed on device — forcing full install (skipping package dedup)', {
+        sessionId,
+        projectId,
+        variantLabel,
+        storagePath: effectiveStoragePath,
+      });
+    }
+
     // ── Branch 2: Device-check fast-path (Redis expired but APK on device) ──
     // Avoids expensive re-download + re-install when the app is still on
     // the emulator. Skipped when a pending-install flag is set (we don't
-    // trust device state in that case).
+    // trust device state in that case) or when an exact build was demanded
+    // (package presence ≠ correct build present — see exactBuildRequested).
     const knownPackage = appPackageOverride || projectAny.packageName;
-    if (knownPackage && !hasPendingInstall) {
+    if (knownPackage && !hasPendingInstall && !exactBuildRequested && !buildMismatch) {
       const isInstalled = await time('branch2_check_package', () =>
         this.isPackageOnDevice(client, sessionId, userId, knownPackage));
       if (isInstalled) {
