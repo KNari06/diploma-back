@@ -3906,17 +3906,19 @@ export class CommandExecutor {
                 }
               }
 
-              // V16: Only mark as 'healed' when a compiled plan actually existed and failed.
-              // If no compiled plan was present (no_plan), LLM resolver is the primary path — not healing.
-              const hadCompiledPlan = !!intentMeta?.compiled?.locatorPlan?.length;
+              // LLM resolution is the resolver FALLBACK path (source: 'resolver',
+              // resolutionPath: 'llm_resolver'), NOT self-healing. "Healed" must be
+              // reserved for an actual locator rewrite via the self_heal path
+              // (source: 'self_heal') — otherwise every AI-resolved step in a
+              // regression run (where compiled plans routinely miss on a drifted
+              // page) falsely lights up a "healed" badge. So this is 'executed'.
               const runtimeMeta: StepRuntimeMeta = {
-                runtimeStatus: hadCompiledPlan ? 'healed' : 'executed',
+                runtimeStatus: 'executed',
                 source: 'resolver',
                 confidenceTier: topCandidate.confidence >= 0.85 ? 'high' :
                                topCandidate.confidence >= 0.6 ? 'medium' : 'low',
                 executionMs: Date.now() - startTime,
                 usedLocatorStrategy: 'llm_resolver',
-                healConfidence: topCandidate.confidence,
                 resolutionPath: 'llm_resolver',
                 needsReview: topCandidate.confidence < 0.85,
                 flaky: topCandidate.confidence < 0.75,
@@ -4021,14 +4023,14 @@ export class CommandExecutor {
 
                       await scrollLocator.waitFor({ state: 'visible', timeout: Math.min(timeout, 10000) });
 
-                      const hadCompiledPlanScroll = !!intentMeta?.compiled?.locatorPlan?.length;
+                      // Same as the LLM-resolver path above: this is resolver
+                      // fallback, not self-healing → 'executed', no heal badge.
                       const runtimeMeta: StepRuntimeMeta = {
-                        runtimeStatus: hadCompiledPlanScroll ? 'healed' : 'executed',
+                        runtimeStatus: 'executed',
                         source: 'resolver',
                         confidenceTier: scrollCandidate.confidence >= 0.85 ? 'high' : 'medium',
                         executionMs: Date.now() - startTime,
                         usedLocatorStrategy: 'llm_resolver_scroll',
-                        healConfidence: scrollCandidate.confidence,
                         resolutionPath: 'llm_resolver',
                         needsReview: scrollCandidate.confidence < 0.85,
                       };

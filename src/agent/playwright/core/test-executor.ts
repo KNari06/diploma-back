@@ -1369,6 +1369,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               step: currentStepIndex,
               attempt: retryAttempt,
               stepDescription,
+              // Carry the action type through so the run report can render an
+              // accurate per-step action badge (in scope from the loop above).
+              action,
               success: stepResult.success,
               // V16: Surface soft failure so frontend can show warning instead of error
               ...(isSoftFailure ? { softFailure: true, softFailureError: stepResult.error } : {}),

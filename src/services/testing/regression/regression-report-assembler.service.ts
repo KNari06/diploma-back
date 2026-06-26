@@ -352,11 +352,15 @@ export class RegressionReportAssemblerService {
           const meta = step.data?.runtimeMeta;
           const success = step.data?.success !== false;
           const isSoftFailure = !success && !!step.data?.softFailure;
-          // Surface self-healing + flakiness so QA can spot fragile steps in
-          // the report. A step is "healed" when its locator had to be rewritten
-          // by self_heal to pass; "flaky" is an independent historical signal
-          // the backend annotates onto the runtimeMeta.
-          const healed = meta?.runtimeStatus === 'healed' || meta?.source === 'self_heal';
+          // Surface self-healing so QA can spot fragile steps. "Healed" means a
+          // self_heal rewrite actually SUCCEEDED — gate strictly on
+          // runtimeStatus === 'healed'. We intentionally do NOT also accept
+          // `source === 'self_heal'`: a blocked heal (low confidence) carries
+          // source 'self_heal' but runtimeStatus 'failed', and that step did
+          // not heal — it failed, so it must not wear a "healed" badge. Normal
+          // LLM-resolver fallbacks are source 'resolver'/status 'executed' and
+          // are likewise excluded. "flaky" is an independent historical signal.
+          const healed = meta?.runtimeStatus === 'healed';
           const phase = phaseList?.[i];
           // Phase 3: a failing teardown step is a warning, not a failure —
           // teardown runs best-effort and never flips the overall verdict.
@@ -384,6 +388,9 @@ export class RegressionReportAssemblerService {
             index: i + 1,
             description,
             status: stepStatus,
+            // Action type for the per-step badge (carried through from the
+            // executed command). Absent on legacy runs persisted before this.
+            ...(typeof step.data?.action === 'string' && step.data.action ? { action: step.data.action } : {}),
             durationMs: meta?.executionMs,
             error: !success ? {
               message: meta?.failureExplanation || meta?.failedReason || 'Step failed',
