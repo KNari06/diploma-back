@@ -170,7 +170,12 @@ function buildPrompt(ctxText: string, stepsText: string, reason: ObserverReason)
     'Current page context:',
     ctxText.slice(0, 2000),
     '',
-    'Respond with JSON only:',
+    // The message is shown verbatim in the editor UI, so it MUST match the
+    // language the user sees — infer it from the page context / step text
+    // above (e.g. Russian page → Russian message). Default to English only
+    // when the language is genuinely unclear.
+    'Respond with JSON only. Write "message" in the SAME language as the page',
+    'context / steps above (not always English):',
     '{"kind":"login_required|step_missing|blocked|wrong_page|none","confidence":0..1,"message":"<=14 words"}',
   ].join('\n');
 }

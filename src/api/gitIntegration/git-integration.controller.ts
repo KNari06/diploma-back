@@ -277,8 +277,10 @@ export async function handleWebhook(req: Request, res: Response): Promise<void> 
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const isAuthError = message.toLowerCase().includes('invalid github webhook signature') ||
-      message.toLowerCase().includes('invalid gitlab webhook token');
+    const lower = message.toLowerCase();
+    const isAuthError = lower.includes('invalid github webhook signature') ||
+      lower.includes('invalid gitlab webhook token') ||
+      lower.includes('webhook signature required');
 
     logger.error('[GIT_WEBHOOK_API] Failed to process webhook', { error: message });
 
