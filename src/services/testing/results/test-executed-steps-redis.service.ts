@@ -131,6 +131,9 @@ function reduceStepCompletedPayload(payload: any): any {
       browser: typeof payload.browser === 'string' ? payload.browser : undefined,
       step: typeof payload.step === 'number' ? payload.step : undefined,
       stepDescription: truncateString(payload.stepDescription, 2000),
+      // Preserve the action type so the run report can show a per-step action
+      // badge after the Redis → Postgres round-trip.
+      action: typeof payload.action === 'string' ? truncateString(payload.action, 64) : undefined,
       success: typeof payload.success === 'boolean' ? payload.success : undefined,
       // V16: Preserve softFailure flag so report shows warning instead of error
       softFailure: payload.softFailure === true ? true : undefined,

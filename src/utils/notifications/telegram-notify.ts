@@ -119,7 +119,18 @@ export function buildTelegramMessage(payload: TgNotificationPayload): string {
   // 400 "can't parse entities", so the notification silently never arrives.
   lines.push(`<a href="${escTg(payload.ctaUrl)}">${escTg(payload.ctaLabel)}</a>`);
 
-  return lines.join('\n');
+  const text = lines.join('\n');
+
+  // Telegram rejects messages over 4096 chars with a 400 → silent loss. Field-
+  // level truncation above bounds normal cases, but a large bug list can still
+  // overflow. Clamp the whole message, keeping the CTA line (the actionable
+  // part) intact by trimming the body, not the trailing link.
+  const TG_MAX = 4096;
+  if (text.length <= TG_MAX) return text;
+  const cta = lines[lines.length - 1];
+  const budget = TG_MAX - cta.length - 2; // 2 for the joining newline + ellipsis margin
+  const body = lines.slice(0, -1).join('\n');
+  return `${body.slice(0, Math.max(0, budget - 1))}…\n${cta}`;
 }
 
 // ─── Send ───────────────────────────────────────────────────────────────

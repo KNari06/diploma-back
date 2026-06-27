@@ -2011,6 +2011,11 @@ export async function generateNegatives(req: AuthenticatedRequest, res: Response
       return;
     }
 
+    if (result.status === 'forbidden') {
+      res.status(403).json({ success: false, error: result.message });
+      return;
+    }
+
     res.json({
       success: true,
       data:
@@ -2104,6 +2109,13 @@ export async function regenerateNegatives(req: AuthenticatedRequest, res: Respon
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }
+    if (result.status === 'busy') {
+      res.status(409).json({
+        success: false,
+        error: 'Negatives are already being generated for this test case. Try again shortly.',
+      });
+      return;
+    }
     if (result.status === 'error') {
       res.status(500).json({ success: false, error: result.message });
       return;
@@ -2168,5 +2180,53 @@ export async function deleteNegative(req: AuthenticatedRequest, res: Response) {
     res.json({ success: true });
   } catch (error) {
     handleControllerError(res, error, 'Failed to delete negative');
+  }
+}
+
+/**
+ * PATCH /regression/plans/:planId/negatives/bulk
+ * Enable/disable many negatives at once. Authorized per-negative by project in
+ * the service (the planId only scopes the route). Body: { negativeIds, enabled }.
+ */
+export async function bulkSetNegativesEnabled(req: AuthenticatedRequest, res: Response) {
+  try {
+    const userId = getUserId(req);
+    const { negativeIds, enabled } = req.body;
+
+    if (!Array.isArray(negativeIds) || negativeIds.length === 0) {
+      res.status(400).json({ success: false, error: 'negativeIds must be a non-empty array' });
+      return;
+    }
+    if (enabled !== true && enabled !== false) {
+      res.status(400).json({ success: false, error: 'enabled must be true or false' });
+      return;
+    }
+
+    const result = await NegativeGenerationService.bulkSetEnabled(negativeIds, userId, enabled);
+    res.json({ success: true, data: { updated: result.updated, forbidden: result.forbidden } });
+  } catch (error) {
+    handleControllerError(res, error, 'Failed to bulk-update negatives');
+  }
+}
+
+/**
+ * DELETE /regression/plans/:planId/negatives/bulk
+ * Delete many negatives at once. Authorized per-negative by project in the
+ * service. Body: { negativeIds }.
+ */
+export async function bulkDeleteNegatives(req: AuthenticatedRequest, res: Response) {
+  try {
+    const userId = getUserId(req);
+    const { negativeIds } = req.body;
+
+    if (!Array.isArray(negativeIds) || negativeIds.length === 0) {
+      res.status(400).json({ success: false, error: 'negativeIds must be a non-empty array' });
+      return;
+    }
+
+    const result = await NegativeGenerationService.bulkDelete(negativeIds, userId);
+    res.json({ success: true, data: { deleted: result.deleted, forbidden: result.forbidden } });
+  } catch (error) {
+    handleControllerError(res, error, 'Failed to bulk-delete negatives');
   }
 }

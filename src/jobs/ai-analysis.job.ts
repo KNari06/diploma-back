@@ -84,6 +84,33 @@ export class AIAnalysisJobHandler {
       // Convert database result to TestResult type
       const testResultData = this.convertToTestResult(testResult);
 
+      // Skip bug detection for NEGATIVE tests. A failed negative means the app
+      // rejected bad input as intended OR a non-mutated setup step drifted —
+      // neither is an app bug. Running the analyzer here produces false bug
+      // reports (e.g. "login endpoint broken") AND charges the user 5 credits
+      // for a phantom bug. Bail before the LLM call so we don't pay for it.
+      if (await this.isNegativeTest(testId)) {
+        logger.info('[AI-ANALYSIS] Skipping bug detection for negative test', {
+          testId, testResultId,
+        });
+        try {
+          await dbAdminService.updateTestResult(testResultId, {
+            ai_summary: {
+              skipped: true,
+              skippedReason: 'negative_test',
+              summary: 'Bug detection skipped — negative test (a failure here means the app rejected bad input as intended, or a setup step drifted).',
+              bugs: [],
+            },
+          });
+        } catch (persistErr) {
+          logger.warn('[AI-ANALYSIS] Failed to persist negative-test skip summary', {
+            testResultId, error: persistErr instanceof Error ? persistErr.message : String(persistErr),
+          });
+        }
+        logQueueEvent('completed', job.id!, { testResultId, testId, skipped: 'negative_test' });
+        return;
+      }
+
       // Load integration context (non-fatal, best-effort)
       let integrationContext = '';
       try {
@@ -452,6 +479,28 @@ export class AIAnalysisJobHandler {
       return (data as { run_id?: string } | null)?.run_id ?? null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Whether this test is a generated negative case. `test_executions.is_negative`
+   * is set by the regression run service (regression-run.service.ts). A failed
+   * negative usually means the app CORRECTLY rejected bad input (or a setup step
+   * drifted) — NOT an app bug — so bug detection must be skipped to avoid false
+   * bug reports and the 5-credit charge. Fail-open to false (treat as positive)
+   * so a lookup error never silently suppresses real bug detection.
+   */
+  private static async isNegativeTest(testId: string): Promise<boolean> {
+    try {
+      const { data } = await dbAdminService.supabaseAdmin
+        .from('test_executions')
+        .select('is_negative')
+        .eq('result->>testId', testId)
+        .limit(1)
+        .maybeSingle();
+      return !!(data as { is_negative?: boolean } | null)?.is_negative;
+    } catch {
+      return false;
     }
   }
 

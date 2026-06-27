@@ -754,6 +754,12 @@ export interface TestStepCompletedPayload {
   /** Retry attempt number (0 = first run, 1+ = retries). See TestProgressPayload.attempt. */
   attempt?: number;
   stepDescription: string;
+  /**
+   * The executed command's action type ('click' | 'type' | 'navigate' | ...).
+   * Carried through so the run report can render an accurate per-step action
+   * badge without parsing the description text. Optional for backward compat.
+   */
+  action?: string;
   success: boolean;
   timestamp: string;
   /**

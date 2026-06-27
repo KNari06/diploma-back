@@ -145,18 +145,61 @@ export class HealthCheckAggregatorService {
     };
   }
 
+  // Console/network noise that is NOT a JS application bug and must never be
+  // reported as an "unhandled JS exception": resources blocked by the runner's
+  // own browser (ad-blockers / extensions) and generic resource-load failures.
+  // These dominate the list (often dozens of identical lines) and turn a clean
+  // run red for reasons the app under test has no control over.
+  private static readonly JS_EXCEPTION_NOISE = [
+    'err_blocked_by_client',
+    'failed to load resource',
+    'net::err_',
+    'err_blocked_by_response',
+  ];
+
   private static checkJsExceptions(errors: any): HealthCheckFinding {
     if (!errors || !Array.isArray(errors) || errors.length === 0) {
       return { category: 'js_exceptions', severity: 'pass', message: 'No JS exceptions' };
     }
 
+    // Normalize each entry to a clean, non-empty string. Objects may carry the
+    // text under message/text/description; anything that ends up empty is
+    // dropped (previously these rendered as a literal "undefined" line).
+    const normalized = errors
+      .map((e: any) => {
+        const raw =
+          typeof e === 'string'
+            ? e
+            : (e?.message || e?.text || e?.description || '');
+        return String(raw).trim();
+      })
+      .filter((s: string) => s.length > 0);
+
+    // Drop runner/ad-blocker noise — not application JS exceptions.
+    const real = normalized.filter(
+      (s: string) => !this.JS_EXCEPTION_NOISE.some((n) => s.toLowerCase().includes(n)),
+    );
+
+    if (real.length === 0) {
+      return { category: 'js_exceptions', severity: 'pass', message: 'No JS exceptions' };
+    }
+
+    // Dedupe identical messages, keeping a count so "x27" reads as one row.
+    const counts = new Map<string, number>();
+    for (const s of real) {
+      const key = s.slice(0, 200);
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+
+    const details = Array.from(counts.entries())
+      .slice(0, 5)
+      .map(([text, count]) => ({ text: count > 1 ? `${text}  (×${count})` : text }));
+
     return {
       category: 'js_exceptions',
       severity: 'fail',
-      message: `${errors.length} unhandled JS exception${errors.length > 1 ? 's' : ''}`,
-      details: errors.slice(0, 5).map((e: any) => ({
-        text: typeof e === 'string' ? e.slice(0, 200) : (e.message || '').slice(0, 200),
-      })),
+      message: `${real.length} unhandled JS exception${real.length > 1 ? 's' : ''}`,
+      details,
     };
   }
 

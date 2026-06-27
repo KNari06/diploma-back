@@ -11,6 +11,35 @@ jest.mock('../db/negative.db', () => ({
   setNegativeEnabled: jest.fn(),
   getAvgDurationMsForTestCases: jest.fn(),
   getSourcesWithFreshNegatives: jest.fn(),
+  anySourceIsMobile: jest.fn().mockResolvedValue(false),
+  getNegativesOwnership: jest.fn(),
+  setNegativeEnabledByIds: jest.fn(),
+  deleteNegativesByIds: jest.fn(),
+}));
+
+jest.mock('@/services/core/plan-access.service', () => ({
+  isPaidUser: jest.fn().mockResolvedValue(true),
+}));
+
+// In-memory Redis stand-in emulating SET NX EX + the compare-and-del eval, so
+// the cross-process source lock behaves deterministically in unit tests.
+const redisStore = new Map<string, string>();
+jest.mock('@/config/infrastructure/queues', () => ({
+  redisConnection: {
+    set: jest.fn(async (key: string, val: string, ..._args: any[]) => {
+      // We are always called as SET key val EX <sec> NX in this module.
+      if (redisStore.has(key)) return null; // NX: already held
+      redisStore.set(key, val);
+      return 'OK';
+    }),
+    eval: jest.fn(async (_script: string, _numKeys: number, key: string, token: string) => {
+      if (redisStore.get(key) === token) {
+        redisStore.delete(key);
+        return 1;
+      }
+      return 0;
+    }),
+  },
 }));
 
 jest.mock('@/services/testing/regression/db/regression.db', () => ({
@@ -146,24 +175,39 @@ describe('generateForSourceGuarded', () => {
     expect(r).toEqual({ skipped: false, createdIds: ['n1', 'n2'] });
   });
 
-  it('serializes concurrent calls for the same source (no double generate)', async () => {
-    // First call sees 0 and generates; a second concurrent call must observe
-    // the mutex and (after it releases) see the now-existing count.
+  it('cross-process source lock: a concurrent call is skipped, no double generate', async () => {
+    // The first call holds the Redis lock through a slow generation; the second
+    // concurrent call cannot acquire it (NX fails) and is skipped rather than
+    // double-generating. This is the cross-process guard (API regenerate vs
+    // worker job) the in-memory Map could not provide.
     let count = 0;
     asMock(NegativeTestGeneratorService.getNegativeCount).mockImplementation(async () => count);
-    asMock(NegativeTestGeneratorService.generateForTestCase).mockImplementation(async () => {
-      count = 2; // generation populated the source
-      return ['n1', 'n2'];
-    });
+    let resolveGen!: (v: string[]) => void;
+    asMock(NegativeTestGeneratorService.generateForTestCase).mockImplementation(
+      () =>
+        new Promise<string[]>((r) => {
+          resolveGen = (v: string[]) => {
+            count = 2; // generation populated the source
+            r(v);
+          };
+        }),
+    );
 
-    const [a, b] = await Promise.all([
-      NegativeGenerationService.generateForSourceGuarded('s1', 'u1'),
-      NegativeGenerationService.generateForSourceGuarded('s1', 'u1'),
-    ]);
+    // Start the first (acquires the lock and parks in generation).
+    const first = NegativeGenerationService.generateForSourceGuarded('s1', 'u1');
+    // Yield so the first acquires the lock before the second tries.
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
 
+    // Second call: lock is held → it will poll. Let the first finish first.
+    const second = NegativeGenerationService.generateForSourceGuarded('s1', 'u1');
+    resolveGen(['n1', 'n2']);
+
+    const [a, b] = await Promise.all([first, second]);
     const results = [a, b];
-    expect(results.filter((r) => !r.skipped)).toHaveLength(1); // exactly one generated
-    expect(results.filter((r) => r.skipped)).toHaveLength(1); // the other skipped
+    // Exactly one generated; the other skipped (lock contention OR count>0).
+    expect(results.filter((r) => !r.skipped)).toHaveLength(1);
+    expect(results.filter((r) => r.skipped)).toHaveLength(1);
     expect(NegativeTestGeneratorService.generateForTestCase).toHaveBeenCalledTimes(1);
   });
 });
@@ -199,5 +243,59 @@ describe('regenerate', () => {
 
     const r = await NegativeGenerationService.regenerate('s1', 'u1');
     expect(r.status).toBe('error');
+  });
+});
+
+describe('bulkSetEnabled / bulkDelete', () => {
+  it('mutates only negatives the user can access, reports forbidden count', async () => {
+    // n1,n2 in an accessible project (u1 owns pr1); n3 in a project u1 can't.
+    asMock(negativeDb.getNegativesOwnership).mockResolvedValue([
+      { id: 'n1', projectId: 'pr1' },
+      { id: 'n2', projectId: 'pr1' },
+      { id: 'n3', projectId: 'prX' },
+    ]);
+    asMock(getProjectForAccess).mockImplementation(async (projectId: string) =>
+      projectId === 'pr1' ? { user_id: 'u1', workspace_id: null } : { user_id: 'other', workspace_id: null },
+    );
+    asMock(negativeDb.setNegativeEnabledByIds).mockResolvedValue(2);
+
+    const r = await NegativeGenerationService.bulkSetEnabled(['n1', 'n2', 'n3'], 'u1', false);
+
+    expect(r).toEqual({ status: 'ok', updated: 2, forbidden: 1 });
+    // Only the accessible ids reach the db mutation.
+    expect(negativeDb.setNegativeEnabledByIds).toHaveBeenCalledWith(['n1', 'n2'], false);
+  });
+
+  it('bulkDelete deletes only accessible ids', async () => {
+    asMock(negativeDb.getNegativesOwnership).mockResolvedValue([
+      { id: 'n1', projectId: 'pr1' },
+      { id: 'n2', projectId: 'prX' },
+    ]);
+    asMock(getProjectForAccess).mockImplementation(async (projectId: string) =>
+      projectId === 'pr1' ? { user_id: 'u1', workspace_id: null } : { user_id: 'other', workspace_id: null },
+    );
+    asMock(negativeDb.deleteNegativesByIds).mockResolvedValue(1);
+
+    const r = await NegativeGenerationService.bulkDelete(['n1', 'n2'], 'u1');
+
+    expect(r).toEqual({ status: 'ok', deleted: 1, forbidden: 1 });
+    expect(negativeDb.deleteNegativesByIds).toHaveBeenCalledWith(['n1']);
+  });
+
+  it('dedupes ids and never calls the db when nothing is accessible', async () => {
+    asMock(negativeDb.getNegativesOwnership).mockResolvedValue([{ id: 'n1', projectId: 'prX' }]);
+    asMock(getProjectForAccess).mockResolvedValue({ user_id: 'other', workspace_id: null });
+
+    const r = await NegativeGenerationService.bulkSetEnabled(['n1', 'n1'], 'u1', true);
+
+    expect(r).toEqual({ status: 'ok', updated: 0, forbidden: 1 });
+    expect(negativeDb.setNegativeEnabledByIds).not.toHaveBeenCalled();
+  });
+
+  it('returns zeros for an empty id list without touching the db', async () => {
+    asMock(negativeDb.getNegativesOwnership).mockResolvedValue([]);
+    const r = await NegativeGenerationService.bulkDelete([], 'u1');
+    expect(r).toEqual({ status: 'ok', deleted: 0, forbidden: 0 });
+    expect(negativeDb.deleteNegativesByIds).not.toHaveBeenCalled();
   });
 });

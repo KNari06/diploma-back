@@ -60,6 +60,26 @@ export class GitIntegrationService {
       .select('*')
       .single();
 
+    // Idempotent on (project_id, repository_url) UNIQUE. An integration may already exist —
+    // notably one auto-created with an EMPTY secret by syncGitIntegration during plan save,
+    // which runs BEFORE the frontend's createGitIntegration call carrying the real secret.
+    // Without this, the real secret is silently dropped (duplicate insert error swallowed by
+    // the caller) and the integration stays secret-less — which now means it can NEVER receive
+    // webhooks (fail-closed guard). So: on conflict, update the existing row instead. Never
+    // overwrite a non-empty stored secret with an empty one (the auto-create path passes '').
+    if (error?.code === '23505') {
+      const existing = await this.findByProjectAndRepositoryUrl(projectId, normalizedRepositoryUrl);
+      if (existing) {
+        return await this.updateIntegration({
+          integrationId: existing.id,
+          userId,
+          webhookSecret: webhookSecret ? webhookSecret : undefined,
+          events: safeEvents,
+          enabled: true,
+        });
+      }
+    }
+
     if (error || !data) {
       throw new Error(`Failed to create git integration: ${error?.message}`);
     }
