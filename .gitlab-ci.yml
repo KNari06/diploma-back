@@ -1,23 +1,26 @@
 # ─────────────────────────────────────────────────────────────────
-# QAI Backend — GitLab CI/CD (Azure)
+# QAI Backend — GitLab CI/CD (Azure) — self-hosted ARM runner
 #
-# Одна Docker image → деплой двух Container Apps:
-#   • qai-api-prod    — CMD: node -r tsconfig-paths/register dist/index.js
-#   • qai-worker-prod — CMD: node ... + HTTP health server на 8080
+# Одна Docker image (amd64) → деплой двух Container Apps:
+#   • qai-api-prod
+#   • qai-worker-prod
+# Образ в ACR; Container Apps тянут через Managed Identity.
 #
-# Образ хранится в Azure Container Registry (ACR). Container Apps тянут
-# через Managed Identity (без паролей).
+# Раннер: dev-runner (Azure VM, ARM64, docker executor + host docker.sock).
+# Container Apps бегут amd64, VM — arm64 → образ собирается через buildx
+# (driver docker-container) под qemu. binfmt amd64 должен быть на VM:
+#   docker run --privileged --rm tonistiigi/binfmt --install amd64
 #
 # Required CI/CD Variables (Group: qait.dev):
-#   AZURE_CLIENT_ID       — terraform output gitlab_runner_client_id
-#   AZURE_TENANT_ID       — terraform output azure_tenant_id
-#   AZURE_SUBSCRIPTION_ID — terraform output azure_subscription_id
-#   RESOURCE_GROUP        — qai-prod-rg
-#   ACR_NAME              — qaiprodacr24d6d7
-#   ACR_LOGIN_SERVER      — qaiprodacr24d6d7.azurecr.io
-#   CONTAINER_APP_API     — qai-api-prod
-#   CONTAINER_APP_WORKER  — qai-worker-prod
+#   AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
+#   RESOURCE_GROUP=qai-prod-rg  ACR_NAME=qaiprodacr24d6d7
+#   ACR_LOGIN_SERVER=qaiprodacr24d6d7.azurecr.io
+#   CONTAINER_APP_API=qai-api-prod  CONTAINER_APP_WORKER=qai-worker-prod
 # ─────────────────────────────────────────────────────────────────
+
+default:
+  tags:
+    - dev-runner            # все джобы → наш self-hosted runner
 
 workflow:
   rules:
@@ -26,12 +29,6 @@ workflow:
     - when: never
 
 variables:
-  DOCKER_HOST: tcp://docker:2376
-  DOCKER_TLS_CERTDIR: "/certs"
-  DOCKER_TLS_VERIFY: "1"
-  DOCKER_CERT_PATH: "/certs/client"
-  DOCKER_BUILDKIT: "0"
-
   IMAGE: "${ACR_LOGIN_SERVER}/qai-backend:${CI_COMMIT_SHORT_SHA}"
   IMAGE_LATEST: "${ACR_LOGIN_SERVER}/qai-backend:latest"
 
@@ -40,7 +37,7 @@ stages:
   - deploy
 
 # ─────────────────────────────────────────────────────────────────
-# Шаблон: авторизация в Azure через OIDC Federated Identity
+# Azure OIDC Federated Identity (работает и на self-hosted runner)
 # ─────────────────────────────────────────────────────────────────
 .azure_auth: &azure_auth
   id_tokens:
@@ -49,25 +46,20 @@ stages:
   before_script:
     - |
       set -euo pipefail
-
       az login \
         --federated-token "$AZURE_TOKEN" \
         --service-principal \
         -u "$AZURE_CLIENT_ID" \
         --tenant "$AZURE_TENANT_ID" \
         --output none
-
       az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 
 # ─────────────────────────────────────────────────────────────────
-# Сборка Docker образа и push в ACR
+# Сборка образа (amd64 через buildx/qemu) и push в ACR — host docker
 # ─────────────────────────────────────────────────────────────────
 build:
   stage: build
   image: mcr.microsoft.com/azure-cli:azurelinux3.0
-  services:
-    - name: docker:26-dind
-      alias: docker
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
   <<: *azure_auth
@@ -75,38 +67,37 @@ build:
     - |
       set -euo pipefail
 
-      echo "🐳 Installing Docker CLI"
-      tdnf install -y moby-cli ca-certificates
+      echo "🐳 docker CLI + buildx"
+      tdnf install -y moby-cli ca-certificates curl tar
       tdnf clean all
+      mkdir -p ~/.docker/cli-plugins
+      curl -fsSL https://github.com/docker/buildx/releases/download/v0.17.1/buildx-v0.17.1.linux-arm64 \
+        -o ~/.docker/cli-plugins/docker-buildx
+      chmod +x ~/.docker/cli-plugins/docker-buildx
+      docker buildx version
 
-      echo "⏳ Waiting for Docker daemon..."
-      for i in $(seq 1 30); do
-        docker info >/dev/null 2>&1 && break
-        sleep 2
-      done
-
+      echo "🔌 host Docker via mounted socket"
       docker info >/dev/null
 
       echo "🔐 Login to ACR"
       az acr login --name "$ACR_NAME"
 
-      echo "🔨 Building image:"
-      echo "$IMAGE"
+      echo "🏗️ buildx builder (docker-container, amd64 via qemu)"
+      docker buildx create --name qaibuilder --driver docker-container --use 2>/dev/null || docker buildx use qaibuilder
+      docker buildx inspect --bootstrap
 
-      docker pull "$IMAGE_LATEST" 2>/dev/null || true
-
-      docker build \
-        --cache-from "$IMAGE_LATEST" \
+      echo "🔨 build & push (linux/amd64): $IMAGE"
+      docker buildx build \
+        --platform linux/amd64 \
+        --cache-from type=registry,ref="$IMAGE_LATEST" \
+        --cache-to type=inline \
         --tag "$IMAGE" \
         --tag "$IMAGE_LATEST" \
+        --push \
         .
 
-      echo "⬆️ Pushing to ACR..."
-      docker push "$IMAGE"
-      docker push "$IMAGE_LATEST"
-
 # ─────────────────────────────────────────────────────────────────
-# Деплой API — Azure Container App
+# Деплой API
 # ─────────────────────────────────────────────────────────────────
 deploy:api:
   stage: deploy
@@ -119,29 +110,23 @@ deploy:api:
   script:
     - |
       set -euo pipefail
-
       echo "🚀 Deploying API → $CONTAINER_APP_API"
-
       az containerapp update \
         --name "$CONTAINER_APP_API" \
         --resource-group "$RESOURCE_GROUP" \
         --image "$IMAGE" \
         --output none
-
       URL=$(az containerapp show \
         --name "$CONTAINER_APP_API" \
         --resource-group "$RESOURCE_GROUP" \
-        --query "properties.configuration.ingress.fqdn" \
-        -o tsv)
-
+        --query "properties.configuration.ingress.fqdn" -o tsv)
       echo "✅ API deployed → https://$URL"
   environment:
     name: production/api
     url: https://api.qait.dev
 
 # ─────────────────────────────────────────────────────────────────
-# Деплой Worker — Azure Container App
-# command/args заданы в Terraform — CI обновляет только image
+# Деплой Worker (command/args заданы в Terraform — CI меняет только image)
 # ─────────────────────────────────────────────────────────────────
 deploy:worker:
   stage: deploy
@@ -154,15 +139,12 @@ deploy:worker:
   script:
     - |
       set -euo pipefail
-
       echo "🚀 Deploying Worker → $CONTAINER_APP_WORKER"
-
       az containerapp update \
         --name "$CONTAINER_APP_WORKER" \
         --resource-group "$RESOURCE_GROUP" \
         --image "$IMAGE" \
         --output none
-
       echo "✅ Worker deployed"
   environment:
     name: production/worker
