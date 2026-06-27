@@ -71,6 +71,19 @@ export interface SourceTestCaseRow {
   url: string | null;
   start_url: string | null;
   project_id: string;
+  // Identity fields a negative must inherit so it dispatches + runs like its
+  // source. platform/replay_strategy route web vs mobile; parameters_schema +
+  // resource_bindings + mobile_variant_label + triggers are read by the mobile
+  // dispatch/run path — a negative missing them fails on SETUP (never reaching
+  // the screen under test), not on the mutation. depends_on is intentionally
+  // NOT loaded: mobile ignores it (web-only precondition inlining), and a
+  // negative inheriting it would add spurious cross-run ordering constraints.
+  platform: string | null;
+  replay_strategy: string | null;
+  parameters_schema: any;
+  resource_bindings: any;
+  mobile_variant_label: string | null;
+  triggers: any;
 }
 
 /** Load a source (happy-path) test case for mutation generation. */
@@ -79,7 +92,11 @@ export async function getSourceTestCase(
 ): Promise<SourceTestCaseRow | null> {
   const { data, error } = await supabaseAdmin
     .from('intent_test_cases')
-    .select('id, name, flow_id, steps_json, url, start_url, project_id')
+    .select(
+      'id, name, flow_id, steps_json, url, start_url, project_id, ' +
+        'platform, replay_strategy, parameters_schema, resource_bindings, ' +
+        'mobile_variant_label, triggers',
+    )
     .eq('id', sourceTestCaseId)
     .maybeSingle();
 
@@ -91,7 +108,7 @@ export async function getSourceTestCase(
     return null;
   }
 
-  return (data as SourceTestCaseRow) || null;
+  return (data as unknown as SourceTestCaseRow) || null;
 }
 
 /** Owner + project of a test case, for authorizing source-scoped operations. */
@@ -110,6 +127,30 @@ export async function getTestCaseOwner(
   }
 
   return { userId: data.user_id, projectId: data.project_id };
+}
+
+/**
+ * Returns true if any of the given test cases is a mobile platform. Used to
+ * gate negative GENERATION behind the paid plan (mobile RUNS are Pro-only, so
+ * a free user generating mobile negatives would burn LLM cost on something they
+ * can never run). Batched single query.
+ */
+export async function anySourceIsMobile(testCaseIds: string[]): Promise<boolean> {
+  if (testCaseIds.length === 0) return false;
+
+  const { data, error } = await supabaseAdmin
+    .from('intent_test_cases')
+    .select('id')
+    .in('id', testCaseIds)
+    .like('platform', 'mobile_%')
+    .limit(1);
+
+  if (error) {
+    logger.warn('[NEGATIVE_DB] Failed mobile-source check', { error: error.message });
+    return false;
+  }
+
+  return (data?.length || 0) > 0;
 }
 
 /** Fetch a test case name (used for progress events). */
@@ -144,6 +185,14 @@ export interface InsertNegativeInput {
   flowId: string | null;
   sourceTestCaseId: string;
   negativeMeta: NegativeMeta;
+  // Identity inherited from the source so the negative dispatches + runs the
+  // same way (web vs mobile routing, login/secret setup, app variant).
+  platform: string;
+  replayStrategy: string;
+  parametersSchema: any;
+  resourceBindings: any;
+  mobileVariantLabel: string | null;
+  triggers: any;
 }
 
 /** Insert one negative test case. Returns the new id or null on failure. */
@@ -161,12 +210,25 @@ export async function insertNegativeTestCase(
       kind: 'regression_member',
       url: input.url,
       start_url: input.startUrl,
-      replay_strategy: 'steps_json',
+      // Inherit the source's replay_strategy (web 'commands'/'steps_editor',
+      // mobile 'mobile_steps'). The previous hardcoded 'steps_json' is not a
+      // valid replay_strategy CHECK value and would violate the constraint.
+      replay_strategy: input.replayStrategy,
       steps_json: input.stepsJson,
       flow_id: input.flowId,
       is_negative: true,
       source_intent_test_case_id: input.sourceTestCaseId,
       negative_meta: input.negativeMeta,
+      // Inherited identity. platform routes the dispatch (web vs mobile);
+      // parameters_schema lets unmutated {{param_*}} steps resolve;
+      // resource_bindings carries login/secret setup; mobile_variant_label
+      // pins the same app build; triggers carries event→action rules.
+      // resource_bindings + triggers are NOT NULL (default []) — coalesce.
+      platform: input.platform,
+      parameters_schema: input.parametersSchema ?? null,
+      resource_bindings: input.resourceBindings ?? [],
+      mobile_variant_label: input.mobileVariantLabel ?? null,
+      triggers: input.triggers ?? [],
     })
     .select('id')
     .single();
@@ -357,6 +419,71 @@ export async function setNegativeEnabled(negativeId: string, enabled: boolean): 
   }
 
   return (data?.length || 0) > 0;
+}
+
+// ── bulk control (toggle / delete many) ────────────────────────────────────────
+
+/**
+ * Batch ownership lookup for many negatives. Returns one row per existing
+ * negative id (missing ids simply absent). The bulk service uses this to
+ * authorize per-id by project BEFORE mutating — a bulk request may span
+ * negatives from different projects, so we never trust the id list blindly.
+ */
+export async function getNegativesOwnership(
+  negativeIds: string[],
+): Promise<Array<{ id: string; projectId: string | null }>> {
+  if (negativeIds.length === 0) return [];
+
+  const { data, error } = await supabaseAdmin
+    .from('intent_test_cases')
+    .select('id, project_id')
+    .eq('is_negative', true)
+    .in('id', negativeIds);
+
+  if (error || !data) {
+    if (error) logger.warn('[NEGATIVE_DB] Failed bulk ownership lookup', { error: error.message });
+    return [];
+  }
+
+  return data.map((r) => ({ id: r.id, projectId: r.project_id }));
+}
+
+/** Enable/disable many negatives by id. Returns the count actually updated. */
+export async function setNegativeEnabledByIds(negativeIds: string[], enabled: boolean): Promise<number> {
+  if (negativeIds.length === 0) return 0;
+
+  const { data, error } = await supabaseAdmin
+    .from('intent_test_cases')
+    .update({ negative_enabled: enabled })
+    .eq('is_negative', true)
+    .in('id', negativeIds)
+    .select('id');
+
+  if (error) {
+    logger.error('[NEGATIVE_DB] Failed bulk set-enabled', { count: negativeIds.length, enabled, error: error.message });
+    return 0;
+  }
+
+  return data?.length || 0;
+}
+
+/** Delete many negatives by id. Returns the count actually removed. */
+export async function deleteNegativesByIds(negativeIds: string[]): Promise<number> {
+  if (negativeIds.length === 0) return 0;
+
+  const { data, error } = await supabaseAdmin
+    .from('intent_test_cases')
+    .delete()
+    .eq('is_negative', true)
+    .in('id', negativeIds)
+    .select('id');
+
+  if (error) {
+    logger.error('[NEGATIVE_DB] Failed bulk delete', { count: negativeIds.length, error: error.message });
+    return 0;
+  }
+
+  return data?.length || 0;
 }
 
 // ── estimate inputs ─────────────────────────────────────────────────────────────

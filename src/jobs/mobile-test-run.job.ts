@@ -873,6 +873,13 @@ export class MobileTestRunJobHandler {
       const stepDescriptionById = new Map(
         intentSteps.map((s) => [s.id, s.description]),
       );
+      // id → action type ('click' | 'type' | 'swipe' | ...) so the run report
+      // can show an accurate per-step action badge, mirroring the web path
+      // (test-executor.ts). The runner only echoes back stepId, so we resolve
+      // the authored type from intentSteps here.
+      const stepActionById = new Map(
+        intentSteps.map((s) => [s.id, s.type]),
+      );
 
       // Emit step-level progress
       for (let i = 0; i < runResult.steps.length; i++) {
@@ -915,6 +922,9 @@ export class MobileTestRunJobHandler {
             step: i + 1,
             stepDescription:
               stepDescriptionById.get(stepResult.stepId) || `Step: ${stepResult.stepId}`,
+            // Carry the action type through so the run report renders a per-step
+            // action badge for mobile runs too (web sets this in test-executor.ts).
+            action: stepActionById.get(stepResult.stepId),
             // For soft-fails the per-step result remains `success: false`
             // (the action did fail), but the UI should not flag it as a
             // failure — `softFailure: true` on runtimeMeta is the signal

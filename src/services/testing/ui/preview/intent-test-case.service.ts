@@ -1140,6 +1140,19 @@ export class IntentTestCaseService {
           locatorCount: appliedStep.compiled?.locatorPlan?.length,
         });
 
+        // A single-step apply mutates the source's steps_json, so any negatives
+        // derived from it are now stale. This is the primary edit path for
+        // MOBILE authoring (and web pick/apply), which — unlike update() and
+        // batchUpdateStepsFromRun() — did not mark negatives stale. Best-effort,
+        // non-blocking. Safe no-op when this row is itself a negative (the query
+        // keys on source_intent_test_case_id; a negative is no one's source).
+        this.markNegativesStale(intentTestCaseId).catch((err) => {
+          logger.warn('[INTENT_TEST_CASE] Failed to mark negatives stale after step apply', {
+            testCaseId: intentTestCaseId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+
         return true;
       } catch (error) {
         logger.error('[INTENT_TEST_CASE] Exception updating step from preview apply', {

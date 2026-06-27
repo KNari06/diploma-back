@@ -902,6 +902,8 @@ export interface NegativeMeta {
   originalValue: string;
   mutatedValue: string;
   expectedBehavior: string;
+  /** Why the generator chose this step + attack (quality signal / audit trail). */
+  reasoning?: string;
 }
 
 export interface NegativeSummary {
@@ -955,6 +957,15 @@ export interface RunReportStep {
   index: number;
   description: string;
   status: 'passed' | 'failed' | 'warning' | 'skipped';
+  /**
+   * The step's action type (e.g. 'click', 'type', 'navigate', 'assert').
+   * Sourced from the executed command's action at run time so the report
+   * timeline can show an accurate action badge per step instead of inferring
+   * it by parsing the description text (which misses steps whose description
+   * doesn't start with the verb, e.g. a bare field label). Optional — legacy
+   * runs persisted before this field was carried through won't have it.
+   */
+  action?: string;
   durationMs?: number;
   /**
    * Per-step screenshot URL captured for EVERY step (pass or fail) when

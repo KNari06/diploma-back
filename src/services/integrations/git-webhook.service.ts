@@ -154,25 +154,35 @@ export class GitWebhookService {
     // single webhook secret configured at the repo/project level). When multiple integrations
     // share the same repo, try each integration's secret until one matches. This handles the
     // edge case where integrations in different workspaces have different secrets.
-    if (signature && integrations.some((i) => i.webhook_secret)) {
-      let verified = false;
-      for (const integration of integrations) {
-        if (!integration.webhook_secret) continue;
-        if (provider === 'github') {
-          if (this.verifyGitHubSignature(rawBody, signature, integration.webhook_secret)) {
-            verified = true;
-            break;
-          }
-        } else {
-          if (this.verifyGitLabToken(signature, integration.webhook_secret)) {
-            verified = true;
-            break;
-          }
+    //
+    // FAIL-CLOSED: signature verification is MANDATORY. A webhook is rejected unless it carries
+    // a signature AND at least one matched integration has a non-empty secret that validates it.
+    // The previous `signature && some(secret)` guard was fail-OPEN: integrations auto-created
+    // with an empty webhook_secret (see syncGitIntegration / tryCreateIntegrationFromMatchingPlan)
+    // caused the whole check to be skipped, so anyone knowing the repo URL could trigger runs.
+    const hasSecret = integrations.some((i) => i.webhook_secret);
+    if (!signature || !hasSecret) {
+      throw new Error(
+        `Webhook signature required but ${!signature ? 'missing from request' : 'no webhook secret is configured for this repository'}`
+      );
+    }
+    let verified = false;
+    for (const integration of integrations) {
+      if (!integration.webhook_secret) continue;
+      if (provider === 'github') {
+        if (this.verifyGitHubSignature(rawBody, signature, integration.webhook_secret)) {
+          verified = true;
+          break;
+        }
+      } else {
+        if (this.verifyGitLabToken(signature, integration.webhook_secret)) {
+          verified = true;
+          break;
         }
       }
-      if (!verified) {
-        throw new Error(`Invalid ${provider === 'github' ? 'GitHub webhook signature' : 'GitLab webhook token'}`);
-      }
+    }
+    if (!verified) {
+      throw new Error(`Invalid ${provider === 'github' ? 'GitHub webhook signature' : 'GitLab webhook token'}`);
     }
 
     // Persist delivery once (integration_id = first for audit/duplicate detection)

@@ -84,7 +84,9 @@ async function notifyAdminsByEmail(
     return;
   }
 
-  const pendingUsersUrl = `${env.FRONTEND_URL.replace(/\/$/, '')}/admin/users?status=pending`;
+  // Admin dashboard is a separate deployment — approvals live at
+  // /dashboard/approvals on ADMIN_URL, not /admin/users on the main app.
+  const pendingUsersUrl = `${env.ADMIN_URL.replace(/\/$/, '')}/dashboard/approvals`;
 
   const email = EmailService.buildNewUserSignupEmail({
     userId: payload.userId,
@@ -130,7 +132,9 @@ async function notifyAdminsByTelegram(
   payload: NewUserSignupPayload,
   admins: AdminRecord[],
 ): Promise<void> {
-  const dashboardUrl = `${env.FRONTEND_URL.replace(/\/$/, '')}/admin/users?status=pending`;
+  // Admin dashboard is a SEPARATE deployment (admin.qait.dev), not the main
+  // app — its approvals page is /dashboard/approvals, not /admin/users.
+  const dashboardUrl = `${env.ADMIN_URL.replace(/\/$/, '')}/dashboard/approvals`;
   const displayName = payload.name?.trim() || payload.email.split('@')[0];
 
   let delivered = 0;

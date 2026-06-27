@@ -2,6 +2,8 @@ import { requireAuth, requireCredits } from '@/middleware/auth.middleware';
 import { Router } from 'express';
 import {
   applyDoctorFindingHandler,
+  bulkDeleteNegatives,
+  bulkSetNegativesEnabled,
   cancelRun,
   createShareLink,
   deleteNegative,
@@ -781,6 +783,11 @@ router.get('/plans/:planId/negatives/estimate', requireAuth, getNegativesEstimat
 
 // Regenerate negatives for one source test case in the plan
 router.post('/plans/:planId/sources/:testCaseId/regenerate-negatives', requireAuth, regenerateNegatives);
+
+// Bulk control (enable/disable / delete many). Plan-scoped route; authorized
+// per-negative by project in the service.
+router.patch('/plans/:planId/negatives/bulk', requireAuth, bulkSetNegativesEnabled);
+router.delete('/plans/:planId/negatives/bulk', requireAuth, bulkDeleteNegatives);
 
 // Per-negative control (enable/disable, delete)
 router.patch('/negatives/:negativeId', requireAuth, setNegativeEnabled);

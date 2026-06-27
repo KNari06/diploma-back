@@ -143,6 +143,16 @@ export const AI_TASK_MODELS = {
   /** Post-healing visual verification (Gemini multimodal, confirm correct element) */
   healingVerification: 'gemini-2.5-flash' as const,
 
+  // ── Negative / Boundary Testing ────────────────────────────────────────
+  /**
+   * Negative-test mutation generation. Reasoning task: read each happy-path
+   * step's field identity, decide the highest-value attack (auth/validation
+   * over navigation), and write an observable error-state assertion — not a
+   * classification. Uses the smart tier (gpt-5.4-mini), NOT `AI_MODELS.fast`
+   * (whose env default is gpt-4.1-mini). Override via OPENAI_MODEL_NEGATIVE_GEN.
+   */
+  negativeGeneration: env.OPENAI_MODEL_NEGATIVE_GEN || AI_MODELS.smart,
+
   // ── Lite Engine / Test Orchestration ───────────────────────────────────
   /** Core brain for Lite engine decision making */
   coreBrain: AI_MODELS.smart,

@@ -3,6 +3,9 @@ import { NegativeToggleResolverService } from '@/services/testing/plans/negative
 import { NegativeTestGeneratorService } from './negative-test-generator.service';
 import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { getProjectForAccess } from '@/services/testing/regression/db/regression.db';
+import { isPaidUser } from '@/services/core/plan-access.service';
+import { redisConnection } from '@/config/infrastructure/queues';
+import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import * as negativeDb from './db/negative.db';
 
@@ -31,17 +34,81 @@ const AVG_NEGATIVES_PER_SOURCE = 4;
 /** Fallback per-UI-test wall-clock when there is no execution history. */
 const FALLBACK_TEST_MS = 45_000;
 
-/** Per-source mutex so regenerate can't race the background generation job. */
-const sourceMutexes = new Map<string, Promise<void>>();
-function withSourceMutex<T>(sourceId: string, fn: () => Promise<T>): Promise<T> {
-  const prev = sourceMutexes.get(sourceId) || Promise.resolve();
-  let release!: () => void;
-  const next = new Promise<void>((r) => { release = r; });
-  sourceMutexes.set(sourceId, next);
-  return prev.then(fn).finally(() => {
-    release();
-    if (sourceMutexes.get(sourceId) === next) sourceMutexes.delete(sourceId);
-  });
+/**
+ * Per-source CROSS-PROCESS mutex so regenerate (runs in the API process) can't
+ * race the background generation job (runs in the WORKER process) and
+ * double-generate. A previous in-memory Map only guarded within one process —
+ * the API and worker held separate Maps, so the lock was effectively absent
+ * across the regenerate↔job boundary.
+ *
+ * Backed by Redis SET NX EX (same primitive as the scheduler leader lock). On
+ * contention we WAIT briefly then retry; if the lock can't be acquired within
+ * the window the other holder is generating for the same source, so we skip
+ * (return null) rather than duplicate. Release is a compare-and-del so we never
+ * delete a lock we no longer own (e.g. after a TTL-expiry takeover).
+ */
+const SOURCE_LOCK_TTL_SEC = 120; // bounds a crashed holder; > one generation
+const SOURCE_LOCK_WAIT_MS = 8_000; // total time to wait for a busy lock
+const SOURCE_LOCK_POLL_MS = 200;
+const RELEASE_IF_OWNER = `
+  if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+  else
+    return 0
+  end`;
+
+async function withSourceMutex<T>(
+  sourceId: string,
+  fn: () => Promise<T>,
+): Promise<T | null> {
+  const key = `${env.QUEUE_PREFIX}negative:lock:${sourceId}`;
+  // Unique-enough owner token without Math.random/Date.now sensitivity: pid +
+  // a monotonic counter. Only needs to be distinct between the two contenders.
+  const token = `${process.pid}:${nextLockToken()}`;
+  const deadline = nowMs() + SOURCE_LOCK_WAIT_MS;
+
+  let acquired = false;
+  while (!acquired) {
+    const ok = await redisConnection.set(key, token, 'EX', SOURCE_LOCK_TTL_SEC, 'NX');
+    if (ok) {
+      acquired = true;
+      break;
+    }
+    if (nowMs() >= deadline) break;
+    await sleep(SOURCE_LOCK_POLL_MS);
+  }
+
+  if (!acquired) {
+    logger.info('[NEGATIVE_GEN] Source lock busy — another process is generating, skipping', {
+      sourceId,
+    });
+    return null;
+  }
+
+  try {
+    return await fn();
+  } finally {
+    try {
+      await redisConnection.eval(RELEASE_IF_OWNER, 1, key, token);
+    } catch (err) {
+      logger.warn('[NEGATIVE_GEN] Failed to release source lock (TTL will expire it)', {
+        sourceId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+let lockTokenCounter = 0;
+function nextLockToken(): number {
+  lockTokenCounter = (lockTokenCounter + 1) % Number.MAX_SAFE_INTEGER;
+  return lockTokenCounter;
+}
+function nowMs(): number {
+  return Number(process.hrtime.bigint() / 1_000_000n);
+}
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
@@ -90,6 +157,7 @@ export class NegativeGenerationService {
     userId: string,
   ): Promise<
     | { status: 'plan_not_found' }
+    | { status: 'forbidden'; message: string }
     | { status: 'ok'; jobId: string | null; testCaseCount: number; message?: string }
   > {
     if (!(await this.assertPlanAccess(planId, userId))) {
@@ -105,6 +173,18 @@ export class NegativeGenerationService {
         testCaseCount: 0,
         message: 'No test cases have negative testing enabled',
       };
+    }
+
+    // Paid gate: mobile RUNS are Pro-only (dispatchMobileTest), so generating
+    // mobile negatives for a free user would burn LLM cost on tests they can
+    // never execute. Gate generation when any enabled source is mobile.
+    if (await negativeDb.anySourceIsMobile(enabledTestCaseIds)) {
+      if (!(await isPaidUser(userId))) {
+        return {
+          status: 'forbidden',
+          message: 'Negative testing for mobile test cases requires a paid plan.',
+        };
+      }
     }
 
     const { QueueManager } = await import('@/config/infrastructure/queues');
@@ -226,6 +306,55 @@ export class NegativeGenerationService {
   }
 
   /**
+   * Bulk enable/disable or delete negatives by id. A bulk request can span
+   * negatives from different projects, so we authorize PER ID: fetch ownership,
+   * keep only ids the user may act on, mutate just those. Returns how many were
+   * affected and how many were skipped for access — never throws on a partial
+   * set, never touches a negative the caller can't access.
+   */
+  private static async bulkAuthorize(
+    negativeIds: string[],
+    userId: string,
+  ): Promise<{ allowed: string[]; forbidden: number }> {
+    const unique = Array.from(new Set(negativeIds)).filter((id) => typeof id === 'string' && id.length > 0);
+    if (unique.length === 0) return { allowed: [], forbidden: 0 };
+
+    const owners = await negativeDb.getNegativesOwnership(unique);
+    // Cache project access per projectId so N negatives in one project = 1 check.
+    const accessByProject = new Map<string | null, boolean>();
+    const allowed: string[] = [];
+    for (const o of owners) {
+      let ok = accessByProject.get(o.projectId);
+      if (ok === undefined) {
+        ok = await hasProjectAccess(o.projectId, userId);
+        accessByProject.set(o.projectId, ok);
+      }
+      if (ok) allowed.push(o.id);
+    }
+    // forbidden = existing-but-no-access. (Non-existent ids are silently ignored.)
+    return { allowed, forbidden: owners.length - allowed.length };
+  }
+
+  static async bulkSetEnabled(
+    negativeIds: string[],
+    userId: string,
+    enabled: boolean,
+  ): Promise<{ status: 'ok'; updated: number; forbidden: number }> {
+    const { allowed, forbidden } = await this.bulkAuthorize(negativeIds, userId);
+    const updated = allowed.length > 0 ? await negativeDb.setNegativeEnabledByIds(allowed, enabled) : 0;
+    return { status: 'ok', updated, forbidden };
+  }
+
+  static async bulkDelete(
+    negativeIds: string[],
+    userId: string,
+  ): Promise<{ status: 'ok'; deleted: number; forbidden: number }> {
+    const { allowed, forbidden } = await this.bulkAuthorize(negativeIds, userId);
+    const deleted = allowed.length > 0 ? await negativeDb.deleteNegativesByIds(allowed) : 0;
+    return { status: 'ok', deleted, forbidden };
+  }
+
+  /**
    * Check-then-generate for one source under the per-source mutex. Skips when
    * fresh negatives already exist. Shared by the background job so the job and
    * regenerate serialize against each other (no duplicate generation race).
@@ -235,12 +364,15 @@ export class NegativeGenerationService {
     sourceTestCaseId: string,
     userId: string,
   ): Promise<{ skipped: true } | { skipped: false; createdIds: string[] }> {
-    return withSourceMutex(sourceTestCaseId, async () => {
+    const result = await withSourceMutex(sourceTestCaseId, async () => {
       const existing = await NegativeTestGeneratorService.getNegativeCount(sourceTestCaseId);
       if (existing > 0) return { skipped: true as const };
       const createdIds = await NegativeTestGeneratorService.generateForTestCase(sourceTestCaseId, userId);
       return { skipped: false as const, createdIds };
     });
+    // null = lock held by another process (regenerate / a concurrent job) that
+    // is already generating for this source — treat as skipped, not a failure.
+    return result ?? { skipped: true as const };
   }
 
   /**
@@ -255,13 +387,14 @@ export class NegativeGenerationService {
     | { status: 'ok'; createdIds: string[] }
     | { status: 'not_found' }
     | { status: 'forbidden' }
+    | { status: 'busy' }
     | { status: 'error'; message: string }
   > {
     const owner = await negativeDb.getTestCaseOwner(sourceTestCaseId);
     if (!owner) return { status: 'not_found' };
     if (!(await hasProjectAccess(owner.projectId, userId))) return { status: 'forbidden' };
 
-    return withSourceMutex(sourceTestCaseId, async () => {
+    const result = await withSourceMutex(sourceTestCaseId, async () => {
       try {
         await NegativeTestGeneratorService.deleteExistingNegatives(sourceTestCaseId);
         const createdIds = await NegativeTestGeneratorService.generateForTestCase(sourceTestCaseId, userId);
@@ -272,5 +405,9 @@ export class NegativeGenerationService {
         return { status: 'error' as const, message };
       }
     });
+    // null = another process holds the source lock (the background job is
+    // generating for this source). Surface as 'busy' so the caller can retry,
+    // rather than racing into a delete+regenerate alongside the job.
+    return result ?? { status: 'busy' as const };
   }
 }
