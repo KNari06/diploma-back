@@ -179,6 +179,9 @@ const envSchema = z.object({
 
   // Frontend
   FRONTEND_URL: z.string().url().optional().default('http://localhost:3000'),
+  // Admin dashboard (separate deployment, e.g. https://admin.qait.dev).
+  // Used for admin-targeted notification links (new-user approval, etc.).
+  ADMIN_URL: z.string().url().optional().default('http://localhost:3000'),
   ALLOWED_ORIGINS: z.string().optional(),
 
   // Backend URL (used for OAuth callbacks)
