@@ -7,8 +7,9 @@
 # Образ в ACR; Container Apps тянут через Managed Identity.
 #
 # Раннер: dev-runner (Azure VM, ARM64, docker executor + host docker.sock).
-# ВАЖНО: Container Apps бегут amd64, VM — arm64 → сборка идёт под qemu
-# (binfmt amd64 должен быть установлен на VM). Медленно, но нативно деплоит.
+# Container Apps бегут amd64, VM — arm64 → образ собирается через buildx
+# (driver docker-container) под qemu. binfmt amd64 должен быть на VM:
+#   docker run --privileged --rm tonistiigi/binfmt --install amd64
 #
 # Required CI/CD Variables (Group: qait.dev):
 #   AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
@@ -28,8 +29,6 @@ workflow:
     - when: never
 
 variables:
-  DOCKER_DEFAULT_PLATFORM: linux/amd64   # ARM-runner, но Container Apps = amd64
-  DOCKER_BUILDKIT: "1"
   IMAGE: "${ACR_LOGIN_SERVER}/qai-backend:${CI_COMMIT_SHORT_SHA}"
   IMAGE_LATEST: "${ACR_LOGIN_SERVER}/qai-backend:latest"
 
@@ -56,7 +55,7 @@ stages:
       az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 
 # ─────────────────────────────────────────────────────────────────
-# Сборка образа (amd64 под qemu) и push в ACR — через host docker
+# Сборка образа (amd64 через buildx/qemu) и push в ACR — host docker
 # ─────────────────────────────────────────────────────────────────
 build:
   stage: build
@@ -68,29 +67,34 @@ build:
     - |
       set -euo pipefail
 
-      echo "🐳 Installing Docker CLI"
-      tdnf install -y moby-cli ca-certificates
+      echo "🐳 docker CLI + buildx"
+      tdnf install -y moby-cli ca-certificates curl tar
       tdnf clean all
+      mkdir -p ~/.docker/cli-plugins
+      curl -fsSL https://github.com/docker/buildx/releases/download/v0.17.1/buildx-v0.17.1.linux-arm64 \
+        -o ~/.docker/cli-plugins/docker-buildx
+      chmod +x ~/.docker/cli-plugins/docker-buildx
+      docker buildx version
 
-      echo "🔌 Using host Docker daemon via mounted socket"
+      echo "🔌 host Docker via mounted socket"
       docker info >/dev/null
 
       echo "🔐 Login to ACR"
       az acr login --name "$ACR_NAME"
 
-      echo "🔨 Building (linux/amd64): $IMAGE"
-      docker pull "$IMAGE_LATEST" 2>/dev/null || true
+      echo "🏗️ buildx builder (docker-container, amd64 via qemu)"
+      docker buildx create --name qaibuilder --driver docker-container --use 2>/dev/null || docker buildx use qaibuilder
+      docker buildx inspect --bootstrap
 
-      docker build \
+      echo "🔨 build & push (linux/amd64): $IMAGE"
+      docker buildx build \
         --platform linux/amd64 \
-        --cache-from "$IMAGE_LATEST" \
+        --cache-from type=registry,ref="$IMAGE_LATEST" \
+        --cache-to type=inline \
         --tag "$IMAGE" \
         --tag "$IMAGE_LATEST" \
+        --push \
         .
-
-      echo "⬆️ Pushing to ACR..."
-      docker push "$IMAGE"
-      docker push "$IMAGE_LATEST"
 
 # ─────────────────────────────────────────────────────────────────
 # Деплой API
