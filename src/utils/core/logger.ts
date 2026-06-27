@@ -263,6 +263,13 @@ const transports: winston.transport[] = [
           labels: { app: PROCESS_KIND, env: 'prod' },
           json: true,
           replaceTimestamp: true,
+          // Batch only the high-volume api process. The worker/scheduler are
+          // mostly idle (a startup/job burst, then they wait for work) — with
+          // batching their last batch never flushes until the NEXT log arrives,
+          // so an idle process's logs never reach Loki. api has continuous
+          // traffic so its batches always flush; worker/scheduler must send
+          // immediately or they stay invisible in Grafana.
+          batching: PROCESS_KIND === 'api',
           onConnectionError: (e) => console.error('[loki]', e),
         }),
       ]
