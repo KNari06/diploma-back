@@ -250,7 +250,7 @@ export class ManualTestRunJobHandler {
         this.emitResultError(testId, browser, new Error(result.error || 'Test execution failed'));
 
         // Send failure notification
-        await this.sendFailureNotification(testId, new Error(result.error || 'Test execution failed'));
+        await this.sendFailureNotification(testId, new Error(result.error || 'Test execution failed'), options);
 
         // Don't throw - this is the final result after all retries
         // BullMQ retry should NOT happen here - executePlaywrightTestWithRetry already did all retries
@@ -334,7 +334,7 @@ export class ManualTestRunJobHandler {
       await this.updateTestStatus(testId, 'failed', browser, undefined, new Date().toISOString());
 
       // Send failure notification
-      await this.sendFailureNotification(testId, error);
+      await this.sendFailureNotification(testId, error, options);
 
       throw handleAgentError(error as Error);
     } finally {
@@ -675,8 +675,17 @@ export class ManualTestRunJobHandler {
   /**
    * Send failure notification
    */
-  private static async sendFailureNotification(testId: string, error: any) {
+  private static async sendFailureNotification(testId: string, error: any, options?: any) {
     try {
+      // Regression / scheduled / chat / webhook runs set `options.trigger`
+      // (ad-hoc editor runs never do). Those runs already emit ONE run-level
+      // summary notification (TestCompletionHandler → shared report link), so
+      // suppress the per-test message here to avoid N-failures → N+1 messages.
+      if (options?.trigger) {
+        logger.debug(`[TEST-RUN] Skipping per-test failure notification for regression test (trigger=${options.trigger}): ${testId}`);
+        return;
+      }
+
       // Get test details
       const test = await dbAdminService.getTest(testId) as any;
       if (!test) {
