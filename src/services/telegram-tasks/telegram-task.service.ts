@@ -62,6 +62,27 @@ export function taskLink(chatId: number, sourceMsgId: number | null, label: stri
   return url ? `<a href="${url}">${safe}</a>` : safe;
 }
 
+/**
+ * Turn the model's reply into safe Telegram HTML. The model emits task links as
+ * tokens [[t:<id>]]label[[/t]] (it never writes URLs itself — so it can't mangle
+ * them). We:
+ *   1. escape ALL of the model's free text (so any stray < & > is safe),
+ *   2. then replace the (now-escaped) tokens with a real <a href> built in code
+ *      from the task's true source message — or plain text if the id is unknown
+ *      or the chat can't be deep-linked.
+ * Deterministic links; the model only chooses WHICH task and the wording.
+ */
+export function renderReplyTokens(reply: string, tasks: TelegramTaskRow[]): string {
+  const byId = new Map(tasks.map((t) => [t.id, t] as const));
+  const escaped = escapeHtml(reply); // escapes the tokens' brackets too — fine, we match the escaped form
+  // After escaping, [[t:id]]label[[/t]] is unchanged ([ and ] aren't escaped).
+  return escaped.replace(/\[\[t:([0-9a-f-]{6,})\]\]([\s\S]*?)\[\[\/t\]\]/gi, (_m, id: string, label: string) => {
+    const t = byId.get(id);
+    const url = t ? taskUrl(t.chat_id, t.source_msg_id) : null;
+    return url ? `<a href="${url}">${label}</a>` : label; // label already escaped above
+  });
+}
+
 /** Best-effort outbound post to the group (never throws into the caller). */
 // Telegram hard-limits a message to 4096 chars; an over-limit send is rejected
 // (400) and would otherwise be silently dropped. Cap with headroom.
@@ -335,15 +356,18 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
     // hard code-side guard so a chatty model can't spam the group on ordinary
     // digests (the schema asks for this, but we don't trust the model to obey).
     const wantsReply = reply && m.addressedToBot;
+    // Build deterministic links from the model's [[t:id]] tokens (it never wrote
+    // URLs itself). renderReplyTokens already escapes the text, so send as HTML.
+    const renderedReply = wantsReply ? renderReplyTokens(reply!, contextTasks) : '';
 
     // Link the bot's message back to the user's so it's clear what it answers.
     if (wantsReply && bits.length) {
       // Both an answer AND changes: post the answer (rich, may contain links),
       // then the change ack.
-      await sendRich(m.chatId, reply!, m.msgId);
+      await sendRich(m.chatId, renderedReply, m.msgId);
       await send(m.chatId, bits.join(' · '), m.msgId);
     } else if (wantsReply) {
-      await sendRich(m.chatId, reply!, m.msgId);
+      await sendRich(m.chatId, renderedReply, m.msgId);
     } else if (bits.length) {
       await send(m.chatId, bits.join(' · '), m.msgId);
     }

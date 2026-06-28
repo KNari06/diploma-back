@@ -310,13 +310,14 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
         '  • An ACTION ("done", "close the video task", "in progress 2 days") →',
         '    emit the actions as usual; `reply` may be a short confirmation or null.',
         '',
-        'FORMATTING `reply` (Telegram HTML): NEVER print the raw id=<uuid> — it is',
-        'internal. When you list tasks, NUMBER them ("1. ", "2. ", …), one per',
-        'line, and make each task\'s title a clickable link using its link= value:',
-        '  1. <a href="LINK">[Project] Title</a>',
-        '  2. <a href="LINK">[Project] Title</a>',
-        'If a task has no link=, just write the plain numbered title. Use only',
-        '<a>, <b>, <i> tags. (A single-task answer needs no number.)',
+        'FORMATTING `reply`: NEVER print the raw id=<uuid>. When you list tasks,',
+        'NUMBER them ("1. ", "2. ", …), one per line. To make a task clickable, wrap',
+        'its title in a token using that task\'s id EXACTLY: [[t:<id>]][Project]',
+        'Title[[/t]] — do NOT write any URL or <a> tag yourself; the system turns',
+        'the token into the correct link. Example:',
+        '  1. [[t:0b28...]][JP] Video not playing[[/t]]',
+        '  2. [[t:9a55...]][Hustle] Google Credits[[/t]]',
+        'Plain prose (non-task) text needs no token.',
       ].join('\n')
     : '';
 
