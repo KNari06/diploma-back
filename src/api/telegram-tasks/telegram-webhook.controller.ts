@@ -36,12 +36,30 @@ interface TgMessage {
 }
 interface TgUpdate { message?: TgMessage; edited_message?: TgMessage }
 
-/** True when `text` @mentions the given bot username (word-boundary aware so
- *  `@qait_task` matches but `@qait_tasker` does not). Exported for testing. */
+/** The bot's real @username, resolved from Telegram (getMe) at startup. Falls
+ *  back to the configured TELEGRAM_BOT_USERNAME until then. setResolvedBotUsername
+ *  is called once on boot so we never depend on the env being byte-exact (e.g.
+ *  "qait_task" configured vs the real "qait_task_bot"). */
+let resolvedBotUsername: string | undefined;
+export function setResolvedBotUsername(username: string | undefined): void {
+  resolvedBotUsername = username?.replace(/^@/, '').toLowerCase();
+}
+
+/** True when `text` @mentions the bot. Matches the exact username AND tolerates
+ *  the conventional `_bot` suffix in either direction (config "qait_task" still
+ *  matches "@qait_task_bot"), while still rejecting an unrelated longer handle
+ *  (@qait_tasker). Exported for testing. */
 export function mentionsBot(text: string, botUsername: string | undefined): boolean {
-  const uname = botUsername?.replace(/^@/, '').toLowerCase();
-  if (!uname) return false;
-  return new RegExp(`@${uname}(?![a-z0-9_])`, 'i').test(text);
+  const candidates = new Set<string>();
+  for (const raw of [resolvedBotUsername, botUsername?.replace(/^@/, '').toLowerCase()]) {
+    if (!raw) continue;
+    candidates.add(raw);
+    candidates.add(raw.endsWith('_bot') ? raw.slice(0, -4) : `${raw}_bot`);
+  }
+  for (const uname of candidates) {
+    if (new RegExp(`@${uname}(?![a-z0-9_])`, 'i').test(text)) return true;
+  }
+  return false;
 }
 
 /** True when the message is addressed to OUR bot — a reply to one of our bot's

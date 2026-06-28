@@ -83,10 +83,13 @@ async function applyActions(
   actions: Action[],
   sourceMsgId: number | undefined,
   askReplyTo?: number,
-): Promise<{ created: string[]; closed: string[]; progressed: string[]; asked: boolean; deadlines: string[] }> {
+): Promise<{ created: string[]; closed: string[]; progressed: string[]; asked: boolean; deadlines: string[]; notes: string[] }> {
   const created: string[] = [];
   const closed: string[] = [];
   const progressed: string[] = [];
+  // Human-readable per-change labels for an informative ack (vs "noted status
+  // on 1 task"). Filled for status/deadline changes where the task name helps.
+  const notes: string[] = [];
   const deadlines: string[] = [];
   let asked = false;
   for (const a of actions) {
@@ -111,7 +114,15 @@ async function applyActions(
         });
         await db.touchActivity(a.task_id);
         break;
-      case 'progress': await db.setProgress(a.task_id, a.state, a.note); progressed.push(a.task_id); break;
+      case 'progress': {
+        await db.setProgress(a.task_id, a.state, a.note);
+        progressed.push(a.task_id);
+        const t = await db.getTask(a.task_id);
+        const label = t ? `${t.project ? `[${t.project}] ` : ''}${t.title}` : 'task';
+        const STATUS_LABEL = { in_progress: 'in progress', blocked: 'blocked', needs_investigation: 'needs investigation' } as const;
+        notes.push(`📌 ${escapeHtml(label)} — ${STATUS_LABEL[a.state]}`);
+        break;
+      }
       case 'claim': {
         // Someone took a task with no deadline → ask "when?", as a reply to the
         // claim message, and remember the question id so their answer links back.
@@ -148,7 +159,7 @@ async function applyActions(
       case 'touch': await db.touchActivity(a.task_id); break;
     }
   }
-  return { created, closed, progressed, asked, deadlines };
+  return { created, closed, progressed, asked, deadlines, notes };
 }
 
 export interface InboundMessage {
@@ -217,7 +228,9 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
     const bits: string[] = [];
     if (r.created.length) bits.push(`📝 tracking ${r.created.length} new task${r.created.length > 1 ? 's' : ''}`);
     if (r.closed.length) bits.push(`✅ closed ${r.closed.length} task${r.closed.length > 1 ? 's' : ''}`);
-    if (r.progressed.length) bits.push(`📌 noted status on ${r.progressed.length} task${r.progressed.length > 1 ? 's' : ''}`);
+    // Prefer the detailed per-task status labels over a bare count.
+    if (r.notes.length) bits.push(...r.notes);
+    else if (r.progressed.length) bits.push(`📌 noted status on ${r.progressed.length} task${r.progressed.length > 1 ? 's' : ''}`);
     if (r.deadlines.length) bits.push(`📅 set deadline on ${r.deadlines.length} task${r.deadlines.length > 1 ? 's' : ''}`);
 
     // Honor the model's reply ONLY when the user actually addressed the bot — a

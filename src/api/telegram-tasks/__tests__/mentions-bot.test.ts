@@ -21,4 +21,16 @@ describe('mentionsBot', () => {
   it('returns false when no bot username is configured', () => {
     expect(mentionsBot('@qait_task hi', undefined)).toBe(false);
   });
+
+  // Real prod bug: bot is @qait_task_bot but env was "qait_task" (no _bot) — the
+  // mention must still match in either direction.
+  it('tolerates the _bot suffix mismatch in both directions', () => {
+    expect(mentionsBot('@qait_task_bot what is task 1?', 'qait_task')).toBe(true);
+    expect(mentionsBot('@qait_task hello', 'qait_task_bot')).toBe(true);
+    expect(mentionsBot('@qait_task_bot hi', 'qait_task_bot')).toBe(true);
+  });
+
+  it('still rejects an unrelated longer handle even with suffix tolerance', () => {
+    expect(mentionsBot('@qait_tasker hi', 'qait_task')).toBe(false);
+  });
 });

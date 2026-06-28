@@ -1649,6 +1649,27 @@ const startServer = async () => {
           logger.error('[SERVER] Failed to verify SMTP config', { error: formatError(mailerError) });
         }
 
+        // Resolve QAIT Tasker's real @username from Telegram so @mention detection
+        // doesn't depend on TELEGRAM_BOT_USERNAME being byte-exact. Fire-and-forget,
+        // non-fatal — the configured env value remains the fallback.
+        if (env.TELEGRAM_TASKS_ENABLED && env.TELEGRAM_BOT_TOKEN) {
+          void (async () => {
+            try {
+              const { getMe } = await import('@/services/api/telegram.service');
+              const { setResolvedBotUsername } = await import('@/api/telegram-tasks/telegram-webhook.controller');
+              const me = await getMe(env.TELEGRAM_BOT_TOKEN!);
+              if (me?.username) {
+                setResolvedBotUsername(me.username);
+                logger.info('[TELEGRAM_TASKS] resolved bot username', { username: me.username });
+              }
+            } catch (e) {
+              logger.warn('[TELEGRAM_TASKS] getMe failed; using TELEGRAM_BOT_USERNAME fallback', {
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
+          })();
+        }
+
         // V21: Start system health monitor (polls Supabase, broadcasts maintenance
         // banner to all connected clients on outage). Independent from zombie cleanup
         // and safe to start before any test infrastructure is initialised.
