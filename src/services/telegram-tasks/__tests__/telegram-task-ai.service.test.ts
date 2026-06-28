@@ -9,7 +9,7 @@ jest.mock('@/services/ai/core/openai.service', () => ({
   getChatCompletionWithMessages: jest.fn(),
 }));
 
-import { validateActions, type AiTaskView } from '../telegram-task-ai.service';
+import { validateActions, renderDeadline, type AiTaskView } from '../telegram-task-ai.service';
 
 const task = (id: string, over: Partial<AiTaskView> = {}): AiTaskView => ({
   id,
@@ -19,6 +19,8 @@ const task = (id: string, over: Partial<AiTaskView> = {}): AiTaskView => ({
   progress: 'none',
   progress_note: null,
   has_deadline: false,
+  due_text: null,
+  due_at: null,
   link: null,
   ...over,
 });
@@ -155,6 +157,52 @@ describe('validateActions', () => {
     });
   });
 
+  describe('ambiguous-reply guard (reply maps to 2+ tasks, e.g. a digest)', () => {
+    const owner = { owner: '@x', isManager: true };
+    const many = [task('c1', { owner: '@x' }), task('c2', { owner: '@x' }), task('c3', { owner: '@x' })];
+
+    it('rewrites a guessed single-target claim into a clarify over the reply candidates', () => {
+      // "this task on me" replying to a digest → reply resolves to c1+c2; the
+      // model picked c1, but it cannot know which → ask instead.
+      const out = validateActions([{ kind: 'claim', task_id: 'c1' }], many, 'r', owner, ['c1', 'c2']);
+      expect(out).toEqual([{ kind: 'clarify', candidate_ids: ['c1', 'c2'] }]);
+    });
+
+    it('also guards close / progress / set_deadline', () => {
+      for (const a of [
+        { kind: 'close', task_id: 'c1', reason: 'done' },
+        { kind: 'progress', task_id: 'c2', state: 'in_progress' },
+        { kind: 'set_deadline', task_id: 'c1', due_text: 'Friday', due_at: null },
+      ]) {
+        const out = validateActions([a], many, 'r', owner, ['c1', 'c2']);
+        expect(out).toEqual([{ kind: 'clarify', candidate_ids: ['c1', 'c2'] }]);
+      }
+    });
+
+    it('does NOT guard when the reply maps to a single task (unambiguous)', () => {
+      const out = validateActions([{ kind: 'claim', task_id: 'c1' }], many, 'r', owner, ['c1']);
+      expect(out).toEqual([{ kind: 'claim', task_id: 'c1' }]);
+    });
+
+    it('does NOT guard a target outside the ambiguous set', () => {
+      const out = validateActions([{ kind: 'claim', task_id: 'c3' }], many, 'r', owner, ['c1', 'c2']);
+      expect(out).toEqual([{ kind: 'claim', task_id: 'c3' }]);
+    });
+
+    it('lets update/touch through (explicit edit / harmless) even when ambiguous', () => {
+      const out = validateActions([{ kind: 'touch', task_id: 'c1' }], many, 'r', owner, ['c1', 'c2']);
+      expect(out).toEqual([{ kind: 'touch', task_id: 'c1' }]);
+    });
+
+    it('does not double-ask when the model already emitted a clarify', () => {
+      const out = validateActions(
+        [{ kind: 'clarify', candidate_ids: ['c1', 'c2'] }, { kind: 'claim', task_id: 'c1' }],
+        many, 'r', owner, ['c1', 'c2'],
+      );
+      expect(out.filter((x) => x.kind === 'clarify')).toHaveLength(1);
+    });
+  });
+
   describe('set_deadline', () => {
     const owned = [task('t1', { owner: '@ndarkhans' })];
 
@@ -189,6 +237,33 @@ describe('validateActions', () => {
   it('ignores non-array / garbage entries gracefully', () => {
     const out = validateActions([{ kind: 'nonsense', task_id: 'a1' }, {}], open, 'r');
     expect(out).toEqual([]);
+  });
+});
+
+describe('renderDeadline (what the model sees about a task deadline)', () => {
+  const NOW = Date.parse('2026-06-29T12:00:00Z');
+  const v = (over: Partial<AiTaskView>): AiTaskView => task('x', over);
+
+  it('shows "no deadline" when none is set', () => {
+    expect(renderDeadline(v({ has_deadline: false }), NOW)).toBe(' [no deadline]');
+  });
+
+  it('flags OVERDUE when due_at is in the past', () => {
+    const out = renderDeadline(v({ has_deadline: true, due_text: 'к пятнице', due_at: '2026-06-26T10:00:00Z' }), NOW);
+    expect(out).toContain('OVERDUE');
+    expect(out).toContain('к пятнице');
+    expect(out).toContain('2026-06-26T10:00:00Z');
+  });
+
+  it('does NOT flag OVERDUE when due_at is in the future', () => {
+    const out = renderDeadline(v({ has_deadline: true, due_text: 'Friday', due_at: '2026-07-03T10:00:00Z' }), NOW);
+    expect(out).not.toContain('OVERDUE');
+    expect(out).toContain('2026-07-03T10:00:00Z');
+  });
+
+  it('shows the words but no overdue verdict when due_at is unknown/unparsed', () => {
+    const out = renderDeadline(v({ has_deadline: true, due_text: 'soon', due_at: null }), NOW);
+    expect(out).toBe(' [deadline "soon"]');
   });
 });
 

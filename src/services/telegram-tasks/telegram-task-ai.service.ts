@@ -35,6 +35,8 @@ export interface AiTaskView {
   progress: 'none' | ProgressState;
   progress_note: string | null;
   has_deadline: boolean; // true if due_text/due_at already set — don't re-ask
+  due_text: string | null; // the owner's words for the deadline, e.g. "к пятнице" (null if none)
+  due_at: string | null; // absolute ISO deadline, for overdue reasoning (null if unparsed/none)
   link: string | null; // t.me deep link to the source message, for clickable titles in replies
 }
 
@@ -247,7 +249,21 @@ function buildSystem(): string {
   ].join('\n');
 }
 
-function renderOpenTasks(openTasks: AiTaskView[]): string {
+/** Render the deadline part of a task line: the human words, and — when an
+ *  absolute due_at is known — whether it is OVERDUE relative to nowMs. */
+export function renderDeadline(t: AiTaskView, nowMs: number): string {
+  if (!t.has_deadline) return ' [no deadline]';
+  const words = t.due_text ? ` "${esc(t.due_text)}"` : '';
+  if (t.due_at) {
+    const due = Date.parse(t.due_at);
+    if (!Number.isNaN(due)) {
+      return ` [deadline${words} (${t.due_at})${due < nowMs ? ' — OVERDUE' : ''}]`;
+    }
+  }
+  return ` [deadline${words}]`;
+}
+
+function renderOpenTasks(openTasks: AiTaskView[], nowMs: number): string {
   if (openTasks.length === 0) return '(none)';
   return openTasks
     .map(
@@ -257,7 +273,7 @@ function renderOpenTasks(openTasks: AiTaskView[]): string {
         `- id=${t.id}: ${t.project ? `[${esc(t.project)}] ` : ''}${esc(t.title)}` +
         `${t.owner ? ` (owner ${t.owner})` : ' (unassigned)'}` +
         `${t.progress !== 'none' ? ` [last status: ${t.progress}${t.progress_note ? ` — ${esc(t.progress_note)}` : ''}]` : ''}` +
-        `${t.has_deadline ? ' [has deadline]' : ' [no deadline]'}` +
+        renderDeadline(t, nowMs) +
         `${t.link ? ` link=${t.link}` : ''}`,
     )
     .join('\n');
@@ -305,6 +321,7 @@ async function callReconcileTool(
 }
 
 export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult> {
+  const nowMs = Date.now();
   const openHeader =
     ctx.hiddenOpenCount > 0
       ? `OPEN TASKS (most recent ${ctx.openTasks.length}; ${ctx.hiddenOpenCount} older open tasks not shown):`
@@ -345,7 +362,7 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
     ctx.replyToTaskIds.length ? `REPLYING TO TASK(S): ${ctx.replyToTaskIds.join(', ')}` : 'REPLYING TO: (not a reply / unknown)',
     '',
     openHeader,
-    renderOpenTasks(ctx.openTasks),
+    renderOpenTasks(ctx.openTasks, nowMs),
     addressedBlock,
     '',
     'NEW MESSAGE (act only on THIS message; the recent chat is context):',
@@ -357,7 +374,7 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
     actions: validateActions(raw.actions as Array<Record<string, unknown>>, ctx.openTasks, ctx.text, {
       owner: canonicalOwner(ctx.author) ?? undefined,
       isManager: ctx.isManager,
-    }),
+    }, ctx.replyToTaskIds),
     reply: raw.reply,
   };
 }
@@ -377,8 +394,18 @@ export function validateActions(
   openTasks: AiTaskView[],
   fallbackReason: string,
   actor?: { owner: string | undefined; isManager: boolean },
+  // Task ids the inbound message's reply resolved to. When 2+ (e.g. a reply to a
+  // multi-task digest, whose tasks all share one source_msg_id), "this task on
+  // me" is genuinely ambiguous — the model must NOT silently pick one. Any
+  // single-target action landing inside this set is rewritten to a clarify that
+  // lists the candidates. A reply to ONE task (length ≤ 1) is unambiguous and
+  // passes through untouched.
+  ambiguousReplyIds?: string[],
 ): Action[] {
   const openIds = new Set(openTasks.map((t) => t.id));
+  // Only ambiguous when the reply maps to 2+ still-open tasks.
+  const ambiguous = new Set((ambiguousReplyIds ?? []).filter((id) => openIds.has(id)));
+  const ambiguousActive = ambiguous.size >= 2;
   const ownerById = new Map(openTasks.map((t) => [t.id, t.owner] as const));
   /** Can `actor` change the status of this task? Owner of it, or a manager.
    *  No actor (batch) → allowed. Unowned task → allowed (anyone can advance it). */
@@ -390,6 +417,9 @@ export function validateActions(
     return !!actor.owner && owner.toLowerCase() === actor.owner.toLowerCase();
   };
   const out: Action[] = [];
+  // Set when a single-target action was suppressed by the ambiguous-reply guard;
+  // resolved into one clarify over the ambiguous candidates after the loop.
+  let needsClarify = false;
   for (const a of raw) {
     const kind = a.kind;
     if (kind === 'create' && typeof a.title === 'string' && a.title.trim()) {
@@ -413,6 +443,14 @@ export function validateActions(
       continue;
     }
     if (typeof a.task_id !== 'string' || !openIds.has(a.task_id)) continue;
+    // Ambiguous-reply guard: a status/claim/deadline action that targets one of
+    // several tasks the reply could mean is NOT trustworthy — the model guessed.
+    // Defer it; a single clarify over all candidates is emitted after the loop.
+    // (update/touch are exempt: update is an explicit edit, touch is harmless.)
+    if (ambiguousActive && ambiguous.has(a.task_id) && kind !== 'update' && kind !== 'touch') {
+      needsClarify = true;
+      continue;
+    }
     if (kind === 'close') {
       // Status-changing → authority-gated. A non-owner non-manager close is
       // downgraded to touch (the task is clearly being discussed) rather than
@@ -463,6 +501,12 @@ export function validateActions(
       });
     }
   }
+  // Ambiguous reply with no explicit clarify from the model → ask which task,
+  // listing the candidates the reply could have meant. Skip if the model already
+  // emitted a clarify (don't double-ask).
+  if (needsClarify && !out.some((x) => x.kind === 'clarify')) {
+    out.push({ kind: 'clarify', candidate_ids: [...ambiguous] });
+  }
   return out;
 }
 
@@ -479,7 +523,8 @@ export async function batchAnalyze(
 ): Promise<Action[]> {
   if (openTasks.length === 0 || messages.length === 0) return [];
 
-  const taskList = renderOpenTasks(openTasks);
+  const nowMs = Date.now();
+  const taskList = renderOpenTasks(openTasks, nowMs);
   const convo = messages
     .map((m) => `${m.author ?? '?'}: ${m.text.length > 400 ? m.text.slice(0, 400) + '…' : m.text}`)
     .join('\n');
@@ -494,8 +539,13 @@ export async function batchAnalyze(
     'conversation does not clarify — leave it untouched so a human is asked.',
     'Do NOT create new tasks in batch mode unless the conversation clearly',
     'assigns brand-new work that is not already in the open list.',
+    // The batch runs unattended — it can never ask a follow-up. claim/clarify are
+    // stripped after the fact anyway, so don't waste reasoning emitting them.
+    'NEVER emit claim or clarify in batch mode — there is no one to answer.',
   ].join('\n');
-  const user = `OPEN TASKS:\n${taskList}\n\nCONVERSATION (oldest first):\n${convo}`;
+  const user =
+    `NOW: ${new Date(nowMs).toISOString()} UTC (team timezone Asia/Almaty, UTC+5).\n\n` +
+    `OPEN TASKS:\n${taskList}\n\nCONVERSATION (oldest first):\n${convo}`;
 
   const raw = await callReconcileTool(system, user, 3000);
   // Batch mode never produces a `reply` — it only resolves statuses. Also strip

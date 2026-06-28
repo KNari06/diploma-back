@@ -17,7 +17,7 @@ import { reconcile, type AiTaskView, type Action } from '@/services/telegram-tas
 // ── fixture tasks (the open board the model reasons against) ─────────────────
 const T = (id: string, over: Partial<AiTaskView> = {}): AiTaskView => ({
   id, project: null, title: 't', owner: null, progress: 'none',
-  progress_note: null, has_deadline: false, link: null, ...over,
+  progress_note: null, has_deadline: false, due_text: null, due_at: null, link: null, ...over,
 });
 
 const VIDEO = T('11111111-1111-1111-1111-111111111111', { project: 'JP', title: 'Video not playing', owner: '@gipardb' });

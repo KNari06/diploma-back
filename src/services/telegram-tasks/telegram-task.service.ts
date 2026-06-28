@@ -38,6 +38,8 @@ function toAiView(t: TelegramTaskRow): AiTaskView {
     progress: t.progress,
     progress_note: t.progress_note,
     has_deadline: !!t.due_text || !!t.due_at,
+    due_text: t.due_text,
+    due_at: t.due_at,
     link: taskUrl(t.chat_id, t.source_msg_id),
   };
 }
@@ -52,14 +54,6 @@ export function taskUrl(chatId: number, sourceMsgId: number | null): string | nu
   const s = String(chatId);
   if (sourceMsgId && s.startsWith('-100')) return `https://t.me/c/${s.slice(4)}/${sourceMsgId}`;
   return null;
-}
-
-/** A deep link as an HTML <a> wrapping `label` (escaped), or the plain escaped
- *  label when no link can be built. */
-export function taskLink(chatId: number, sourceMsgId: number | null, label: string): string {
-  const safe = escapeHtml(label);
-  const url = taskUrl(chatId, sourceMsgId);
-  return url ? `<a href="${url}">${safe}</a>` : safe;
 }
 
 /**
@@ -158,15 +152,23 @@ async function applyActions(
   sourceMsgId: number | undefined,
   askReplyTo?: number,
   deadlineReplyMsgId?: number,
-): Promise<{ created: string[]; closed: string[]; closedLinks: string[]; progressed: string[]; asked: boolean; deadlines: string[]; notes: string[] }> {
+  claimant?: string, // canonical @owner who is taking the task (a `claim` reassigns to them)
+): Promise<{ created: string[]; closed: string[]; closedLabels: string[]; progressed: string[]; asked: boolean; deadlines: string[]; notes: string[]; anchorMsgIds: number[] }> {
   const created: string[] = [];
   const closed: string[] = [];
-  const closedLinks: string[] = []; // HTML labels (linked to source msg) for the ack
+  const closedLabels: string[] = []; // plain escaped labels for the ack (jump handled by native quote-reply)
   const progressed: string[] = [];
   // Human-readable per-change labels for an informative ack (vs "noted status
   // on 1 task"). Filled for status/deadline changes where the task name helps.
   const notes: string[] = [];
   const deadlines: string[] = [];
+  // Distinct source-message ids of tasks this batch touched. When exactly one,
+  // the ack quote-replies to it — Telegram's native reply jumps reliably on ALL
+  // platforms (unlike t.me/c/ text links, which break on desktop — tdesktop#8108).
+  const anchorMsgIds: number[] = [];
+  const addAnchor = (id: number | null): void => {
+    if (id && !anchorMsgIds.includes(id)) anchorMsgIds.push(id);
+  };
   let asked = false;
   for (const a of actions) {
     switch (a.kind) {
@@ -182,7 +184,10 @@ async function applyActions(
         await db.closeTask(a.task_id, a.reason);
         closed.push(a.task_id);
         const t = await db.getTask(a.task_id);
-        if (t) closedLinks.push(taskLink(t.chat_id, t.source_msg_id, `${t.project ? `[${t.project}] ` : ''}${t.title}`));
+        if (t) {
+          closedLabels.push(escapeHtml(`${t.project ? `[${t.project}] ` : ''}${t.title}`));
+          addAnchor(t.source_msg_id);
+        }
         break;
       }
       case 'reopen': await db.reopenTask(a.task_id); break;
@@ -201,20 +206,25 @@ async function applyActions(
         progressed.push(a.task_id);
         const t = await db.getTask(a.task_id);
         const label = t ? `${t.project ? `[${t.project}] ` : ''}${t.title}` : 'task';
-        // The task title links to the message it was created from.
-        const linked = t ? taskLink(t.chat_id, t.source_msg_id, label) : escapeHtml(label);
+        if (t) addAnchor(t.source_msg_id); // ack quote-replies to the task message
         const STATUS_LABEL = { in_progress: 'in progress', blocked: 'blocked', needs_investigation: 'needs investigation' } as const;
-        notes.push(`📌 ${linked} — ${STATUS_LABEL[a.state]}`);
+        notes.push(`📌 ${escapeHtml(label)} — ${STATUS_LABEL[a.state]}`);
         break;
       }
       case 'claim': {
-        // Someone took a task with no deadline → ask "when?", as a reply to the
-        // claim message, and remember the question id so their answer links back.
+        // "I'll take it / беру на себя" → the claimant becomes the owner.
+        if (claimant) await db.updateTask(a.task_id, { owner: claimant });
+        // Then ask "when?", as a reply to the claim message, remembering the
+        // question id so their answer links back.
         const task = await db.getTask(a.task_id);
         const label = task ? `${task.project ? `[${task.project}] ` : ''}${task.title}` : 'this task';
         const qId = await sendReturningId(chatId, `🕒 When will it be ready? — ${escapeHtml(label)}`, askReplyTo);
         if (qId) {
           await db.setAwaitingDeadline(a.task_id, qId);
+          // Also a generic bot-msg ref: a deadline reply resolves via
+          // awaiting_deadline_msg_id, but a non-deadline reply ("done"/"reopen")
+          // to the same question still resolves to this task.
+          await db.recordBotMsgRefs(chatId, qId, [a.task_id]);
           asked = true;
         } else {
           // Question couldn't be posted (Telegram error). Don't mark in_progress
@@ -249,7 +259,7 @@ async function applyActions(
       case 'touch': await db.touchActivity(a.task_id); break;
     }
   }
-  return { created, closed, closedLinks, progressed, asked, deadlines, notes };
+  return { created, closed, closedLabels, progressed, asked, deadlines, notes, anchorMsgIds };
 }
 
 export interface InboundMessage {
@@ -294,7 +304,7 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
   const msgRowId = await db.logMessage(m.chatId, m.msgId, author, text);
 
   try {
-    const [contextTasks, totalOpen, recent, replyTaskIds, deadlineTaskId] = await Promise.all([
+    const [contextTasks, totalOpen, recent, replyTaskIds, deadlineTaskId, botMsgTaskIds] = await Promise.all([
       db.recentOpenTasks(m.chatId, MAX_CONTEXT_TASKS),
       db.countOpenTasks(m.chatId),
       msgRowId ? db.recentMessages(m.chatId, RECENT_MSG_WINDOW, msgRowId) : Promise.resolve([]),
@@ -302,11 +312,17 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
       // Deterministic deadline link: did this message reply to the bot's "when?"
       // question for a specific task?
       m.replyToMsgId ? db.findTaskAwaitingDeadline(m.chatId, m.replyToMsgId) : Promise.resolve(null),
+      // Did this message reply to one of the bot's OWN messages (ack/answer/
+      // question)? Resolve which task(s) that message was about.
+      m.replyToMsgId ? db.taskIdsByBotMsg(m.chatId, m.replyToMsgId) : Promise.resolve([]),
     ]);
 
-    // Merge the deadline-reply task into the reply hints so the model resolves
-    // the deadline answer to exactly that task (no ambiguity across tasks).
-    const allReplyTaskIds = deadlineTaskId ? [...new Set([deadlineTaskId, ...replyTaskIds])] : replyTaskIds;
+    // Merge every deterministic reply hint (task source message, deadline
+    // question, any bot message about a task) so the model — and the ambiguous-
+    // reply guard — resolve the reply to exactly the right task(s).
+    const allReplyTaskIds = [
+      ...new Set([...(deadlineTaskId ? [deadlineTaskId] : []), ...replyTaskIds, ...botMsgTaskIds]),
+    ];
 
     // Cost guard (structural, not language-keyword based): a one-token message
     // in a chat with NO open tasks that isn't addressed to the bot cannot
@@ -327,24 +343,33 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
       openTasks: contextTasks.map(toAiView),
       hiddenOpenCount: Math.max(0, totalOpen - contextTasks.length),
       recentMessages: recent,
-      addressedToBot: m.addressedToBot || deadlineTaskId !== null,
+      // A reply to any bot message about a task is implicitly addressed to the bot.
+      addressedToBot: m.addressedToBot || deadlineTaskId !== null || botMsgTaskIds.length > 0,
     });
 
     // deadlineReplyMsgId is set only when this message replied to a bot "when?"
     // question — makes the set_deadline write conditional (race-safe).
-    const r = await applyActions(m.chatId, actions, m.msgId, m.msgId, deadlineTaskId ? m.replyToMsgId : undefined);
+    // claimant = the canonical author, so a `claim` reassigns the task to them.
+    const r = await applyActions(
+      m.chatId,
+      actions,
+      m.msgId,
+      m.msgId,
+      deadlineTaskId ? m.replyToMsgId : undefined,
+      canonicalOwner(author) ?? undefined,
+    );
 
     // Always surface what CHANGED (don't let a chatty reply hide a create/close).
     // A `claim` already posted its own "when?" question, so it's not in `bits`.
     const bits: string[] = [];
-    // "tracking N tasks" links to the digest message they came from (m.msgId).
     if (r.created.length) {
       const n = r.created.length;
-      bits.push(`📝 ${taskLink(m.chatId, m.msgId, `tracking ${n} new task${n > 1 ? 's' : ''}`)}`);
+      bits.push(`📝 tracking ${n} new task${n > 1 ? 's' : ''}`);
     }
-    // closed: link each task title to its source message (up to 3, else count).
+    // closed: name each task (up to 3, else count). The quote-reply anchor below
+    // jumps to the task message — no fragile inline link needed.
     if (r.closed.length) {
-      if (r.closedLinks.length && r.closedLinks.length <= 3) bits.push(`✅ closed ${r.closedLinks.join(', ')}`);
+      if (r.closedLabels.length && r.closedLabels.length <= 3) bits.push(`✅ closed ${r.closedLabels.join(', ')}`);
       else bits.push(`✅ closed ${r.closed.length} task${r.closed.length > 1 ? 's' : ''}`);
     }
     // Prefer the detailed per-task status labels (already linked) over a bare count.
@@ -360,16 +385,30 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
     // URLs itself). renderReplyTokens already escapes the text, so send as HTML.
     const renderedReply = wantsReply ? renderReplyTokens(reply!, contextTasks) : '';
 
-    // Link the bot's message back to the user's so it's clear what it answers.
+    // Anchor the change ack as a native quote-reply to the touched task's source
+    // message when exactly ONE task changed — Telegram's reply jumps reliably on
+    // every platform (a t.me/c/ text link does not — tdesktop#8108). With 0 or
+    // 2+ anchors there's no single message to quote, so fall back to replying to
+    // the user's own message (still clear what it answers).
+    const ackReplyTo = r.anchorMsgIds.length === 1 ? r.anchorMsgIds[0] : m.msgId;
+
+    // Tasks this ack is ABOUT — recorded against the bot message id so a reply to
+    // the ack ("reopen it" / "done") resolves deterministically to them, not via
+    // LLM guessing. (claim posts its own question + records its own ref in
+    // applyActions; that path is unaffected.)
+    const ackTaskIds = [...new Set([...r.closed, ...r.progressed, ...r.deadlines])];
+
+    // The answer (Q&A) always replies to the user's message; only the change ack
+    // uses the task anchor.
     if (wantsReply && bits.length) {
-      // Both an answer AND changes: post the answer (rich, may contain links),
-      // then the change ack.
       await sendRich(m.chatId, renderedReply, m.msgId);
-      await send(m.chatId, bits.join(' · '), m.msgId);
+      const ackId = await sendReturningId(m.chatId, bits.join(' · '), ackReplyTo);
+      if (ackId && ackTaskIds.length) await db.recordBotMsgRefs(m.chatId, ackId, ackTaskIds);
     } else if (wantsReply) {
       await sendRich(m.chatId, renderedReply, m.msgId);
     } else if (bits.length) {
-      await send(m.chatId, bits.join(' · '), m.msgId);
+      const ackId = await sendReturningId(m.chatId, bits.join(' · '), ackReplyTo);
+      if (ackId && ackTaskIds.length) await db.recordBotMsgRefs(m.chatId, ackId, ackTaskIds);
     }
   } catch (err) {
     logger.error('[TELEGRAM_TASKS] ingest failed', { chatId: m.chatId, error: err instanceof Error ? err.message : String(err) });
@@ -399,12 +438,23 @@ export async function runMorningBatch(chatId: number): Promise<void> {
   await db.markBatched(open.map((t) => t.id));
 
   const remaining = await db.openTasks(chatId);
-  const unknown = remaining.filter((t) => t.progress === 'none');
-  const known = remaining.filter((t) => t.progress !== 'none');
-  if (unknown.length === 0) return;
+  const nowMs = Date.now();
+  const isOverdue = (t: TelegramTaskRow): boolean => {
+    if (!t.due_at) return false;
+    const due = Date.parse(t.due_at);
+    return !Number.isNaN(due) && due < nowMs;
+  };
+  // Chase a task when it has no status signal yet (progress 'none'), OR its
+  // deadline has passed regardless of status — an overdue in_progress/blocked
+  // task is exactly what must be re-asked. Tasks with a status AND no passed
+  // deadline are "known" and left alone. (Previously only progress==='none' was
+  // chased, so a stalled or overdue in_progress task was silently ignored.)
+  const chase = remaining.filter((t) => t.progress === 'none' || isOverdue(t));
+  const known = remaining.filter((t) => !(t.progress === 'none' || isOverdue(t)));
+  if (chase.length === 0) return;
 
   const byOwner = new Map<string, TelegramTaskRow[]>();
-  for (const t of unknown) {
+  for (const t of chase) {
     const k = t.owner ?? 'unassigned';
     (byOwner.get(k) ?? byOwner.set(k, []).get(k)!).push(t);
   }
@@ -415,11 +465,18 @@ export async function runMorningBatch(chatId: number): Promise<void> {
   for (const [owner, list] of byOwner) {
     lines.push('');
     lines.push(owner === 'unassigned' ? '(unassigned)' : escapeHtml(owner));
-    for (const t of list) lines.push(`• ${t.project ? `[${escapeHtml(t.project)}] ` : ''}${escapeHtml(t.title)}`);
+    for (const t of list) {
+      // Flag overdue + show the current status so the owner sees why it's chased.
+      const tags: string[] = [];
+      if (isOverdue(t)) tags.push(`⚠️ OVERDUE${t.due_text ? ` (said "${escapeHtml(t.due_text)}")` : ''}`);
+      if (t.progress !== 'none') tags.push(escapeHtml(t.progress));
+      const suffix = tags.length ? ` — ${tags.join(', ')}` : '';
+      lines.push(`• ${t.project ? `[${escapeHtml(t.project)}] ` : ''}${escapeHtml(t.title)}${suffix}`);
+    }
   }
   if (known.length) {
     lines.push('');
-    lines.push(`<i>(${known.length} other task(s) have a known status — not asking about those.)</i>`);
+    lines.push(`<i>(${known.length} other task(s) have a known status on track — not asking about those.)</i>`);
   }
   lines.push('');
   lines.push('<i>Reply (per task or in one go) with the date + blockers; or just say "done" if it\'s finished.</i>');
@@ -435,6 +492,9 @@ export async function sweepAllChats(): Promise<{ chats: number; expired: number;
   const expired = await db.expireStaleOpenTasks(expireCutoff);
   const pruneCutoff = new Date(Date.now() - MSG_RETENTION_DAYS * 86_400_000).toISOString();
   const pruned = await db.pruneMessages(pruneCutoff);
+  // Bot-msg refs are only useful while the referenced message is recent enough to
+  // reply to; prune on the same horizon as messages.
+  await db.pruneBotMsgRefs(pruneCutoff);
 
   const chats = await db.allKnownChats();
   for (const chatId of chats) {

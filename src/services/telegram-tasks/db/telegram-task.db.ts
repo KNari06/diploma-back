@@ -194,9 +194,15 @@ export async function touchActivity(id: string): Promise<void> {
 }
 
 export async function setProgress(id: string, progress: ProgressState, note: string | null): Promise<void> {
+  const trimmed = note ? note.slice(0, 500) : null;
+  // Skip a true no-op (same state AND same note) so a re-run of the batch over an
+  // overlapping window doesn't churn last_activity_at / progress_note with nothing
+  // new. A genuine note change or state change still writes.
+  const current = await getTask(id);
+  if (current && current.progress === progress && (current.progress_note ?? null) === trimmed) return;
   await supabaseAdmin
     .from('telegram_tasks')
-    .update({ progress, progress_note: note ? note.slice(0, 500) : null, last_activity_at: new Date().toISOString() })
+    .update({ progress, progress_note: trimmed, last_activity_at: new Date().toISOString() })
     .eq('id', id)
     .eq('status', 'open');
 }
@@ -258,6 +264,40 @@ export async function findTaskAwaitingDeadline(chatId: number, questionMsgId: nu
     .maybeSingle();
   if (error || !data) return null;
   return (data as { id: string }).id;
+}
+
+/** Record that a bot message (`botMsgId`) was ABOUT these task(s), so a later
+ *  user reply to that bot message resolves deterministically to them. Best-effort
+ *  — a failure just degrades to LLM matching, never breaks the send path. */
+export async function recordBotMsgRefs(chatId: number, botMsgId: number, taskIds: string[]): Promise<void> {
+  if (taskIds.length === 0) return;
+  const rows = [...new Set(taskIds)].map((task_id) => ({ chat_id: chatId, bot_msg_id: botMsgId, task_id }));
+  const { error } = await supabaseAdmin.from('telegram_bot_msg_refs').insert(rows);
+  if (error) logger.warn('[TELEGRAM_TASKS] recordBotMsgRefs failed', { chatId, botMsgId, error: error.message });
+}
+
+/** Task id(s) a bot message was about — i.e. the user replied to one of the bot's
+ *  own messages (ack / answer). Deterministic reply-chain link, generalizing the
+ *  source-message and deadline-question links. */
+export async function taskIdsByBotMsg(chatId: number, botMsgId: number): Promise<string[]> {
+  const { data, error } = await supabaseAdmin
+    .from('telegram_bot_msg_refs')
+    .select('task_id')
+    .eq('chat_id', chatId)
+    .eq('bot_msg_id', botMsgId);
+  if (error || !data) return [];
+  return (data as Array<{ task_id: string }>).map((r) => r.task_id);
+}
+
+/** Delete bot-msg-ref rows older than the cutoff (pruned with messages). */
+export async function pruneBotMsgRefs(cutoffIso: string): Promise<number> {
+  const { data, error } = await supabaseAdmin
+    .from('telegram_bot_msg_refs')
+    .delete()
+    .lt('created_at', cutoffIso)
+    .select('id');
+  if (error || !data) return 0;
+  return data.length;
 }
 
 export async function closeTask(id: string, reason: string): Promise<void> {
