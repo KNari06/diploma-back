@@ -311,9 +311,12 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
         '    emit the actions as usual; `reply` may be a short confirmation or null.',
         '',
         'FORMATTING `reply` (Telegram HTML): NEVER print the raw id=<uuid> — it is',
-        'internal. When you name a task, make its title a clickable link using its',
-        'link= value: <a href="LINK">[Project] Title</a>. If a task has no link=,',
-        'just write the plain title. Use only <a>, <b>, <i> tags; one task per line.',
+        'internal. When you list tasks, NUMBER them ("1. ", "2. ", …), one per',
+        'line, and make each task\'s title a clickable link using its link= value:',
+        '  1. <a href="LINK">[Project] Title</a>',
+        '  2. <a href="LINK">[Project] Title</a>',
+        'If a task has no link=, just write the plain numbered title. Use only',
+        '<a>, <b>, <i> tags. (A single-task answer needs no number.)',
       ].join('\n')
     : '';
 
