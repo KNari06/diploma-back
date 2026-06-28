@@ -38,6 +38,8 @@ function toAiView(t: TelegramTaskRow): AiTaskView {
     progress: t.progress,
     progress_note: t.progress_note,
     has_deadline: !!t.due_text || !!t.due_at,
+    due_text: t.due_text,
+    due_at: t.due_at,
     link: taskUrl(t.chat_id, t.source_msg_id),
   };
 }
@@ -436,12 +438,23 @@ export async function runMorningBatch(chatId: number): Promise<void> {
   await db.markBatched(open.map((t) => t.id));
 
   const remaining = await db.openTasks(chatId);
-  const unknown = remaining.filter((t) => t.progress === 'none');
-  const known = remaining.filter((t) => t.progress !== 'none');
-  if (unknown.length === 0) return;
+  const nowMs = Date.now();
+  const isOverdue = (t: TelegramTaskRow): boolean => {
+    if (!t.due_at) return false;
+    const due = Date.parse(t.due_at);
+    return !Number.isNaN(due) && due < nowMs;
+  };
+  // Chase a task when it has no status signal yet (progress 'none'), OR its
+  // deadline has passed regardless of status — an overdue in_progress/blocked
+  // task is exactly what must be re-asked. Tasks with a status AND no passed
+  // deadline are "known" and left alone. (Previously only progress==='none' was
+  // chased, so a stalled or overdue in_progress task was silently ignored.)
+  const chase = remaining.filter((t) => t.progress === 'none' || isOverdue(t));
+  const known = remaining.filter((t) => !(t.progress === 'none' || isOverdue(t)));
+  if (chase.length === 0) return;
 
   const byOwner = new Map<string, TelegramTaskRow[]>();
-  for (const t of unknown) {
+  for (const t of chase) {
     const k = t.owner ?? 'unassigned';
     (byOwner.get(k) ?? byOwner.set(k, []).get(k)!).push(t);
   }
@@ -452,11 +465,18 @@ export async function runMorningBatch(chatId: number): Promise<void> {
   for (const [owner, list] of byOwner) {
     lines.push('');
     lines.push(owner === 'unassigned' ? '(unassigned)' : escapeHtml(owner));
-    for (const t of list) lines.push(`• ${t.project ? `[${escapeHtml(t.project)}] ` : ''}${escapeHtml(t.title)}`);
+    for (const t of list) {
+      // Flag overdue + show the current status so the owner sees why it's chased.
+      const tags: string[] = [];
+      if (isOverdue(t)) tags.push(`⚠️ OVERDUE${t.due_text ? ` (said "${escapeHtml(t.due_text)}")` : ''}`);
+      if (t.progress !== 'none') tags.push(escapeHtml(t.progress));
+      const suffix = tags.length ? ` — ${tags.join(', ')}` : '';
+      lines.push(`• ${t.project ? `[${escapeHtml(t.project)}] ` : ''}${escapeHtml(t.title)}${suffix}`);
+    }
   }
   if (known.length) {
     lines.push('');
-    lines.push(`<i>(${known.length} other task(s) have a known status — not asking about those.)</i>`);
+    lines.push(`<i>(${known.length} other task(s) have a known status on track — not asking about those.)</i>`);
   }
   lines.push('');
   lines.push('<i>Reply (per task or in one go) with the date + blockers; or just say "done" if it\'s finished.</i>');

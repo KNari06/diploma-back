@@ -35,6 +35,8 @@ export interface AiTaskView {
   progress: 'none' | ProgressState;
   progress_note: string | null;
   has_deadline: boolean; // true if due_text/due_at already set — don't re-ask
+  due_text: string | null; // the owner's words for the deadline, e.g. "к пятнице" (null if none)
+  due_at: string | null; // absolute ISO deadline, for overdue reasoning (null if unparsed/none)
   link: string | null; // t.me deep link to the source message, for clickable titles in replies
 }
 
@@ -247,7 +249,21 @@ function buildSystem(): string {
   ].join('\n');
 }
 
-function renderOpenTasks(openTasks: AiTaskView[]): string {
+/** Render the deadline part of a task line: the human words, and — when an
+ *  absolute due_at is known — whether it is OVERDUE relative to nowMs. */
+export function renderDeadline(t: AiTaskView, nowMs: number): string {
+  if (!t.has_deadline) return ' [no deadline]';
+  const words = t.due_text ? ` "${esc(t.due_text)}"` : '';
+  if (t.due_at) {
+    const due = Date.parse(t.due_at);
+    if (!Number.isNaN(due)) {
+      return ` [deadline${words} (${t.due_at})${due < nowMs ? ' — OVERDUE' : ''}]`;
+    }
+  }
+  return ` [deadline${words}]`;
+}
+
+function renderOpenTasks(openTasks: AiTaskView[], nowMs: number): string {
   if (openTasks.length === 0) return '(none)';
   return openTasks
     .map(
@@ -257,7 +273,7 @@ function renderOpenTasks(openTasks: AiTaskView[]): string {
         `- id=${t.id}: ${t.project ? `[${esc(t.project)}] ` : ''}${esc(t.title)}` +
         `${t.owner ? ` (owner ${t.owner})` : ' (unassigned)'}` +
         `${t.progress !== 'none' ? ` [last status: ${t.progress}${t.progress_note ? ` — ${esc(t.progress_note)}` : ''}]` : ''}` +
-        `${t.has_deadline ? ' [has deadline]' : ' [no deadline]'}` +
+        renderDeadline(t, nowMs) +
         `${t.link ? ` link=${t.link}` : ''}`,
     )
     .join('\n');
@@ -305,6 +321,7 @@ async function callReconcileTool(
 }
 
 export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult> {
+  const nowMs = Date.now();
   const openHeader =
     ctx.hiddenOpenCount > 0
       ? `OPEN TASKS (most recent ${ctx.openTasks.length}; ${ctx.hiddenOpenCount} older open tasks not shown):`
@@ -345,7 +362,7 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
     ctx.replyToTaskIds.length ? `REPLYING TO TASK(S): ${ctx.replyToTaskIds.join(', ')}` : 'REPLYING TO: (not a reply / unknown)',
     '',
     openHeader,
-    renderOpenTasks(ctx.openTasks),
+    renderOpenTasks(ctx.openTasks, nowMs),
     addressedBlock,
     '',
     'NEW MESSAGE (act only on THIS message; the recent chat is context):',
@@ -506,7 +523,8 @@ export async function batchAnalyze(
 ): Promise<Action[]> {
   if (openTasks.length === 0 || messages.length === 0) return [];
 
-  const taskList = renderOpenTasks(openTasks);
+  const nowMs = Date.now();
+  const taskList = renderOpenTasks(openTasks, nowMs);
   const convo = messages
     .map((m) => `${m.author ?? '?'}: ${m.text.length > 400 ? m.text.slice(0, 400) + '…' : m.text}`)
     .join('\n');
@@ -521,8 +539,13 @@ export async function batchAnalyze(
     'conversation does not clarify — leave it untouched so a human is asked.',
     'Do NOT create new tasks in batch mode unless the conversation clearly',
     'assigns brand-new work that is not already in the open list.',
+    // The batch runs unattended — it can never ask a follow-up. claim/clarify are
+    // stripped after the fact anyway, so don't waste reasoning emitting them.
+    'NEVER emit claim or clarify in batch mode — there is no one to answer.',
   ].join('\n');
-  const user = `OPEN TASKS:\n${taskList}\n\nCONVERSATION (oldest first):\n${convo}`;
+  const user =
+    `NOW: ${new Date(nowMs).toISOString()} UTC (team timezone Asia/Almaty, UTC+5).\n\n` +
+    `OPEN TASKS:\n${taskList}\n\nCONVERSATION (oldest first):\n${convo}`;
 
   const raw = await callReconcileTool(system, user, 3000);
   // Batch mode never produces a `reply` — it only resolves statuses. Also strip

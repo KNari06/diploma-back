@@ -194,9 +194,15 @@ export async function touchActivity(id: string): Promise<void> {
 }
 
 export async function setProgress(id: string, progress: ProgressState, note: string | null): Promise<void> {
+  const trimmed = note ? note.slice(0, 500) : null;
+  // Skip a true no-op (same state AND same note) so a re-run of the batch over an
+  // overlapping window doesn't churn last_activity_at / progress_note with nothing
+  // new. A genuine note change or state change still writes.
+  const current = await getTask(id);
+  if (current && current.progress === progress && (current.progress_note ?? null) === trimmed) return;
   await supabaseAdmin
     .from('telegram_tasks')
-    .update({ progress, progress_note: note ? note.slice(0, 500) : null, last_activity_at: new Date().toISOString() })
+    .update({ progress, progress_note: trimmed, last_activity_at: new Date().toISOString() })
     .eq('id', id)
     .eq('status', 'open');
 }
