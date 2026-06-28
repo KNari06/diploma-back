@@ -16,7 +16,7 @@ import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
-import { aliasHint } from './owner-aliases';
+import { aliasHint, canonicalOwner } from './owner-aliases';
 
 export type ProgressState = 'in_progress' | 'blocked' | 'needs_investigation';
 
@@ -28,6 +28,7 @@ export interface AiTaskView {
   owner: string | null;
   progress: 'none' | ProgressState;
   progress_note: string | null;
+  has_deadline: boolean; // true if due_text/due_at already set — don't re-ask
 }
 
 export type Action =
@@ -36,6 +37,16 @@ export type Action =
   | { kind: 'reopen'; task_id: string }
   | { kind: 'update'; task_id: string; project?: string | null; title?: string; owner?: string | null }
   | { kind: 'progress'; task_id: string; state: ProgressState; note: string }
+  // The author took on a task but stated NO deadline → bot should ask "when?".
+  | { kind: 'claim'; task_id: string }
+  // A deadline was stated for a task. due_text = the user's words; due_at = an
+  // absolute ISO timestamp the model resolved (or null if it couldn't).
+  | { kind: 'set_deadline'; task_id: string; due_text: string; due_at: string | null }
+  // The message clearly intends a task change but it is AMBIGUOUS which open task
+  // (2+ plausible candidates, no reply to disambiguate). Instead of guessing, the
+  // bot asks the user to reply to the specific task. candidate_ids are the tasks
+  // it was torn between (for a helpful prompt).
+  | { kind: 'clarify'; candidate_ids: string[] }
   | { kind: 'touch'; task_id: string };
 
 export interface ReconcileContext {
@@ -72,14 +83,17 @@ const RECONCILE_TOOL: ChatCompletionTool = {
           items: {
             type: 'object',
             properties: {
-              kind: { type: 'string', enum: ['create', 'close', 'reopen', 'update', 'progress', 'touch'] },
-              task_id: { type: ['string', 'null'], description: 'Existing task id (uuid), for close/reopen/update/progress/touch.' },
+              kind: { type: 'string', enum: ['create', 'close', 'reopen', 'update', 'progress', 'claim', 'set_deadline', 'clarify', 'touch'] },
+              candidate_ids: { type: ['array', 'null'], items: { type: 'string' }, description: 'For clarify: the open task ids the message could plausibly refer to (2+).' },
+              task_id: { type: ['string', 'null'], description: 'Existing task id (uuid), for close/reopen/update/progress/claim/set_deadline/touch.' },
               project: { type: ['string', 'null'], description: 'For create/update.' },
               title: { type: ['string', 'null'], description: 'For create/update.' },
               owner: { type: ['string', 'null'], description: 'For create/update: @username verbatim.' },
               reason: { type: ['string', 'null'], description: 'For close: the phrase that signalled done.' },
               state: { type: ['string', 'null'], enum: ['in_progress', 'blocked', 'needs_investigation', null], description: 'For progress (required) OR create (optional initial status).' },
               note: { type: ['string', 'null'], description: 'Status note for progress/create, e.g. "turns out hard, 1-2 days".' },
+              due_text: { type: ['string', 'null'], description: 'For set_deadline: the deadline in the user\'s own words, e.g. "к пятнице", "by Friday", "2-3 days".' },
+              due_at: { type: ['string', 'null'], description: 'For set_deadline: that deadline resolved to an absolute ISO 8601 timestamp using NOW given in the prompt; null if it cannot be resolved to a date.' },
             },
             required: ['kind'],
           },
@@ -126,17 +140,50 @@ function buildSystem(): string {
     '          MANAGER may close anyone\'s task.',
     'reopen  — an explicit statement that a closed/assumed-done task is NOT done.',
     'update  — same task, but its owner, project, or wording changed.',
-    'progress — the owner reports a real STATUS that is not "done": state =',
-    '          in_progress ("working on it","in progress","1-2 days","делаю"),',
-    '          blocked ("waiting on X","depends on","заблокирован"), or',
-    '          needs_investigation ("turns out hard","need more investigation",',
-    '          "не понятно почему"). Put their own words in "note". A digest line',
-    '          can BOTH create a task AND state its status (e.g. "Pointer -',
-    '          @user - in Progress, 1-2 days") → emit ONE create with state+note',
-    '          set on it. Records status AND resets the staleness clock.',
-    'touch   — the message mentions/asks about an existing task with NO real status',
-    '          ("is this actual?","what is the plan?","this is done?"). Resets the',
-    '          staleness clock only — so a discussed task is not chased as silent.',
+    'progress — use ONLY when the message is the task OWNER explicitly reporting',
+    '          the state of THEIR OWN work on a specific open task. The sentence',
+    '          must be ABOUT doing the work, in first person:',
+    '            in_progress — "I\'m working on it", "почти готово", "1-2 days left"',
+    '            blocked — "I\'m blocked on X", "жду Y, не могу продолжить"',
+    '            needs_investigation — "I dug in, turns out it\'s hard", "I need to',
+    '              investigate more"',
+    '          This is a HIGH BAR. If you are not clearly seeing the owner narrate',
+    '          their own progress, do NOT emit progress. In particular these are',
+    '          NEVER progress (they are facts/opinions/instructions/questions, not',
+    '          a work status) — emit touch if they clearly point at one open task,',
+    '          otherwise emit NOTHING:',
+    '            • how-to / instructions / opinions: "надо писать в точ точ как в',
+    '              логе", "we should do X", "лучше через Y", a pasted log/screenshot',
+    '            • facts or observations: "Chat session not found", "типа", an error',
+    '              text, a quote',
+    '            • "I didn\'t check / не проверял / не знаю", answering or asking a',
+    '              question, or anyone who is NOT the owner commenting',
+    '          When in doubt between progress and touch, choose touch. When in',
+    '          doubt between touch and nothing, choose nothing.',
+    'claim   — the author says they are TAKING ON / will do a specific open task',
+    '          ("I\'ll take this", "беру", "I\'ll do the video task", "let me handle',
+    '          X") but gives NO deadline, AND that task has no deadline yet',
+    '          (has_deadline=false). Emit claim{task_id}; the bot will ask "when?".',
+    '          If the same message ALSO states a deadline, do NOT claim — emit',
+    '          set_deadline instead. If has_deadline is already true, do not claim.',
+    'set_deadline — a deadline/ETA is stated for a specific task ("by Friday",',
+    '          "к пятнице", "2-3 days", "до конца недели", or answering the bot\'s',
+    '          "when will it be ready?"). due_text = their exact words; due_at =',
+    '          that resolved to an absolute ISO 8601 timestamp using the NOW value',
+    '          given below (null if it truly cannot be turned into a date). This',
+    '          also implies the task is in progress.',
+    'clarify — the message clearly intends a task change (close/progress/deadline/',
+    '          claim) BUT you cannot tell WHICH open task it means: 2+ plausible',
+    '          candidates and no reply to disambiguate. Do NOT guess. Emit a single',
+    '          clarify with candidate_ids = the tasks you were torn between; the',
+    '          bot will ask the user to reply to the specific one. Use this ONLY',
+    '          for a real action under genuine ambiguity — never for chatter, and',
+    '          never when a reply already pins the task.',
+    'touch   — the message refers to a SPECIFIC open task but carries no real',
+    '          owner-status ("is this actual?", "what is the plan?", "this is',
+    '          done?", a discussion of how to do it). Resets the staleness clock',
+    '          only. If the message does not clearly point at one specific open',
+    '          task, emit NOTHING instead of touch.',
     '',
     'OWNER: copy the @username verbatim (with @) when present. If only a plain name',
     'is given ("Marketing doc - Serzhan", "... - Bauka"), use that name as owner. If',
@@ -144,9 +191,11 @@ function buildSystem(): string {
     'owner (the first / the one being asked) for owner; "me" means the AUTHOR.',
     '',
     'PRIORITY when unsure: prefer reusing an existing task_id over create; prefer',
-    'touch/progress over close; never close on a question. If a message clearly does',
-    'nothing task-related (pure chatter: "тут почему?", "Хотя да", "ok"), emit no',
-    'actions.',
+    'touch over progress/close when the message is vague; never close on a',
+    'question; never set progress on "I don\'t know / didn\'t check". If a message',
+    'does nothing task-related (chatter "тут почему?", "Хотя да", "ok"; or just',
+    'answering someone\'s question like "I didn\'t check"), emit NO actions at all',
+    'unless it clearly references a specific open task (then at most touch).',
     '',
     'EXAMPLES (input → actions):',
     '• "JP\\n1. Video not playing - @gipardb - what is the plan?\\n2. AI check bugs',
@@ -160,6 +209,14 @@ function buildSystem(): string {
     '  needs_investigation, note:"turns out hard, need to investigate more"}',
     '• "#task add the switcher to git"  → create{title:"add the switcher to git"}',
     '• "как будто выглядит избыточным" / "Хотя да"  → (no actions)',
+    '• reply "I didnot check" (answering "do deps work in JP?")  → (no actions —',
+    '  not knowing is NOT a status)',
+    '• "надо прям в точ точ как в логе писать" + a log screenshot  → (no actions —',
+    '  an instruction about HOW to do it, not a work status)',
+    '• "Chat session not found" / "типа"  → (no actions — a fact/observation)',
+    '• owner of an open deadline-less task: "беру это на себя"  → claim{task_id}',
+    '• "сделаю до пятницы" / answering the bot\'s "when?": "by Friday"  →',
+    '  set_deadline{task_id, due_text:"by Friday", due_at:"<resolved ISO>"}',
     '',
     'IF SOMEONE ASKS WHAT YOU CAN DO (your capabilities), put this in `reply`:',
     'You track the group\'s tasks automatically — you read daily "Priorities"',
@@ -178,7 +235,8 @@ function renderOpenTasks(openTasks: AiTaskView[]): string {
       (t) =>
         `- id=${t.id}: ${t.project ? `[${t.project}] ` : ''}${t.title}` +
         `${t.owner ? ` (owner ${t.owner})` : ' (unassigned)'}` +
-        `${t.progress !== 'none' ? ` [last status: ${t.progress}${t.progress_note ? ` — ${t.progress_note}` : ''}]` : ''}`,
+        `${t.progress !== 'none' ? ` [last status: ${t.progress}${t.progress_note ? ` — ${t.progress_note}` : ''}]` : ''}` +
+        `${t.has_deadline ? ' [has deadline]' : ' [no deadline]'}`,
     )
     .join('\n');
 }
@@ -245,6 +303,8 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
     : '';
 
   const userBlock = [
+    `NOW: ${new Date().toISOString()} (resolve relative deadlines like "Friday"/"к пятнице" against this)`,
+    '',
     'RECENT CHAT (oldest first, for resolving references like "the first one"):',
     renderRecent(ctx.recentMessages),
     '',
@@ -261,7 +321,10 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
 
   const raw = await callReconcileTool(buildSystem(), userBlock, 1500);
   return {
-    actions: validateActions(raw.actions as Array<Record<string, unknown>>, ctx.openTasks, ctx.text),
+    actions: validateActions(raw.actions as Array<Record<string, unknown>>, ctx.openTasks, ctx.text, {
+      owner: canonicalOwner(ctx.author) ?? undefined,
+      isManager: ctx.isManager,
+    }),
     reply: raw.reply,
   };
 }
@@ -270,13 +333,29 @@ const PROGRESS_STATES = new Set<ProgressState>(['in_progress', 'blocked', 'needs
 
 /** Narrow raw model output to safe, known-task actions. Reused by reconcile()
  *  and the overnight batch. Drops anything malformed or referencing an
- *  out-of-context task id. */
+ *  out-of-context task id.
+ *
+ *  `actor` (per-message path only) enforces authority deterministically, so a
+ *  prompt slip can't let a non-owner mutate a task: close/reopen/progress on a
+ *  task survive ONLY if the actor owns that task or is a manager. Omitted on the
+ *  batch path (it reasons over the whole day, not one author). */
 export function validateActions(
   raw: Array<Record<string, unknown>>,
   openTasks: AiTaskView[],
   fallbackReason: string,
+  actor?: { owner: string | undefined; isManager: boolean },
 ): Action[] {
   const openIds = new Set(openTasks.map((t) => t.id));
+  const ownerById = new Map(openTasks.map((t) => [t.id, t.owner] as const));
+  /** Can `actor` change the status of this task? Owner of it, or a manager.
+   *  No actor (batch) → allowed. Unowned task → allowed (anyone can advance it). */
+  const mayMutate = (taskId: string): boolean => {
+    if (!actor) return true;
+    if (actor.isManager) return true;
+    const owner = ownerById.get(taskId);
+    if (!owner) return true;
+    return !!actor.owner && owner.toLowerCase() === actor.owner.toLowerCase();
+  };
   const out: Action[] = [];
   for (const a of raw) {
     const kind = a.kind;
@@ -292,20 +371,55 @@ export function validateActions(
       });
       continue;
     }
+    if (kind === 'clarify') {
+      // candidate_ids must be 2+ real open tasks for the ask to make sense.
+      const ids = Array.isArray(a.candidate_ids)
+        ? (a.candidate_ids as unknown[]).filter((x): x is string => typeof x === 'string' && openIds.has(x))
+        : [];
+      if (ids.length >= 2) out.push({ kind: 'clarify', candidate_ids: [...new Set(ids)] });
+      continue;
+    }
     if (typeof a.task_id !== 'string' || !openIds.has(a.task_id)) continue;
     if (kind === 'close') {
-      out.push({ kind: 'close', task_id: a.task_id, reason: typeof a.reason === 'string' ? a.reason : fallbackReason });
+      // Status-changing → authority-gated. A non-owner non-manager close is
+      // downgraded to touch (the task is clearly being discussed) rather than
+      // dropped, so it still resets the staleness clock.
+      if (mayMutate(a.task_id)) {
+        out.push({ kind: 'close', task_id: a.task_id, reason: typeof a.reason === 'string' ? a.reason : fallbackReason });
+      } else {
+        out.push({ kind: 'touch', task_id: a.task_id });
+      }
     } else if (kind === 'reopen') {
-      out.push({ kind: 'reopen', task_id: a.task_id });
+      if (mayMutate(a.task_id)) out.push({ kind: 'reopen', task_id: a.task_id });
+      else out.push({ kind: 'touch', task_id: a.task_id });
     } else if (kind === 'touch') {
       out.push({ kind: 'touch', task_id: a.task_id });
     } else if (kind === 'progress' && PROGRESS_STATES.has(a.state as ProgressState)) {
-      out.push({
-        kind: 'progress',
-        task_id: a.task_id,
-        state: a.state as ProgressState,
-        note: typeof a.note === 'string' ? a.note : fallbackReason,
-      });
+      if (mayMutate(a.task_id)) {
+        out.push({
+          kind: 'progress',
+          task_id: a.task_id,
+          state: a.state as ProgressState,
+          note: typeof a.note === 'string' ? a.note : fallbackReason,
+        });
+      } else {
+        out.push({ kind: 'touch', task_id: a.task_id });
+      }
+    } else if (kind === 'claim') {
+      // Taking on a task → only the owner/manager; otherwise just a touch.
+      if (mayMutate(a.task_id)) out.push({ kind: 'claim', task_id: a.task_id });
+      else out.push({ kind: 'touch', task_id: a.task_id });
+    } else if (kind === 'set_deadline' && typeof a.due_text === 'string' && a.due_text.trim()) {
+      if (mayMutate(a.task_id)) {
+        out.push({
+          kind: 'set_deadline',
+          task_id: a.task_id,
+          due_text: a.due_text.trim(),
+          due_at: typeof a.due_at === 'string' && a.due_at.trim() ? a.due_at.trim() : null,
+        });
+      } else {
+        out.push({ kind: 'touch', task_id: a.task_id });
+      }
     } else if (kind === 'update') {
       out.push({
         kind: 'update',
@@ -351,6 +465,49 @@ export async function batchAnalyze(
   const user = `OPEN TASKS:\n${taskList}\n\nCONVERSATION (oldest first):\n${convo}`;
 
   const raw = await callReconcileTool(system, user, 3000);
-  // Batch mode never produces a `reply` — it only resolves statuses.
-  return validateActions(raw.actions as Array<Record<string, unknown>>, openTasks, 'batch analysis');
+  // Batch mode never produces a `reply` — it only resolves statuses. Also strip
+  // interactive actions (claim/clarify): the batch runs unattended at 10:00, so
+  // it must never post "when?"/"which?" questions. Deterministic guard, not just
+  // the prompt's request.
+  return validateActions(raw.actions as Array<Record<string, unknown>>, openTasks, 'batch analysis').filter(
+    (a) => a.kind !== 'claim' && a.kind !== 'clarify',
+  );
+}
+
+// ─── Vision: describe an attached image so it joins the text context ─────────
+
+/**
+ * Describe an attached image (screenshot / log / photo) in one or two factual
+ * sentences, so a caption-less photo still carries meaning into reconcile. Pure
+ * description — does NOT decide task actions (reconcile does that on the
+ * combined text). Returns a short string, or '' on any failure (fail-open: a
+ * vision hiccup must not block the message). Uses the vision-capable model.
+ */
+export async function describeImage(base64: string, mime: string): Promise<string> {
+  try {
+    const res = await getChatCompletionWithMessages(
+      [
+        {
+          role: 'system',
+          content:
+            'You describe an image shared in a software QA team chat in 1-2 short, ' +
+            'factual sentences for a text-only task tracker. If it is a screenshot of ' +
+            'a log, error, or app screen, say what it shows and quote the key error/text ' +
+            'verbatim if short. No speculation, no task advice — just what is visible.',
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Describe this image:' },
+            { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}`, detail: 'high' } },
+          ],
+        },
+      ],
+      { model: AI_TASK_MODELS.aiCheckVision, max_tokens: 300 },
+    );
+    return res.content?.trim() || '';
+  } catch (err) {
+    logger.warn('[TELEGRAM_TASKS] describeImage failed', { error: err instanceof Error ? err.message : String(err) });
+    return '';
+  }
 }

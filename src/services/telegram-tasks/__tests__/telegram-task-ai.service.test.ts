@@ -18,6 +18,7 @@ const task = (id: string, over: Partial<AiTaskView> = {}): AiTaskView => ({
   owner: null,
   progress: 'none',
   progress_note: null,
+  has_deadline: false,
   ...over,
 });
 
@@ -75,6 +76,113 @@ describe('validateActions', () => {
   it('falls back to the provided reason when close.reason is missing', () => {
     const out = validateActions([{ kind: 'close', task_id: 'a1' }], open, 'batch analysis');
     expect(out[0]).toEqual({ kind: 'close', task_id: 'a1', reason: 'batch analysis' });
+  });
+
+  // ── authority guard (the "I didn't check" bug): a non-owner non-manager must
+  //    not mutate a task; status changes downgrade to a harmless touch ──────────
+  describe('authority guard', () => {
+    const owned = [task('t1', { owner: '@ndarkhans' })];
+
+    it('downgrades progress from a NON-owner to touch', () => {
+      const out = validateActions(
+        [{ kind: 'progress', task_id: 't1', state: 'in_progress', note: "I didn't check" }],
+        owned,
+        'r',
+        { owner: '@yerassylospan', isManager: false },
+      );
+      expect(out).toEqual([{ kind: 'touch', task_id: 't1' }]);
+    });
+
+    it('allows progress from the OWNER', () => {
+      const out = validateActions(
+        [{ kind: 'progress', task_id: 't1', state: 'in_progress', note: 'on it' }],
+        owned,
+        'r',
+        { owner: '@ndarkhans', isManager: false },
+      );
+      expect(out[0]).toMatchObject({ kind: 'progress', state: 'in_progress' });
+    });
+
+    it('allows a MANAGER to close anyone’s task', () => {
+      const out = validateActions(
+        [{ kind: 'close', task_id: 't1', reason: 'shipped' }],
+        owned,
+        'r',
+        { owner: '@someone_else', isManager: true },
+      );
+      expect(out[0]).toMatchObject({ kind: 'close', task_id: 't1' });
+    });
+
+    it('downgrades a non-owner CLOSE to touch (still resets staleness)', () => {
+      const out = validateActions(
+        [{ kind: 'close', task_id: 't1', reason: 'done?' }],
+        owned,
+        'r',
+        { owner: '@yerassylospan', isManager: false },
+      );
+      expect(out).toEqual([{ kind: 'touch', task_id: 't1' }]);
+    });
+
+    it('with no actor (batch path) applies status changes without an authority check', () => {
+      const out = validateActions(
+        [{ kind: 'progress', task_id: 't1', state: 'blocked', note: 'x' }],
+        owned,
+        'r',
+      );
+      expect(out[0]).toMatchObject({ kind: 'progress', state: 'blocked' });
+    });
+
+    it('owner claim survives; non-owner claim downgrades to touch', () => {
+      const ownerOut = validateActions([{ kind: 'claim', task_id: 't1' }], owned, 'r', { owner: '@ndarkhans', isManager: false });
+      expect(ownerOut).toEqual([{ kind: 'claim', task_id: 't1' }]);
+      const strangerOut = validateActions([{ kind: 'claim', task_id: 't1' }], owned, 'r', { owner: '@x', isManager: false });
+      expect(strangerOut).toEqual([{ kind: 'touch', task_id: 't1' }]);
+    });
+  });
+
+  describe('clarify', () => {
+    const many = [task('c1'), task('c2'), task('c3')];
+
+    it('keeps a clarify with 2+ real candidate ids (deduped)', () => {
+      const out = validateActions([{ kind: 'clarify', candidate_ids: ['c1', 'c2', 'c1'] }], many, 'r');
+      expect(out).toEqual([{ kind: 'clarify', candidate_ids: ['c1', 'c2'] }]);
+    });
+
+    it('drops a clarify with fewer than 2 valid candidates', () => {
+      expect(validateActions([{ kind: 'clarify', candidate_ids: ['c1'] }], many, 'r')).toEqual([]);
+      expect(validateActions([{ kind: 'clarify', candidate_ids: ['ghost', 'nope'] }], many, 'r')).toEqual([]);
+    });
+  });
+
+  describe('set_deadline', () => {
+    const owned = [task('t1', { owner: '@ndarkhans' })];
+
+    it('keeps due_text + due_at from the owner', () => {
+      const out = validateActions(
+        [{ kind: 'set_deadline', task_id: 't1', due_text: 'by Friday', due_at: '2026-07-03T09:00:00Z' }],
+        owned,
+        'r',
+        { owner: '@ndarkhans', isManager: false },
+      );
+      expect(out[0]).toEqual({ kind: 'set_deadline', task_id: 't1', due_text: 'by Friday', due_at: '2026-07-03T09:00:00Z' });
+    });
+
+    it('allows a null due_at (unparseable date) but requires due_text', () => {
+      const ok = validateActions([{ kind: 'set_deadline', task_id: 't1', due_text: 'к концу недели', due_at: null }], owned, 'r');
+      expect(ok[0]).toMatchObject({ kind: 'set_deadline', due_at: null });
+      const dropped = validateActions([{ kind: 'set_deadline', task_id: 't1', due_text: '  ', due_at: null }], owned, 'r');
+      expect(dropped).toEqual([]);
+    });
+
+    it('downgrades a non-owner set_deadline to touch', () => {
+      const out = validateActions(
+        [{ kind: 'set_deadline', task_id: 't1', due_text: 'tomorrow', due_at: null }],
+        owned,
+        'r',
+        { owner: '@x', isManager: false },
+      );
+      expect(out).toEqual([{ kind: 'touch', task_id: 't1' }]);
+    });
   });
 
   it('ignores non-array / garbage entries gracefully', () => {

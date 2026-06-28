@@ -131,7 +131,7 @@ export async function sendMessage(
   chatId: string | number,
   text: string,
   parseMode: 'HTML' | 'Markdown' | 'MarkdownV2' = 'HTML',
-  options?: { disableLinkPreview?: boolean },
+  options?: { disableLinkPreview?: boolean; replyToMessageId?: number },
 ): Promise<TelegramMessage> {
   try {
     logger.info('[TELEGRAM_SERVICE] Sending message', { chatId, textLength: text.length });
@@ -145,6 +145,12 @@ export async function sendMessage(
         parse_mode: parseMode,
         ...(options?.disableLinkPreview && {
           link_preview_options: { is_disabled: true },
+        }),
+        // reply_parameters is the current Bot API field (reply_to_message_id is
+        // the legacy form Telegram still accepts); allow_sending_without_reply
+        // so a deleted target doesn't fail the whole send.
+        ...(options?.replyToMessageId && {
+          reply_parameters: { message_id: options.replyToMessageId, allow_sending_without_reply: true },
         }),
       }),
     });
@@ -284,6 +290,42 @@ export async function getMe(botToken: string): Promise<{
       error: error instanceof Error ? error.message : String(error),
     });
     throw error;
+  }
+}
+
+/**
+ * Resolve a Telegram file_id to its bytes and return them base64-encoded with
+ * the mime type, ready for a vision LLM (`data:<mime>;base64,...`). Two calls:
+ * getFile → file_path, then download from the /file/bot endpoint. Returns null
+ * on any failure or if the file exceeds `maxBytes` (default 5 MB — vision input
+ * guard). Never throws.
+ */
+export async function getFileBase64(
+  botToken: string,
+  fileId: string,
+  maxBytes = 5 * 1024 * 1024,
+): Promise<{ base64: string; mime: string } | null> {
+  try {
+    const metaRes = await fetch(`${TELEGRAM_API_URL}/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`);
+    if (!metaRes.ok) return null;
+    const meta = (await metaRes.json()) as TelegramApiResponse<{ file_path?: string; file_size?: number }>;
+    if (!meta.ok || !meta.result?.file_path) return null;
+    if (meta.result.file_size && meta.result.file_size > maxBytes) {
+      logger.warn('[TELEGRAM_SERVICE] file too large for vision, skipping', { fileId, size: meta.result.file_size });
+      return null;
+    }
+
+    const fileRes = await fetch(`${TELEGRAM_API_URL}/file/bot${botToken}/${meta.result.file_path}`);
+    if (!fileRes.ok) return null;
+    const buf = Buffer.from(await fileRes.arrayBuffer());
+    if (buf.byteLength > maxBytes) return null;
+
+    const path = meta.result.file_path.toLowerCase();
+    const mime = path.endsWith('.png') ? 'image/png' : path.endsWith('.webp') ? 'image/webp' : 'image/jpeg';
+    return { base64: buf.toString('base64'), mime };
+  } catch (error) {
+    logger.warn('[TELEGRAM_SERVICE] getFileBase64 failed', { fileId, error: error instanceof Error ? error.message : String(error) });
+    return null;
   }
 }
 
