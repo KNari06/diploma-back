@@ -1182,6 +1182,20 @@ export interface StepOptions {
   /** Force fresh element lookup, skip evidence cache */
   disableCaching?: boolean;
   /**
+   * Force vision-only ("use screenshot") element resolution. When true, the
+   * resolver SKIPS the text/DOM waterfall (identity fast-path, evidence cache,
+   * compiled plan, text LLM) and resolves the element purely from a screenshot
+   * via the vision model — vision-led: it still returns a stable element `ref`
+   * when it can map the visual match to a captured node, falling back to a
+   * bounding box. If vision yields no match the step HARD-FAILS (`not_found`)
+   * — there is NO fallback to text resolution. Per-step, default false.
+   * Only meaningful for element-targeting steps (not navigate/wait/ai_check/…).
+   * Trade-off: every run captures a screenshot + one vision call — slightly
+   * slower and more tokens. Deliberately bypasses the 3-stage waterfall
+   * (CLAUDE.md Hard invariant #7 documents this as the single sanctioned skip).
+   */
+  useScreenshotOnly?: boolean;
+  /**
    * User-authored "optional step" flag. When true, a failing step does NOT
    * fail the overall run — the preview-run loop continues to the next step and
    * background replay soft-fails it (step_soft_failed). Mirrors the mobile

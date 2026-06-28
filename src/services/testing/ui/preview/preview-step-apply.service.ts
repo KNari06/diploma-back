@@ -4567,13 +4567,16 @@ export class PreviewStepApplyService {
         compiledPageUrl,
         currentPageUrl,
         locatorCount: stepDraft.compiled?.locatorPlan?.length,
-        ...(params.skipCompiled || compiledUrlStale ? { fellThroughTo: 'skipped' as const } : {}),
+        ...(params.skipCompiled || compiledUrlStale || stepDraft.options?.useScreenshotOnly === true ? { fellThroughTo: 'skipped' as const } : {}),
       });
 
       if (
         stepDraft.compiled && stepDraft.compiled.locatorPlan && stepDraft.compiled.locatorPlan.length > 0
         && !params.skipCompiled
         && !compiledUrlStale
+        // Force vision-only: skip the compiled fast-path so apply falls through
+        // to lintStepWithAI → resolveElement's screenshot-only gate.
+        && stepDraft.options?.useScreenshotOnly !== true
       ) {
         logger.debug('[PREVIEW_APPLY] Trying compiled locator plan before lint', {
           previewSessionId,

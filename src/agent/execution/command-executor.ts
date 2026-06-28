@@ -3624,12 +3624,14 @@ export class CommandExecutor {
     // V11: If no compiled plan exists, pre-mark compiled as deterministic fail so
     // allStagesDeterministicFail() can return true for intent-only steps (no compiled plan).
     // Without this, fail-fast is silently disabled for all intent-only steps.
-    if (!intentMeta?.compiled || this.skipCompiledPlan) {
+    // Force vision-only steps skip the compiled fast-path (pre-mark it as a
+    // deterministic fail so fail-fast logic stays correct).
+    if (!intentMeta?.compiled || this.skipCompiledPlan || intentMeta?.useScreenshotOnly) {
       retryCtx.stageDeterministicFail.compiled = true;
     }
 
     // 1. Try compiled locator plan first (skip if deterministic fail on previous attempt)
-    if (intentMeta?.compiled && !this.skipCompiledPlan && !retryCtx.stageDeterministicFail.compiled) {
+    if (intentMeta?.compiled && !this.skipCompiledPlan && !retryCtx.stageDeterministicFail.compiled && !intentMeta?.useScreenshotOnly) {
       const compiledContext = iframeSelector
         ? await this.getFrameFromIframeSelector(iframeSelector, Math.min(timeout, 10000))
         : this.page;
@@ -3758,6 +3760,8 @@ export class CommandExecutor {
             // step.options.disableCaching — see ./step-options/* for the
             // field family. Mirrors intent-step-lint.service.ts:1227.
             && !intentMeta.disableCaching
+            // Force vision-only steps skip the evidence shortcut.
+            && !intentMeta.useScreenshotOnly
           ) {
             const shortcut = evaluateEvidenceShortcut({
               evidence: intentMeta.evidence,
@@ -3844,6 +3848,9 @@ export class CommandExecutor {
               // ancestor fingerprint the editor captured (heal-context #2 fix).
               recordedFingerprint: intentMeta.recordedFingerprint,
               recordedDescription: intentMeta.recordedDescription,
+              // Force vision-only resolution when the step opted in — the gate
+              // at the top of resolveElement reads stepDraft.options.
+              ...(intentMeta.useScreenshotOnly ? { options: { useScreenshotOnly: true } } : {}),
             },
             domNodes,
             pageUrl: this.page.url(),
