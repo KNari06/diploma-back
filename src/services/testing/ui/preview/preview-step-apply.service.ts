@@ -6144,7 +6144,12 @@ export class PreviewStepApplyService {
           // pinning a compiled plan would lock the step onto a possibly-wrong
           // element AND promote it out of manual-add status, which would
           // bypass this same soft-validation guard on the next run.
-          if (candidate.node && !softPassedOnNoEffect) {
+          // Vision-only steps deliberately never persist a compiled plan: it would
+          // contradict the step's "always vision" contract, cost a buildCompiledPlan
+          // every run for nothing (the compiled fast-path + evidence shortcut are
+          // gated off useScreenshotOnly on read), and become a stale-plan trap if
+          // the step is later switched off the flag. Mirrors the soft-pass skip below.
+          if (candidate.node && !softPassedOnNoEffect && stepDraft.options?.useScreenshotOnly !== true) {
             try {
               // Get pageSignature from session if available
               const session = sessionService.getSession(previewSessionId);
