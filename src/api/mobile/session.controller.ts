@@ -108,6 +108,9 @@ async function traceMobileSessionExpiry(
   surfacedBy: 'apply' | 'lint',
   runnerCode?: string,
 ): Promise<void> {
+  // NOTE: the queryable Loki `session.expired` audit line is emitted by
+  // `sendMobileRunnerError` (the single funnel every session-gone path passes
+  // through). This helper only writes the richer JSONL trace event.
   try {
     EditorTraceService.getOrCreate(`mobile-${sessionId}`, userId)
       .writeMobileSessionExpiredSurfaced({ sessionId, surfacedBy, runnerCode });
@@ -1053,7 +1056,7 @@ export async function tapSession(req: Request, res: Response): Promise<void> {
       y,
       error: error instanceof Error ? error.message : String(error),
     });
-    sendMobileRunnerError(res, error, 'Tap failed');
+    sendMobileRunnerError(res, error, 'Tap failed', { userId: req.user?.id, sessionId, surfacedBy: 'tap' });
   }
 }
 
@@ -1113,7 +1116,7 @@ export async function swipeSession(req: Request, res: Response): Promise<void> {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    sendMobileRunnerError(res, error, 'Swipe failed');
+    sendMobileRunnerError(res, error, 'Swipe failed', { userId: req.user?.id, sessionId, surfacedBy: 'swipe' });
   }
 }
 
@@ -1145,7 +1148,7 @@ export async function goHomeSession(req: Request, res: Response): Promise<void> 
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    sendMobileRunnerError(res, error, 'Go home failed');
+    sendMobileRunnerError(res, error, 'Go home failed', { userId: req.user?.id, sessionId, surfacedBy: 'home' });
   }
 }
 
@@ -1177,7 +1180,7 @@ export async function goBackSession(req: Request, res: Response): Promise<void> 
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    sendMobileRunnerError(res, error, 'Go back failed');
+    sendMobileRunnerError(res, error, 'Go back failed', { userId: req.user?.id, sessionId, surfacedBy: 'back' });
   }
 }
 
@@ -1216,7 +1219,7 @@ export async function typeSession(req: Request, res: Response): Promise<void> {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    sendMobileRunnerError(res, error, 'Type text failed');
+    sendMobileRunnerError(res, error, 'Type text failed', { userId: req.user?.id, sessionId, surfacedBy: 'type' });
   }
 }
 
@@ -1256,7 +1259,7 @@ export async function keySession(req: Request, res: Response): Promise<void> {
       keycode,
       error: error instanceof Error ? error.message : String(error),
     });
-    sendMobileRunnerError(res, error, 'Key press failed');
+    sendMobileRunnerError(res, error, 'Key press failed', { userId: req.user?.id, sessionId, surfacedBy: 'key' });
   }
 }
 
@@ -1296,7 +1299,7 @@ export async function commandSession(req: Request, res: Response): Promise<void>
       type,
       error: error instanceof Error ? error.message : String(error),
     });
-    sendMobileRunnerError(res, error, 'Command failed');
+    sendMobileRunnerError(res, error, 'Command failed', { userId: req.user?.id, sessionId, surfacedBy: 'command' });
   }
 }
 
@@ -1518,7 +1521,7 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
     // carries the cause in `error`, passes the runner's typed code/status, and
     // maps a session that died mid-lint (TOCTOU past the up-front guard) to a
     // typed 410 SESSION_EXPIRED.
-    sendMobileRunnerError(res, error, 'Lint failed');
+    sendMobileRunnerError(res, error, 'Lint failed', { userId: req.user?.id, sessionId, surfacedBy: 'lint' });
     if (isSessionGoneError(error)) {
       const e = error as { reason?: string; code?: string };
       void traceMobileSessionExpiry(sessionId, req.user.id, 'lint', e.reason ?? e.code);
@@ -1704,7 +1707,7 @@ export async function applySession(req: Request, res: Response): Promise<void> {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    sendMobileRunnerError(res, error, 'Apply failed');
+    sendMobileRunnerError(res, error, 'Apply failed', { userId: req.user?.id, sessionId, surfacedBy: 'apply' });
     if (isSessionGoneError(error)) {
       const e = error as { reason?: string; code?: string };
       void traceMobileSessionExpiry(sessionId, req.user!.id, 'apply', e.reason ?? e.code);
@@ -2370,7 +2373,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
       intentTestCaseId,
       error: error instanceof Error ? error.message : String(error),
     });
-    sendMobileRunnerError(res, error, 'Failed to run test case');
+    sendMobileRunnerError(res, error, 'Failed to run test case', { userId: req.user?.id, sessionId, surfacedBy: 'run' });
   }
 }
 

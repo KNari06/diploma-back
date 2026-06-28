@@ -17,7 +17,7 @@
 import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { ExecutionService } from '@/services/testing/executions/execution.service';
-import { logQueueEvent, logger } from '@/utils/core/logger';
+import { logQueueEvent, logger, logAiCheckError } from '@/utils/core/logger';
 import { shouldRetry, calculateRetryDelay } from '@/utils/core/error-handler';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { CiRunService } from '@/services/mobile/ci-run.service';
@@ -913,6 +913,23 @@ export class MobileTestRunJobHandler {
               : isSoftFailure
                 ? 'soft-failed'
                 : 'failed';
+
+          // Audit (Loki): a mobile AI-check could NOT produce a trustworthy
+          // verdict — the runner sets `aiCheckSkippedReason` ONLY on a check
+          // malfunction (circuit_breaker_open / inconclusive / empty_tree / …).
+          // A legitimately-failed assertion has none and is NOT logged here (it's
+          // a normal failed step). No explanation: the runner's verdict can echo
+          // a resolved {{secrets.*}} value the backend can't redact (#10).
+          if (stepResult.aiCheckSkippedReason) {
+            logAiCheckError({
+              source: 'runner',
+              userId,
+              testId,
+              stepId: stepResult.stepId,
+              reason: stepResult.aiCheckSkippedReason,
+            });
+          }
+
           // Persist to the Redis buffer in-process (the worker owns step
           // persistence), then broadcast. The job's finally drains this buffer
           // via finalizeToDb — no cross-process append round-trip.

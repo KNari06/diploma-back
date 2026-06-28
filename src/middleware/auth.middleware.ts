@@ -78,9 +78,21 @@ export const requireAuth = async (
     const user = await verifyToken(token);
 
     if (!user) {
-      logger.debug('[AUTH] Token verification failed', {
+      // Session/token expiry or an invalid token — the canonical "please login
+      // again" 401. Logged at INFO (not debug) so it ships to Loki keyed by
+      // event/code: this is the signal a customer's session silently died,
+      // previously invisible. INFO (not WARN) on purpose — this fires on EVERY
+      // request bearing an expired/forged Bearer token (offline tabs, refresh
+      // retry loops, internet scanners), so it must not page; alert on the
+      // AGGREGATE rate instead. We can't cheaply tell expired from malformed here
+      // (verifyToken returns null for both), so the code is generic; identity is
+      // unavailable (no valid user), so we carry ip/path for correlation.
+      logger.info('[AUTH] Token verification failed', {
+        event: 'auth.token_invalid',
+        code: 'TOKEN_INVALID_OR_EXPIRED',
         path: req.path,
         method: req.method,
+        ip: req.ip,
       });
       res.status(401).json({
         success: false,

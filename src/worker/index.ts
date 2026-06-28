@@ -511,16 +511,33 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
   worker.on('failed', (job, err) => {
     if (!job) {
       logger.error(`❌ [${workerName}] Job failed but job is null/undefined`, {
+        event: 'job.failed',
+        severity: 'error',
+        jobName: workerName,
         error: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
       });
       return;
     }
 
-    logger.error(`❌ [${workerName}] Job failed: ${job.id}`, {
+    // Audit (Loki): a NON-final failure is a transient attempt BullMQ will retry
+    // — emit it at warn as `job.retry` so a default "alert on job.failed/error"
+    // fires only on TERMINAL failures (retry exhausted). This keeps the queryable
+    // signal honest instead of paging on auto-recovered flaps.
+    const maxAttempts = job.opts?.attempts ?? 1;
+    const finalFailure = job.attemptsMade >= maxAttempts;
+    const logFailure = finalFailure ? logger.error.bind(logger) : logger.warn.bind(logger);
+    logFailure(`❌ [${workerName}] Job failed: ${job.id}`, {
+      event: finalFailure ? 'job.failed' : 'job.retry',
+      severity: finalFailure ? 'error' : 'warning',
+      jobName: workerName,
+      jobId: job.id,
+      final: finalFailure,
+      attemptsMade: job.attemptsMade,
+      maxAttempts,
+      userId: (job.data as { userId?: string } | undefined)?.userId,
       error: err instanceof Error ? err.message : String(err),
       stack: err instanceof Error ? err.stack : undefined,
-      attemptsMade: job.attemptsMade,
       jobData: job.data ? JSON.stringify(job.data).substring(0, 200) : 'N/A',
     });
 
@@ -545,6 +562,9 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
 
   worker.on('error', (err) => {
     logger.error(`❌ ${workerName} worker ERROR:`, {
+      event: 'worker.error',
+      severity: 'critical',
+      jobName: workerName,
       error: err instanceof Error ? err.message : String(err),
       stack: err instanceof Error ? err.stack : undefined,
     });

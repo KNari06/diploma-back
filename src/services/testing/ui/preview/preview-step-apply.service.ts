@@ -4,7 +4,7 @@
  * Features: ownership enforcement, post-action verification, state-aware retries
  */
 
-import { logger } from '@/utils/core/logger';
+import { logger, logAiCheckError } from '@/utils/core/logger';
 import { recordSource, resolvePlaceholders } from '@/utils/interpolation/resolve-placeholders';
 import { collectSecretValues, redactWithValues } from '@/utils/interpolation/redact-secrets';
 import { logIntentResolveApply } from './intent-resolve-audit';
@@ -4170,9 +4170,27 @@ export class PreviewStepApplyService {
             previewSessionId,
             pass: aiCheckResult.pass,
             confidence: aiCheckResult.confidence,
-            explanation: aiCheckResult.explanation,
+            // Redact — the explanation can echo a resolved {{secrets.*}} value
+            // (Hard invariant #10), same as the audit block below.
+            explanation: redactWithValues(aiCheckResult.explanation, secretValuesForAudit),
             highlightRefsCount: aiCheckResult.highlightRefs?.length || 0,
           });
+
+          if (!aiCheckResult.pass && aiCheckResult.evaluationError) {
+            // Audit (Loki): ONLY when the check ERRORED (untrustworthy verdict). A
+            // confident pass:false is a legitimate assertion failure — already a
+            // recorded failed step, not a system failure. `explanation` can echo a
+            // resolved {{secrets.*}} value, so redact it with the run's secret
+            // values (Hard invariant #10 / preview invariant #12).
+            logAiCheckError({
+              source: 'preview',
+              userId,
+              sessionId: previewSessionId,
+              stepId: stepDraft.id,
+              confidence: aiCheckResult.confidence,
+              redactedExplanation: redactWithValues(aiCheckResult.explanation, secretValuesForAudit),
+            });
+          }
 
           /**
            * V4: Best-effort highlight mapping for ai_check.

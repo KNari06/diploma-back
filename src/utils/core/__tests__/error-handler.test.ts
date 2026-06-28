@@ -8,6 +8,7 @@ import {
   successResponse,
   errorResponse,
   errorHandler,
+  httpErrorAuditMiddleware,
   notFoundHandler,
   asyncHandler,
   handleValidationError,
@@ -19,6 +20,7 @@ import {
   calculateRetryDelay,
 } from '../error-handler';
 import { QAIError, ValidationError, NotFoundError, RateLimitError } from '@/types';
+import { logger } from '../logger';
 
 describe('error-handler', () => {
   let mockReq: Partial<Request>;
@@ -38,6 +40,7 @@ describe('error-handler', () => {
       status: jest.fn().mockReturnThis(),
       json: jest.fn().mockReturnThis(),
       setHeader: jest.fn().mockReturnThis(),
+      on: jest.fn().mockReturnThis(),
     };
     mockNext = jest.fn();
     jest.clearAllMocks();
@@ -309,6 +312,82 @@ describe('error-handler', () => {
           error: 'Internal server error',
         })
       );
+    });
+
+  });
+
+  describe('httpErrorAuditMiddleware', () => {
+    const makeRes = (statusCode: number) => {
+      let finishCb: (() => void) | undefined;
+      const res = {
+        on: jest.fn((event: string, cb: () => void) => {
+          if (event === 'finish') finishCb = cb;
+        }),
+        statusCode,
+      } as unknown as Response;
+      return { res, fireFinish: () => finishCb?.() };
+    };
+
+    it('emits a keyed http.error audit event on a 5xx response', () => {
+      const loggerSpy = jest.spyOn(logger, 'error').mockReturnValue(undefined as never);
+      const { res, fireFinish } = makeRes(500);
+      const reqWithUser = { ...mockReq, user: { id: 'user-123' } } as unknown as Request;
+
+      httpErrorAuditMiddleware(reqWithUser, res, mockNext);
+      fireFinish();
+
+      expect(mockNext).toHaveBeenCalled();
+      expect(loggerSpy).toHaveBeenCalledWith(
+        '[HTTP] server error response',
+        expect.objectContaining({ event: 'http.error', severity: 'error', status: 500, userId: 'user-123' }),
+      );
+      loggerSpy.mockRestore();
+    });
+
+    it('does NOT emit http.error for a 4xx response', () => {
+      const loggerSpy = jest.spyOn(logger, 'error').mockReturnValue(undefined as never);
+      const { res, fireFinish } = makeRes(400);
+
+      httpErrorAuditMiddleware(mockReq as Request, res, mockNext);
+      fireFinish();
+
+      expect(loggerSpy).not.toHaveBeenCalledWith(
+        '[HTTP] server error response',
+        expect.anything(),
+      );
+      loggerSpy.mockRestore();
+    });
+
+    it('does not propagate a logger failure — finish handler is best-effort', () => {
+      const loggerSpy = jest.spyOn(logger, 'error').mockImplementation(() => { throw new Error('loki transport down'); });
+      const { res, fireFinish } = makeRes(500);
+
+      httpErrorAuditMiddleware(mockReq as Request, res, mockNext);
+      expect(() => fireFinish()).not.toThrow();
+      loggerSpy.mockRestore();
+    });
+
+    it('strips the query string from the logged URL to prevent secret leakage', () => {
+      const loggerSpy = jest.spyOn(logger, 'error').mockReturnValue(undefined as never);
+      const { res, fireFinish } = makeRes(500);
+      const req = {
+        ...mockReq,
+        originalUrl: '/api/v1/verify-email?token=super-secret-otp',
+        url: '/api/v1/verify-email?token=super-secret-otp',
+      } as unknown as Request;
+
+      httpErrorAuditMiddleware(req, res, mockNext);
+      fireFinish();
+
+      expect(loggerSpy).toHaveBeenCalledWith(
+        '[HTTP] server error response',
+        expect.objectContaining({ url: '/api/v1/verify-email' }),
+      );
+      expect(loggerSpy).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ url: expect.stringContaining('token=') }),
+      );
+      loggerSpy.mockRestore();
     });
   });
 

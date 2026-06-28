@@ -40,6 +40,13 @@ export interface AiCheckResult {
   explanation: string;
   /** Confidence score (0-1, optional) */
   confidence?: number;
+  /**
+   * True when the check could NOT produce a trustworthy verdict (input
+   * validation / LLM call / parse error) — distinct from a confident `pass:false`
+   * (the assertion was genuinely not met). Observability gates `ai_check.errored`
+   * on this so a legitimately-failed assertion isn't logged as a system failure.
+   */
+  evaluationError?: boolean;
   /** Which artifacts were used for evaluation */
   artifactsUsed: {
     html: boolean;
@@ -296,6 +303,7 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
       pass: parsed.pass,
       explanation: parsed.explanation || 'No explanation provided',
       confidence: parsed.confidence,
+      evaluationError: false,
       artifactsUsed,
       highlightRefs: parsed.highlightRefs || [],
     };
@@ -306,11 +314,12 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
       durationMs: Date.now() - startTime,
     });
 
-    // Return failure result on error
+    // Return failure result on error — the check could not be evaluated.
     return {
       pass: false,
       explanation: `AI check evaluation failed: ${error instanceof Error ? error.message : String(error)}`,
       confidence: 0,
+      evaluationError: true,
       artifactsUsed: {
         html: !!input.html,
         a11y: !!input.a11yTree,
