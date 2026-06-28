@@ -465,6 +465,11 @@ export async function batchAnalyze(
   const user = `OPEN TASKS:\n${taskList}\n\nCONVERSATION (oldest first):\n${convo}`;
 
   const raw = await callReconcileTool(system, user, 3000);
-  // Batch mode never produces a `reply` — it only resolves statuses.
-  return validateActions(raw.actions as Array<Record<string, unknown>>, openTasks, 'batch analysis');
+  // Batch mode never produces a `reply` — it only resolves statuses. Also strip
+  // interactive actions (claim/clarify): the batch runs unattended at 10:00, so
+  // it must never post "when?"/"which?" questions. Deterministic guard, not just
+  // the prompt's request.
+  return validateActions(raw.actions as Array<Record<string, unknown>>, openTasks, 'batch analysis').filter(
+    (a) => a.kind !== 'claim' && a.kind !== 'clarify',
+  );
 }

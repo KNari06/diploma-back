@@ -76,13 +76,15 @@ async function sendReturningId(chatId: number, text: string, replyTo?: number): 
  */
 
 /** Apply a validated action list to the db. Returns what changed. `askReplyTo`
- *  is the inbound message id a `claim` question should reply to (so the user's
- *  deadline answer threads back to the task). */
+ *  is the inbound message id a `claim` question should reply to. `deadlineReplyMsgId`
+ *  is the bot-question id this message replied to (if any) — used to make a
+ *  set_deadline write conditional, so racing replies can't both win. */
 async function applyActions(
   chatId: number,
   actions: Action[],
   sourceMsgId: number | undefined,
   askReplyTo?: number,
+  deadlineReplyMsgId?: number,
 ): Promise<{ created: string[]; closed: string[]; progressed: string[]; asked: boolean; deadlines: string[]; notes: string[] }> {
   const created: string[] = [];
   const closed: string[] = [];
@@ -132,11 +134,16 @@ async function applyActions(
         if (qId) {
           await db.setAwaitingDeadline(a.task_id, qId);
           asked = true;
+        } else {
+          // Question couldn't be posted (Telegram error). Don't mark in_progress
+          // with no deadline (that would hide it from the morning batch). Just
+          // touch so it's not chased as silent, and the batch still asks later.
+          await db.touchActivity(a.task_id);
         }
         break;
       }
       case 'set_deadline':
-        await db.setDeadline(a.task_id, a.due_text, a.due_at);
+        await db.setDeadline(a.task_id, a.due_text, a.due_at, deadlineReplyMsgId);
         deadlines.push(a.task_id);
         break;
       case 'clarify': {
@@ -221,7 +228,9 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
       addressedToBot: m.addressedToBot || deadlineTaskId !== null,
     });
 
-    const r = await applyActions(m.chatId, actions, m.msgId, m.msgId);
+    // deadlineReplyMsgId is set only when this message replied to a bot "when?"
+    // question — makes the set_deadline write conditional (race-safe).
+    const r = await applyActions(m.chatId, actions, m.msgId, m.msgId, deadlineTaskId ? m.replyToMsgId : undefined);
 
     // Always surface what CHANGED (don't let a chatty reply hide a create/close).
     // A `claim` already posted its own "when?" question, so it's not in `bits`.

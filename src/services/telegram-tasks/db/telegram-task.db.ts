@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '@/db/supabase';
+import { logger } from '@/utils/core/logger';
 import type { ProgressState } from '../telegram-task-ai.service';
 
 /**
@@ -210,19 +211,39 @@ export async function setAwaitingDeadline(id: string, questionMsgId: number): Pr
 }
 
 /** Record a deadline (parsed + original words); clears the awaiting flag and
- *  marks in_progress (a stated deadline implies work is underway). */
-export async function setDeadline(id: string, dueText: string, dueAt: string | null): Promise<void> {
-  await supabaseAdmin
+ *  marks in_progress (a stated deadline implies work is underway). The
+ *  model-supplied `dueAt` is validated to a real timestamp first — a garbage ISO
+ *  string would otherwise make Postgres reject the whole write (and we'd lose
+ *  due_text too). On a bad date we keep due_text and store due_at=null. Errors
+ *  are logged, not swallowed. `expectAwaitingMsgId`, when given, makes the write
+ *  conditional on the task still awaiting THAT question — so two racing replies
+ *  can't both win (the second updates 0 rows). */
+export async function setDeadline(
+  id: string,
+  dueText: string,
+  dueAt: string | null,
+  expectAwaitingMsgId?: number,
+): Promise<void> {
+  let safeDueAt: string | null = null;
+  if (dueAt) {
+    const t = Date.parse(dueAt);
+    if (Number.isFinite(t)) safeDueAt = new Date(t).toISOString();
+    else logger.warn('[TELEGRAM_TASKS] unparseable due_at from model, storing null', { id, dueAt });
+  }
+  let q = supabaseAdmin
     .from('telegram_tasks')
     .update({
       due_text: dueText.slice(0, 200),
-      due_at: dueAt,
+      due_at: safeDueAt,
       awaiting_deadline_msg_id: null,
       progress: 'in_progress',
       last_activity_at: new Date().toISOString(),
     })
     .eq('id', id)
     .eq('status', 'open');
+  if (expectAwaitingMsgId !== undefined) q = q.eq('awaiting_deadline_msg_id', expectAwaitingMsgId);
+  const { error } = await q;
+  if (error) logger.error('[TELEGRAM_TASKS] setDeadline failed', { id, error: error.message });
 }
 
 /** Find an open task in this chat whose pending "when?" question is `questionMsgId`
