@@ -158,6 +158,7 @@ async function applyActions(
   sourceMsgId: number | undefined,
   askReplyTo?: number,
   deadlineReplyMsgId?: number,
+  claimant?: string, // canonical @owner who is taking the task (a `claim` reassigns to them)
 ): Promise<{ created: string[]; closed: string[]; closedLinks: string[]; progressed: string[]; asked: boolean; deadlines: string[]; notes: string[] }> {
   const created: string[] = [];
   const closed: string[] = [];
@@ -208,8 +209,10 @@ async function applyActions(
         break;
       }
       case 'claim': {
-        // Someone took a task with no deadline → ask "when?", as a reply to the
-        // claim message, and remember the question id so their answer links back.
+        // "I'll take it / беру на себя" → the claimant becomes the owner.
+        if (claimant) await db.updateTask(a.task_id, { owner: claimant });
+        // Then ask "when?", as a reply to the claim message, remembering the
+        // question id so their answer links back.
         const task = await db.getTask(a.task_id);
         const label = task ? `${task.project ? `[${task.project}] ` : ''}${task.title}` : 'this task';
         const qId = await sendReturningId(chatId, `🕒 When will it be ready? — ${escapeHtml(label)}`, askReplyTo);
@@ -332,7 +335,15 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
 
     // deadlineReplyMsgId is set only when this message replied to a bot "when?"
     // question — makes the set_deadline write conditional (race-safe).
-    const r = await applyActions(m.chatId, actions, m.msgId, m.msgId, deadlineTaskId ? m.replyToMsgId : undefined);
+    // claimant = the canonical author, so a `claim` reassigns the task to them.
+    const r = await applyActions(
+      m.chatId,
+      actions,
+      m.msgId,
+      m.msgId,
+      deadlineTaskId ? m.replyToMsgId : undefined,
+      canonicalOwner(author) ?? undefined,
+    );
 
     // Always surface what CHANGED (don't let a chatty reply hide a create/close).
     // A `claim` already posted its own "when?" question, so it's not in `bits`.
