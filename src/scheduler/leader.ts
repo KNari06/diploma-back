@@ -34,6 +34,7 @@ import { AiCallLogsRetentionJob } from '@/jobs/ai-call-logs-retention.job';
 import { ArtifactRetentionJob } from '@/jobs/artifact-retention.job';
 import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
 import { ExpiringPlansJob } from '@/jobs/expiring-plans.job';
+import { TelegramTaskSweepJob } from '@/jobs/telegram-task-sweep.job';
 import { StaleRunReaperJob } from '@/jobs/stale-run-reaper.job';
 import { TestSchedulerJobHandler } from '@/jobs/test-scheduler.job';
 import { logger } from '@/utils/core/logger';
@@ -89,6 +90,7 @@ export function startSchedulerBundle(): void {
   StaleRunReaperJob.start();
   AiCallLogsRetentionJob.start();
   ExpiringPlansJob.start();
+  TelegramTaskSweepJob.start();
   if (ScreenshotCaptureFeature.isEnabled()) {
     ScreenshotCaptureFeature.logStatus();
     ArtifactRetentionJob.start();
@@ -103,6 +105,7 @@ export function stopSchedulerBundle(): void {
   StaleRunReaperJob.stop();
   AiCallLogsRetentionJob.stop();
   ExpiringPlansJob.stop();
+  TelegramTaskSweepJob.stop();
   ArtifactRetentionJob.stop();
 }
 

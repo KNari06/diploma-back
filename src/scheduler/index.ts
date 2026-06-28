@@ -12,6 +12,7 @@ import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
 import { ArtifactRetentionJob } from '@/jobs/artifact-retention.job';
 import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
 import { ExpiringPlansJob } from '@/jobs/expiring-plans.job';
+import { TelegramTaskSweepJob } from '@/jobs/telegram-task-sweep.job';
 import { StaleRunReaperJob } from '@/jobs/stale-run-reaper.job';
 import { AiCallLogsRetentionJob } from '@/jobs/ai-call-logs-retention.job';
 import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
@@ -70,6 +71,10 @@ async function main(): Promise<void> {
     ArtifactRetentionJob.start();
   }
 
+  // QAIT Tasker morning batch (Telegram task status check). Self-gates on
+  // TELEGRAM_TASKS_ENABLED, so this is a no-op when the feature is off.
+  TelegramTaskSweepJob.start();
+
   const shutdown = async (signal: string) => {
     logger.info('[SCHEDULER_PROCESS] Received shutdown signal', { signal });
     try {
@@ -82,6 +87,7 @@ async function main(): Promise<void> {
       AiCallLogsRetentionJob.stop();
       ArtifactRetentionJob.stop();
       ExpiringPlansJob.stop();
+      TelegramTaskSweepJob.stop();
       await TestSchedulerJobHandler.waitForIdle();
     } finally {
       process.exit(0);
