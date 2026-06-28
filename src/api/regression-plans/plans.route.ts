@@ -96,7 +96,7 @@ const router = Router();
  *                         type: array
  *                         items:
  *                           type: string
- *                           enum: [merge_to_main, pr_opened, release]
+ *                           enum: [merge_to_main, pr_opened, release, push_to_branch]
  *                       branch:
  *                         type: string
  *                         description: Branch to trigger on (e.g. main, develop)
