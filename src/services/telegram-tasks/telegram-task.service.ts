@@ -11,7 +11,6 @@ import { logger } from '@/utils/core/logger';
 import {
   type Action,
   type AiTaskView,
-  answerTaskQuestion,
   batchAnalyze,
   reconcile,
 } from './telegram-task-ai.service';
@@ -44,48 +43,10 @@ async function send(chatId: number, text: string): Promise<void> {
 }
 
 /**
- * Heuristic: is a message addressed to the bot a QUESTION (→ Q&A) or an ACTION
- * (→ reconcile/closure)? Users may reply to the bot's ack message with "done"
- * or "close #3" intending to change a task — that must still reconcile, not get
- * a read-only answer. We treat it as a question when it has a '?', a wh-/how
- * word, or no obvious action verb. Conservative: ambiguous → question (Q&A),
- * because the digest-line reply path still covers explicit closures.
+ * Q&A / action when addressed to the bot is NOT decided by keywords here — the
+ * reconcile LLM call itself decides (question → it returns `reply`; action → it
+ * returns actions). This keeps all language understanding in the model.
  */
-// NB: JS `\w` and `\b` are ASCII-only — they do NOT match Cyrillic/Kazakh
-// (CLAUDE.md Hard invariant #15). So we use the unicode flag + an explicit
-// letter class, and substring (no `\b`) matching for the Cyrillic/Kazakh stems.
-const ACTION_HINT_RE =
-  /(?:^|[^\p{L}])(done|closed?|merged|deployed|fixed|finished)(?![\p{L}])|готов|сделал|залил|закрыл|біт/iu;
-const QUESTION_HINT_RE =
-  /[?？]|(?:^|[^\p{L}])(what|which|who|when|how|where|status|list|show)(?![\p{L}])|сколько|что|какие|кто|статус/iu;
-
-export function looksLikeQuestion(text: string): boolean {
-  if (QUESTION_HINT_RE.test(text)) return true;
-  if (ACTION_HINT_RE.test(text)) return false; // clear action → let reconcile handle it
-  return true; // default to Q&A when addressed to the bot
-}
-
-/**
- * Q&A mode: answer a question addressed to the bot, over THIS chat's open tasks.
- * Read-only — never creates/closes tasks. Posts the answer back to the group.
- */
-async function answerQuestion(m: InboundMessage): Promise<void> {
-  // Strip a leading/!inline @mention of the bot so the model sees a clean question.
-  const uname = env.TELEGRAM_BOT_USERNAME?.replace(/^@/, '');
-  const question = (uname ? m.text.replace(new RegExp(`@${uname}`, 'ig'), '') : m.text).trim();
-  if (!question) {
-    await send(m.chatId, escapeHtml('Ask me about the tasks — e.g. "what\'s open?", "what does @dara have left?", or "what can you do?".'));
-    return;
-  }
-
-  const [openTasks, recent] = await Promise.all([
-    db.openTasks(m.chatId),
-    db.recentMessages(m.chatId, RECENT_MSG_WINDOW, Number.MAX_SAFE_INTEGER),
-  ]);
-
-  const answer = await answerTaskQuestion(question, openTasks.map(toAiView), recent);
-  await send(m.chatId, escapeHtml(answer));
-}
 
 /** Apply a validated action list to the db. Returns what changed. */
 async function applyActions(
@@ -133,7 +94,7 @@ export interface InboundMessage {
   authorName: string | undefined; // display/first name fallback
   isEdit: boolean;
   replyToMsgId: number | undefined;
-  addressedToBot: boolean; // @mention of the bot or reply to a bot message → Q&A mode
+  addressedToBot: boolean; // @mention of the bot or reply to a bot message — the model decides question vs action
 }
 
 /**
@@ -149,22 +110,6 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
 
   const msgRowId = await db.logMessage(m.chatId, m.msgId, author, text);
 
-  // Q&A mode: the message is addressed to the bot (@mention or reply-to-bot) AND
-  // reads as a question (not an action like "done"/"merged"). Answer over THIS
-  // chat's tasks instead of reconciling — read-only. An action addressed to the
-  // bot falls through to reconcile so closures still work.
-  if (m.addressedToBot && !m.isEdit && looksLikeQuestion(m.text)) {
-    try {
-      await answerQuestion(m);
-    } catch (err) {
-      logger.error('[TELEGRAM_TASKS] query answer failed', {
-        chatId: m.chatId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-    return;
-  }
-
   try {
     const [contextTasks, totalOpen, recent, replyTaskIds] = await Promise.all([
       db.recentOpenTasks(m.chatId, MAX_CONTEXT_TASKS),
@@ -173,16 +118,16 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
       m.replyToMsgId ? db.openTaskIdsBySourceMsg(m.chatId, m.replyToMsgId) : Promise.resolve([]),
     ]);
 
-    // Cheap cost guard: with NO open tasks in the chat, the only action the model
-    // could take is `create`. A short, single-line, non-#task message is almost
-    // never a real task assignment (digests are long + multi-line), so skip the
-    // LLM call entirely — this drops the dominant chatter case in a quiet chat
-    // without risking a missed closure (there's nothing open to close). The
-    // message is still logged above, so it joins the next batch's context.
-    const looksActionable = m.text.includes('\n') || m.text.trim().length > 15 || /#task/i.test(m.text);
-    if (totalOpen === 0 && !looksActionable) return;
+    // Cost guard (structural, not language-keyword based): a one-token message
+    // in a chat with NO open tasks that isn't addressed to the bot cannot
+    // produce a useful action (nothing to close/update; a real task assignment
+    // is never a single bare word). Skip the LLM for that case only. Everything
+    // else — any open task present, any multi-word message, or anything aimed at
+    // the bot — goes to the model. The message is logged regardless.
+    const isSingleToken = !/\s/.test(m.text.trim());
+    if (totalOpen === 0 && !m.addressedToBot && isSingleToken) return;
 
-    const actions = await reconcile({
+    const { actions, reply } = await reconcile({
       text,
       author,
       isManager: isManagerUsername(m.authorUsername),
@@ -190,15 +135,22 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
       openTasks: contextTasks.map(toAiView),
       hiddenOpenCount: Math.max(0, totalOpen - contextTasks.length),
       recentMessages: recent,
+      addressedToBot: m.addressedToBot,
     });
 
     const r = await applyActions(m.chatId, actions, m.msgId);
 
-    const bits: string[] = [];
-    if (r.created.length) bits.push(`📝 tracking ${r.created.length} new task${r.created.length > 1 ? 's' : ''}`);
-    if (r.closed.length) bits.push(`✅ closed ${r.closed.length} task${r.closed.length > 1 ? 's' : ''}`);
-    if (r.progressed.length) bits.push(`📌 noted status on ${r.progressed.length} task${r.progressed.length > 1 ? 's' : ''}`);
-    if (bits.length) await send(m.chatId, bits.join(' · '));
+    // The model's own reply (answer to a question / confirmation) takes priority
+    // — it's what the user asked for. Otherwise post the system ack of changes.
+    if (reply) {
+      await send(m.chatId, escapeHtml(reply));
+    } else {
+      const bits: string[] = [];
+      if (r.created.length) bits.push(`📝 tracking ${r.created.length} new task${r.created.length > 1 ? 's' : ''}`);
+      if (r.closed.length) bits.push(`✅ closed ${r.closed.length} task${r.closed.length > 1 ? 's' : ''}`);
+      if (r.progressed.length) bits.push(`📌 noted status on ${r.progressed.length} task${r.progressed.length > 1 ? 's' : ''}`);
+      if (bits.length) await send(m.chatId, bits.join(' · '));
+    }
   } catch (err) {
     logger.error('[TELEGRAM_TASKS] ingest failed', { chatId: m.chatId, error: err instanceof Error ? err.message : String(err) });
   }
