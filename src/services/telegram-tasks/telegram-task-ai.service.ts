@@ -357,7 +357,7 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
     actions: validateActions(raw.actions as Array<Record<string, unknown>>, ctx.openTasks, ctx.text, {
       owner: canonicalOwner(ctx.author) ?? undefined,
       isManager: ctx.isManager,
-    }),
+    }, ctx.replyToTaskIds),
     reply: raw.reply,
   };
 }
@@ -377,8 +377,18 @@ export function validateActions(
   openTasks: AiTaskView[],
   fallbackReason: string,
   actor?: { owner: string | undefined; isManager: boolean },
+  // Task ids the inbound message's reply resolved to. When 2+ (e.g. a reply to a
+  // multi-task digest, whose tasks all share one source_msg_id), "this task on
+  // me" is genuinely ambiguous — the model must NOT silently pick one. Any
+  // single-target action landing inside this set is rewritten to a clarify that
+  // lists the candidates. A reply to ONE task (length ≤ 1) is unambiguous and
+  // passes through untouched.
+  ambiguousReplyIds?: string[],
 ): Action[] {
   const openIds = new Set(openTasks.map((t) => t.id));
+  // Only ambiguous when the reply maps to 2+ still-open tasks.
+  const ambiguous = new Set((ambiguousReplyIds ?? []).filter((id) => openIds.has(id)));
+  const ambiguousActive = ambiguous.size >= 2;
   const ownerById = new Map(openTasks.map((t) => [t.id, t.owner] as const));
   /** Can `actor` change the status of this task? Owner of it, or a manager.
    *  No actor (batch) → allowed. Unowned task → allowed (anyone can advance it). */
@@ -390,6 +400,9 @@ export function validateActions(
     return !!actor.owner && owner.toLowerCase() === actor.owner.toLowerCase();
   };
   const out: Action[] = [];
+  // Set when a single-target action was suppressed by the ambiguous-reply guard;
+  // resolved into one clarify over the ambiguous candidates after the loop.
+  let needsClarify = false;
   for (const a of raw) {
     const kind = a.kind;
     if (kind === 'create' && typeof a.title === 'string' && a.title.trim()) {
@@ -413,6 +426,14 @@ export function validateActions(
       continue;
     }
     if (typeof a.task_id !== 'string' || !openIds.has(a.task_id)) continue;
+    // Ambiguous-reply guard: a status/claim/deadline action that targets one of
+    // several tasks the reply could mean is NOT trustworthy — the model guessed.
+    // Defer it; a single clarify over all candidates is emitted after the loop.
+    // (update/touch are exempt: update is an explicit edit, touch is harmless.)
+    if (ambiguousActive && ambiguous.has(a.task_id) && kind !== 'update' && kind !== 'touch') {
+      needsClarify = true;
+      continue;
+    }
     if (kind === 'close') {
       // Status-changing → authority-gated. A non-owner non-manager close is
       // downgraded to touch (the task is clearly being discussed) rather than
@@ -462,6 +483,12 @@ export function validateActions(
         ...(typeof a.owner === 'string' || a.owner === null ? { owner: a.owner as string | null } : {}),
       });
     }
+  }
+  // Ambiguous reply with no explicit clarify from the model → ask which task,
+  // listing the candidates the reply could have meant. Skip if the model already
+  // emitted a clarify (don't double-ask).
+  if (needsClarify && !out.some((x) => x.kind === 'clarify')) {
+    out.push({ kind: 'clarify', candidate_ids: [...ambiguous] });
   }
   return out;
 }

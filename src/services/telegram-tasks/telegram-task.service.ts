@@ -219,6 +219,10 @@ async function applyActions(
         const qId = await sendReturningId(chatId, `🕒 When will it be ready? — ${escapeHtml(label)}`, askReplyTo);
         if (qId) {
           await db.setAwaitingDeadline(a.task_id, qId);
+          // Also a generic bot-msg ref: a deadline reply resolves via
+          // awaiting_deadline_msg_id, but a non-deadline reply ("done"/"reopen")
+          // to the same question still resolves to this task.
+          await db.recordBotMsgRefs(chatId, qId, [a.task_id]);
           asked = true;
         } else {
           // Question couldn't be posted (Telegram error). Don't mark in_progress
@@ -298,7 +302,7 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
   const msgRowId = await db.logMessage(m.chatId, m.msgId, author, text);
 
   try {
-    const [contextTasks, totalOpen, recent, replyTaskIds, deadlineTaskId] = await Promise.all([
+    const [contextTasks, totalOpen, recent, replyTaskIds, deadlineTaskId, botMsgTaskIds] = await Promise.all([
       db.recentOpenTasks(m.chatId, MAX_CONTEXT_TASKS),
       db.countOpenTasks(m.chatId),
       msgRowId ? db.recentMessages(m.chatId, RECENT_MSG_WINDOW, msgRowId) : Promise.resolve([]),
@@ -306,11 +310,17 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
       // Deterministic deadline link: did this message reply to the bot's "when?"
       // question for a specific task?
       m.replyToMsgId ? db.findTaskAwaitingDeadline(m.chatId, m.replyToMsgId) : Promise.resolve(null),
+      // Did this message reply to one of the bot's OWN messages (ack/answer/
+      // question)? Resolve which task(s) that message was about.
+      m.replyToMsgId ? db.taskIdsByBotMsg(m.chatId, m.replyToMsgId) : Promise.resolve([]),
     ]);
 
-    // Merge the deadline-reply task into the reply hints so the model resolves
-    // the deadline answer to exactly that task (no ambiguity across tasks).
-    const allReplyTaskIds = deadlineTaskId ? [...new Set([deadlineTaskId, ...replyTaskIds])] : replyTaskIds;
+    // Merge every deterministic reply hint (task source message, deadline
+    // question, any bot message about a task) so the model — and the ambiguous-
+    // reply guard — resolve the reply to exactly the right task(s).
+    const allReplyTaskIds = [
+      ...new Set([...(deadlineTaskId ? [deadlineTaskId] : []), ...replyTaskIds, ...botMsgTaskIds]),
+    ];
 
     // Cost guard (structural, not language-keyword based): a one-token message
     // in a chat with NO open tasks that isn't addressed to the bot cannot
@@ -331,7 +341,8 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
       openTasks: contextTasks.map(toAiView),
       hiddenOpenCount: Math.max(0, totalOpen - contextTasks.length),
       recentMessages: recent,
-      addressedToBot: m.addressedToBot || deadlineTaskId !== null,
+      // A reply to any bot message about a task is implicitly addressed to the bot.
+      addressedToBot: m.addressedToBot || deadlineTaskId !== null || botMsgTaskIds.length > 0,
     });
 
     // deadlineReplyMsgId is set only when this message replied to a bot "when?"
@@ -379,15 +390,23 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
     // the user's own message (still clear what it answers).
     const ackReplyTo = r.anchorMsgIds.length === 1 ? r.anchorMsgIds[0] : m.msgId;
 
+    // Tasks this ack is ABOUT — recorded against the bot message id so a reply to
+    // the ack ("reopen it" / "done") resolves deterministically to them, not via
+    // LLM guessing. (claim posts its own question + records its own ref in
+    // applyActions; that path is unaffected.)
+    const ackTaskIds = [...new Set([...r.closed, ...r.progressed, ...r.deadlines])];
+
     // The answer (Q&A) always replies to the user's message; only the change ack
     // uses the task anchor.
     if (wantsReply && bits.length) {
       await sendRich(m.chatId, renderedReply, m.msgId);
-      await send(m.chatId, bits.join(' · '), ackReplyTo);
+      const ackId = await sendReturningId(m.chatId, bits.join(' · '), ackReplyTo);
+      if (ackId && ackTaskIds.length) await db.recordBotMsgRefs(m.chatId, ackId, ackTaskIds);
     } else if (wantsReply) {
       await sendRich(m.chatId, renderedReply, m.msgId);
     } else if (bits.length) {
-      await send(m.chatId, bits.join(' · '), ackReplyTo);
+      const ackId = await sendReturningId(m.chatId, bits.join(' · '), ackReplyTo);
+      if (ackId && ackTaskIds.length) await db.recordBotMsgRefs(m.chatId, ackId, ackTaskIds);
     }
   } catch (err) {
     logger.error('[TELEGRAM_TASKS] ingest failed', { chatId: m.chatId, error: err instanceof Error ? err.message : String(err) });
@@ -453,6 +472,9 @@ export async function sweepAllChats(): Promise<{ chats: number; expired: number;
   const expired = await db.expireStaleOpenTasks(expireCutoff);
   const pruneCutoff = new Date(Date.now() - MSG_RETENTION_DAYS * 86_400_000).toISOString();
   const pruned = await db.pruneMessages(pruneCutoff);
+  // Bot-msg refs are only useful while the referenced message is recent enough to
+  // reply to; prune on the same horizon as messages.
+  await db.pruneBotMsgRefs(pruneCutoff);
 
   const chats = await db.allKnownChats();
   for (const chatId of chats) {

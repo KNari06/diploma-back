@@ -260,6 +260,40 @@ export async function findTaskAwaitingDeadline(chatId: number, questionMsgId: nu
   return (data as { id: string }).id;
 }
 
+/** Record that a bot message (`botMsgId`) was ABOUT these task(s), so a later
+ *  user reply to that bot message resolves deterministically to them. Best-effort
+ *  — a failure just degrades to LLM matching, never breaks the send path. */
+export async function recordBotMsgRefs(chatId: number, botMsgId: number, taskIds: string[]): Promise<void> {
+  if (taskIds.length === 0) return;
+  const rows = [...new Set(taskIds)].map((task_id) => ({ chat_id: chatId, bot_msg_id: botMsgId, task_id }));
+  const { error } = await supabaseAdmin.from('telegram_bot_msg_refs').insert(rows);
+  if (error) logger.warn('[TELEGRAM_TASKS] recordBotMsgRefs failed', { chatId, botMsgId, error: error.message });
+}
+
+/** Task id(s) a bot message was about — i.e. the user replied to one of the bot's
+ *  own messages (ack / answer). Deterministic reply-chain link, generalizing the
+ *  source-message and deadline-question links. */
+export async function taskIdsByBotMsg(chatId: number, botMsgId: number): Promise<string[]> {
+  const { data, error } = await supabaseAdmin
+    .from('telegram_bot_msg_refs')
+    .select('task_id')
+    .eq('chat_id', chatId)
+    .eq('bot_msg_id', botMsgId);
+  if (error || !data) return [];
+  return (data as Array<{ task_id: string }>).map((r) => r.task_id);
+}
+
+/** Delete bot-msg-ref rows older than the cutoff (pruned with messages). */
+export async function pruneBotMsgRefs(cutoffIso: string): Promise<number> {
+  const { data, error } = await supabaseAdmin
+    .from('telegram_bot_msg_refs')
+    .delete()
+    .lt('created_at', cutoffIso)
+    .select('id');
+  if (error || !data) return 0;
+  return data.length;
+}
+
 export async function closeTask(id: string, reason: string): Promise<void> {
   await supabaseAdmin
     .from('telegram_tasks')

@@ -155,6 +155,52 @@ describe('validateActions', () => {
     });
   });
 
+  describe('ambiguous-reply guard (reply maps to 2+ tasks, e.g. a digest)', () => {
+    const owner = { owner: '@x', isManager: true };
+    const many = [task('c1', { owner: '@x' }), task('c2', { owner: '@x' }), task('c3', { owner: '@x' })];
+
+    it('rewrites a guessed single-target claim into a clarify over the reply candidates', () => {
+      // "this task on me" replying to a digest → reply resolves to c1+c2; the
+      // model picked c1, but it cannot know which → ask instead.
+      const out = validateActions([{ kind: 'claim', task_id: 'c1' }], many, 'r', owner, ['c1', 'c2']);
+      expect(out).toEqual([{ kind: 'clarify', candidate_ids: ['c1', 'c2'] }]);
+    });
+
+    it('also guards close / progress / set_deadline', () => {
+      for (const a of [
+        { kind: 'close', task_id: 'c1', reason: 'done' },
+        { kind: 'progress', task_id: 'c2', state: 'in_progress' },
+        { kind: 'set_deadline', task_id: 'c1', due_text: 'Friday', due_at: null },
+      ]) {
+        const out = validateActions([a], many, 'r', owner, ['c1', 'c2']);
+        expect(out).toEqual([{ kind: 'clarify', candidate_ids: ['c1', 'c2'] }]);
+      }
+    });
+
+    it('does NOT guard when the reply maps to a single task (unambiguous)', () => {
+      const out = validateActions([{ kind: 'claim', task_id: 'c1' }], many, 'r', owner, ['c1']);
+      expect(out).toEqual([{ kind: 'claim', task_id: 'c1' }]);
+    });
+
+    it('does NOT guard a target outside the ambiguous set', () => {
+      const out = validateActions([{ kind: 'claim', task_id: 'c3' }], many, 'r', owner, ['c1', 'c2']);
+      expect(out).toEqual([{ kind: 'claim', task_id: 'c3' }]);
+    });
+
+    it('lets update/touch through (explicit edit / harmless) even when ambiguous', () => {
+      const out = validateActions([{ kind: 'touch', task_id: 'c1' }], many, 'r', owner, ['c1', 'c2']);
+      expect(out).toEqual([{ kind: 'touch', task_id: 'c1' }]);
+    });
+
+    it('does not double-ask when the model already emitted a clarify', () => {
+      const out = validateActions(
+        [{ kind: 'clarify', candidate_ids: ['c1', 'c2'] }, { kind: 'claim', task_id: 'c1' }],
+        many, 'r', owner, ['c1', 'c2'],
+      );
+      expect(out.filter((x) => x.kind === 'clarify')).toHaveLength(1);
+    });
+  });
+
   describe('set_deadline', () => {
     const owned = [task('t1', { owner: '@ndarkhans' })];
 
