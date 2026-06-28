@@ -26,6 +26,7 @@ function secretMatches(provided: string | undefined, expected: string | undefine
  */
 
 interface TgUser { username?: string; first_name?: string; is_bot?: boolean }
+interface TgPhotoSize { file_id: string; file_size?: number }
 interface TgMessage {
   message_id: number;
   text?: string;
@@ -33,6 +34,10 @@ interface TgMessage {
   chat?: { id: number };
   from?: TgUser;
   reply_to_message?: { message_id: number; from?: TgUser };
+  // Photo comes as ascending-resolution sizes; the LAST is the largest. A
+  // document image (screenshot sent as file) carries its own mime.
+  photo?: TgPhotoSize[];
+  document?: { file_id: string; mime_type?: string };
 }
 interface TgUpdate { message?: TgMessage; edited_message?: TgMessage }
 
@@ -78,16 +83,28 @@ function isAddressedToBot(msg: TgMessage, text: string): boolean {
   return mentionsBot(text, env.TELEGRAM_BOT_USERNAME);
 }
 
+/** The file_id of an attached image (largest photo size, or an image document),
+ *  or undefined. Used so the service can read the picture with a vision LLM. */
+function imageFileId(msg: TgMessage): string | undefined {
+  if (msg.photo && msg.photo.length) return msg.photo[msg.photo.length - 1].file_id; // largest
+  if (msg.document?.mime_type?.startsWith('image/')) return msg.document.file_id;
+  return undefined;
+}
+
 /** Map a Telegram message object to our inbound shape, or null if not usable. */
 function toInbound(msg: TgMessage | undefined, isEdit: boolean): InboundMessage | null {
   if (!msg || !msg.chat) return null;
   if (msg.from?.is_bot) return null; // never ingest bot messages (incl. our own)
-  const text = msg.text ?? msg.caption;
-  if (!text) return null;
+  const text = msg.text ?? msg.caption ?? '';
+  const imageFile = imageFileId(msg);
+  // Usable if it has text OR an image. A caption-less photo was previously
+  // dropped entirely; now it flows through (the service reads it via vision).
+  if (!text && !imageFile) return null;
   return {
     chatId: msg.chat.id,
     msgId: msg.message_id,
     text,
+    imageFileId: imageFile,
     authorUsername: msg.from?.username,
     authorName: msg.from?.first_name,
     isEdit,

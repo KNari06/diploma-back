@@ -473,3 +473,41 @@ export async function batchAnalyze(
     (a) => a.kind !== 'claim' && a.kind !== 'clarify',
   );
 }
+
+// ─── Vision: describe an attached image so it joins the text context ─────────
+
+/**
+ * Describe an attached image (screenshot / log / photo) in one or two factual
+ * sentences, so a caption-less photo still carries meaning into reconcile. Pure
+ * description — does NOT decide task actions (reconcile does that on the
+ * combined text). Returns a short string, or '' on any failure (fail-open: a
+ * vision hiccup must not block the message). Uses the vision-capable model.
+ */
+export async function describeImage(base64: string, mime: string): Promise<string> {
+  try {
+    const res = await getChatCompletionWithMessages(
+      [
+        {
+          role: 'system',
+          content:
+            'You describe an image shared in a software QA team chat in 1-2 short, ' +
+            'factual sentences for a text-only task tracker. If it is a screenshot of ' +
+            'a log, error, or app screen, say what it shows and quote the key error/text ' +
+            'verbatim if short. No speculation, no task advice — just what is visible.',
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Describe this image:' },
+            { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}`, detail: 'high' } },
+          ],
+        },
+      ],
+      { model: AI_TASK_MODELS.aiCheckVision, max_tokens: 300 },
+    );
+    return res.content?.trim() || '';
+  } catch (err) {
+    logger.warn('[TELEGRAM_TASKS] describeImage failed', { error: err instanceof Error ? err.message : String(err) });
+    return '';
+  }
+}

@@ -6,12 +6,13 @@
  * concerns (the controller owns those).
  */
 import { env } from '@/config/environment/env';
-import { sendMessage } from '@/services/api/telegram.service';
+import { getFileBase64, sendMessage } from '@/services/api/telegram.service';
 import { logger } from '@/utils/core/logger';
 import {
   type Action,
   type AiTaskView,
   batchAnalyze,
+  describeImage,
   reconcile,
 } from './telegram-task-ai.service';
 import { canonicalOwner, isManagerUsername } from './owner-aliases';
@@ -208,6 +209,7 @@ export interface InboundMessage {
   isEdit: boolean;
   replyToMsgId: number | undefined;
   addressedToBot: boolean; // @mention of the bot or reply to a bot message — the model decides question vs action
+  imageFileId: string | undefined; // attached photo/image-doc → read via vision
 }
 
 /**
@@ -216,9 +218,28 @@ export interface InboundMessage {
  * throws — the webhook must always 200.
  */
 export async function ingestMessage(m: InboundMessage): Promise<void> {
+  // If a photo/image is attached, read it with vision and fold the description
+  // into the message text so a caption-less screenshot still carries meaning.
+  // Fail-open: a vision error leaves text as-is.
+  let baseText = m.text;
+  if (m.imageFileId && env.TELEGRAM_BOT_TOKEN) {
+    try {
+      const file = await getFileBase64(env.TELEGRAM_BOT_TOKEN, m.imageFileId);
+      if (file) {
+        const desc = await describeImage(file.base64, file.mime);
+        if (desc) baseText = baseText ? `${baseText}\n[attached image: ${desc}]` : `[attached image: ${desc}]`;
+        else if (!baseText) baseText = '[attached image]';
+      } else if (!baseText) {
+        baseText = '[attached image]';
+      }
+    } catch {
+      if (!baseText) baseText = '[attached image]';
+    }
+  }
+
   const text = m.isEdit
-    ? `[EDITED MESSAGE — reconcile against existing tasks, do not duplicate]\n${m.text}`
-    : m.text;
+    ? `[EDITED MESSAGE — reconcile against existing tasks, do not duplicate]\n${baseText}`
+    : baseText;
   const author = m.authorUsername ? `@${m.authorUsername}` : m.authorName;
 
   const msgRowId = await db.logMessage(m.chatId, m.msgId, author, text);
@@ -244,8 +265,10 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
     // is never a single bare word). Skip the LLM for that case only. Everything
     // else — any open task present, any multi-word message, or anything aimed at
     // the bot — goes to the model. The message is logged regardless.
-    const isSingleToken = !/\s/.test(m.text.trim());
-    if (totalOpen === 0 && !m.addressedToBot && isSingleToken) return;
+    // Use the enriched `text` (includes any image description) and never skip a
+    // message that carried an image — a screenshot can assign/clarify work.
+    const isSingleToken = !/\s/.test(text.trim());
+    if (totalOpen === 0 && !m.addressedToBot && !m.imageFileId && isSingleToken) return;
 
     const { actions, reply } = await reconcile({
       text,
