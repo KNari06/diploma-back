@@ -46,6 +46,16 @@ export interface ReconcileContext {
   openTasks: AiTaskView[]; // BOUNDED: most-recently-active open tasks only
   hiddenOpenCount: number;
   recentMessages: Array<{ author: string | null; text: string }>;
+  /** True when the message is addressed to the bot (@mention / reply-to-bot).
+   *  The model then decides itself whether it's a question (answer via `reply`)
+   *  or an action (emit actions) — no keyword routing on our side. */
+  addressedToBot: boolean;
+}
+
+export interface ReconcileResult {
+  actions: Action[];
+  /** Natural-language message to post back, if the model produced one. */
+  reply: string | null;
 }
 
 const RECONCILE_TOOL: ChatCompletionTool = {
@@ -73,6 +83,11 @@ const RECONCILE_TOOL: ChatCompletionTool = {
             },
             required: ['kind'],
           },
+        },
+        reply: {
+          type: ['string', 'null'],
+          description:
+            'Optional natural-language message to post back to the group. Use ONLY when the message is addressed to the bot (a question to answer, or a confirmation). Leave null/empty for ordinary digest/status messages — those get a separate system ack.',
         },
       },
       required: ['actions'],
@@ -145,6 +160,13 @@ function buildSystem(): string {
     '  needs_investigation, note:"turns out hard, need to investigate more"}',
     '• "#task add the switcher to git"  → create{title:"add the switcher to git"}',
     '• "как будто выглядит избыточным" / "Хотя да"  → (no actions)',
+    '',
+    'IF SOMEONE ASKS WHAT YOU CAN DO (your capabilities), put this in `reply`:',
+    'You track the group\'s tasks automatically — you read daily "Priorities"',
+    'digests into tracked tasks (project + owner + status), close them when',
+    'someone reports done, record status updates (in progress / blocked / needs',
+    'investigation), ask owners each morning about unclear tasks, and answer',
+    'questions about the tasks when @mentioned or replied to.',
     ...(aliasHint() ? ['', aliasHint()] : []),
   ].join('\n');
 }
@@ -168,8 +190,12 @@ function renderRecent(msgs: Array<{ author: string | null; text: string }>): str
     .join('\n');
 }
 
-/** One forced tool call → parsed `actions` array (or [] on any failure). */
-async function callReconcileTool(system: string, user: string, maxTokens: number): Promise<unknown[]> {
+/** One forced tool call → parsed `{actions, reply}` (or empty on any failure). */
+async function callReconcileTool(
+  system: string,
+  user: string,
+  maxTokens: number,
+): Promise<{ actions: unknown[]; reply: string | null }> {
   try {
     const res = await getChatCompletionWithMessages(
       [
@@ -184,22 +210,39 @@ async function callReconcileTool(system: string, user: string, maxTokens: number
       },
     );
     const argStr = res.tool_calls?.[0]?.function?.arguments;
-    if (!argStr) return [];
-    const parsed = JSON.parse(argStr) as { actions?: unknown };
-    return Array.isArray(parsed.actions) ? parsed.actions : [];
+    if (!argStr) return { actions: [], reply: null };
+    const parsed = JSON.parse(argStr) as { actions?: unknown; reply?: unknown };
+    return {
+      actions: Array.isArray(parsed.actions) ? parsed.actions : [],
+      reply: typeof parsed.reply === 'string' && parsed.reply.trim() ? parsed.reply.trim() : null,
+    };
   } catch (err) {
     logger.error('[TELEGRAM_TASKS] reconcile LLM call failed', {
       error: err instanceof Error ? err.message : String(err),
     });
-    return [];
+    return { actions: [], reply: null };
   }
 }
 
-export async function reconcile(ctx: ReconcileContext): Promise<Action[]> {
+export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult> {
   const openHeader =
     ctx.hiddenOpenCount > 0
       ? `OPEN TASKS (most recent ${ctx.openTasks.length}; ${ctx.hiddenOpenCount} older open tasks not shown):`
       : 'OPEN TASKS:';
+
+  const addressedBlock = ctx.addressedToBot
+    ? [
+        '',
+        'THE USER ADDRESSED YOU DIRECTLY (@mention or reply to your message).',
+        'Decide what they want — you, not a keyword rule:',
+        '  • A QUESTION about the tasks ("what is open?", "what does @dara have',
+        '    left?", "what can you do?") → put a concise, grounded answer in',
+        '    `reply` and emit NO actions. Answer ONLY from the open tasks above;',
+        '    if the data does not contain it, say so. Reply in the user\'s language.',
+        '  • An ACTION ("done", "close the video task", "in progress 2 days") →',
+        '    emit the actions as usual; `reply` may be a short confirmation or null.',
+      ].join('\n')
+    : '';
 
   const userBlock = [
     'RECENT CHAT (oldest first, for resolving references like "the first one"):',
@@ -210,13 +253,17 @@ export async function reconcile(ctx: ReconcileContext): Promise<Action[]> {
     '',
     openHeader,
     renderOpenTasks(ctx.openTasks),
+    addressedBlock,
     '',
     'NEW MESSAGE (act only on THIS message; the recent chat is context):',
     `"""${ctx.text}"""`,
   ].join('\n');
 
   const raw = await callReconcileTool(buildSystem(), userBlock, 1500);
-  return validateActions(raw as Array<Record<string, unknown>>, ctx.openTasks, ctx.text);
+  return {
+    actions: validateActions(raw.actions as Array<Record<string, unknown>>, ctx.openTasks, ctx.text),
+    reply: raw.reply,
+  };
 }
 
 const PROGRESS_STATES = new Set<ProgressState>(['in_progress', 'blocked', 'needs_investigation']);
@@ -304,5 +351,6 @@ export async function batchAnalyze(
   const user = `OPEN TASKS:\n${taskList}\n\nCONVERSATION (oldest first):\n${convo}`;
 
   const raw = await callReconcileTool(system, user, 3000);
-  return validateActions(raw as Array<Record<string, unknown>>, openTasks, 'batch analysis');
+  // Batch mode never produces a `reply` — it only resolves statuses.
+  return validateActions(raw.actions as Array<Record<string, unknown>>, openTasks, 'batch analysis');
 }

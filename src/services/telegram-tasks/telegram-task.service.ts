@@ -33,14 +33,25 @@ function toAiView(t: TelegramTaskRow): AiTaskView {
 }
 
 /** Best-effort outbound post to the group (never throws into the caller). */
+// Telegram hard-limits a message to 4096 chars; an over-limit send is rejected
+// (400) and would otherwise be silently dropped. Cap with headroom.
+const TG_MAX_CHARS = 3900;
+
 async function send(chatId: number, text: string): Promise<void> {
   if (!env.TELEGRAM_BOT_TOKEN) return;
+  const safe = text.length > TG_MAX_CHARS ? `${text.slice(0, TG_MAX_CHARS)}…` : text;
   try {
-    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, text, 'HTML');
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, safe, 'HTML');
   } catch (err) {
     logger.warn('[TELEGRAM_TASKS] send failed', { chatId, error: err instanceof Error ? err.message : String(err) });
   }
 }
+
+/**
+ * Q&A / action when addressed to the bot is NOT decided by keywords here — the
+ * reconcile LLM call itself decides (question → it returns `reply`; action → it
+ * returns actions). This keeps all language understanding in the model.
+ */
 
 /** Apply a validated action list to the db. Returns what changed. */
 async function applyActions(
@@ -88,6 +99,7 @@ export interface InboundMessage {
   authorName: string | undefined; // display/first name fallback
   isEdit: boolean;
   replyToMsgId: number | undefined;
+  addressedToBot: boolean; // @mention of the bot or reply to a bot message — the model decides question vs action
 }
 
 /**
@@ -111,16 +123,16 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
       m.replyToMsgId ? db.openTaskIdsBySourceMsg(m.chatId, m.replyToMsgId) : Promise.resolve([]),
     ]);
 
-    // Cheap cost guard: with NO open tasks in the chat, the only action the model
-    // could take is `create`. A short, single-line, non-#task message is almost
-    // never a real task assignment (digests are long + multi-line), so skip the
-    // LLM call entirely — this drops the dominant chatter case in a quiet chat
-    // without risking a missed closure (there's nothing open to close). The
-    // message is still logged above, so it joins the next batch's context.
-    const looksActionable = m.text.includes('\n') || m.text.trim().length > 15 || /#task/i.test(m.text);
-    if (totalOpen === 0 && !looksActionable) return;
+    // Cost guard (structural, not language-keyword based): a one-token message
+    // in a chat with NO open tasks that isn't addressed to the bot cannot
+    // produce a useful action (nothing to close/update; a real task assignment
+    // is never a single bare word). Skip the LLM for that case only. Everything
+    // else — any open task present, any multi-word message, or anything aimed at
+    // the bot — goes to the model. The message is logged regardless.
+    const isSingleToken = !/\s/.test(m.text.trim());
+    if (totalOpen === 0 && !m.addressedToBot && isSingleToken) return;
 
-    const actions = await reconcile({
+    const { actions, reply } = await reconcile({
       text,
       author,
       isManager: isManagerUsername(m.authorUsername),
@@ -128,15 +140,31 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
       openTasks: contextTasks.map(toAiView),
       hiddenOpenCount: Math.max(0, totalOpen - contextTasks.length),
       recentMessages: recent,
+      addressedToBot: m.addressedToBot,
     });
 
     const r = await applyActions(m.chatId, actions, m.msgId);
 
+    // Always surface what CHANGED (don't let a chatty reply hide a create/close).
     const bits: string[] = [];
     if (r.created.length) bits.push(`📝 tracking ${r.created.length} new task${r.created.length > 1 ? 's' : ''}`);
     if (r.closed.length) bits.push(`✅ closed ${r.closed.length} task${r.closed.length > 1 ? 's' : ''}`);
     if (r.progressed.length) bits.push(`📌 noted status on ${r.progressed.length} task${r.progressed.length > 1 ? 's' : ''}`);
-    if (bits.length) await send(m.chatId, bits.join(' · '));
+
+    // Honor the model's reply ONLY when the user actually addressed the bot — a
+    // hard code-side guard so a chatty model can't spam the group on ordinary
+    // digests (the schema asks for this, but we don't trust the model to obey).
+    const wantsReply = reply && m.addressedToBot;
+
+    if (wantsReply && bits.length) {
+      // Both an answer AND changes: post the answer, then the change ack.
+      await send(m.chatId, escapeHtml(reply!));
+      await send(m.chatId, bits.join(' · '));
+    } else if (wantsReply) {
+      await send(m.chatId, escapeHtml(reply!));
+    } else if (bits.length) {
+      await send(m.chatId, bits.join(' · '));
+    }
   } catch (err) {
     logger.error('[TELEGRAM_TASKS] ingest failed', { chatId: m.chatId, error: err instanceof Error ? err.message : String(err) });
   }
