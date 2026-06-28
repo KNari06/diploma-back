@@ -54,14 +54,6 @@ export function taskUrl(chatId: number, sourceMsgId: number | null): string | nu
   return null;
 }
 
-/** A deep link as an HTML <a> wrapping `label` (escaped), or the plain escaped
- *  label when no link can be built. */
-export function taskLink(chatId: number, sourceMsgId: number | null, label: string): string {
-  const safe = escapeHtml(label);
-  const url = taskUrl(chatId, sourceMsgId);
-  return url ? `<a href="${url}">${safe}</a>` : safe;
-}
-
 /**
  * Turn the model's reply into safe Telegram HTML. The model emits task links as
  * tokens [[t:<id>]]label[[/t]] (it never writes URLs itself — so it can't mangle
@@ -159,15 +151,22 @@ async function applyActions(
   askReplyTo?: number,
   deadlineReplyMsgId?: number,
   claimant?: string, // canonical @owner who is taking the task (a `claim` reassigns to them)
-): Promise<{ created: string[]; closed: string[]; closedLinks: string[]; progressed: string[]; asked: boolean; deadlines: string[]; notes: string[] }> {
+): Promise<{ created: string[]; closed: string[]; closedLabels: string[]; progressed: string[]; asked: boolean; deadlines: string[]; notes: string[]; anchorMsgIds: number[] }> {
   const created: string[] = [];
   const closed: string[] = [];
-  const closedLinks: string[] = []; // HTML labels (linked to source msg) for the ack
+  const closedLabels: string[] = []; // plain escaped labels for the ack (jump handled by native quote-reply)
   const progressed: string[] = [];
   // Human-readable per-change labels for an informative ack (vs "noted status
   // on 1 task"). Filled for status/deadline changes where the task name helps.
   const notes: string[] = [];
   const deadlines: string[] = [];
+  // Distinct source-message ids of tasks this batch touched. When exactly one,
+  // the ack quote-replies to it — Telegram's native reply jumps reliably on ALL
+  // platforms (unlike t.me/c/ text links, which break on desktop — tdesktop#8108).
+  const anchorMsgIds: number[] = [];
+  const addAnchor = (id: number | null): void => {
+    if (id && !anchorMsgIds.includes(id)) anchorMsgIds.push(id);
+  };
   let asked = false;
   for (const a of actions) {
     switch (a.kind) {
@@ -183,7 +182,10 @@ async function applyActions(
         await db.closeTask(a.task_id, a.reason);
         closed.push(a.task_id);
         const t = await db.getTask(a.task_id);
-        if (t) closedLinks.push(taskLink(t.chat_id, t.source_msg_id, `${t.project ? `[${t.project}] ` : ''}${t.title}`));
+        if (t) {
+          closedLabels.push(escapeHtml(`${t.project ? `[${t.project}] ` : ''}${t.title}`));
+          addAnchor(t.source_msg_id);
+        }
         break;
       }
       case 'reopen': await db.reopenTask(a.task_id); break;
@@ -202,10 +204,9 @@ async function applyActions(
         progressed.push(a.task_id);
         const t = await db.getTask(a.task_id);
         const label = t ? `${t.project ? `[${t.project}] ` : ''}${t.title}` : 'task';
-        // The task title links to the message it was created from.
-        const linked = t ? taskLink(t.chat_id, t.source_msg_id, label) : escapeHtml(label);
+        if (t) addAnchor(t.source_msg_id); // ack quote-replies to the task message
         const STATUS_LABEL = { in_progress: 'in progress', blocked: 'blocked', needs_investigation: 'needs investigation' } as const;
-        notes.push(`📌 ${linked} — ${STATUS_LABEL[a.state]}`);
+        notes.push(`📌 ${escapeHtml(label)} — ${STATUS_LABEL[a.state]}`);
         break;
       }
       case 'claim': {
@@ -252,7 +253,7 @@ async function applyActions(
       case 'touch': await db.touchActivity(a.task_id); break;
     }
   }
-  return { created, closed, closedLinks, progressed, asked, deadlines, notes };
+  return { created, closed, closedLabels, progressed, asked, deadlines, notes, anchorMsgIds };
 }
 
 export interface InboundMessage {
@@ -348,14 +349,14 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
     // Always surface what CHANGED (don't let a chatty reply hide a create/close).
     // A `claim` already posted its own "when?" question, so it's not in `bits`.
     const bits: string[] = [];
-    // "tracking N tasks" links to the digest message they came from (m.msgId).
     if (r.created.length) {
       const n = r.created.length;
-      bits.push(`📝 ${taskLink(m.chatId, m.msgId, `tracking ${n} new task${n > 1 ? 's' : ''}`)}`);
+      bits.push(`📝 tracking ${n} new task${n > 1 ? 's' : ''}`);
     }
-    // closed: link each task title to its source message (up to 3, else count).
+    // closed: name each task (up to 3, else count). The quote-reply anchor below
+    // jumps to the task message — no fragile inline link needed.
     if (r.closed.length) {
-      if (r.closedLinks.length && r.closedLinks.length <= 3) bits.push(`✅ closed ${r.closedLinks.join(', ')}`);
+      if (r.closedLabels.length && r.closedLabels.length <= 3) bits.push(`✅ closed ${r.closedLabels.join(', ')}`);
       else bits.push(`✅ closed ${r.closed.length} task${r.closed.length > 1 ? 's' : ''}`);
     }
     // Prefer the detailed per-task status labels (already linked) over a bare count.
@@ -371,16 +372,22 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
     // URLs itself). renderReplyTokens already escapes the text, so send as HTML.
     const renderedReply = wantsReply ? renderReplyTokens(reply!, contextTasks) : '';
 
-    // Link the bot's message back to the user's so it's clear what it answers.
+    // Anchor the change ack as a native quote-reply to the touched task's source
+    // message when exactly ONE task changed — Telegram's reply jumps reliably on
+    // every platform (a t.me/c/ text link does not — tdesktop#8108). With 0 or
+    // 2+ anchors there's no single message to quote, so fall back to replying to
+    // the user's own message (still clear what it answers).
+    const ackReplyTo = r.anchorMsgIds.length === 1 ? r.anchorMsgIds[0] : m.msgId;
+
+    // The answer (Q&A) always replies to the user's message; only the change ack
+    // uses the task anchor.
     if (wantsReply && bits.length) {
-      // Both an answer AND changes: post the answer (rich, may contain links),
-      // then the change ack.
       await sendRich(m.chatId, renderedReply, m.msgId);
-      await send(m.chatId, bits.join(' · '), m.msgId);
+      await send(m.chatId, bits.join(' · '), ackReplyTo);
     } else if (wantsReply) {
       await sendRich(m.chatId, renderedReply, m.msgId);
     } else if (bits.length) {
-      await send(m.chatId, bits.join(' · '), m.msgId);
+      await send(m.chatId, bits.join(' · '), ackReplyTo);
     }
   } catch (err) {
     logger.error('[TELEGRAM_TASKS] ingest failed', { chatId: m.chatId, error: err instanceof Error ? err.message : String(err) });
