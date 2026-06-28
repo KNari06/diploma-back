@@ -765,6 +765,47 @@ export const logQueueEvent = (event: string, jobId: string, data?: any) => {
   });
 };
 
+export interface AiCheckErrorAudit {
+  /** Where the check ran. */
+  source: 'replay' | 'preview' | 'runner';
+  userId?: string;
+  stepId?: string;
+  confidence?: number;
+  /** Why the check could not be trusted (the runner's skippedReason, etc.). */
+  reason?: string;
+  /** Correlation ids — whichever the call site has. */
+  projectId?: string;
+  sessionId?: string;
+  testId?: string;
+  /**
+   * Free-text that the caller MUST already have redacted (Hard invariant #10 —
+   * the assertion/verdict can echo resolved `{{secrets.*}}` values). The
+   * `redacted*` naming is the contract; OMIT when the call site holds no
+   * redactor (e.g. the runner path: the backend never has the compiled secrets).
+   */
+  redactedAssertion?: string;
+  redactedExplanation?: string;
+}
+
+/**
+ * Canonical `ai_check.errored` audit line (WARN) — emitted ONLY when an AI-check
+ * could not produce a trustworthy verdict (LLM/parse/input error), NOT when an
+ * assertion legitimately failed (a confident `pass:false` is a normal test
+ * result, already a recorded failed step — logging it here would bury the real
+ * malfunction signal). One owner for the event name, level, and field shape so
+ * they can't drift, and one documented home for the redaction obligation.
+ */
+export const logAiCheckError = (audit: AiCheckErrorAudit): void => {
+  const { redactedAssertion, redactedExplanation, ...rest } = audit;
+  logger.warn('[AI_CHECK] evaluation errored', {
+    event: 'ai_check.errored',
+    severity: 'warning',
+    ...rest,
+    ...(redactedAssertion !== undefined ? { assertion: redactedAssertion } : {}),
+    ...(redactedExplanation !== undefined ? { explanation: redactedExplanation } : {}),
+  });
+};
+
 export const logAIAnalysis = (testId: string, analysis: any) => {
   // Validate inputs
   if (!testId || typeof testId !== 'string') {

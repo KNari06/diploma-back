@@ -58,6 +58,7 @@ function buildSystemPrompt(lang: string): string {
     'Answer using ONLY the information inside <product_facts> below. It is your single source of truth.',
     '- Never invent or estimate pricing, limits, numbers, features, dates, or integrations that are not stated there.',
     '- If a placeholder like {{...}} appears, treat that detail as NOT YET available — do not output the placeholder.',
+    '- If the facts DO cover the question — answer confidently and directly. Do not hedge or say "I\'m not sure" when the answer is clearly stated in <product_facts>.',
     '- If the facts do not cover the question (or only partially), say plainly that you are not certain about that specific detail, share what you do know, and offer to book a demo or contact the team for the exact answer. A confident "I don\'t have that detail yet" is always better than a guess.',
     '</grounding>',
     '',

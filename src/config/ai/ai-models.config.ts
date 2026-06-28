@@ -168,6 +168,8 @@ export const AI_TASK_MODELS = {
   taskPlanning: AI_MODELS.fast,
   /** Pre-LLM snapshot pruner (fast context-aware element filter) */
   snapshotPruning: AI_MODELS.fast,
+  /** QAIT Tasker: reconcile a Telegram chat message → task actions (tool-use). */
+  telegramTaskReconcile: AI_MODELS.fast,
 
   // ── Analysis ───────────────────────────────────────────────────────────
   /** Page analysis with vision */

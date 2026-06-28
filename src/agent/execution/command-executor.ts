@@ -20,7 +20,7 @@ import type { IntentActionType } from '@/services/testing/ui/preview/preview.typ
 import { diagnoseStepBlocker, actOnDiagnosis } from '@/services/testing/ui/preview/step-blocker-diagnosis.service';
 import { COMMAND_EXECUTOR_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
-import { logger } from '@/utils/core/logger';
+import { logger, logAiCheckError } from '@/utils/core/logger';
 import { Frame, Locator, Page } from 'playwright';
 import { shouldPressEnterAfterFill } from '../utils/ai/enter-detection-ai';
 import { getLocator, getSmartLocator, isSelectorRelatedError, normalizeSelector, validateAndGetLocator } from '../utils/selectors/selector-utils';
@@ -2203,6 +2203,22 @@ export class CommandExecutor {
 
             // If check fails, throw error with explanation
             if (!aiCheckResult.pass) {
+              // Audit (Loki): ONLY when the check ERRORED (couldn't produce a
+              // trustworthy verdict). A confident pass:false is a legitimate
+              // assertion failure — already a recorded failed step, not a system
+              // failure. assertion + explanation go through redactString (Hard
+              // invariant #10 — they can carry resolved {{secrets.*}} values).
+              if (aiCheckResult.evaluationError) {
+                logAiCheckError({
+                  source: 'replay',
+                  userId: this.metadata.userId,
+                  projectId: this.metadata.projectId,
+                  stepId: intentCommand.intentMeta?.stepId,
+                  confidence: aiCheckResult.confidence,
+                  redactedAssertion: this.redactString(intentCommand.intentMeta.assertionText ?? ''),
+                  redactedExplanation: this.redactString(aiCheckResult.explanation),
+                });
+              }
               // Record failure in runtime meta
               if (isIntentCommand && intentCommand.intentMeta?.stepId) {
                 this.stepRuntimeMeta.set(intentCommand.intentMeta.stepId, {

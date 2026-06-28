@@ -220,6 +220,19 @@ const envSchema = z.object({
   // Telegram Bot
   TELEGRAM_BOT_TOKEN: z.string().optional(),
 
+  // QAIT Tasker (Telegram task tracking). Feature-gated, OFF by default — when
+  // off the webhook accepts-and-ignores and the sweep job doesn't start.
+  TELEGRAM_TASKS_ENABLED: z.string().transform(v => v === 'true').default('false'),
+  // Shared secret echoed by Telegram in the X-Telegram-Bot-Api-Secret-Token
+  // header (set when registering the webhook). Required for the webhook to act.
+  TELEGRAM_WEBHOOK_SECRET: z.string().optional(),
+  // Comma-separated @usernames allowed to close/reopen ANYONE's task (digest author).
+  TELEGRAM_TASK_MANAGERS: z.string().optional(),
+  // Owner aliases: "@user = nick, nick; @user = nick" (nickname → canonical @username).
+  TELEGRAM_TASK_ALIASES: z.string().optional(),
+  // Local hour (Asia/Almaty, 0-23) to run the morning batch + status check.
+  TELEGRAM_TASK_BATCH_HOUR: z.string().transform(Number).default('10'),
+
   // Feature Flags - B2B Organization/Members
   // Staged rollout: enable reads first, then writes, then credits cutover
   FEATURE_ORG_MEMBERS_ENABLED: z.string().transform(v => v === 'true').default('true'),

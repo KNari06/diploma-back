@@ -2,6 +2,7 @@ import adminTracesRoutes from '@/api/admin/admin-traces.route';
 import adminRegressionMetricsRoutes from '@/api/admin/admin-regression-metrics.route';
 import allureImportRoutes from '@/api/allure-import/allure-import.route';
 import analyticsRoutes from '@/api/analytics/analytics.route';
+import clientLogsRoutes from '@/api/client-logs/client-logs.route';
 import emailInboxRoutes from '@/api/email-inbox/email-inbox.routes';
 import explorationsRoutes from '@/api/explorations/explorations.route';
 import dashboardRoutes from '@/api/dashboard/dashboard.route';
@@ -57,6 +58,7 @@ import stripeRoutes from '@/api/stripe/stripe.routes';
 import { handleWebhook } from '@/api/stripe/stripe.controller';
 import { asyncHandler } from '@/utils/core/error-handler';
 import supportRoutes from '@/api/support/support.routes';
+import telegramTasksRoutes from '@/api/telegram-tasks/telegram-webhook.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
 import waitlistRoutes from '@/api/waitlist/waitlist.route';
@@ -72,7 +74,7 @@ import { env, isDevelopment } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
 import { testSupabaseAuthHealth, testSupabaseConnection } from '@/db/supabase';
 import { SystemHealthMonitor } from '@/services/system/system-health-monitor.service';
-import { errorHandler, notFoundHandler } from '@/utils/core/error-handler';
+import { errorHandler, notFoundHandler, httpErrorAuditMiddleware } from '@/utils/core/error-handler';
 import { logger, morganStream, formatError } from '@/utils/core/logger';
 import cors from 'cors';
 import express from 'express';
@@ -247,6 +249,13 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
 
 // app.use(limiter); // Disabled - using custom rate limiter in middleware
 
+// HTTP-status truth (audit): keyed `http.error` event for EVERY 5xx response,
+// registered FIRST — before the Stripe/Git webhook handlers and all routing —
+// so its res.on('finish') hook observes the final status of EVERY response
+// (the Stripe webhook is an app.post mounted just below; it would otherwise be
+// uncovered).
+app.use(httpErrorAuditMiddleware);
+
 // Raw body parser for Stripe webhook (must be before express.json())
 app.use(`/api/${env.API_VERSION}/stripe/webhook`, express.raw({ type: 'application/json' }));
 // Mount the Stripe webhook handler ONCE, directly on the raw-body path, so it
@@ -263,6 +272,10 @@ app.post(
 app.use(`/api/${env.API_VERSION}/git-integrations/webhook`, express.raw({ type: 'application/json', limit: '10mb' }));
 // Fallback when reverse proxy strips /api (e.g. nginx proxy_pass with trailing slash)
 app.use(`/${env.API_VERSION}/git-integrations/webhook`, express.raw({ type: 'application/json', limit: '10mb' }));
+// QAIT Tasker Telegram webhook needs the raw body too (the controller JSON-parses
+// the Buffer). Public route (no auth) — auth is Telegram's secret-token header.
+app.use(`/api/${env.API_VERSION}/telegram-tasks/webhook`, express.raw({ type: 'application/json', limit: '1mb' }));
+app.use(`/api/${env.API_VERSION}/telegram-tasks`, telegramTasksRoutes);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -1353,6 +1366,11 @@ app.use(`/api/${env.API_VERSION}/announcements`, announcementsRoutes); // What's
 app.use(`/api/${env.API_VERSION}/user`, userRoutes); // User profile (needed for pending users)
 app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // User issue reports
 
+// Client failure ingest — auth only (NOT requireApproved: a user hitting an
+// error mid-onboarding still needs their browser failure recorded). The route
+// applies its own per-user rate limit.
+app.use(`/api/${env.API_VERSION}/client-logs`, clientLogsRoutes);
+
 // API routes — require approved account status (requireAuth sets req.user, requireApproved checks status)
 app.use(`/api/${env.API_VERSION}/analytics`, requireAuth, requireApproved, analyticsRoutes);
 app.use(`/api/${env.API_VERSION}/dashboard`, requireAuth, requireApproved, dashboardRoutes);
@@ -1889,9 +1907,13 @@ const startServer = async () => {
     process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
     process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-    // Prevent process from exiting on unhandled errors (log only)
+    // Prevent process from exiting on unhandled errors (log only).
+    // Tagged event/severity so these — the net for failures nothing else
+    // catches — are queryable in Loki and alertable as criticals.
     process.on('uncaughtException', (error) => {
       logger.error('[SERVER] Uncaught exception:', {
+        event: 'unhandled.exception',
+        severity: 'critical',
         error: error.message,
         stack: error.stack,
       });
@@ -1900,6 +1922,8 @@ const startServer = async () => {
 
     process.on('unhandledRejection', (reason) => {
       logger.error('[SERVER] Unhandled rejection:', {
+        event: 'unhandled.rejection',
+        severity: 'critical',
         reason: reason instanceof Error ? reason.message : String(reason),
         stack: reason instanceof Error ? reason.stack : undefined,
       });

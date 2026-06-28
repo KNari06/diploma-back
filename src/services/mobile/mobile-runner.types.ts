@@ -266,6 +266,14 @@ export interface MobileStepResult {
   error?: string;
   screenshot?: string; // base64
   resolvedVia?: 'compiled' | 'exact_label' | 'exact_text' | 'partial' | 'coordinates' | 'llm' | 'vision' | 'thinking' | 'soft_score' | 'passthrough' | 'skipped' | 'unresolved' | 'low_confidence';
+  /**
+   * Set by the runner when a FAILED ai-check could not produce a trustworthy
+   * verdict (circuit_breaker_open / inconclusive / empty_tree / low_confidence /
+   * truncated_at_budget / …). Absent on a normal confident fail. Gates the
+   * backend `ai_check.errored` audit so a legitimately-failed assertion isn't
+   * logged as a system failure.
+   */
+  aiCheckSkippedReason?: string;
   durationMs: number;
   /** Freshly-built compiled plan from this run. Persist onto the IntentStep. */
   compiledPlan?: MobileCompiledPlan;
