@@ -1562,12 +1562,23 @@ export class RegressionPlanService {
               events: ['push', 'pull_request', 'release'],
             });
             integration = { id: created.id };
-            logger.info('[REGRESSION_PLAN_SERVICE] Auto-created git integration for plan', {
-              planId: plan.id,
-              integrationId: created.id,
-              repositoryUrl: created.repository_url,
-              provider: created.provider,
-            });
+            // The row is created with an EMPTY webhook_secret. The webhook path is
+            // fail-closed, so until the user supplies a secret (frontend sends it on
+            // the create/update integration call) this integration can NEVER fire —
+            // every delivery is rejected for "no secret configured". Warn (queryable
+            // in Loki) so a "my automation never runs" report is diagnosable.
+            const secretless = !created.webhook_secret;
+            logger[secretless ? 'warn' : 'info'](
+              '[REGRESSION_PLAN_SERVICE] Auto-created git integration for plan',
+              {
+                planId: plan.id,
+                integrationId: created.id,
+                repositoryUrl: created.repository_url,
+                provider: created.provider,
+                secretless,
+                willFire: !secretless,
+              },
+            );
           } catch (createError) {
             logger.warn('[REGRESSION_PLAN_SERVICE] Could not auto-create git integration (e.g. access denied or duplicate)', {
               planId: plan.id,
