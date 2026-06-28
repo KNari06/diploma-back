@@ -40,6 +40,23 @@ function toAiView(t: TelegramTaskRow): AiTaskView {
   };
 }
 
+/**
+ * A deep link to the message a task was created from, as an HTML <a>. Telegram
+ * `t.me/c/<id>/<msg>` links resolve only inside supergroups/channels, whose
+ * chat_id is the large negative `-100…` form; the internal id drops that prefix.
+ * For a normal group / DM (no -100 prefix) or a missing source message we can't
+ * build a working link, so we return the plain (escaped) label unlinked.
+ */
+export function taskLink(chatId: number, sourceMsgId: number | null, label: string): string {
+  const safe = escapeHtml(label);
+  const s = String(chatId);
+  if (sourceMsgId && s.startsWith('-100')) {
+    const internal = s.slice(4); // strip "-100"
+    return `<a href="https://t.me/c/${internal}/${sourceMsgId}">${safe}</a>`;
+  }
+  return safe;
+}
+
 /** Best-effort outbound post to the group (never throws into the caller). */
 // Telegram hard-limits a message to 4096 chars; an over-limit send is rejected
 // (400) and would otherwise be silently dropped. Cap with headroom.
@@ -88,9 +105,10 @@ async function applyActions(
   sourceMsgId: number | undefined,
   askReplyTo?: number,
   deadlineReplyMsgId?: number,
-): Promise<{ created: string[]; closed: string[]; progressed: string[]; asked: boolean; deadlines: string[]; notes: string[] }> {
+): Promise<{ created: string[]; closed: string[]; closedLinks: string[]; progressed: string[]; asked: boolean; deadlines: string[]; notes: string[] }> {
   const created: string[] = [];
   const closed: string[] = [];
+  const closedLinks: string[] = []; // HTML labels (linked to source msg) for the ack
   const progressed: string[] = [];
   // Human-readable per-change labels for an informative ack (vs "noted status
   // on 1 task"). Filled for status/deadline changes where the task name helps.
@@ -107,7 +125,13 @@ async function applyActions(
         }
         break;
       }
-      case 'close': await db.closeTask(a.task_id, a.reason); closed.push(a.task_id); break;
+      case 'close': {
+        await db.closeTask(a.task_id, a.reason);
+        closed.push(a.task_id);
+        const t = await db.getTask(a.task_id);
+        if (t) closedLinks.push(taskLink(t.chat_id, t.source_msg_id, `${t.project ? `[${t.project}] ` : ''}${t.title}`));
+        break;
+      }
       case 'reopen': await db.reopenTask(a.task_id); break;
       case 'update':
         // Pass ONLY the patchable fields (not kind/task_id) so updateTask can't
@@ -124,8 +148,10 @@ async function applyActions(
         progressed.push(a.task_id);
         const t = await db.getTask(a.task_id);
         const label = t ? `${t.project ? `[${t.project}] ` : ''}${t.title}` : 'task';
+        // The task title links to the message it was created from.
+        const linked = t ? taskLink(t.chat_id, t.source_msg_id, label) : escapeHtml(label);
         const STATUS_LABEL = { in_progress: 'in progress', blocked: 'blocked', needs_investigation: 'needs investigation' } as const;
-        notes.push(`📌 ${escapeHtml(label)} — ${STATUS_LABEL[a.state]}`);
+        notes.push(`📌 ${linked} — ${STATUS_LABEL[a.state]}`);
         break;
       }
       case 'claim': {
@@ -170,7 +196,7 @@ async function applyActions(
       case 'touch': await db.touchActivity(a.task_id); break;
     }
   }
-  return { created, closed, progressed, asked, deadlines, notes };
+  return { created, closed, closedLinks, progressed, asked, deadlines, notes };
 }
 
 export interface InboundMessage {
@@ -239,9 +265,17 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
     // Always surface what CHANGED (don't let a chatty reply hide a create/close).
     // A `claim` already posted its own "when?" question, so it's not in `bits`.
     const bits: string[] = [];
-    if (r.created.length) bits.push(`📝 tracking ${r.created.length} new task${r.created.length > 1 ? 's' : ''}`);
-    if (r.closed.length) bits.push(`✅ closed ${r.closed.length} task${r.closed.length > 1 ? 's' : ''}`);
-    // Prefer the detailed per-task status labels over a bare count.
+    // "tracking N tasks" links to the digest message they came from (m.msgId).
+    if (r.created.length) {
+      const n = r.created.length;
+      bits.push(`📝 ${taskLink(m.chatId, m.msgId, `tracking ${n} new task${n > 1 ? 's' : ''}`)}`);
+    }
+    // closed: link each task title to its source message (up to 3, else count).
+    if (r.closed.length) {
+      if (r.closedLinks.length && r.closedLinks.length <= 3) bits.push(`✅ closed ${r.closedLinks.join(', ')}`);
+      else bits.push(`✅ closed ${r.closed.length} task${r.closed.length > 1 ? 's' : ''}`);
+    }
+    // Prefer the detailed per-task status labels (already linked) over a bare count.
     if (r.notes.length) bits.push(...r.notes);
     else if (r.progressed.length) bits.push(`📌 noted status on ${r.progressed.length} task${r.progressed.length > 1 ? 's' : ''}`);
     if (r.deadlines.length) bits.push(`📅 set deadline on ${r.deadlines.length} task${r.deadlines.length > 1 ? 's' : ''}`);
