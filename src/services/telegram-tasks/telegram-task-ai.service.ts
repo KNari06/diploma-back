@@ -29,6 +29,7 @@ export interface AiTaskView {
   progress: 'none' | ProgressState;
   progress_note: string | null;
   has_deadline: boolean; // true if due_text/due_at already set — don't re-ask
+  link: string | null; // t.me deep link to the source message, for clickable titles in replies
 }
 
 export type Action =
@@ -236,7 +237,8 @@ function renderOpenTasks(openTasks: AiTaskView[]): string {
         `- id=${t.id}: ${t.project ? `[${t.project}] ` : ''}${t.title}` +
         `${t.owner ? ` (owner ${t.owner})` : ' (unassigned)'}` +
         `${t.progress !== 'none' ? ` [last status: ${t.progress}${t.progress_note ? ` — ${t.progress_note}` : ''}]` : ''}` +
-        `${t.has_deadline ? ' [has deadline]' : ' [no deadline]'}`,
+        `${t.has_deadline ? ' [has deadline]' : ' [no deadline]'}` +
+        `${t.link ? ` link=${t.link}` : ''}`,
     )
     .join('\n');
 }
@@ -299,6 +301,11 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
         '    if the data does not contain it, say so. Reply in the user\'s language.',
         '  • An ACTION ("done", "close the video task", "in progress 2 days") →',
         '    emit the actions as usual; `reply` may be a short confirmation or null.',
+        '',
+        'FORMATTING `reply` (Telegram HTML): NEVER print the raw id=<uuid> — it is',
+        'internal. When you name a task, make its title a clickable link using its',
+        'link= value: <a href="LINK">[Project] Title</a>. If a task has no link=,',
+        'just write the plain title. Use only <a>, <b>, <i> tags; one task per line.',
       ].join('\n')
     : '';
 
