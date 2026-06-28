@@ -306,3 +306,73 @@ export async function batchAnalyze(
   const raw = await callReconcileTool(system, user, 3000);
   return validateActions(raw as Array<Record<string, unknown>>, openTasks, 'batch analysis');
 }
+
+// ─── Q&A: answer a question about this chat's tasks ──────────────────────────
+
+const CAPABILITIES = [
+  'I track this group\'s tasks automatically. What I can do:',
+  '• Read your daily "Priorities" digests and turn each line into a tracked task (project + owner + status).',
+  '• Detect when a task is done from your replies ("done", "merged", "готово") and close it.',
+  '• Record status updates ("in progress", "blocked", "turns out hard") without closing.',
+  '• Every morning, ask owners about tasks with no clear status.',
+  '• Answer questions about the tasks — just @mention me or reply to my message.',
+  'Examples: "what\'s open?", "what does @dara have left?", "what\'s blocked?", "how many tasks for JP?".',
+].join('\n');
+
+/**
+ * Answer a natural-language question about the chat's tasks. READ-ONLY — never
+ * creates/closes anything. Grounded strictly in the provided tasks; if the
+ * answer isn't in the data, it says so rather than inventing. Returns plain text
+ * (HTML-safe) for posting back to the group, or a capabilities blurb when the
+ * user asks what the bot can do.
+ */
+export async function answerTaskQuestion(
+  question: string,
+  openTasks: AiTaskView[],
+  recentMessages: Array<{ author: string | null; text: string }>,
+): Promise<string> {
+  const system = [
+    'You are QAIT Tasker, a task-tracking assistant for a software QA team\'s',
+    'Telegram group. A user has addressed you with a question. Answer it using',
+    'ONLY the OPEN TASKS provided below (and the recent chat for context).',
+    '',
+    'Rules:',
+    '- Ground every statement in the listed tasks. Do NOT invent tasks, owners,',
+    '  or statuses. If the data does not contain the answer, say so plainly.',
+    '- Be concise and scannable: short lines or a small bulleted list, not prose.',
+    '- Group by owner or project when it helps. Mention counts when asked.',
+    '- Languages: reply in the language the user asked in (EN/RU/KK).',
+    '- You do NOT create, close, or change tasks here — this is read-only. If the',
+    '  user asks you to change something, tell them to just say it in the group',
+    '  (e.g. reply "done") and you\'ll pick it up.',
+    '- If the user asks what you can do / your capabilities, reply with this:',
+    '',
+    CAPABILITIES,
+  ].join('\n');
+
+  const user = [
+    'OPEN TASKS:',
+    renderOpenTasks(openTasks),
+    '',
+    'RECENT CHAT (context):',
+    renderRecent(recentMessages),
+    '',
+    `QUESTION: """${question}"""`,
+  ].join('\n');
+
+  try {
+    const res = await getChatCompletionWithMessages(
+      [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+      { model: AI_TASK_MODELS.telegramTaskReconcile, max_tokens: 700 },
+    );
+    return res.content?.trim() || 'Sorry, I could not produce an answer.';
+  } catch (err) {
+    logger.error('[TELEGRAM_TASKS] answer LLM call failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return '⚠️ Sorry, I hit an error answering that. Try again in a moment.';
+  }
+}

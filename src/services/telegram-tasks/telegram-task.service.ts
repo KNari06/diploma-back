@@ -11,6 +11,7 @@ import { logger } from '@/utils/core/logger';
 import {
   type Action,
   type AiTaskView,
+  answerTaskQuestion,
   batchAnalyze,
   reconcile,
 } from './telegram-task-ai.service';
@@ -40,6 +41,28 @@ async function send(chatId: number, text: string): Promise<void> {
   } catch (err) {
     logger.warn('[TELEGRAM_TASKS] send failed', { chatId, error: err instanceof Error ? err.message : String(err) });
   }
+}
+
+/**
+ * Q&A mode: answer a question addressed to the bot, over THIS chat's open tasks.
+ * Read-only — never creates/closes tasks. Posts the answer back to the group.
+ */
+async function answerQuestion(m: InboundMessage): Promise<void> {
+  // Strip a leading/!inline @mention of the bot so the model sees a clean question.
+  const uname = env.TELEGRAM_BOT_USERNAME?.replace(/^@/, '');
+  const question = (uname ? m.text.replace(new RegExp(`@${uname}`, 'ig'), '') : m.text).trim();
+  if (!question) {
+    await send(m.chatId, escapeHtml('Ask me about the tasks — e.g. "what\'s open?", "what does @dara have left?", or "what can you do?".'));
+    return;
+  }
+
+  const [openTasks, recent] = await Promise.all([
+    db.openTasks(m.chatId),
+    db.recentMessages(m.chatId, RECENT_MSG_WINDOW, Number.MAX_SAFE_INTEGER),
+  ]);
+
+  const answer = await answerTaskQuestion(question, openTasks.map(toAiView), recent);
+  await send(m.chatId, escapeHtml(answer));
 }
 
 /** Apply a validated action list to the db. Returns what changed. */
@@ -88,6 +111,7 @@ export interface InboundMessage {
   authorName: string | undefined; // display/first name fallback
   isEdit: boolean;
   replyToMsgId: number | undefined;
+  addressedToBot: boolean; // @mention of the bot or reply to a bot message → Q&A mode
 }
 
 /**
@@ -102,6 +126,21 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
   const author = m.authorUsername ? `@${m.authorUsername}` : m.authorName;
 
   const msgRowId = await db.logMessage(m.chatId, m.msgId, author, text);
+
+  // Q&A mode: the message is addressed to the bot (@mention or reply-to-bot).
+  // Answer a question over THIS chat's tasks instead of reconciling. Never
+  // creates/closes tasks — read-only.
+  if (m.addressedToBot && !m.isEdit) {
+    try {
+      await answerQuestion(m);
+    } catch (err) {
+      logger.error('[TELEGRAM_TASKS] query answer failed', {
+        chatId: m.chatId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
 
   try {
     const [contextTasks, totalOpen, recent, replyTaskIds] = await Promise.all([

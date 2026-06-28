@@ -32,9 +32,24 @@ interface TgMessage {
   caption?: string;
   chat?: { id: number };
   from?: TgUser;
-  reply_to_message?: { message_id: number };
+  reply_to_message?: { message_id: number; from?: TgUser };
 }
 interface TgUpdate { message?: TgMessage; edited_message?: TgMessage }
+
+/** True when `text` @mentions the given bot username (word-boundary aware so
+ *  `@qait_task` matches but `@qait_tasker` does not). Exported for testing. */
+export function mentionsBot(text: string, botUsername: string | undefined): boolean {
+  const uname = botUsername?.replace(/^@/, '').toLowerCase();
+  if (!uname) return false;
+  return new RegExp(`@${uname}(?![a-z0-9_])`, 'i').test(text);
+}
+
+/** True when the message is addressed to the bot — either a reply to one of the
+ *  bot's own messages, or an @mention of the bot's username. Drives Q&A mode. */
+function isAddressedToBot(msg: TgMessage, text: string): boolean {
+  if (msg.reply_to_message?.from?.is_bot) return true;
+  return mentionsBot(text, env.TELEGRAM_BOT_USERNAME);
+}
 
 /** Map a Telegram message object to our inbound shape, or null if not usable. */
 function toInbound(msg: TgMessage | undefined, isEdit: boolean): InboundMessage | null {
@@ -50,6 +65,7 @@ function toInbound(msg: TgMessage | undefined, isEdit: boolean): InboundMessage 
     authorName: msg.from?.first_name,
     isEdit,
     replyToMsgId: msg.reply_to_message?.message_id,
+    addressedToBot: isAddressedToBot(msg, text),
   };
 }
 

@@ -232,6 +232,10 @@ const envSchema = z.object({
   TELEGRAM_TASK_ALIASES: z.string().optional(),
   // Local hour (Asia/Almaty, 0-23) to run the morning batch + status check.
   TELEGRAM_TASK_BATCH_HOUR: z.string().transform(Number).default('10'),
+  // Bot's @username (without @), e.g. "qait_task". Lets the bot recognise when a
+  // message @mentions it and switch to Q&A mode. Reply-to-bot is detected without
+  // this; set it so plain @mentions also work.
+  TELEGRAM_BOT_USERNAME: z.string().optional(),
 
   // Feature Flags - B2B Organization/Members
   // Staged rollout: enable reads first, then writes, then credits cutover
