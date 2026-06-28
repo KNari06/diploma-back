@@ -16,6 +16,8 @@ import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
 import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
 import { AiCallLogsRetentionJob } from '@/jobs/ai-call-logs-retention.job';
 import { ExpiringPlansJob } from '@/jobs/expiring-plans.job';
+import { TelegramTaskSweepJob } from '@/jobs/telegram-task-sweep.job';
+import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 
 initLogBridge();
@@ -61,6 +63,25 @@ async function main(): Promise<void> {
     logger.error('[SCHEDULER_DAILY] Expiring-plans reminder failed', {
       error: error instanceof Error ? error.message : String(error),
     });
+  }
+
+  // QAIT Tasker morning batch. Here we call tick() directly (bypassing the
+  // in-process hour-gate): in this Cloud Run Job path the firing TIME is owned
+  // by Cloud Scheduler, not the gate. NOTE: this Job runs at 03:00 UTC = 08:00
+  // Almaty; the intended batch time is 10:00 Almaty (05:00 UTC). To match, give
+  // QAIT Tasker its OWN Cloud Scheduler trigger at 05:00 UTC, or accept 08:00.
+  // The TELEGRAM_TASK_BATCH_HOUR gate governs only the persistent scheduler
+  // (local docker-compose + worker leader-bundle). Feature-gated either way.
+  if (env.TELEGRAM_TASKS_ENABLED) {
+    try {
+      const swept = await TelegramTaskSweepJob.tick();
+      logger.info('[SCHEDULER_DAILY] QAIT Tasker sweep done', swept);
+    } catch (error) {
+      failed = true;
+      logger.error('[SCHEDULER_DAILY] QAIT Tasker sweep failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   if (failed) {

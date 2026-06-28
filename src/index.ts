@@ -57,6 +57,7 @@ import stripeRoutes from '@/api/stripe/stripe.routes';
 import { handleWebhook } from '@/api/stripe/stripe.controller';
 import { asyncHandler } from '@/utils/core/error-handler';
 import supportRoutes from '@/api/support/support.routes';
+import telegramTasksRoutes from '@/api/telegram-tasks/telegram-webhook.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
 import waitlistRoutes from '@/api/waitlist/waitlist.route';
@@ -263,6 +264,10 @@ app.post(
 app.use(`/api/${env.API_VERSION}/git-integrations/webhook`, express.raw({ type: 'application/json', limit: '10mb' }));
 // Fallback when reverse proxy strips /api (e.g. nginx proxy_pass with trailing slash)
 app.use(`/${env.API_VERSION}/git-integrations/webhook`, express.raw({ type: 'application/json', limit: '10mb' }));
+// QAIT Tasker Telegram webhook needs the raw body too (the controller JSON-parses
+// the Buffer). Public route (no auth) — auth is Telegram's secret-token header.
+app.use(`/api/${env.API_VERSION}/telegram-tasks/webhook`, express.raw({ type: 'application/json', limit: '1mb' }));
+app.use(`/api/${env.API_VERSION}/telegram-tasks`, telegramTasksRoutes);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
