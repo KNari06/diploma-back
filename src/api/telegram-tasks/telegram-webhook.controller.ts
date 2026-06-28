@@ -1,7 +1,20 @@
 import { env } from '@/config/environment/env';
 import { ingestMessage, type InboundMessage } from '@/services/telegram-tasks/telegram-task.service';
 import { logger } from '@/utils/core/logger';
+import { timingSafeEqual } from 'crypto';
 import type { Request, Response } from 'express';
+
+/** Constant-time secret compare. timingSafeEqual throws on length mismatch, so
+ *  gate on length first (the length check itself is not secret-dependent — the
+ *  configured secret's length is fixed). Defends against a timing side-channel
+ *  even though the secret is high-entropy and a remote attack is impractical. */
+function secretMatches(provided: string | undefined, expected: string | undefined): boolean {
+  if (!expected || !provided) return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
 
 /**
  * Telegram webhook receiver for QAIT Tasker.
@@ -48,19 +61,27 @@ export function handleTelegramWebhook(req: Request, res: Response): void {
     res.sendStatus(200); // silently accept-and-ignore when disabled
     return;
   }
-  const secret = req.header('X-Telegram-Bot-Api-Secret-Token');
-  if (!env.TELEGRAM_WEBHOOK_SECRET || secret !== env.TELEGRAM_WEBHOOK_SECRET) {
+  if (!secretMatches(req.header('X-Telegram-Bot-Api-Secret-Token'), env.TELEGRAM_WEBHOOK_SECRET)) {
     res.sendStatus(401);
     return;
   }
 
-  // Parse the raw body (this path uses express.raw, so req.body is a Buffer).
+  // This path is mounted with express.raw, so req.body MUST be a Buffer. If it
+  // isn't, the raw-body middleware didn't run (misconfiguration) — fail LOUD
+  // rather than silently accept-and-ignore, which would mask zero-ingestion.
+  if (!Buffer.isBuffer(req.body)) {
+    logger.error('[TELEGRAM_TASKS] webhook body is not a Buffer — raw parser not applied to this path', {
+      bodyType: typeof req.body,
+    });
+    res.sendStatus(500);
+    return;
+  }
+
   let update: TgUpdate;
   try {
-    const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body);
-    update = JSON.parse(raw) as TgUpdate;
+    update = JSON.parse(req.body.toString('utf8')) as TgUpdate;
   } catch {
-    res.sendStatus(200); // malformed → ack so Telegram doesn't retry forever
+    res.sendStatus(200); // malformed JSON → ack so Telegram doesn't retry forever
     return;
   }
 

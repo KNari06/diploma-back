@@ -64,7 +64,13 @@ async function applyActions(
       case 'close': await db.closeTask(a.task_id, a.reason); closed.push(a.task_id); break;
       case 'reopen': await db.reopenTask(a.task_id); break;
       case 'update':
-        await db.updateTask(a.task_id, { ...a, ...(a.owner !== undefined ? { owner: canonicalOwner(a.owner) } : {}) });
+        // Pass ONLY the patchable fields (not kind/task_id) so updateTask can't
+        // be polluted by future action properties. owner is alias-canonicalized.
+        await db.updateTask(a.task_id, {
+          project: a.project,
+          title: a.title,
+          owner: a.owner !== undefined ? canonicalOwner(a.owner) : undefined,
+        });
         await db.touchActivity(a.task_id);
         break;
       case 'progress': await db.setProgress(a.task_id, a.state, a.note); progressed.push(a.task_id); break;
@@ -104,6 +110,15 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
       msgRowId ? db.recentMessages(m.chatId, RECENT_MSG_WINDOW, msgRowId) : Promise.resolve([]),
       m.replyToMsgId ? db.openTaskIdsBySourceMsg(m.chatId, m.replyToMsgId) : Promise.resolve([]),
     ]);
+
+    // Cheap cost guard: with NO open tasks in the chat, the only action the model
+    // could take is `create`. A short, single-line, non-#task message is almost
+    // never a real task assignment (digests are long + multi-line), so skip the
+    // LLM call entirely — this drops the dominant chatter case in a quiet chat
+    // without risking a missed closure (there's nothing open to close). The
+    // message is still logged above, so it joins the next batch's context.
+    const looksActionable = m.text.includes('\n') || m.text.trim().length > 15 || /#task/i.test(m.text);
+    if (totalOpen === 0 && !looksActionable) return;
 
     const actions = await reconcile({
       text,
