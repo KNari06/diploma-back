@@ -38,24 +38,28 @@ function toAiView(t: TelegramTaskRow): AiTaskView {
     progress: t.progress,
     progress_note: t.progress_note,
     has_deadline: !!t.due_text || !!t.due_at,
+    link: taskUrl(t.chat_id, t.source_msg_id),
   };
 }
 
 /**
- * A deep link to the message a task was created from, as an HTML <a>. Telegram
- * `t.me/c/<id>/<msg>` links resolve only inside supergroups/channels, whose
- * chat_id is the large negative `-100…` form; the internal id drops that prefix.
- * For a normal group / DM (no -100 prefix) or a missing source message we can't
- * build a working link, so we return the plain (escaped) label unlinked.
+ * The t.me deep-link URL to the message a task was created from, or null.
+ * `t.me/c/<id>/<msg>` resolves only inside supergroups/channels, whose chat_id
+ * is the large negative `-100…` form; the internal id drops that prefix. Normal
+ * group / DM (no -100) or a missing source message → null (no working link).
  */
+export function taskUrl(chatId: number, sourceMsgId: number | null): string | null {
+  const s = String(chatId);
+  if (sourceMsgId && s.startsWith('-100')) return `https://t.me/c/${s.slice(4)}/${sourceMsgId}`;
+  return null;
+}
+
+/** A deep link as an HTML <a> wrapping `label` (escaped), or the plain escaped
+ *  label when no link can be built. */
 export function taskLink(chatId: number, sourceMsgId: number | null, label: string): string {
   const safe = escapeHtml(label);
-  const s = String(chatId);
-  if (sourceMsgId && s.startsWith('-100')) {
-    const internal = s.slice(4); // strip "-100"
-    return `<a href="https://t.me/c/${internal}/${sourceMsgId}">${safe}</a>`;
-  }
-  return safe;
+  const url = taskUrl(chatId, sourceMsgId);
+  return url ? `<a href="${url}">${safe}</a>` : safe;
 }
 
 /** Best-effort outbound post to the group (never throws into the caller). */
@@ -73,6 +77,33 @@ async function send(chatId: number, text: string, replyTo?: number): Promise<voi
     await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, safe, 'HTML', replyTo ? { replyToMessageId: replyTo } : undefined);
   } catch (err) {
     logger.warn('[TELEGRAM_TASKS] send failed', { chatId, error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+/** Send LLM-authored rich text (may contain <a>/<b>/<i>). Telegram rejects the
+ *  whole message if the HTML is malformed, so on failure we retry once with all
+ *  tags stripped + escaped — the user still gets the answer, just unlinked,
+ *  instead of silence. */
+async function sendRich(chatId: number, html: string, replyTo?: number): Promise<void> {
+  if (!env.TELEGRAM_BOT_TOKEN) return;
+  const capped = html.length > TG_MAX_CHARS ? `${html.slice(0, TG_MAX_CHARS)}…` : html;
+  try {
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, capped, 'HTML', replyTo ? { replyToMessageId: replyTo } : undefined);
+  } catch (err) {
+    logger.warn('[TELEGRAM_TASKS] rich send failed, retrying as plain text', {
+      chatId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    // Strip tags, then UNESCAPE existing entities before re-escaping once — else
+    // an already-escaped "&amp;" would become "&amp;amp;" (double-escape).
+    const stripped = capped.replace(/<[^>]+>/g, '');
+    const unescaped = stripped
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, '&'); // & last, so "&amp;lt;" → "&lt;" → "<" doesn't happen
+    await send(chatId, escapeHtml(unescaped), replyTo);
   }
 }
 
@@ -307,11 +338,12 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
 
     // Link the bot's message back to the user's so it's clear what it answers.
     if (wantsReply && bits.length) {
-      // Both an answer AND changes: post the answer, then the change ack.
-      await send(m.chatId, escapeHtml(reply!), m.msgId);
+      // Both an answer AND changes: post the answer (rich, may contain links),
+      // then the change ack.
+      await sendRich(m.chatId, reply!, m.msgId);
       await send(m.chatId, bits.join(' · '), m.msgId);
     } else if (wantsReply) {
-      await send(m.chatId, escapeHtml(reply!), m.msgId);
+      await sendRich(m.chatId, reply!, m.msgId);
     } else if (bits.length) {
       await send(m.chatId, bits.join(' · '), m.msgId);
     }

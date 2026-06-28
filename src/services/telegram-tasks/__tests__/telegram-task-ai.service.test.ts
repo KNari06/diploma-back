@@ -19,6 +19,7 @@ const task = (id: string, over: Partial<AiTaskView> = {}): AiTaskView => ({
   progress: 'none',
   progress_note: null,
   has_deadline: false,
+  link: null,
   ...over,
 });
 

@@ -38,6 +38,21 @@ interface TgMessage {
   // document image (screenshot sent as file) carries its own mime.
   photo?: TgPhotoSize[];
   document?: { file_id: string; mime_type?: string };
+  // Set when this message is part of an album (multiple media in one post).
+  media_group_id?: string;
+}
+
+// Albums arrive as N separate messages sharing one media_group_id; the caption
+// is only on the first. Process just the first per group to avoid N vision
+// calls + N duplicate reconciles. Tiny bounded LRU of recently-seen group ids.
+const seenAlbums = new Set<string>();
+const SEEN_ALBUMS_CAP = 500;
+function isDuplicateAlbumPart(groupId: string | undefined): boolean {
+  if (!groupId) return false;
+  if (seenAlbums.has(groupId)) return true;
+  if (seenAlbums.size >= SEEN_ALBUMS_CAP) seenAlbums.clear();
+  seenAlbums.add(groupId);
+  return false;
 }
 interface TgUpdate { message?: TgMessage; edited_message?: TgMessage }
 
@@ -95,6 +110,9 @@ function imageFileId(msg: TgMessage): string | undefined {
 function toInbound(msg: TgMessage | undefined, isEdit: boolean): InboundMessage | null {
   if (!msg || !msg.chat) return null;
   if (msg.from?.is_bot) return null; // never ingest bot messages (incl. our own)
+  // Skip the 2nd+ photos of an album — only the first (with the caption) is
+  // processed, so one album = one reconcile, not N. Edits never carry a new group.
+  if (!isEdit && isDuplicateAlbumPart(msg.media_group_id)) return null;
   const text = msg.text ?? msg.caption ?? '';
   const imageFile = imageFileId(msg);
   // Usable if it has text OR an image. A caption-less photo was previously

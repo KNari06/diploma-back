@@ -3,7 +3,17 @@
 jest.mock('@/services/ai/core/openai.service', () => ({ getChatCompletionWithMessages: jest.fn() }));
 jest.mock('../db/telegram-task.db', () => ({}));
 
-import { taskLink } from '../telegram-task.service';
+import { taskLink, taskUrl } from '../telegram-task.service';
+
+describe('taskUrl', () => {
+  it('builds a t.me/c url for a supergroup', () => {
+    expect(taskUrl(-1001234567890, 42)).toBe('https://t.me/c/1234567890/42');
+  });
+  it('is null for a non-supergroup chat or missing source message', () => {
+    expect(taskUrl(123456, 42)).toBeNull();
+    expect(taskUrl(-1001234567890, null)).toBeNull();
+  });
+});
 
 describe('taskLink', () => {
   it('builds a t.me/c link for a supergroup, stripping the -100 prefix', () => {
