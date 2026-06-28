@@ -409,7 +409,9 @@ export async function runMorningBatch(chatId: number): Promise<void> {
     (byOwner.get(k) ?? byOwner.set(k, []).get(k)!).push(t);
   }
 
-  const lines = ['🌅 <b>Morning status check — I couldn\'t tell where these stand:</b>'];
+  const lines = ['🌅 <b>Morning check.</b> For each task below, please reply with:'];
+  lines.push('  1️⃣ <b>when</b> you expect it done (a date/ETA)');
+  lines.push('  2️⃣ any <b>blockers</b> — or "no blockers"');
   for (const [owner, list] of byOwner) {
     lines.push('');
     lines.push(owner === 'unassigned' ? '(unassigned)' : escapeHtml(owner));
@@ -420,7 +422,7 @@ export async function runMorningBatch(chatId: number): Promise<void> {
     lines.push(`<i>(${known.length} other task(s) have a known status — not asking about those.)</i>`);
   }
   lines.push('');
-  lines.push('Reply with the status: done / in progress / blocked / needs investigation.');
+  lines.push('<i>Reply (per task or in one go) with the date + blockers; or just say "done" if it\'s finished.</i>');
   await send(chatId, lines.join('\n'));
 }
 
