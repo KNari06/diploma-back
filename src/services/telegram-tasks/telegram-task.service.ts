@@ -94,8 +94,16 @@ async function sendRich(chatId: number, html: string, replyTo?: number): Promise
       chatId,
       error: err instanceof Error ? err.message : String(err),
     });
-    const plain = escapeHtml(capped.replace(/<[^>]+>/g, ''));
-    await send(chatId, plain, replyTo);
+    // Strip tags, then UNESCAPE existing entities before re-escaping once — else
+    // an already-escaped "&amp;" would become "&amp;amp;" (double-escape).
+    const stripped = capped.replace(/<[^>]+>/g, '');
+    const unescaped = stripped
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, '&'); // & last, so "&amp;lt;" → "&lt;" → "<" doesn't happen
+    await send(chatId, escapeHtml(unescaped), replyTo);
   }
 }
 
