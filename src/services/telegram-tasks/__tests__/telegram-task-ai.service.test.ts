@@ -140,6 +140,20 @@ describe('validateActions', () => {
     });
   });
 
+  describe('clarify', () => {
+    const many = [task('c1'), task('c2'), task('c3')];
+
+    it('keeps a clarify with 2+ real candidate ids (deduped)', () => {
+      const out = validateActions([{ kind: 'clarify', candidate_ids: ['c1', 'c2', 'c1'] }], many, 'r');
+      expect(out).toEqual([{ kind: 'clarify', candidate_ids: ['c1', 'c2'] }]);
+    });
+
+    it('drops a clarify with fewer than 2 valid candidates', () => {
+      expect(validateActions([{ kind: 'clarify', candidate_ids: ['c1'] }], many, 'r')).toEqual([]);
+      expect(validateActions([{ kind: 'clarify', candidate_ids: ['ghost', 'nope'] }], many, 'r')).toEqual([]);
+    });
+  });
+
   describe('set_deadline', () => {
     const owned = [task('t1', { owner: '@ndarkhans' })];
 

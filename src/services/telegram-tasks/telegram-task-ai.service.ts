@@ -42,6 +42,11 @@ export type Action =
   // A deadline was stated for a task. due_text = the user's words; due_at = an
   // absolute ISO timestamp the model resolved (or null if it couldn't).
   | { kind: 'set_deadline'; task_id: string; due_text: string; due_at: string | null }
+  // The message clearly intends a task change but it is AMBIGUOUS which open task
+  // (2+ plausible candidates, no reply to disambiguate). Instead of guessing, the
+  // bot asks the user to reply to the specific task. candidate_ids are the tasks
+  // it was torn between (for a helpful prompt).
+  | { kind: 'clarify'; candidate_ids: string[] }
   | { kind: 'touch'; task_id: string };
 
 export interface ReconcileContext {
@@ -78,7 +83,8 @@ const RECONCILE_TOOL: ChatCompletionTool = {
           items: {
             type: 'object',
             properties: {
-              kind: { type: 'string', enum: ['create', 'close', 'reopen', 'update', 'progress', 'claim', 'set_deadline', 'touch'] },
+              kind: { type: 'string', enum: ['create', 'close', 'reopen', 'update', 'progress', 'claim', 'set_deadline', 'clarify', 'touch'] },
+              candidate_ids: { type: ['array', 'null'], items: { type: 'string' }, description: 'For clarify: the open task ids the message could plausibly refer to (2+).' },
               task_id: { type: ['string', 'null'], description: 'Existing task id (uuid), for close/reopen/update/progress/claim/set_deadline/touch.' },
               project: { type: ['string', 'null'], description: 'For create/update.' },
               title: { type: ['string', 'null'], description: 'For create/update.' },
@@ -166,6 +172,13 @@ function buildSystem(): string {
     '          that resolved to an absolute ISO 8601 timestamp using the NOW value',
     '          given below (null if it truly cannot be turned into a date). This',
     '          also implies the task is in progress.',
+    'clarify — the message clearly intends a task change (close/progress/deadline/',
+    '          claim) BUT you cannot tell WHICH open task it means: 2+ plausible',
+    '          candidates and no reply to disambiguate. Do NOT guess. Emit a single',
+    '          clarify with candidate_ids = the tasks you were torn between; the',
+    '          bot will ask the user to reply to the specific one. Use this ONLY',
+    '          for a real action under genuine ambiguity — never for chatter, and',
+    '          never when a reply already pins the task.',
     'touch   — the message refers to a SPECIFIC open task but carries no real',
     '          owner-status ("is this actual?", "what is the plan?", "this is',
     '          done?", a discussion of how to do it). Resets the staleness clock',
@@ -356,6 +369,14 @@ export function validateActions(
         ...(hasState ? { initialState: a.state as ProgressState } : {}),
         ...(hasState && typeof a.note === 'string' ? { initialNote: a.note } : {}),
       });
+      continue;
+    }
+    if (kind === 'clarify') {
+      // candidate_ids must be 2+ real open tasks for the ask to make sense.
+      const ids = Array.isArray(a.candidate_ids)
+        ? (a.candidate_ids as unknown[]).filter((x): x is string => typeof x === 'string' && openIds.has(x))
+        : [];
+      if (ids.length >= 2) out.push({ kind: 'clarify', candidate_ids: [...new Set(ids)] });
       continue;
     }
     if (typeof a.task_id !== 'string' || !openIds.has(a.task_id)) continue;

@@ -128,6 +128,23 @@ async function applyActions(
         await db.setDeadline(a.task_id, a.due_text, a.due_at);
         deadlines.push(a.task_id);
         break;
+      case 'clarify': {
+        // Ambiguous which task — ask the user to reply to the specific one rather
+        // than guess. List the candidates so they can pick. The user's reply to a
+        // task line then resolves deterministically via source_msg_id.
+        const tasks = await Promise.all(a.candidate_ids.map((id) => db.getTask(id)));
+        const lines = tasks
+          .filter((t): t is NonNullable<typeof t> => !!t)
+          .map((t) => `• ${t.project ? `[${escapeHtml(t.project)}] ` : ''}${escapeHtml(t.title)}`);
+        if (lines.length >= 2) {
+          await send(
+            chatId,
+            `🤔 Which task did you mean? Reply to the specific one:\n${lines.join('\n')}`,
+          );
+          asked = true;
+        }
+        break;
+      }
       case 'touch': await db.touchActivity(a.task_id); break;
     }
   }
