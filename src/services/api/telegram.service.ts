@@ -131,7 +131,7 @@ export async function sendMessage(
   chatId: string | number,
   text: string,
   parseMode: 'HTML' | 'Markdown' | 'MarkdownV2' = 'HTML',
-  options?: { disableLinkPreview?: boolean },
+  options?: { disableLinkPreview?: boolean; replyToMessageId?: number },
 ): Promise<TelegramMessage> {
   try {
     logger.info('[TELEGRAM_SERVICE] Sending message', { chatId, textLength: text.length });
@@ -145,6 +145,12 @@ export async function sendMessage(
         parse_mode: parseMode,
         ...(options?.disableLinkPreview && {
           link_preview_options: { is_disabled: true },
+        }),
+        // reply_parameters is the current Bot API field (reply_to_message_id is
+        // the legacy form Telegram still accepts); allow_sending_without_reply
+        // so a deleted target doesn't fail the whole send.
+        ...(options?.replyToMessageId && {
+          reply_parameters: { message_id: options.replyToMessageId, allow_sending_without_reply: true },
         }),
       }),
     });

@@ -28,6 +28,7 @@ export interface AiTaskView {
   owner: string | null;
   progress: 'none' | ProgressState;
   progress_note: string | null;
+  has_deadline: boolean; // true if due_text/due_at already set — don't re-ask
 }
 
 export type Action =
@@ -36,6 +37,11 @@ export type Action =
   | { kind: 'reopen'; task_id: string }
   | { kind: 'update'; task_id: string; project?: string | null; title?: string; owner?: string | null }
   | { kind: 'progress'; task_id: string; state: ProgressState; note: string }
+  // The author took on a task but stated NO deadline → bot should ask "when?".
+  | { kind: 'claim'; task_id: string }
+  // A deadline was stated for a task. due_text = the user's words; due_at = an
+  // absolute ISO timestamp the model resolved (or null if it couldn't).
+  | { kind: 'set_deadline'; task_id: string; due_text: string; due_at: string | null }
   | { kind: 'touch'; task_id: string };
 
 export interface ReconcileContext {
@@ -72,14 +78,16 @@ const RECONCILE_TOOL: ChatCompletionTool = {
           items: {
             type: 'object',
             properties: {
-              kind: { type: 'string', enum: ['create', 'close', 'reopen', 'update', 'progress', 'touch'] },
-              task_id: { type: ['string', 'null'], description: 'Existing task id (uuid), for close/reopen/update/progress/touch.' },
+              kind: { type: 'string', enum: ['create', 'close', 'reopen', 'update', 'progress', 'claim', 'set_deadline', 'touch'] },
+              task_id: { type: ['string', 'null'], description: 'Existing task id (uuid), for close/reopen/update/progress/claim/set_deadline/touch.' },
               project: { type: ['string', 'null'], description: 'For create/update.' },
               title: { type: ['string', 'null'], description: 'For create/update.' },
               owner: { type: ['string', 'null'], description: 'For create/update: @username verbatim.' },
               reason: { type: ['string', 'null'], description: 'For close: the phrase that signalled done.' },
               state: { type: ['string', 'null'], enum: ['in_progress', 'blocked', 'needs_investigation', null], description: 'For progress (required) OR create (optional initial status).' },
               note: { type: ['string', 'null'], description: 'Status note for progress/create, e.g. "turns out hard, 1-2 days".' },
+              due_text: { type: ['string', 'null'], description: 'For set_deadline: the deadline in the user\'s own words, e.g. "к пятнице", "by Friday", "2-3 days".' },
+              due_at: { type: ['string', 'null'], description: 'For set_deadline: that deadline resolved to an absolute ISO 8601 timestamp using NOW given in the prompt; null if it cannot be resolved to a date.' },
             },
             required: ['kind'],
           },
@@ -146,6 +154,18 @@ function buildSystem(): string {
     '              question, or anyone who is NOT the owner commenting',
     '          When in doubt between progress and touch, choose touch. When in',
     '          doubt between touch and nothing, choose nothing.',
+    'claim   — the author says they are TAKING ON / will do a specific open task',
+    '          ("I\'ll take this", "беру", "I\'ll do the video task", "let me handle',
+    '          X") but gives NO deadline, AND that task has no deadline yet',
+    '          (has_deadline=false). Emit claim{task_id}; the bot will ask "when?".',
+    '          If the same message ALSO states a deadline, do NOT claim — emit',
+    '          set_deadline instead. If has_deadline is already true, do not claim.',
+    'set_deadline — a deadline/ETA is stated for a specific task ("by Friday",',
+    '          "к пятнице", "2-3 days", "до конца недели", or answering the bot\'s',
+    '          "when will it be ready?"). due_text = their exact words; due_at =',
+    '          that resolved to an absolute ISO 8601 timestamp using the NOW value',
+    '          given below (null if it truly cannot be turned into a date). This',
+    '          also implies the task is in progress.',
     'touch   — the message refers to a SPECIFIC open task but carries no real',
     '          owner-status ("is this actual?", "what is the plan?", "this is',
     '          done?", a discussion of how to do it). Resets the staleness clock',
@@ -181,6 +201,9 @@ function buildSystem(): string {
     '• "надо прям в точ точ как в логе писать" + a log screenshot  → (no actions —',
     '  an instruction about HOW to do it, not a work status)',
     '• "Chat session not found" / "типа"  → (no actions — a fact/observation)',
+    '• owner of an open deadline-less task: "беру это на себя"  → claim{task_id}',
+    '• "сделаю до пятницы" / answering the bot\'s "when?": "by Friday"  →',
+    '  set_deadline{task_id, due_text:"by Friday", due_at:"<resolved ISO>"}',
     '',
     'IF SOMEONE ASKS WHAT YOU CAN DO (your capabilities), put this in `reply`:',
     'You track the group\'s tasks automatically — you read daily "Priorities"',
@@ -199,7 +222,8 @@ function renderOpenTasks(openTasks: AiTaskView[]): string {
       (t) =>
         `- id=${t.id}: ${t.project ? `[${t.project}] ` : ''}${t.title}` +
         `${t.owner ? ` (owner ${t.owner})` : ' (unassigned)'}` +
-        `${t.progress !== 'none' ? ` [last status: ${t.progress}${t.progress_note ? ` — ${t.progress_note}` : ''}]` : ''}`,
+        `${t.progress !== 'none' ? ` [last status: ${t.progress}${t.progress_note ? ` — ${t.progress_note}` : ''}]` : ''}` +
+        `${t.has_deadline ? ' [has deadline]' : ' [no deadline]'}`,
     )
     .join('\n');
 }
@@ -266,6 +290,8 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
     : '';
 
   const userBlock = [
+    `NOW: ${new Date().toISOString()} (resolve relative deadlines like "Friday"/"к пятнице" against this)`,
+    '',
     'RECENT CHAT (oldest first, for resolving references like "the first one"):',
     renderRecent(ctx.recentMessages),
     '',
@@ -354,6 +380,21 @@ export function validateActions(
           task_id: a.task_id,
           state: a.state as ProgressState,
           note: typeof a.note === 'string' ? a.note : fallbackReason,
+        });
+      } else {
+        out.push({ kind: 'touch', task_id: a.task_id });
+      }
+    } else if (kind === 'claim') {
+      // Taking on a task → only the owner/manager; otherwise just a touch.
+      if (mayMutate(a.task_id)) out.push({ kind: 'claim', task_id: a.task_id });
+      else out.push({ kind: 'touch', task_id: a.task_id });
+    } else if (kind === 'set_deadline' && typeof a.due_text === 'string' && a.due_text.trim()) {
+      if (mayMutate(a.task_id)) {
+        out.push({
+          kind: 'set_deadline',
+          task_id: a.task_id,
+          due_text: a.due_text.trim(),
+          due_at: typeof a.due_at === 'string' && a.due_at.trim() ? a.due_at.trim() : null,
         });
       } else {
         out.push({ kind: 'touch', task_id: a.task_id });

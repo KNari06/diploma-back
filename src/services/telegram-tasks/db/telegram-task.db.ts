@@ -22,10 +22,13 @@ export interface TelegramTaskRow {
   last_batch_at: string | null;
   closed_at: string | null;
   closed_reason: string | null;
+  due_at: string | null;
+  due_text: string | null;
+  awaiting_deadline_msg_id: number | null;
 }
 
 const TASK_COLS =
-  'id, chat_id, project, title, owner, status, progress, progress_note, source_msg_id, created_at, last_activity_at, last_batch_at, closed_at, closed_reason';
+  'id, chat_id, project, title, owner, status, progress, progress_note, source_msg_id, created_at, last_activity_at, last_batch_at, closed_at, closed_reason, due_at, due_text, awaiting_deadline_msg_id';
 
 // ── messages ─────────────────────────────────────────────────────────────────
 
@@ -114,6 +117,16 @@ export async function createTask(t: {
   return data as TelegramTaskRow;
 }
 
+export async function getTask(id: string): Promise<TelegramTaskRow | null> {
+  const { data, error } = await supabaseAdmin
+    .from('telegram_tasks')
+    .select(TASK_COLS)
+    .eq('id', id)
+    .maybeSingle();
+  if (error || !data) return null;
+  return data as TelegramTaskRow;
+}
+
 export async function openTasks(chatId: number): Promise<TelegramTaskRow[]> {
   const { data, error } = await supabaseAdmin
     .from('telegram_tasks')
@@ -185,6 +198,45 @@ export async function setProgress(id: string, progress: ProgressState, note: str
     .update({ progress, progress_note: note ? note.slice(0, 500) : null, last_activity_at: new Date().toISOString() })
     .eq('id', id)
     .eq('status', 'open');
+}
+
+/** Mark a task as awaiting a deadline answer (the bot's "when?" question id). */
+export async function setAwaitingDeadline(id: string, questionMsgId: number): Promise<void> {
+  await supabaseAdmin
+    .from('telegram_tasks')
+    .update({ awaiting_deadline_msg_id: questionMsgId, progress: 'in_progress', last_activity_at: new Date().toISOString() })
+    .eq('id', id)
+    .eq('status', 'open');
+}
+
+/** Record a deadline (parsed + original words); clears the awaiting flag and
+ *  marks in_progress (a stated deadline implies work is underway). */
+export async function setDeadline(id: string, dueText: string, dueAt: string | null): Promise<void> {
+  await supabaseAdmin
+    .from('telegram_tasks')
+    .update({
+      due_text: dueText.slice(0, 200),
+      due_at: dueAt,
+      awaiting_deadline_msg_id: null,
+      progress: 'in_progress',
+      last_activity_at: new Date().toISOString(),
+    })
+    .eq('id', id)
+    .eq('status', 'open');
+}
+
+/** Find an open task in this chat whose pending "when?" question is `questionMsgId`
+ *  — i.e. the user replied to the bot's deadline question. Deterministic link. */
+export async function findTaskAwaitingDeadline(chatId: number, questionMsgId: number): Promise<string | null> {
+  const { data, error } = await supabaseAdmin
+    .from('telegram_tasks')
+    .select('id')
+    .eq('chat_id', chatId)
+    .eq('awaiting_deadline_msg_id', questionMsgId)
+    .eq('status', 'open')
+    .maybeSingle();
+  if (error || !data) return null;
+  return (data as { id: string }).id;
 }
 
 export async function closeTask(id: string, reason: string): Promise<void> {

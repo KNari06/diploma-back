@@ -18,6 +18,7 @@ const task = (id: string, over: Partial<AiTaskView> = {}): AiTaskView => ({
   owner: null,
   progress: 'none',
   progress_note: null,
+  has_deadline: false,
   ...over,
 });
 
@@ -129,6 +130,44 @@ describe('validateActions', () => {
         'r',
       );
       expect(out[0]).toMatchObject({ kind: 'progress', state: 'blocked' });
+    });
+
+    it('owner claim survives; non-owner claim downgrades to touch', () => {
+      const ownerOut = validateActions([{ kind: 'claim', task_id: 't1' }], owned, 'r', { owner: '@ndarkhans', isManager: false });
+      expect(ownerOut).toEqual([{ kind: 'claim', task_id: 't1' }]);
+      const strangerOut = validateActions([{ kind: 'claim', task_id: 't1' }], owned, 'r', { owner: '@x', isManager: false });
+      expect(strangerOut).toEqual([{ kind: 'touch', task_id: 't1' }]);
+    });
+  });
+
+  describe('set_deadline', () => {
+    const owned = [task('t1', { owner: '@ndarkhans' })];
+
+    it('keeps due_text + due_at from the owner', () => {
+      const out = validateActions(
+        [{ kind: 'set_deadline', task_id: 't1', due_text: 'by Friday', due_at: '2026-07-03T09:00:00Z' }],
+        owned,
+        'r',
+        { owner: '@ndarkhans', isManager: false },
+      );
+      expect(out[0]).toEqual({ kind: 'set_deadline', task_id: 't1', due_text: 'by Friday', due_at: '2026-07-03T09:00:00Z' });
+    });
+
+    it('allows a null due_at (unparseable date) but requires due_text', () => {
+      const ok = validateActions([{ kind: 'set_deadline', task_id: 't1', due_text: 'к концу недели', due_at: null }], owned, 'r');
+      expect(ok[0]).toMatchObject({ kind: 'set_deadline', due_at: null });
+      const dropped = validateActions([{ kind: 'set_deadline', task_id: 't1', due_text: '  ', due_at: null }], owned, 'r');
+      expect(dropped).toEqual([]);
+    });
+
+    it('downgrades a non-owner set_deadline to touch', () => {
+      const out = validateActions(
+        [{ kind: 'set_deadline', task_id: 't1', due_text: 'tomorrow', due_at: null }],
+        owned,
+        'r',
+        { owner: '@x', isManager: false },
+      );
+      expect(out).toEqual([{ kind: 'touch', task_id: 't1' }]);
     });
   });
 

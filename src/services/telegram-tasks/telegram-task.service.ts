@@ -29,7 +29,15 @@ function escapeHtml(s: string): string {
 }
 
 function toAiView(t: TelegramTaskRow): AiTaskView {
-  return { id: t.id, project: t.project, title: t.title, owner: t.owner, progress: t.progress, progress_note: t.progress_note };
+  return {
+    id: t.id,
+    project: t.project,
+    title: t.title,
+    owner: t.owner,
+    progress: t.progress,
+    progress_note: t.progress_note,
+    has_deadline: !!t.due_text || !!t.due_at,
+  };
 }
 
 /** Best-effort outbound post to the group (never throws into the caller). */
@@ -47,21 +55,40 @@ async function send(chatId: number, text: string): Promise<void> {
   }
 }
 
+/** Send and return the sent message id (needed so a later reply to THIS message
+ *  resolves back to the task). Returns null on failure. */
+async function sendReturningId(chatId: number, text: string, replyTo?: number): Promise<number | null> {
+  if (!env.TELEGRAM_BOT_TOKEN) return null;
+  const safe = text.length > TG_MAX_CHARS ? `${text.slice(0, TG_MAX_CHARS)}…` : text;
+  try {
+    const res = await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, safe, 'HTML', replyTo ? { replyToMessageId: replyTo } : undefined);
+    return res.message_id;
+  } catch (err) {
+    logger.warn('[TELEGRAM_TASKS] send (with id) failed', { chatId, error: err instanceof Error ? err.message : String(err) });
+    return null;
+  }
+}
+
 /**
  * Q&A / action when addressed to the bot is NOT decided by keywords here — the
  * reconcile LLM call itself decides (question → it returns `reply`; action → it
  * returns actions). This keeps all language understanding in the model.
  */
 
-/** Apply a validated action list to the db. Returns what changed. */
+/** Apply a validated action list to the db. Returns what changed. `askReplyTo`
+ *  is the inbound message id a `claim` question should reply to (so the user's
+ *  deadline answer threads back to the task). */
 async function applyActions(
   chatId: number,
   actions: Action[],
   sourceMsgId: number | undefined,
-): Promise<{ created: string[]; closed: string[]; progressed: string[] }> {
+  askReplyTo?: number,
+): Promise<{ created: string[]; closed: string[]; progressed: string[]; asked: boolean; deadlines: string[] }> {
   const created: string[] = [];
   const closed: string[] = [];
   const progressed: string[] = [];
+  const deadlines: string[] = [];
+  let asked = false;
   for (const a of actions) {
     switch (a.kind) {
       case 'create': {
@@ -85,10 +112,26 @@ async function applyActions(
         await db.touchActivity(a.task_id);
         break;
       case 'progress': await db.setProgress(a.task_id, a.state, a.note); progressed.push(a.task_id); break;
+      case 'claim': {
+        // Someone took a task with no deadline → ask "when?", as a reply to the
+        // claim message, and remember the question id so their answer links back.
+        const task = await db.getTask(a.task_id);
+        const label = task ? `${task.project ? `[${task.project}] ` : ''}${task.title}` : 'this task';
+        const qId = await sendReturningId(chatId, `🕒 When will it be ready? — ${escapeHtml(label)}`, askReplyTo);
+        if (qId) {
+          await db.setAwaitingDeadline(a.task_id, qId);
+          asked = true;
+        }
+        break;
+      }
+      case 'set_deadline':
+        await db.setDeadline(a.task_id, a.due_text, a.due_at);
+        deadlines.push(a.task_id);
+        break;
       case 'touch': await db.touchActivity(a.task_id); break;
     }
   }
-  return { created, closed, progressed };
+  return { created, closed, progressed, asked, deadlines };
 }
 
 export interface InboundMessage {
@@ -116,12 +159,19 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
   const msgRowId = await db.logMessage(m.chatId, m.msgId, author, text);
 
   try {
-    const [contextTasks, totalOpen, recent, replyTaskIds] = await Promise.all([
+    const [contextTasks, totalOpen, recent, replyTaskIds, deadlineTaskId] = await Promise.all([
       db.recentOpenTasks(m.chatId, MAX_CONTEXT_TASKS),
       db.countOpenTasks(m.chatId),
       msgRowId ? db.recentMessages(m.chatId, RECENT_MSG_WINDOW, msgRowId) : Promise.resolve([]),
       m.replyToMsgId ? db.openTaskIdsBySourceMsg(m.chatId, m.replyToMsgId) : Promise.resolve([]),
+      // Deterministic deadline link: did this message reply to the bot's "when?"
+      // question for a specific task?
+      m.replyToMsgId ? db.findTaskAwaitingDeadline(m.chatId, m.replyToMsgId) : Promise.resolve(null),
     ]);
+
+    // Merge the deadline-reply task into the reply hints so the model resolves
+    // the deadline answer to exactly that task (no ambiguity across tasks).
+    const allReplyTaskIds = deadlineTaskId ? [...new Set([deadlineTaskId, ...replyTaskIds])] : replyTaskIds;
 
     // Cost guard (structural, not language-keyword based): a one-token message
     // in a chat with NO open tasks that isn't addressed to the bot cannot
@@ -136,20 +186,22 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
       text,
       author,
       isManager: isManagerUsername(m.authorUsername),
-      replyToTaskIds: replyTaskIds,
+      replyToTaskIds: allReplyTaskIds,
       openTasks: contextTasks.map(toAiView),
       hiddenOpenCount: Math.max(0, totalOpen - contextTasks.length),
       recentMessages: recent,
-      addressedToBot: m.addressedToBot,
+      addressedToBot: m.addressedToBot || deadlineTaskId !== null,
     });
 
-    const r = await applyActions(m.chatId, actions, m.msgId);
+    const r = await applyActions(m.chatId, actions, m.msgId, m.msgId);
 
     // Always surface what CHANGED (don't let a chatty reply hide a create/close).
+    // A `claim` already posted its own "when?" question, so it's not in `bits`.
     const bits: string[] = [];
     if (r.created.length) bits.push(`📝 tracking ${r.created.length} new task${r.created.length > 1 ? 's' : ''}`);
     if (r.closed.length) bits.push(`✅ closed ${r.closed.length} task${r.closed.length > 1 ? 's' : ''}`);
     if (r.progressed.length) bits.push(`📌 noted status on ${r.progressed.length} task${r.progressed.length > 1 ? 's' : ''}`);
+    if (r.deadlines.length) bits.push(`📅 set deadline on ${r.deadlines.length} task${r.deadlines.length > 1 ? 's' : ''}`);
 
     // Honor the model's reply ONLY when the user actually addressed the bot — a
     // hard code-side guard so a chatty model can't spam the group on ordinary
