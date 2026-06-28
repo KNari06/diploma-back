@@ -32,9 +32,33 @@ interface TgMessage {
   caption?: string;
   chat?: { id: number };
   from?: TgUser;
-  reply_to_message?: { message_id: number };
+  reply_to_message?: { message_id: number; from?: TgUser };
 }
 interface TgUpdate { message?: TgMessage; edited_message?: TgMessage }
+
+/** True when `text` @mentions the given bot username (word-boundary aware so
+ *  `@qait_task` matches but `@qait_tasker` does not). Exported for testing. */
+export function mentionsBot(text: string, botUsername: string | undefined): boolean {
+  const uname = botUsername?.replace(/^@/, '').toLowerCase();
+  if (!uname) return false;
+  return new RegExp(`@${uname}(?![a-z0-9_])`, 'i').test(text);
+}
+
+/** True when the message is addressed to OUR bot — a reply to one of our bot's
+ *  messages, or an @mention of our username. Drives the model's question-vs-
+ *  action decision. NB: a reply must be to OUR bot, not just any bot in the
+ *  group (a group can have several). When our username isn't configured we
+ *  can't disambiguate, so we fall back to any-bot reply. */
+function isAddressedToBot(msg: TgMessage, text: string): boolean {
+  const replied = msg.reply_to_message?.from;
+  if (replied?.is_bot) {
+    const ours = env.TELEGRAM_BOT_USERNAME?.replace(/^@/, '').toLowerCase();
+    if (!ours) return true; // can't tell which bot; assume ours (single-bot default)
+    if (replied.username?.toLowerCase() === ours) return true;
+    // replied to a DIFFERENT bot — fall through to the @mention check
+  }
+  return mentionsBot(text, env.TELEGRAM_BOT_USERNAME);
+}
 
 /** Map a Telegram message object to our inbound shape, or null if not usable. */
 function toInbound(msg: TgMessage | undefined, isEdit: boolean): InboundMessage | null {
@@ -50,6 +74,7 @@ function toInbound(msg: TgMessage | undefined, isEdit: boolean): InboundMessage 
     authorName: msg.from?.first_name,
     isEdit,
     replyToMsgId: msg.reply_to_message?.message_id,
+    addressedToBot: isAddressedToBot(msg, text),
   };
 }
 
