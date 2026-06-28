@@ -45,11 +45,14 @@ function toAiView(t: TelegramTaskRow): AiTaskView {
 // (400) and would otherwise be silently dropped. Cap with headroom.
 const TG_MAX_CHARS = 3900;
 
-async function send(chatId: number, text: string): Promise<void> {
+async function send(chatId: number, text: string, replyTo?: number): Promise<void> {
   if (!env.TELEGRAM_BOT_TOKEN) return;
   const safe = text.length > TG_MAX_CHARS ? `${text.slice(0, TG_MAX_CHARS)}…` : text;
   try {
-    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, safe, 'HTML');
+    // replyTo threads the bot's message under the user's, so the answer/ack links
+    // back to what it's about. allow_sending_without_reply (in sendMessage) keeps
+    // it from failing if the original was deleted.
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, safe, 'HTML', replyTo ? { replyToMessageId: replyTo } : undefined);
   } catch (err) {
     logger.warn('[TELEGRAM_TASKS] send failed', { chatId, error: err instanceof Error ? err.message : String(err) });
   }
@@ -158,6 +161,7 @@ async function applyActions(
           await send(
             chatId,
             `🤔 Which task did you mean? Reply to the specific one:\n${lines.join('\n')}`,
+            askReplyTo,
           );
           asked = true;
         }
@@ -247,14 +251,15 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
     // digests (the schema asks for this, but we don't trust the model to obey).
     const wantsReply = reply && m.addressedToBot;
 
+    // Link the bot's message back to the user's so it's clear what it answers.
     if (wantsReply && bits.length) {
       // Both an answer AND changes: post the answer, then the change ack.
-      await send(m.chatId, escapeHtml(reply!));
-      await send(m.chatId, bits.join(' · '));
+      await send(m.chatId, escapeHtml(reply!), m.msgId);
+      await send(m.chatId, bits.join(' · '), m.msgId);
     } else if (wantsReply) {
-      await send(m.chatId, escapeHtml(reply!));
+      await send(m.chatId, escapeHtml(reply!), m.msgId);
     } else if (bits.length) {
-      await send(m.chatId, bits.join(' · '));
+      await send(m.chatId, bits.join(' · '), m.msgId);
     }
   } catch (err) {
     logger.error('[TELEGRAM_TASKS] ingest failed', { chatId: m.chatId, error: err instanceof Error ? err.message : String(err) });
