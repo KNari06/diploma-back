@@ -44,10 +44,19 @@ export function mentionsBot(text: string, botUsername: string | undefined): bool
   return new RegExp(`@${uname}(?![a-z0-9_])`, 'i').test(text);
 }
 
-/** True when the message is addressed to the bot — either a reply to one of the
- *  bot's own messages, or an @mention of the bot's username. Drives Q&A mode. */
+/** True when the message is addressed to OUR bot — a reply to one of our bot's
+ *  messages, or an @mention of our username. Drives the model's question-vs-
+ *  action decision. NB: a reply must be to OUR bot, not just any bot in the
+ *  group (a group can have several). When our username isn't configured we
+ *  can't disambiguate, so we fall back to any-bot reply. */
 function isAddressedToBot(msg: TgMessage, text: string): boolean {
-  if (msg.reply_to_message?.from?.is_bot) return true;
+  const replied = msg.reply_to_message?.from;
+  if (replied?.is_bot) {
+    const ours = env.TELEGRAM_BOT_USERNAME?.replace(/^@/, '').toLowerCase();
+    if (!ours) return true; // can't tell which bot; assume ours (single-bot default)
+    if (replied.username?.toLowerCase() === ours) return true;
+    // replied to a DIFFERENT bot — fall through to the @mention check
+  }
   return mentionsBot(text, env.TELEGRAM_BOT_USERNAME);
 }
 

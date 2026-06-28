@@ -33,10 +33,15 @@ function toAiView(t: TelegramTaskRow): AiTaskView {
 }
 
 /** Best-effort outbound post to the group (never throws into the caller). */
+// Telegram hard-limits a message to 4096 chars; an over-limit send is rejected
+// (400) and would otherwise be silently dropped. Cap with headroom.
+const TG_MAX_CHARS = 3900;
+
 async function send(chatId: number, text: string): Promise<void> {
   if (!env.TELEGRAM_BOT_TOKEN) return;
+  const safe = text.length > TG_MAX_CHARS ? `${text.slice(0, TG_MAX_CHARS)}…` : text;
   try {
-    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, text, 'HTML');
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, safe, 'HTML');
   } catch (err) {
     logger.warn('[TELEGRAM_TASKS] send failed', { chatId, error: err instanceof Error ? err.message : String(err) });
   }
@@ -140,16 +145,25 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
 
     const r = await applyActions(m.chatId, actions, m.msgId);
 
-    // The model's own reply (answer to a question / confirmation) takes priority
-    // — it's what the user asked for. Otherwise post the system ack of changes.
-    if (reply) {
-      await send(m.chatId, escapeHtml(reply));
-    } else {
-      const bits: string[] = [];
-      if (r.created.length) bits.push(`📝 tracking ${r.created.length} new task${r.created.length > 1 ? 's' : ''}`);
-      if (r.closed.length) bits.push(`✅ closed ${r.closed.length} task${r.closed.length > 1 ? 's' : ''}`);
-      if (r.progressed.length) bits.push(`📌 noted status on ${r.progressed.length} task${r.progressed.length > 1 ? 's' : ''}`);
-      if (bits.length) await send(m.chatId, bits.join(' · '));
+    // Always surface what CHANGED (don't let a chatty reply hide a create/close).
+    const bits: string[] = [];
+    if (r.created.length) bits.push(`📝 tracking ${r.created.length} new task${r.created.length > 1 ? 's' : ''}`);
+    if (r.closed.length) bits.push(`✅ closed ${r.closed.length} task${r.closed.length > 1 ? 's' : ''}`);
+    if (r.progressed.length) bits.push(`📌 noted status on ${r.progressed.length} task${r.progressed.length > 1 ? 's' : ''}`);
+
+    // Honor the model's reply ONLY when the user actually addressed the bot — a
+    // hard code-side guard so a chatty model can't spam the group on ordinary
+    // digests (the schema asks for this, but we don't trust the model to obey).
+    const wantsReply = reply && m.addressedToBot;
+
+    if (wantsReply && bits.length) {
+      // Both an answer AND changes: post the answer, then the change ack.
+      await send(m.chatId, escapeHtml(reply!));
+      await send(m.chatId, bits.join(' · '));
+    } else if (wantsReply) {
+      await send(m.chatId, escapeHtml(reply!));
+    } else if (bits.length) {
+      await send(m.chatId, bits.join(' · '));
     }
   } catch (err) {
     logger.error('[TELEGRAM_TASKS] ingest failed', { chatId: m.chatId, error: err instanceof Error ? err.message : String(err) });
