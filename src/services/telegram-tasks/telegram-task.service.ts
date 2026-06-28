@@ -44,6 +44,28 @@ async function send(chatId: number, text: string): Promise<void> {
 }
 
 /**
+ * Heuristic: is a message addressed to the bot a QUESTION (→ Q&A) or an ACTION
+ * (→ reconcile/closure)? Users may reply to the bot's ack message with "done"
+ * or "close #3" intending to change a task — that must still reconcile, not get
+ * a read-only answer. We treat it as a question when it has a '?', a wh-/how
+ * word, or no obvious action verb. Conservative: ambiguous → question (Q&A),
+ * because the digest-line reply path still covers explicit closures.
+ */
+// NB: JS `\w` and `\b` are ASCII-only — they do NOT match Cyrillic/Kazakh
+// (CLAUDE.md Hard invariant #15). So we use the unicode flag + an explicit
+// letter class, and substring (no `\b`) matching for the Cyrillic/Kazakh stems.
+const ACTION_HINT_RE =
+  /(?:^|[^\p{L}])(done|closed?|merged|deployed|fixed|finished)(?![\p{L}])|готов|сделал|залил|закрыл|біт/iu;
+const QUESTION_HINT_RE =
+  /[?？]|(?:^|[^\p{L}])(what|which|who|when|how|where|status|list|show)(?![\p{L}])|сколько|что|какие|кто|статус/iu;
+
+export function looksLikeQuestion(text: string): boolean {
+  if (QUESTION_HINT_RE.test(text)) return true;
+  if (ACTION_HINT_RE.test(text)) return false; // clear action → let reconcile handle it
+  return true; // default to Q&A when addressed to the bot
+}
+
+/**
  * Q&A mode: answer a question addressed to the bot, over THIS chat's open tasks.
  * Read-only — never creates/closes tasks. Posts the answer back to the group.
  */
@@ -127,10 +149,11 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
 
   const msgRowId = await db.logMessage(m.chatId, m.msgId, author, text);
 
-  // Q&A mode: the message is addressed to the bot (@mention or reply-to-bot).
-  // Answer a question over THIS chat's tasks instead of reconciling. Never
-  // creates/closes tasks — read-only.
-  if (m.addressedToBot && !m.isEdit) {
+  // Q&A mode: the message is addressed to the bot (@mention or reply-to-bot) AND
+  // reads as a question (not an action like "done"/"merged"). Answer over THIS
+  // chat's tasks instead of reconciling — read-only. An action addressed to the
+  // bot falls through to reconcile so closures still work.
+  if (m.addressedToBot && !m.isEdit && looksLikeQuestion(m.text)) {
     try {
       await answerQuestion(m);
     } catch (err) {
