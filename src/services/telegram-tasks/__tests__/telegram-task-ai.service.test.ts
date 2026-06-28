@@ -77,6 +77,61 @@ describe('validateActions', () => {
     expect(out[0]).toEqual({ kind: 'close', task_id: 'a1', reason: 'batch analysis' });
   });
 
+  // ── authority guard (the "I didn't check" bug): a non-owner non-manager must
+  //    not mutate a task; status changes downgrade to a harmless touch ──────────
+  describe('authority guard', () => {
+    const owned = [task('t1', { owner: '@ndarkhans' })];
+
+    it('downgrades progress from a NON-owner to touch', () => {
+      const out = validateActions(
+        [{ kind: 'progress', task_id: 't1', state: 'in_progress', note: "I didn't check" }],
+        owned,
+        'r',
+        { owner: '@yerassylospan', isManager: false },
+      );
+      expect(out).toEqual([{ kind: 'touch', task_id: 't1' }]);
+    });
+
+    it('allows progress from the OWNER', () => {
+      const out = validateActions(
+        [{ kind: 'progress', task_id: 't1', state: 'in_progress', note: 'on it' }],
+        owned,
+        'r',
+        { owner: '@ndarkhans', isManager: false },
+      );
+      expect(out[0]).toMatchObject({ kind: 'progress', state: 'in_progress' });
+    });
+
+    it('allows a MANAGER to close anyone’s task', () => {
+      const out = validateActions(
+        [{ kind: 'close', task_id: 't1', reason: 'shipped' }],
+        owned,
+        'r',
+        { owner: '@someone_else', isManager: true },
+      );
+      expect(out[0]).toMatchObject({ kind: 'close', task_id: 't1' });
+    });
+
+    it('downgrades a non-owner CLOSE to touch (still resets staleness)', () => {
+      const out = validateActions(
+        [{ kind: 'close', task_id: 't1', reason: 'done?' }],
+        owned,
+        'r',
+        { owner: '@yerassylospan', isManager: false },
+      );
+      expect(out).toEqual([{ kind: 'touch', task_id: 't1' }]);
+    });
+
+    it('with no actor (batch path) applies status changes without an authority check', () => {
+      const out = validateActions(
+        [{ kind: 'progress', task_id: 't1', state: 'blocked', note: 'x' }],
+        owned,
+        'r',
+      );
+      expect(out[0]).toMatchObject({ kind: 'progress', state: 'blocked' });
+    });
+  });
+
   it('ignores non-array / garbage entries gracefully', () => {
     const out = validateActions([{ kind: 'nonsense', task_id: 'a1' }, {}], open, 'r');
     expect(out).toEqual([]);

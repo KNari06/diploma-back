@@ -16,7 +16,7 @@ import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
-import { aliasHint } from './owner-aliases';
+import { aliasHint, canonicalOwner } from './owner-aliases';
 
 export type ProgressState = 'in_progress' | 'blocked' | 'needs_investigation';
 
@@ -126,17 +126,22 @@ function buildSystem(): string {
     '          MANAGER may close anyone\'s task.',
     'reopen  — an explicit statement that a closed/assumed-done task is NOT done.',
     'update  — same task, but its owner, project, or wording changed.',
-    'progress — the owner reports a real STATUS that is not "done": state =',
+    'progress — the OWNER of a task reports a real WORK STATUS that is not done:',
     '          in_progress ("working on it","in progress","1-2 days","делаю"),',
     '          blocked ("waiting on X","depends on","заблокирован"), or',
     '          needs_investigation ("turns out hard","need more investigation",',
     '          "не понятно почему"). Put their own words in "note". A digest line',
-    '          can BOTH create a task AND state its status (e.g. "Pointer -',
-    '          @user - in Progress, 1-2 days") → emit ONE create with state+note',
-    '          set on it. Records status AND resets the staleness clock.',
+    '          can BOTH create a task AND state its status → emit ONE create with',
+    '          state+note. STRICT: only emit progress when the message actually',
+    '          describes work being done/stuck. The following are NOT a status —',
+    '          emit touch (or nothing), never progress:',
+    '            • "I didn\'t check / не проверял / не смотрел / не знаю / no idea"',
+    '              (admitting they DON\'T know — that is the opposite of a status)',
+    '            • answering someone ELSE\'s question, or asking one back',
+    '            • a person who is NOT the task\'s owner commenting on it',
     'touch   — the message mentions/asks about an existing task with NO real status',
-    '          ("is this actual?","what is the plan?","this is done?"). Resets the',
-    '          staleness clock only — so a discussed task is not chased as silent.',
+    '          ("is this actual?","what is the plan?","this is done?","I didn\'t',
+    '          check"). Resets the staleness clock only — never invents a status.',
     '',
     'OWNER: copy the @username verbatim (with @) when present. If only a plain name',
     'is given ("Marketing doc - Serzhan", "... - Bauka"), use that name as owner. If',
@@ -144,9 +149,11 @@ function buildSystem(): string {
     'owner (the first / the one being asked) for owner; "me" means the AUTHOR.',
     '',
     'PRIORITY when unsure: prefer reusing an existing task_id over create; prefer',
-    'touch/progress over close; never close on a question. If a message clearly does',
-    'nothing task-related (pure chatter: "тут почему?", "Хотя да", "ok"), emit no',
-    'actions.',
+    'touch over progress/close when the message is vague; never close on a',
+    'question; never set progress on "I don\'t know / didn\'t check". If a message',
+    'does nothing task-related (chatter "тут почему?", "Хотя да", "ok"; or just',
+    'answering someone\'s question like "I didn\'t check"), emit NO actions at all',
+    'unless it clearly references a specific open task (then at most touch).',
     '',
     'EXAMPLES (input → actions):',
     '• "JP\\n1. Video not playing - @gipardb - what is the plan?\\n2. AI check bugs',
@@ -261,7 +268,10 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
 
   const raw = await callReconcileTool(buildSystem(), userBlock, 1500);
   return {
-    actions: validateActions(raw.actions as Array<Record<string, unknown>>, ctx.openTasks, ctx.text),
+    actions: validateActions(raw.actions as Array<Record<string, unknown>>, ctx.openTasks, ctx.text, {
+      owner: canonicalOwner(ctx.author) ?? undefined,
+      isManager: ctx.isManager,
+    }),
     reply: raw.reply,
   };
 }
@@ -270,13 +280,29 @@ const PROGRESS_STATES = new Set<ProgressState>(['in_progress', 'blocked', 'needs
 
 /** Narrow raw model output to safe, known-task actions. Reused by reconcile()
  *  and the overnight batch. Drops anything malformed or referencing an
- *  out-of-context task id. */
+ *  out-of-context task id.
+ *
+ *  `actor` (per-message path only) enforces authority deterministically, so a
+ *  prompt slip can't let a non-owner mutate a task: close/reopen/progress on a
+ *  task survive ONLY if the actor owns that task or is a manager. Omitted on the
+ *  batch path (it reasons over the whole day, not one author). */
 export function validateActions(
   raw: Array<Record<string, unknown>>,
   openTasks: AiTaskView[],
   fallbackReason: string,
+  actor?: { owner: string | undefined; isManager: boolean },
 ): Action[] {
   const openIds = new Set(openTasks.map((t) => t.id));
+  const ownerById = new Map(openTasks.map((t) => [t.id, t.owner] as const));
+  /** Can `actor` change the status of this task? Owner of it, or a manager.
+   *  No actor (batch) → allowed. Unowned task → allowed (anyone can advance it). */
+  const mayMutate = (taskId: string): boolean => {
+    if (!actor) return true;
+    if (actor.isManager) return true;
+    const owner = ownerById.get(taskId);
+    if (!owner) return true;
+    return !!actor.owner && owner.toLowerCase() === actor.owner.toLowerCase();
+  };
   const out: Action[] = [];
   for (const a of raw) {
     const kind = a.kind;
@@ -294,18 +320,30 @@ export function validateActions(
     }
     if (typeof a.task_id !== 'string' || !openIds.has(a.task_id)) continue;
     if (kind === 'close') {
-      out.push({ kind: 'close', task_id: a.task_id, reason: typeof a.reason === 'string' ? a.reason : fallbackReason });
+      // Status-changing → authority-gated. A non-owner non-manager close is
+      // downgraded to touch (the task is clearly being discussed) rather than
+      // dropped, so it still resets the staleness clock.
+      if (mayMutate(a.task_id)) {
+        out.push({ kind: 'close', task_id: a.task_id, reason: typeof a.reason === 'string' ? a.reason : fallbackReason });
+      } else {
+        out.push({ kind: 'touch', task_id: a.task_id });
+      }
     } else if (kind === 'reopen') {
-      out.push({ kind: 'reopen', task_id: a.task_id });
+      if (mayMutate(a.task_id)) out.push({ kind: 'reopen', task_id: a.task_id });
+      else out.push({ kind: 'touch', task_id: a.task_id });
     } else if (kind === 'touch') {
       out.push({ kind: 'touch', task_id: a.task_id });
     } else if (kind === 'progress' && PROGRESS_STATES.has(a.state as ProgressState)) {
-      out.push({
-        kind: 'progress',
-        task_id: a.task_id,
-        state: a.state as ProgressState,
-        note: typeof a.note === 'string' ? a.note : fallbackReason,
-      });
+      if (mayMutate(a.task_id)) {
+        out.push({
+          kind: 'progress',
+          task_id: a.task_id,
+          state: a.state as ProgressState,
+          note: typeof a.note === 'string' ? a.note : fallbackReason,
+        });
+      } else {
+        out.push({ kind: 'touch', task_id: a.task_id });
+      }
     } else if (kind === 'update') {
       out.push({
         kind: 'update',
