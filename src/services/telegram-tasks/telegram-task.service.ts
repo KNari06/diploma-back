@@ -218,22 +218,19 @@ export interface InboundMessage {
  * throws — the webhook must always 200.
  */
 export async function ingestMessage(m: InboundMessage): Promise<void> {
-  // If a photo/image is attached, read it with vision and fold the description
-  // into the message text so a caption-less screenshot still carries meaning.
-  // Fail-open: a vision error leaves text as-is.
+  // If a photo/image is attached, read it with vision and weave the description
+  // into the message text as plain prose (no "[attached image: …]" tag), so a
+  // caption-less screenshot reads as if the sender wrote what's in it. The model
+  // treats the image content seamlessly alongside any caption. Fail-open: a
+  // vision error leaves the text as-is.
   let baseText = m.text;
   if (m.imageFileId && env.TELEGRAM_BOT_TOKEN) {
     try {
       const file = await getFileBase64(env.TELEGRAM_BOT_TOKEN, m.imageFileId);
-      if (file) {
-        const desc = await describeImage(file.base64, file.mime);
-        if (desc) baseText = baseText ? `${baseText}\n[attached image: ${desc}]` : `[attached image: ${desc}]`;
-        else if (!baseText) baseText = '[attached image]';
-      } else if (!baseText) {
-        baseText = '[attached image]';
-      }
+      const desc = file ? await describeImage(file.base64, file.mime) : '';
+      if (desc) baseText = baseText ? `${baseText}\n${desc}` : desc;
     } catch {
-      if (!baseText) baseText = '[attached image]';
+      /* vision failed — keep whatever text we have (may be empty) */
     }
   }
 
