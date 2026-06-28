@@ -150,8 +150,16 @@ describe('sendMobileAppError', () => {
     expect(res.body.error).toContain('packageName is required');
   });
 
-  it('maps build_record_failed to 409', () => {
-    expect(send({ kind: 'build_record_failed' }).statusCode).toBe(409);
+  it('maps build_record_failed (duplicate commit, 23505) to 409', () => {
+    const res = send({ kind: 'build_record_failed', code: '23505' });
+    expect(res.statusCode).toBe(409);
+    expect(res.body.error).toContain('already exists');
+  });
+
+  it('maps build_record_failed (non-duplicate db error) to 500 with the real reason', () => {
+    const res = send({ kind: 'build_record_failed', code: '42703', message: 'column missing' });
+    expect(res.statusCode).toBe(500);
+    expect(res.body.error).toContain('column missing');
   });
 
   it('maps app_not_uploaded to 404', () => {

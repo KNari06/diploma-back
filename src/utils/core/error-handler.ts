@@ -45,6 +45,37 @@ const isOriginAllowed = (origin: string | undefined): boolean => {
   }
 };
 
+/**
+ * HTTP-status truth (audit): emit ONE keyed `http.error` event for any 5xx
+ * response — on EVERY route, regardless of how it was produced (errorHandler, a
+ * direct `res.status(500)`, notFoundHandler, an upstream 502/503). Register this
+ * ONCE and EARLY (before routing) so `res.on('finish')` observes the FINAL
+ * `res.statusCode` of every response. 4xx are client errors, not server
+ * failures, so they're intentionally skipped (no alert noise). Best-effort: a
+ * logging failure must never affect the response (telemetry never throws into
+ * the request path).
+ */
+export const httpErrorAuditMiddleware = (req: Request, res: Response, next: NextFunction): void => {
+  res.on('finish', () => {
+    if (res.statusCode < 500) return;
+    try {
+      logger.error('[HTTP] server error response', {
+        event: 'http.error',
+        severity: 'error',
+        status: res.statusCode,
+        method: req.method,
+        // Path only — NEVER the query string: routes like /verify-email?token=…
+        // carry secrets that would otherwise land in Loki on a 5xx.
+        url: (req.originalUrl ?? req.url ?? '').split('?')[0],
+        userId: req.user?.id,
+      });
+    } catch {
+      /* best-effort audit — never let logging break the response */
+    }
+  });
+  next();
+};
+
 // Error handler middleware
 // NOTE: the 4th `_next` param is REQUIRED. Express identifies error-handling
 // middleware solely by arity (length === 4). Without it, `app.use(errorHandler)`
@@ -73,7 +104,9 @@ export const errorHandler = (
   logger.error({
     message: error.message,
     stack: error.stack,
-    url: req.url,
+    // Path only — drop the query string so secret tokens (e.g. ?token=…) don't
+    // get logged on errors.
+    url: (req.originalUrl ?? req.url ?? '').split('?')[0],
     method: req.method,
     ip: req.ip,
     userAgent: req.get('User-Agent'),

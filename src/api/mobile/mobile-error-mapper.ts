@@ -6,6 +6,7 @@
 
 import type { Response } from 'express';
 import type { MobileAppError } from '@/services/mobile/mobile-app.service';
+import { logger } from '@/utils/core/logger';
 import { MAX_UPLOAD_SIZE_BYTES, ALLOWED_UPLOAD_EXTENSIONS } from '@/services/mobile/mobile-app.service';
 
 const MB = 1024 * 1024;
@@ -41,9 +42,54 @@ export function isSessionGoneError(error: unknown): boolean {
   return statusCode === 404 && /session not found/i.test(message);
 }
 
-export function sendMobileRunnerError(res: Response, error: unknown, fallback: string): void {
+/**
+ * Optional audit context for `sendMobileRunnerError`. When provided AND the
+ * error is a reclaimed-session error, a keyed `session.expired` line is emitted
+ * to Loki. Opt-in so cleanup paths (destroy / warmup) — where a "gone" session
+ * is benign — pass nothing and don't log a misleading customer failure.
+ */
+export interface MobileRunnerErrorAudit {
+  /** Customer id, for keying the session-expiry audit line. */
+  userId?: string;
+  /** Mobile session id the action targeted. */
+  sessionId?: string;
+  /** Which editor/run surface hit it (apply / lint / tap / run / …). */
+  surfacedBy?: string;
+}
+
+export function sendMobileRunnerError(
+  res: Response,
+  error: unknown,
+  fallback: string,
+  audit?: MobileRunnerErrorAudit,
+): void {
   const message = error instanceof Error ? error.message : String(error);
   const runnerErr = error as { statusCode?: number; code?: string };
+  // A session the runner no longer has (idle TTL / pool reset / redeploy).
+  // Computed up front so the audit line below also covers the streaming
+  // (headers-already-sent) path, not just the 410 branch.
+  const sessionGone = isSessionGoneError(error);
+  // Forward the runner's reclaim cause (device_disconnected / idle_ttl /
+  // evicted / rest_delete / …, parsed from the 404 body).
+  const reclaimReason = (error as { reason?: string })?.reason;
+
+  // Audit (Loki): a reclaimed mobile session is a customer-facing failure that
+  // otherwise lives only in the editor-trace JSONL blob. Emitted ONCE here — the
+  // single funnel every mobile editor/run handler passes through — keyed to the
+  // customer/session/reason, so EVERY session-gone action path is covered (not
+  // just apply/lint), regardless of whether the response already started
+  // streaming. WARN: a genuine, bounded-rate customer failure worth seeing.
+  if (sessionGone && audit) {
+    logger.warn('[MOBILE] session expired', {
+      event: 'session.expired',
+      severity: 'warning',
+      code: 'SESSION_EXPIRED',
+      reason: reclaimReason ?? 'unknown',
+      ...(audit.surfacedBy ? { surfacedBy: audit.surfacedBy } : {}),
+      ...(audit.userId ? { userId: audit.userId } : {}),
+      ...(audit.sessionId ? { sessionId: audit.sessionId } : {}),
+    });
+  }
 
   // Streaming guard: runTestCaseOnSession streams NDJSON (Content-Type
   // application/x-ndjson + res.write per step), so an error AFTER the first
@@ -59,15 +105,10 @@ export function sendMobileRunnerError(res: Response, error: unknown, fallback: s
     return;
   }
 
-  // A session the runner no longer has (idle TTL / pool reset / redeploy) →
-  // typed 410 so the editor routes it through its session-expiry flow instead
-  // of showing a dead-end error that only a reload "fixes".
-  const sessionGone = isSessionGoneError(error);
+  // Reclaimed session → typed 410 so the editor routes it through its
+  // session-expiry flow instead of showing a dead-end error that only a reload
+  // "fixes"; carry the reclaim reason so the editor shows a TRUTHFUL message.
   if (sessionGone) {
-    // Forward the runner's reclaim cause (device_disconnected / idle_ttl /
-    // evicted / rest_delete / …, parsed from the 404 body) so the editor can
-    // show a TRUTHFUL message instead of a blanket "inactivity".
-    const reclaimReason = (error as { reason?: string })?.reason;
     res.status(410).json({
       success: false,
       code: 'SESSION_EXPIRED',

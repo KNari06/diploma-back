@@ -11,6 +11,13 @@ import { TestCompletionHandlerService } from '@/services/testing/results/test-co
 import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
 import { logger } from '@/utils/core/logger';
 
+/** Whole minutes since an ISO timestamp, or undefined if unparseable. */
+function ageMinutesSince(iso: string | null): number | undefined {
+  if (!iso) return undefined;
+  const ms = Date.now() - Date.parse(iso);
+  return Number.isFinite(ms) ? Math.round(ms / 60000) : undefined;
+}
+
 /**
  * Finalization of abandoned test artifacts — runs/tests/executions stranded in
  * a non-terminal status because the work that should have finalized them never
@@ -30,6 +37,49 @@ import { logger } from '@/utils/core/logger';
  * and feeds them in; it never writes run status itself.
  */
 export class StaleReaperService {
+  /** runId/testId already reported as vanished, so a row that recompute can't
+   *  finalize doesn't re-emit `run.vanished` on every 5-min sweep. Bounded:
+   *  cleared when it grows past the cap (vanished rows are rare, so this is a
+   *  generous backstop, not a steady-state size). */
+  private static readonly emittedVanished = new Set<string>();
+  private static readonly EMITTED_VANISHED_CAP = 5000;
+
+  /**
+   * Audit (Loki): a run/test/exploration started but never reached a terminal
+   * status — a SILENT death (worker crash, lost job, runner unreachable) that no
+   * error path ever logged. The reaper detecting it by *absence* is the only
+   * signal we get, so emit a keyed, queryable `run.vanished` event at WARN.
+   * Deduped by run/test id so a row that fails to finalize emits ONCE, not every
+   * sweep. (Explorations are an aggregate count with no id — they emit per sweep
+   * when count>0, which is already once-per-sweep.)
+   */
+  private static emitRunVanished(fields: {
+    kind: 'run' | 'test' | 'exploration';
+    runId?: string;
+    testId?: string;
+    userId?: string | null;
+    projectId?: string | null;
+    stuckStatus?: string;
+    ageMinutes?: number;
+    count?: number;
+  }): void {
+    const dedupKey = fields.runId ?? fields.testId;
+    if (dedupKey) {
+      if (this.emittedVanished.has(dedupKey)) return;
+      if (this.emittedVanished.size >= this.EMITTED_VANISHED_CAP) this.emittedVanished.clear();
+      this.emittedVanished.add(dedupKey);
+    }
+    try {
+      logger.warn('[STALE_RUN_REAPER] run vanished', {
+        event: 'run.vanished',
+        severity: 'warning',
+        ...fields,
+      });
+    } catch {
+      /* best-effort telemetry — never let a log failure interrupt the reap loop */
+    }
+  }
+
   /**
    * Reap regression runs stuck in 'running'/'pending'.
    *
@@ -86,6 +136,14 @@ export class StaleReaperService {
     logger.info('[STALE_RUN_REAPER] Reaping stale runs', { count: runs.length });
 
     for (const run of runs) {
+      this.emitRunVanished({
+        kind: 'run',
+        runId: run.id,
+        userId: run.user_id,
+        projectId: run.project_id,
+        stuckStatus: run.status,
+        ageMinutes: ageMinutesSince(run.started_at),
+      });
       try {
         await TestCompletionHandlerService.recomputeRunStatus(run, { suppressSideEffects: true });
       } catch (err) {
@@ -130,6 +188,10 @@ export class StaleReaperService {
     const ids = stale.map((t) => t.id);
     logger.info('[STALE_RUN_REAPER] Reaping stale tests', { count: ids.length });
 
+    for (const id of ids) {
+      this.emitRunVanished({ kind: 'test', testId: id });
+    }
+
     const { error } = await forceFailStuckTests(ids);
     if (error) {
       logger.error('[STALE_RUN_REAPER] Force-fail of stale tests failed — rows may stay dirty', {
@@ -150,6 +212,9 @@ export class StaleReaperService {
   static async reapStaleExplorations(thresholdMinutes = 30): Promise<{ scanned: number }> {
     const cutoff = new Date(Date.now() - thresholdMinutes * 60 * 1000).toISOString();
     const count = await ExplorationStorageService.reapStaleRunningRuns(cutoff);
+    if (count > 0) {
+      this.emitRunVanished({ kind: 'exploration', count });
+    }
     return { scanned: count };
   }
 
