@@ -46,6 +46,16 @@ const warmupExtendThrottle = new Map<string, number>();
 const WARMUP_EXTEND_MIN_INTERVAL_MS = 60 * 1000;
 
 /**
+ * userId → last time we pinged the runner to keep the user's editor session(s)
+ * warm. Throttled like the warmup-TTL refresh so a burst of keepalives costs at
+ * most one runner round-trip per `RUNNER_TOUCH_MIN_INTERVAL_MS` per user. Kept
+ * comfortably below the runner's MIN_IDLE_FOR_EVICTION (5 min) so an active
+ * editor is always touched before it becomes an eviction target.
+ */
+const runnerTouchThrottle = new Map<string, number>();
+const RUNNER_TOUCH_MIN_INTERVAL_MS = 60 * 1000;
+
+/**
  * Reset (or start) the idle timer for a user.
  * Called from a `socket.use(...)` middleware on every event from any of
  * the user's sockets, and once explicitly after a successful warmup.
@@ -87,6 +97,7 @@ export function cancelIdle(userId: string): void {
     idleTimers.delete(userId);
   }
   warmupExtendThrottle.delete(userId);
+  runnerTouchThrottle.delete(userId);
 }
 
 /**
@@ -147,6 +158,46 @@ export async function refreshWarmupTtl(userId: string): Promise<void> {
 }
 
 /**
+ * Ping the runner to keep the user's editor session(s) warm so they aren't
+ * capacity-evicted during pure editing think-time (editing a step / opening the
+ * find UI sends no device traffic, so the runner's idle clock advances and the
+ * session becomes the "oldest idle" eviction target — the 2026-06-29 lint-410
+ * incident). The backend's idle timer + Redis warmup TTL already track activity
+ * for chat-auth, but NOTHING touched the runner — that gap is closed here.
+ *
+ * Called (throttled, fire-and-forget) from the `mobile:keepalive` handler,
+ * alongside `refreshWarmupTtl`. Best-effort end-to-end: resolving the session
+ * ids or the runner touch can fail without ever breaking the keepalive path.
+ */
+export async function touchRunnerSessions(userId: string): Promise<void> {
+  if (!userId) return;
+
+  const now = Date.now();
+  if (now - (runnerTouchThrottle.get(userId) ?? 0) < RUNNER_TOUCH_MIN_INTERVAL_MS) return;
+  runnerTouchThrottle.set(userId, now);
+
+  try {
+    const sessionIds = await getUserWarmupSessionIds(userId);
+    if (sessionIds.length === 0) return;
+
+    const { getMobileRunnerClient } = await import('@/services/mobile/mobile-runner-client');
+    const client = getMobileRunnerClient();
+    // touchSession is itself best-effort (swallows 404/transport errors).
+    await Promise.all(sessionIds.map((sid) => client.touchSession(sid, { userId })));
+
+    logger.debug('[MOBILE_IDLE] runner sessions touched', {
+      userId: userId.substring(0, 8) + '...',
+      sessions: sessionIds.length,
+    });
+  } catch (error) {
+    logger.warn('[MOBILE_IDLE] runner touch failed (non-fatal)', {
+      userId: userId.substring(0, 8) + '...',
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
  * Whether a user has a pending idle timer (test/debug aid).
  */
 export function hasIdle(userId: string): boolean {
@@ -161,6 +212,7 @@ export function hasIdle(userId: string): boolean {
  */
 async function onIdleFire(userId: string, io: SocketIOServer): Promise<void> {
   warmupExtendThrottle.delete(userId);
+  runnerTouchThrottle.delete(userId);
 
   // Capture the warmed sessionIds BEFORE deleting the Redis keys — the
   // teardown trace below needs them, and `deleteUserMobileKeys` removes the

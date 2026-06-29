@@ -6,7 +6,7 @@
 import { logger } from '@/utils/core/logger';
 import { Socket } from 'socket.io';
 import { getUserId } from '../middleware/middleware';
-import { refreshWarmupTtl } from '@/services/mobile/mobile-idle.service';
+import { refreshWarmupTtl, touchRunnerSessions } from '@/services/mobile/mobile-idle.service';
 import {
   ClientToServerEvents,
   ServerToClientEvents,
@@ -76,16 +76,20 @@ export const handleHeartbeat = (socket: TypedSocket): void => {
   // mobile runner's socket and bypass the backend; this event lets the
   // frontend signal that the user is still active.
   //
-  // Two things must be kept alive for an actively-used mobile session, and
-  // BOTH have a 15-min window that this event refreshes:
-  //   1. The in-memory idle timer (`mobile-idle.service.ts`) — refreshed
+  // Three things must be kept alive for an actively-used mobile session:
+  //   1. The in-memory idle timer (`mobile-idle.service.ts`, 15-min) — refreshed
   //      generically by the `socket.use()` activity middleware in
   //      core/server.ts (this event is not in IDLE_BACKGROUND_EVENTS).
-  //   2. The Redis `mobile_warmup` binding — has a FIXED TTL that nothing
-  //      else extends; `refreshWarmupTtl` re-arms it here (throttled,
-  //      best-effort) so authz/session-resolution don't lapse under an active
-  //      user. Without this, #1 alone keeps the editor open while the binding
-  //      silently expires, breaking chat-driven mobile actions at ~15 min.
+  //   2. The Redis `mobile_warmup` binding (15-min FIXED TTL that nothing else
+  //      extends); `refreshWarmupTtl` re-arms it here (throttled, best-effort)
+  //      so authz/session-resolution don't lapse under an active user. Without
+  //      it, #1 alone keeps the editor open while the binding silently expires,
+  //      breaking chat-driven mobile actions at ~15 min.
+  //   3. The RUNNER session's `lastActivityAt` — `touchRunnerSessions` pings the
+  //      runner (throttled, best-effort) so a session being actively EDITED (no
+  //      device gestures = no runner traffic) isn't capacity-evicted as the
+  //      "oldest idle" session. Closes the 2026-06-29 lint-410 incident: #1/#2
+  //      tracked activity on the backend only — nothing told the runner.
   socket.on('mobile:keepalive', () => {
     logger.debug('[WebSocket] mobile:keepalive', {
       socketId: socket.id,
@@ -93,6 +97,7 @@ export const handleHeartbeat = (socket: TypedSocket): void => {
     });
     if (userId) {
       void refreshWarmupTtl(userId);
+      void touchRunnerSessions(userId);
     }
   });
 };

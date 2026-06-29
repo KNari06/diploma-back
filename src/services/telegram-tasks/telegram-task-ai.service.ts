@@ -26,13 +26,24 @@ function esc(s: string): string {
 
 export type ProgressState = 'in_progress' | 'blocked' | 'needs_investigation';
 
+/** The single task lifecycle (replaces the old status+progress pair). A task is
+ *  in exactly one of these. `done`/`expired` are terminal (excluded from the
+ *  active board). `needs_investigation` from the old model folds into `blocked`. */
+export type Lifecycle = 'open' | 'in_progress' | 'blocked' | 'done' | 'expired';
+
+/** Map a model-emitted progress state onto a lifecycle value. The model may
+ *  still say `needs_investigation`; we collapse it to `blocked`. */
+export function progressToLifecycle(state: ProgressState): Lifecycle {
+  return state === 'in_progress' ? 'in_progress' : 'blocked';
+}
+
 /** Minimal task shape the AI layer needs (subset of the DB row). */
 export interface AiTaskView {
   id: string;
   project: string | null;
   title: string;
-  owner: string | null;
-  progress: 'none' | ProgressState;
+  owner: string | null; // canonical handle if known, else the raw display name
+  lifecycle: Lifecycle;
   progress_note: string | null;
   has_deadline: boolean; // true if due_text/due_at already set — don't re-ask
   due_text: string | null; // the owner's words for the deadline, e.g. "к пятнице" (null if none)
@@ -149,11 +160,24 @@ function buildSystem(): string {
     '          a strong create signal. Do NOT create for a task already in the open',
     '          list (match by MEANING, not exact words) — use update/touch instead.',
     '          Do NOT create for questions, status-checks, or chatter.',
+    '          HIGH BAR outside a digest/#task: a first-person remark about doing',
+    '          work ("I\'m doing the USB run", "беру это", "чекаю", "сейчас гляну")',
+    '          or an imperative aimed at someone ("проверь X", "fix Y") is usually',
+    '          a STATUS or instruction about EXISTING work, NOT a new task — prefer',
+    '          progress/touch/nothing, or update an existing task. Create a brand-',
+    '          new task from a lone chat message ONLY when it clearly defines new,',
+    '          standalone work not already tracked. When unsure, do NOT create.',
     'close   — the message REPORTS a specific task DONE ("done","merged","fixed",',
     '          "deployed","готово","сделал","залил","закрыл","бітті"). A promise',
     '          about the future, a question ("done?"), or a vague "ok"/"+" is NOT',
     '          closure. Authority: a teammate may close only a task they OWN; the',
     '          MANAGER may close anyone\'s task.',
+    '          CRITICAL: only close when REPLYING TO TASK(S) names the exact task,',
+    '          OR the message itself unambiguously names ONE open task by its',
+    '          title/project. A bare "fixed"/"pushed into dev"/"done" with no reply',
+    '          and no task named is NOT enough — do NOT guess which task. If you',
+    '          cannot pin the exact task, emit touch (if one task is clearly being',
+    '          discussed) or NOTHING. Closing the wrong task is a serious error.',
     'reopen  — an explicit statement that a closed/assumed-done task is NOT done.',
     'update  — same task, but its owner, project, or wording changed.',
     'progress — use ONLY when the message is the task OWNER explicitly reporting',
@@ -272,7 +296,7 @@ function renderOpenTasks(openTasks: AiTaskView[], nowMs: number): string {
         // an HTML reply they're already safe (a raw < or & would break the tag).
         `- id=${t.id}: ${t.project ? `[${esc(t.project)}] ` : ''}${esc(t.title)}` +
         `${t.owner ? ` (owner ${t.owner})` : ' (unassigned)'}` +
-        `${t.progress !== 'none' ? ` [last status: ${t.progress}${t.progress_note ? ` — ${esc(t.progress_note)}` : ''}]` : ''}` +
+        ` [${t.lifecycle}${t.progress_note ? `: ${esc(t.progress_note)}` : ''}]` +
         renderDeadline(t, nowMs) +
         `${t.link ? ` link=${t.link}` : ''}`,
     )
@@ -370,13 +394,148 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
   ].join('\n');
 
   const raw = await callReconcileTool(buildSystem(), userBlock, 1500);
-  return {
-    actions: validateActions(raw.actions as Array<Record<string, unknown>>, ctx.openTasks, ctx.text, {
-      owner: canonicalOwner(ctx.author) ?? undefined,
-      isManager: ctx.isManager,
-    }, ctx.replyToTaskIds),
-    reply: raw.reply,
+  const validated = validateActions(raw.actions as Array<Record<string, unknown>>, ctx.openTasks, ctx.text, {
+    owner: canonicalOwner(ctx.author) ?? undefined,
+    isManager: ctx.isManager,
+  }, ctx.replyToTaskIds, {
+    // close/reopen only when the message deterministically replies to that task.
+    replyLinkedIds: ctx.replyToTaskIds,
+    enforceReplyForClose: true,
+  });
+
+  // Second-look verification on RISKY actions only (close/reopen/create/owner
+  // reassign): a separate LLM pass that must justify each one from the message,
+  // or it is dropped before applying. Fires only when such an action exists, so
+  // chatter / status / Q&A cost nothing extra. The deterministic guards above
+  // already pruned the easy mistakes; this catches the SEMANTIC ones they can't
+  // judge (e.g. "merged MR 139" closing an unrelated task).
+  const actions = await verifyRiskyActions(ctx, validated);
+  return { actions, reply: raw.reply };
+}
+
+/** An action whose mistake is costly and not deterministically guardable: it
+ *  closes/reopens an existing task, creates brand-new work, or hands a task to a
+ *  new owner. These get a second-look LLM verification; everything else applies
+ *  as-is. */
+function isRiskyAction(a: Action): boolean {
+  if (a.kind === 'close' || a.kind === 'reopen' || a.kind === 'create') return true;
+  if (a.kind === 'update' && a.owner !== undefined) return true; // owner reassignment
+  return false;
+}
+
+/** Human-readable one-liner of a risky action for the verifier prompt. */
+function describeAction(a: Action, taskById: Map<string, AiTaskView>): string {
+  const t = (id: string): string => {
+    const v = taskById.get(id);
+    return v ? `${v.project ? `[${v.project}] ` : ''}${v.title}` : `task ${id}`;
   };
+  switch (a.kind) {
+    case 'close': return `CLOSE "${t(a.task_id)}" (reason: ${a.reason})`;
+    case 'reopen': return `REOPEN "${t(a.task_id)}"`;
+    case 'create': return `CREATE new task "${a.project ? `[${a.project}] ` : ''}${a.title}"${a.owner ? ` for ${a.owner}` : ''}`;
+    case 'update': return `REASSIGN "${t(a.task_id)}" to owner ${a.owner}`;
+    default: return a.kind;
+  }
+}
+
+const VERIFY_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'verdicts',
+    description: 'For each proposed action, decide if the message truly justifies it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        verdicts: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              index: { type: 'number', description: 'The action index from the list (0-based).' },
+              justified: { type: 'boolean', description: 'true only if THIS message clearly justifies THIS exact action.' },
+              reason: { type: 'string' },
+            },
+            required: ['index', 'justified'],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['verdicts'],
+      additionalProperties: false,
+    },
+  },
+};
+
+/** Second-look pass: keep only risky actions the model can justify from the
+ *  message. Non-risky actions pass through untouched. Fail-OPEN on any verifier
+ *  error (don't lose a legitimate action because the check failed) — the
+ *  deterministic guards already ran, so this is an extra net, not the only one. */
+export async function verifyRiskyActions(ctx: ReconcileContext, actions: Action[]): Promise<Action[]> {
+  const risky = actions.filter(isRiskyAction);
+  if (risky.length === 0) return actions; // nothing to verify → no extra LLM call
+
+  const taskById = new Map(ctx.openTasks.map((t) => [t.id, t] as const));
+  const list = risky.map((a, i) => `${i}. ${describeAction(a, taskById)}`).join('\n');
+
+  const system = [
+    'You are a strict reviewer of a task-tracking bot\'s proposed changes. For',
+    'EACH proposed action, decide if THIS message — from THIS author — clearly and',
+    'specifically justifies THAT EXACT action. Be skeptical; default to NOT',
+    'justified when unsure.',
+    'REJECT (justified=false) when:',
+    '  • a CLOSE/REOPEN targets a task the message does not clearly refer to (a',
+    '    vague "fixed"/"merged"/"done" that names no specific task, or names/links',
+    '    DIFFERENT work than the task — e.g. "merged MR about runner steps" does',
+    '    NOT justify closing "Have 1 big regression in my account").',
+    '  • a CREATE invents a task from a status remark / instruction / question',
+    '    rather than a genuinely new, distinct unit of work.',
+    '  • a REASSIGN changes owner without the message clearly saying who now owns it.',
+    'CONFIRM (justified=true) only when the link between the message and the action',
+    'is clear and specific. When in doubt, reject.',
+  ].join('\n');
+  const user = [
+    `AUTHOR: ${ctx.author ?? 'unknown'}${ctx.isManager ? ' (MANAGER)' : ''}`,
+    ctx.replyToTaskIds.length ? `REPLYING TO TASK(S): ${ctx.replyToTaskIds.join(', ')}` : 'REPLYING TO: (not a reply)',
+    '',
+    'MESSAGE:',
+    `"""${ctx.text}"""`,
+    '',
+    'PROPOSED ACTIONS:',
+    list,
+  ].join('\n');
+
+  let verdicts: Array<{ index: number; justified: boolean }> = [];
+  try {
+    const res = await getChatCompletionWithMessages(
+      [{ role: 'system', content: system }, { role: 'user', content: user }],
+      { model: AI_TASK_MODELS.telegramTaskReconcile, tools: [VERIFY_TOOL], tool_choice: 'required', max_tokens: 600 },
+    );
+    const argStr = res.tool_calls?.[0]?.function?.arguments;
+    const parsed = argStr ? (JSON.parse(argStr) as { verdicts?: unknown }) : {};
+    verdicts = Array.isArray(parsed.verdicts) ? (parsed.verdicts as Array<{ index: number; justified: boolean }>) : [];
+  } catch (err) {
+    logger.warn('[TELEGRAM_TASKS] verify pass failed — applying actions unverified', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return actions; // fail-open
+  }
+
+  // index → justified. Missing verdict for a risky action = treat as justified
+  // (fail-open per-item too; the verifier may have skipped it).
+  const rejected = new Set<number>();
+  for (const v of verdicts) {
+    if (typeof v.index === 'number' && v.justified === false) rejected.add(v.index);
+  }
+  if (rejected.size === 0) return actions;
+
+  const keptRisky = risky.filter((_, i) => !rejected.has(i));
+  const keptRiskySet = new Set(keptRisky);
+  const dropped = risky.length - keptRisky.length;
+  if (dropped > 0) {
+    logger.info('[TELEGRAM_TASKS] verify pass dropped risky actions', { dropped, total: risky.length });
+  }
+  // Rebuild in original order: non-risky kept as-is, risky kept only if confirmed.
+  return actions.filter((a) => !isRiskyAction(a) || keptRiskySet.has(a));
 }
 
 const PROGRESS_STATES = new Set<ProgressState>(['in_progress', 'blocked', 'needs_investigation']);
@@ -401,11 +560,21 @@ export function validateActions(
   // lists the candidates. A reply to ONE task (length ≤ 1) is unambiguous and
   // passes through untouched.
   ambiguousReplyIds?: string[],
+  // Live path only: enforce that close/reopen targets a task the message is
+  // DETERMINISTICALLY replying to. `replyLinkedIds` = task ids resolved from the
+  // reply chain (the task's own message, the bot's "when?"/ack about it). When
+  // `enforceReplyForClose` is true, a close/reopen on a task NOT in this set is
+  // suppressed (rewritten to clarify if there are candidates, else dropped) — so
+  // a bare "fixed"/"pushed into dev" with no reply can never guess-close someone
+  // else's task. Omitted on the batch path (it reasons over the whole day).
+  opts?: { replyLinkedIds?: string[]; enforceReplyForClose?: boolean },
 ): Action[] {
   const openIds = new Set(openTasks.map((t) => t.id));
   // Only ambiguous when the reply maps to 2+ still-open tasks.
   const ambiguous = new Set((ambiguousReplyIds ?? []).filter((id) => openIds.has(id)));
   const ambiguousActive = ambiguous.size >= 2;
+  const replyLinked = new Set((opts?.replyLinkedIds ?? []).filter((id) => openIds.has(id)));
+  const enforceReplyForClose = opts?.enforceReplyForClose === true;
   const ownerById = new Map(openTasks.map((t) => [t.id, t.owner] as const));
   /** Can `actor` change the status of this task? Owner of it, or a manager.
    *  No actor (batch) → allowed. Unowned task → allowed (anyone can advance it). */
@@ -449,6 +618,15 @@ export function validateActions(
     // (update/touch are exempt: update is an explicit edit, touch is harmless.)
     if (ambiguousActive && ambiguous.has(a.task_id) && kind !== 'update' && kind !== 'touch') {
       needsClarify = true;
+      continue;
+    }
+    // Reply-link enforcement for close/reopen (live path): closing a task is
+    // destructive and the model is prone to guess-closing a similar-looking task
+    // from a bare "fixed"/"pushed into dev" with no reply. Require the target to
+    // be deterministically reply-linked; otherwise drop the action entirely (do
+    // NOT touch — a wrong guess should leave the task untouched, not reset its
+    // clock). The model is told to ask the user to reply to the specific task.
+    if (enforceReplyForClose && (kind === 'close' || kind === 'reopen') && !replyLinked.has(a.task_id)) {
       continue;
     }
     if (kind === 'close') {

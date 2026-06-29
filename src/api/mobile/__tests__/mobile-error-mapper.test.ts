@@ -53,6 +53,34 @@ describe('sendMobileRunnerError', () => {
     expect(res.body.code).toBe('UPSTREAM_UNAVAILABLE');
   });
 
+  it('maps NO_CAPACITY to a 503 with a calm, user-facing busy message', () => {
+    const res = makeRes();
+    const err = Object.assign(
+      new Error('Max sessions limit reached (8). All sessions are active — destroy one first.'),
+      { statusCode: 503, code: 'NO_CAPACITY' },
+    );
+    sendMobileRunnerError(res, err, 'fallback');
+    expect(res.statusCode).toBe(503);
+    expect(res.body.code).toBe('NO_CAPACITY');
+    // The developer-facing "Max sessions limit reached (8)" must NOT leak to the user.
+    expect(res.body.message).toMatch(/busy/i);
+    expect(res.body.message).not.toMatch(/Max sessions/i);
+  });
+
+  it('uses the friendly busy copy on the streaming (headers-sent) path too', () => {
+    const res = makeRes(true); // headersSent
+    const err = Object.assign(
+      new Error('Max sessions limit reached (8). All sessions are active — destroy one first.'),
+      { statusCode: 503, code: 'NO_CAPACITY' },
+    );
+    sendMobileRunnerError(res, err, 'fallback');
+    expect(res.ended).toBe(true);
+    const line = JSON.parse(res.written[0]);
+    expect(line).toMatchObject({ type: 'error', code: 'NO_CAPACITY' });
+    expect(line.error).toMatch(/busy/i);
+    expect(line.error).not.toMatch(/Max sessions/i);
+  });
+
   it('maps a reclaimed session to a typed 410 SESSION_EXPIRED', () => {
     const res = makeRes();
     const err = Object.assign(new Error('session not found'), { statusCode: 404 });

@@ -33,6 +33,12 @@ interface TgMessage {
   caption?: string;
   chat?: { id: number };
   from?: TgUser;
+  // Forum (Topics) fields. `is_topic_message` is true only for a real topic
+  // thread; `message_thread_id` is then the topic id. A plain reply in a
+  // non-forum chat can also carry message_thread_id, so we trust it ONLY when
+  // is_topic_message is set (else it's the General topic → null).
+  is_topic_message?: boolean;
+  message_thread_id?: number;
   reply_to_message?: { message_id: number; from?: TgUser };
   // Photo comes as ascending-resolution sizes; the LAST is the largest. A
   // document image (screenshot sent as file) carries its own mime.
@@ -128,6 +134,9 @@ function toInbound(msg: TgMessage | undefined, isEdit: boolean): InboundMessage 
     isEdit,
     replyToMsgId: msg.reply_to_message?.message_id,
     addressedToBot: isAddressedToBot(msg, text),
+    // Topic (forum) scope: trust message_thread_id only for real topic messages;
+    // everything else is the General topic (null).
+    threadId: msg.is_topic_message && msg.message_thread_id ? msg.message_thread_id : null,
   };
 }
 
