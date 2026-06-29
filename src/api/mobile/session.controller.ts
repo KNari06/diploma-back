@@ -107,17 +107,45 @@ async function traceMobileSessionExpiry(
   userId: string,
   surfacedBy: 'apply' | 'lint',
   runnerCode?: string,
+  reason?: string | null,
 ): Promise<void> {
   // NOTE: the queryable Loki `session.expired` audit line is emitted by
   // `sendMobileRunnerError` (the single funnel every session-gone path passes
   // through). This helper only writes the richer JSONL trace event.
   try {
     EditorTraceService.getOrCreate(`mobile-${sessionId}`, userId)
-      .writeMobileSessionExpiredSurfaced({ sessionId, surfacedBy, runnerCode });
+      .writeMobileSessionExpiredSurfaced({ sessionId, surfacedBy, runnerCode, reason: reason ?? 'unknown' });
     await closeAndUploadEditorTrace(`mobile-${sessionId}`);
   } catch (err) {
     logger.warn('[MOBILE_SESSION] expiry trace write failed (non-fatal)', {
       sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Release a warmup lock ONLY if it is still ours (compare-and-del by token).
+ *
+ * The 2026-06-29 incident was a concurrent warmup deleting a lock it didn't
+ * own and then stomping the live session. The mirror risk is the holder
+ * deleting a lock that a LATER warmup re-acquired after the holder's TTL
+ * lapsed. Atomic check-then-del via Lua closes both: we delete the key only
+ * when its value equals our token. Best-effort — a Redis error just leaves the
+ * lock to expire on its 60s TTL, which is safe.
+ */
+async function releaseWarmupLock(lockKey: string, token: string | null): Promise<void> {
+  if (!token) return; // we never held it (e.g. failed before acquiring)
+  try {
+    await redisConnection.eval(
+      `if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end`,
+      1,
+      lockKey,
+      token,
+    );
+  } catch (err) {
+    logger.debug('[MOBILE_SESSION] warmup lock release failed (non-fatal, TTL backstop)', {
+      lockKey,
       error: err instanceof Error ? err.message : String(err),
     });
   }
@@ -414,6 +442,11 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     runnerAuthEnabled: !!env.MOBILE_RUNNER_API_KEY,
   });
 
+  // Warmup lock identity — declared out here so the catch can release OUR lock
+  // (compare-and-del) on failure. Assigned once the lock is acquired below.
+  const lockKey = `${WARMUP_PREFIX}${projectId}:${userId}:lock`;
+  let lockToken: string | null = null;
+
   try {
     // Feature flag check
     if (!env.MOBILE_RUNNER_ENABLED) {
@@ -427,41 +460,119 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // Check if there's already a warmed session for this project+user.
     // Use SET NX to atomically claim the slot — prevents two concurrent warmup
     // requests from both reading null and creating duplicate sessions.
+    //
+    // INCIDENT 2026-06-29 (Flutter, repeated "session gone on first lint"):
+    // a user reloading the editor fires a fresh /warmup per reload. A real
+    // warmup takes ~24-27s (pool_claim ~15s + attach_flutter ~7s). The OLD code
+    // waited only 3s for the in-flight warmup, then `del(lockKey)` — DELETING A
+    // LOCK IT DOESN'T OWN — and fell through to create its OWN session. Two
+    // warmups then ran in parallel on the same project+user; the second one's
+    // cache-invalidation `destroySession` killed the session the editor was
+    // already holding → 410 SESSION_EXPIRED on the first lint, every reload.
+    //
+    // Fix: (1) POLL for the holder's result long enough to cover a real warmup
+    // instead of giving up at 3s; (2) NEVER `del` a lock we don't own — if the
+    // holder is still alive we either return its result or 409 (let the client
+    // retry), and only create fresh when the lock has genuinely EXPIRED (holder
+    // died), which `SET NX` will then let us re-acquire.
     const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
-    const lockKey = `${redisKey}:lock`;
-    const lockAcquired = await time('redis_lock', () => redisConnection.set(lockKey, '1', 'EX', 60, 'NX'));
-    if (!lockAcquired) {
-      // Another warmup is in progress — wait briefly then check for the result
-      logger.info('[MOBILE_SESSION] Concurrent warmup detected, waiting for result', { projectId, userId });
-      await new Promise((r) => setTimeout(r, 3000));
-      const waitResult = await redisConnection.get(redisKey);
-      if (waitResult) {
-        const parsed: WarmupData = JSON.parse(waitResult);
-        if (parsed.sessionId && parsed.sessionId !== '_booting') {
-          await redisConnection.del(lockKey);
-          const runnerSocketUrl = currentRunnerSocketUrl();
-          logger.info('[MOBILE_SESSION] warmup response (path=concurrent_wait)', {
-            userId, projectId,
-            sessionId: parsed.sessionId,
-            runnerSocketUrl,
-            tookMs: Date.now() - warmupStart,
-            timings,
-          });
-          // Active editor → start the per-user idle timer.
-          try { refreshIdle(userId, getIO()); } catch { /* non-fatal */ }
-          res.json({
-            success: true,
-            sessionId: parsed.sessionId,
-            runnerSocketUrl,
-            runnerApiKey: getRunnerAuth(),
-            platform: parsed.platform,
-            reused: true,
-          });
-          return;
+    // lockKey is the hoisted const above; mint a unique token so we only ever
+    // release OUR lock (compare-and-del), never a concurrent warmup's.
+    const myLockToken = randomUUID();
+    const LOCK_TTL_SECONDS = 60;
+    const lockAcquired = await time('redis_lock', () => redisConnection.set(lockKey, myLockToken, 'EX', LOCK_TTL_SECONDS, 'NX'));
+    if (lockAcquired) {
+      lockToken = myLockToken;
+      // Trace marker: this warmup OWNS the lock for this project+user. Pair with
+      // the final `warmup response (path=...)` line (same projectId+userId) to
+      // confirm exactly one warmup ran per reload — a second `lock acquired`
+      // before the first's response = the concurrent path the 2026-06-29 fix
+      // closed. `lockToken` correlates acquire↔release across log lines.
+      logger.info('[MOBILE_SESSION] warmup lock acquired', { projectId, userId, lockToken: myLockToken });
+    } else {
+      // Another warmup holds the lock. Poll the result for up to the holder's
+      // full lock lifetime — a real Flutter warmup runs ~24-27s, far longer
+      // than the old 3s. Reuse the holder's session the moment it lands.
+      const CONCURRENT_POLL_INTERVAL_MS = 1500;
+      const CONCURRENT_POLL_MAX_MS = (LOCK_TTL_SECONDS - 5) * 1000; // stay inside the lock TTL
+      logger.info('[MOBILE_SESSION] Concurrent warmup detected, polling for holder result', {
+        projectId, userId, pollMaxMs: CONCURRENT_POLL_MAX_MS,
+      });
+      const concurrentWaitStart = Date.now();
+      let reusedSession: WarmupData | null = null;
+      let holderGone = false;
+      while (Date.now() - concurrentWaitStart < CONCURRENT_POLL_MAX_MS) {
+        await new Promise((r) => setTimeout(r, CONCURRENT_POLL_INTERVAL_MS));
+        const waitRaw = await redisConnection.get(redisKey);
+        if (waitRaw) {
+          const parsed: WarmupData = JSON.parse(waitRaw);
+          if (parsed.sessionId && parsed.sessionId !== '_booting') {
+            reusedSession = parsed;
+            break;
+          }
+        }
+        // If the lock vanished WITHOUT a result, the holder died mid-warmup —
+        // stop polling and fall through to create fresh (we'll SET NX below).
+        const lockStillHeld = await redisConnection.get(lockKey);
+        if (!lockStillHeld) {
+          holderGone = true;
+          break;
         }
       }
-      // Lock expired or boot still in progress — fall through to create
-      await redisConnection.del(lockKey);
+
+      if (reusedSession) {
+        const runnerSocketUrl = currentRunnerSocketUrl();
+        logger.info('[MOBILE_SESSION] warmup response (path=concurrent_wait)', {
+          userId, projectId,
+          sessionId: reusedSession.sessionId,
+          runnerSocketUrl,
+          waitedMs: Date.now() - concurrentWaitStart,
+          tookMs: Date.now() - warmupStart,
+          timings,
+        });
+        try { refreshIdle(userId, getIO()); } catch { /* non-fatal */ }
+        res.json({
+          success: true,
+          sessionId: reusedSession.sessionId,
+          runnerSocketUrl,
+          runnerApiKey: getRunnerAuth(),
+          platform: reusedSession.platform,
+          reused: true,
+        });
+        return;
+      }
+
+      if (!holderGone) {
+        // Holder is still alive but hasn't produced a session within the poll
+        // window. Do NOT delete its lock and stomp it — tell the client to
+        // retry. The editor's own retry/reopen will pick up the holder's
+        // session via path=concurrent_wait once it lands.
+        logger.warn('[MOBILE_SESSION] Concurrent warmup still in progress, asking client to retry', {
+          projectId, userId, waitedMs: Date.now() - concurrentWaitStart,
+        });
+        res.status(409).json({
+          success: false,
+          code: 'WARMUP_IN_PROGRESS',
+          error: 'A session is already starting for this project. Please wait a moment.',
+          retryAfterMs: 3000,
+        });
+        return;
+      }
+
+      // holderGone: the lock expired without a result. Try to acquire it fresh;
+      // if another warmup beat us to it, bail to retry rather than racing.
+      logger.info('[MOBILE_SESSION] Prior warmup holder died — acquiring fresh lock', { projectId, userId });
+      const reacquired = await redisConnection.set(lockKey, myLockToken, 'EX', LOCK_TTL_SECONDS, 'NX');
+      if (!reacquired) {
+        res.status(409).json({
+          success: false,
+          code: 'WARMUP_IN_PROGRESS',
+          error: 'A session is already starting for this project. Please wait a moment.',
+          retryAfterMs: 3000,
+        });
+        return;
+      }
+      lockToken = myLockToken;
     }
 
     const existingRaw = await redisConnection.get(redisKey);
@@ -815,8 +926,11 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       WARMUP_TTL,
     );
 
-    // Release the warmup lock now that the session is stored
-    await redisConnection.del(lockKey).catch(() => {});
+    // Release the warmup lock now that the session is stored. Compare-and-del
+    // by token: only delete the lock if it's STILL ours — a concurrent warmup
+    // that re-acquired the key after our TTL lapsed must not have its lock
+    // wiped by us (the mirror of the stomp bug fixed in the concurrent branch).
+    await releaseWarmupLock(lockKey, lockToken);
 
     logger.info('[MOBILE_SESSION] Emulator warmed up', {
       projectId,
@@ -935,6 +1049,10 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // failures (the boot window) — install/launch failures are swallowed as
     // non-fatal above and never reach here.
     emitWarmupProgress(userId, 'boot_emulator', 0, message);
+
+    // Release our lock on failure so a retry/reopen isn't blocked for the full
+    // 60s TTL. Compare-and-del — never wipe a concurrent warmup's lock.
+    await releaseWarmupLock(lockKey, lockToken);
 
     sendMobileRunnerError(res, error, 'Failed to warm up emulator session');
   }
@@ -1350,14 +1468,26 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
     // (~one GET /api/sessions, 5s cap) and only on the lint path.
     const alive = await client.sessionExists(sessionId);
     if (!alive) {
-      logger.info('[MOBILE_SESSION] Lint on a session the runner no longer has', { sessionId });
+      // Diagnostic: pull the runner's destroy tombstone so the log names the
+      // REAL cause (idle_ttl / evicted / device_disconnected / multiuser_evict /
+      // pool_recover / shutdown / …) instead of guessing. Best-effort; null when
+      // the tombstone aged out or the runner restarted (a restart itself being
+      // the implicit cause). Tracks the recurring "session gone ~15-23s after
+      // warmup, first lint" incident (2026-06-29) — once a reason shows up we
+      // know which teardown path to fix.
+      const reason = await client.getSessionDestroyReason(sessionId);
+      logger.info('[MOBILE_SESSION] Lint on a session the runner no longer has', {
+        sessionId,
+        reason: reason ?? 'unknown',
+      });
       res.status(410).json({
         success: false,
         code: 'SESSION_EXPIRED',
         error: 'Session expired',
+        ...(reason ? { reason } : {}),
         message: 'The device session is no longer available (it was reclaimed after inactivity or a restart). Reopen the test case to continue.',
       });
-      void traceMobileSessionExpiry(sessionId, req.user.id, 'lint', 'liveness_precheck');
+      void traceMobileSessionExpiry(sessionId, req.user.id, 'lint', 'liveness_precheck', reason);
       return;
     }
 

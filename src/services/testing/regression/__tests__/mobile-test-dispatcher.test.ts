@@ -14,6 +14,7 @@ jest.mock('@/services/storage/mobile-app-storage.service', () => ({
     // Default: framework unknown → dispatcher keeps the stored platform.
     // Flutter-upgrade behaviour is asserted in its own test below.
     getDetectedFramework: jest.fn().mockResolvedValue(undefined),
+    getProjectDefaultVariant: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -59,6 +60,13 @@ jest.mock('@/utils/testing/parameter-substitution.utils', () => ({
   applyParameters: jest.fn((steps: any[], _params: any) => steps),
 }));
 
+// Mobile testing is a Pro-only feature. The dispatcher's first call is the plan
+// gate (isPaidUser). Stub it at the service boundary so the dispatcher proceeds;
+// a dedicated test below flips it to false to keep the gate covered.
+jest.mock('@/services/core/plan-access.service', () => ({
+  isPaidUser: jest.fn().mockResolvedValue(true),
+}));
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function baseCase(overrides: Record<string, any> = {}) {
@@ -80,6 +88,7 @@ const { MobileAppStorageService } = jest.requireMock(
 );
 const { QueueManager } = jest.requireMock('@/config/infrastructure/queues');
 const { dbAdminService } = jest.requireMock('@/db/supabase');
+const { isPaidUser } = jest.requireMock('@/services/core/plan-access.service');
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -89,8 +98,10 @@ beforeEach(() => {
   // test (clearAllMocks wipes the factory default) so a per-test
   // mockResolvedValueOnce can't bleed into a later test.
   MobileAppStorageService.getDetectedFramework.mockResolvedValue(undefined);
+  MobileAppStorageService.getProjectDefaultVariant.mockResolvedValue(undefined);
   dbAdminService.createTest.mockResolvedValue(undefined);
   QueueManager.addMobileTestRunJob.mockResolvedValue(undefined);
+  isPaidUser.mockResolvedValue(true);
 });
 
 // ── Platform / browser mapping ────────────────────────────────────────────────
@@ -202,6 +213,21 @@ describe('steps_json validation', () => {
       ),
     ).rejects.toThrow(ValidationError);
     expect(dbAdminService.createTest).not.toHaveBeenCalled();
+  });
+});
+
+// ── Plan gate (mobile is Pro-only) ───────────────────────────────────────────
+
+describe('plan gate', () => {
+  it('throws ValidationError and enqueues nothing for a non-paid user', async () => {
+    isPaidUser.mockResolvedValueOnce(false);
+
+    await expect(
+      MobileTestDispatcherService.dispatchMobileTest(baseCase(), 'user-1', 'manual'),
+    ).rejects.toThrow(ValidationError);
+
+    expect(dbAdminService.createTest).not.toHaveBeenCalled();
+    expect(QueueManager.addMobileTestRunJob).not.toHaveBeenCalled();
   });
 });
 

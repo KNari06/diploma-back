@@ -15,7 +15,9 @@ import { env } from '@/config/environment/env';
 import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from './openai.service';
-import { generateTextWithGemini, getChatCompletionWithGemini } from './gemini.service';
+import { generateTextWithGemini, getChatCompletionWithGemini, _retryInternals } from './gemini.service';
+
+const { isTransientGeminiError } = _retryInternals;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -123,21 +125,39 @@ export async function generateText(params: {
 
   try {
     if (provider === 'gemini') {
-      const response = await generateTextWithGemini({
-        prompt,
-        model: model as any,
-        temperature,
-        maxTokens,
-        timeout,
-      });
+      try {
+        const response = await generateTextWithGemini({
+          prompt,
+          model: model as any,
+          temperature,
+          maxTokens,
+          timeout,
+        });
 
-      return {
-        ...response,
-        usage: {
-          ...response.usage,
-          provider: 'gemini',
-        },
-      };
+        return {
+          ...response,
+          usage: {
+            ...response.usage,
+            provider: 'gemini',
+          },
+        };
+      } catch (geminiErr) {
+        // Cross-provider fall-over: a transient Gemini fault (503/429/5xx) or a
+        // TIMEOUT should hop to OpenAI rather than fail the task — mirrors the
+        // runner's `callLlmWithFallback`. Only when OpenAI is actually
+        // configured; otherwise rethrow so the outer catch logs it.
+        if (!isTransientGeminiError(geminiErr) || !isProviderAvailable('openai')) throw geminiErr;
+        logger.warn('[AI_PROVIDER] Gemini transient/timeout — falling over to OpenAI', {
+          task,
+          error: geminiErr instanceof Error ? geminiErr.message : String(geminiErr),
+        });
+        const fallbackModel = getDefaultModel('openai', task);
+        const response = await getChatCompletionWithMessages(
+          [{ role: 'user', content: prompt }],
+          { model: fallbackModel, temperature, max_tokens: maxTokens },
+        );
+        return { ...response, usage: { ...response.usage, provider: 'openai' } };
+      }
     } else {
       // OpenAI doesn't have a direct "prompt → text" API, so use chat completion
       const response = await getChatCompletionWithMessages(
@@ -209,21 +229,36 @@ export async function generateChatCompletion(params: {
 
   try {
     if (provider === 'gemini') {
-      const response = await getChatCompletionWithGemini({
-        messages,
-        model: model as any,
-        temperature,
-        maxTokens,
-        timeout,
-      });
+      try {
+        const response = await getChatCompletionWithGemini({
+          messages,
+          model: model as any,
+          temperature,
+          maxTokens,
+          timeout,
+        });
 
-      return {
-        ...response,
-        usage: {
-          ...response.usage,
-          provider: 'gemini',
-        },
-      };
+        return {
+          ...response,
+          usage: {
+            ...response.usage,
+            provider: 'gemini',
+          },
+        };
+      } catch (geminiErr) {
+        // Same cross-provider fall-over as generateText (transient/timeout → OpenAI).
+        if (!isTransientGeminiError(geminiErr) || !isProviderAvailable('openai')) throw geminiErr;
+        logger.warn('[AI_PROVIDER] Gemini transient/timeout — falling over to OpenAI', {
+          task,
+          error: geminiErr instanceof Error ? geminiErr.message : String(geminiErr),
+        });
+        const fallbackModel = getDefaultModel('openai', task);
+        const response = await getChatCompletionWithMessages(
+          messages as any,
+          { model: fallbackModel, temperature, max_tokens: maxTokens },
+        );
+        return { ...response, usage: { ...response.usage, provider: 'openai' } };
+      }
     } else {
       const response = await getChatCompletionWithMessages(
         messages as any,

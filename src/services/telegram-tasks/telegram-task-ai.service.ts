@@ -74,6 +74,7 @@ export interface ReconcileContext {
   author: string | undefined;
   isManager: boolean;
   replyToTaskIds: string[];
+  replyToText?: string; // text of the message being replied to — antecedent for pronoun questions
   openTasks: AiTaskView[]; // BOUNDED: most-recently-active open tasks only
   hiddenOpenCount: number;
   recentMessages: Array<{ author: string | null; text: string }>;
@@ -178,6 +179,9 @@ function buildSystem(): string {
     '          and no task named is NOT enough — do NOT guess which task. If you',
     '          cannot pin the exact task, emit touch (if one task is clearly being',
     '          discussed) or NOTHING. Closing the wrong task is a serious error.',
+    '          BUT when the task IS pinned (REPLYING TO TASK names exactly one open',
+    '          task) and the owner says it is done ("merged", "deployed", "готово"),',
+    '          DO close it — do not hesitate; the target is unambiguous there.',
     'reopen  — an explicit statement that a closed/assumed-done task is NOT done.',
     'update  — same task, but its owner, project, or wording changed.',
     'progress — use ONLY when the message is the task OWNER explicitly reporting',
@@ -236,8 +240,11 @@ function buildSystem(): string {
     'owner (the first / the one being asked) for owner; "me" means the AUTHOR.',
     '',
     'PRIORITY when unsure: prefer reusing an existing task_id over create; prefer',
-    'touch over progress/close when the message is vague; never close on a',
-    'question; never set progress on "I don\'t know / didn\'t check". If a message',
+    'touch over progress/close when the message is vague AND the task is NOT pinned',
+    'by a reply. But a clear completion word ("merged","deployed","done","готово")',
+    'sent as a REPLY to exactly one task is NOT vague — close it, do not downgrade',
+    'to touch. Never close on a question; never set progress on "I don\'t know /',
+    'didn\'t check". If a message',
     'does nothing task-related (chatter "тут почему?", "Хотя да", "ok"; or just',
     'answering someone\'s question like "I didn\'t check"), emit NO actions at all',
     'unless it clearly references a specific open task (then at most touch).',
@@ -248,7 +255,8 @@ function buildSystem(): string {
     '  owner:@gipardb}; create{project:JP,title:"AI check bugs",owner:@ndarkhans}',
     '• "Pointer - @YerassylOspan - when? - in Progress, it takes 1-2 days"  →',
     '  create{title:"Pointer",owner:@YerassylOspan,state:in_progress,note:"1-2 days"}',
-    '• owner @gipardb replies "merged, deployed"  → close{the video task}',
+    '• owner @gipardb, REPLYING TO the video task, says "merged and deployed"  →',
+    '  close{that video task} (the reply pins it — do NOT downgrade to touch)',
     '• manager: "@ndarkhans is this actual?"  → touch{that task}  (a QUESTION)',
     '• "turns out hard, need to investigate more"  → progress{state:',
     '  needs_investigation, note:"turns out hard, need to investigate more"}',
@@ -268,7 +276,10 @@ function buildSystem(): string {
     'digests into tracked tasks (project + owner + status), close them when',
     'someone reports done, record status updates (in progress / blocked / needs',
     'investigation), ask owners each morning about unclear tasks, and answer',
-    'questions about the tasks when @mentioned or replied to.',
+    'questions about the tasks when @mentioned or replied to. Tip: I track each',
+    'forum topic separately, so to mark a task done/changed FROM A DIFFERENT TOPIC,',
+    'reply to that task\'s message — a reply finds the task across any topic, while',
+    'a plain message only matches tasks in the topic you are writing in.',
     ...(aliasHint() ? ['', aliasHint()] : []),
   ].join('\n');
 }
@@ -360,6 +371,11 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
         '    left?", "what can you do?") → put a concise, grounded answer in',
         '    `reply` and emit NO actions. Answer ONLY from the open tasks above;',
         '    if the data does not contain it, say so. Reply in the user\'s language.',
+        '  • A PRONOUN / FOLLOW-UP question ("why?", "это точно?", "and that one?")',
+        '    refers to the REPLIED-TO MESSAGE (shown above) or the recent chat — answer',
+        '    about THAT. If you cannot tell what it refers to (no replied-to message,',
+        '    nothing clear in recent chat), ASK them to clarify — do NOT invent an',
+        '    answer about an unrelated task.',
         '  • An ACTION ("done", "close the video task", "in progress 2 days") →',
         '    emit the actions as usual; `reply` may be a short confirmation or null.',
         '',
@@ -384,6 +400,10 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
     '',
     `AUTHOR: ${ctx.author ?? 'unknown'}${ctx.isManager ? ' (MANAGER)' : ''}`,
     ctx.replyToTaskIds.length ? `REPLYING TO TASK(S): ${ctx.replyToTaskIds.join(', ')}` : 'REPLYING TO: (not a reply / unknown)',
+    // The replied-to message's words — the antecedent for "why?", "это точно?",
+    // "and that one?". When the new message is a bare pronoun/question, resolve it
+    // AGAINST this. Capped so a huge quoted message can't blow the prompt.
+    ctx.replyToText ? `REPLIED-TO MESSAGE: """${ctx.replyToText.slice(0, 500)}"""` : '',
     '',
     openHeader,
     renderOpenTasks(ctx.openTasks, nowMs),
@@ -409,8 +429,44 @@ export async function reconcile(ctx: ReconcileContext): Promise<ReconcileResult>
   // chatter / status / Q&A cost nothing extra. The deterministic guards above
   // already pruned the easy mistakes; this catches the SEMANTIC ones they can't
   // judge (e.g. "merged MR 139" closing an unrelated task).
-  const actions = await verifyRiskyActions(ctx, validated);
+  // Verify the MODEL's risky actions first, THEN apply the deterministic close
+  // assist — the assist is already authority- + reply-pinned-checked, so it must
+  // not be subject to (and dropped by) the LLM verifier (which lacks the context
+  // to justify a bare "merged"). Order matters: verify model output, then assist.
+  const verified = await verifyRiskyActions(ctx, validated);
+  const actions = applyCloseAssist(ctx, verified);
   return { actions, reply: raw.reply };
+}
+
+/** Completion words that, on their own, unambiguously report a task done. Kept
+ *  to short high-confidence forms; the model handles the long tail. */
+const COMPLETION_WORDS = /^(done|merged|deployed|fixed|shipped|готово|сделал[аи]?|залил[аи]?|закрыл[аи]?|бітті|дайын)\b/i;
+
+/** Deterministic close assist (narrow): the model sometimes under-acts — on a
+ *  bare "merged"/"готово" REPLYING to exactly one task from its owner/manager it
+ *  returns nothing instead of close. If the reply pins ONE task, the author may
+ *  mutate it, the message is essentially just a completion word, and the model
+ *  produced no close/progress/touch/clarify on it, inject the close. Conservative
+ *  by design: a longer sentence (which might be about a sub-detail) is left to the
+ *  model. Never fires without a single reply-pinned task. */
+function applyCloseAssist(ctx: ReconcileContext, actions: Action[]): Action[] {
+  if (ctx.replyToTaskIds.length !== 1) return actions; // need exactly one pinned task
+  const taskId = ctx.replyToTaskIds[0];
+  const task = ctx.openTasks.find((t) => t.id === taskId);
+  if (!task) return actions;
+  // Only a short, completion-word-only message (≤4 words) — not a longer remark.
+  const trimmed = ctx.text.trim();
+  if (trimmed.split(/\s+/).length > 4 || !COMPLETION_WORDS.test(trimmed)) return actions;
+  // Authority: owner of the task or a manager.
+  const actor = canonicalOwner(ctx.author);
+  const mayClose = ctx.isManager || !task.owner || (!!actor && task.owner.toLowerCase() === actor.toLowerCase());
+  if (!mayClose) return actions;
+  // Don't override an existing decision on this task (close/progress/touch/clarify).
+  const alreadyActed = actions.some(
+    (a) => ('task_id' in a && a.task_id === taskId) || a.kind === 'clarify',
+  );
+  if (alreadyActed) return actions;
+  return [...actions, { kind: 'close', task_id: taskId, reason: trimmed.slice(0, 200) }];
 }
 
 /** An action whose mistake is costly and not deterministically guardable: it

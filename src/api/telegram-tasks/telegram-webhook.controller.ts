@@ -39,7 +39,8 @@ interface TgMessage {
   // is_topic_message is set (else it's the General topic → null).
   is_topic_message?: boolean;
   message_thread_id?: number;
-  reply_to_message?: { message_id: number; from?: TgUser };
+  // The replied-to message: its text/caption grounds pronoun questions ("@bot why?").
+  reply_to_message?: { message_id: number; from?: TgUser; text?: string; caption?: string };
   // Photo comes as ascending-resolution sizes; the LAST is the largest. A
   // document image (screenshot sent as file) carries its own mime.
   photo?: TgPhotoSize[];
@@ -49,8 +50,32 @@ interface TgMessage {
 }
 
 // Albums arrive as N separate messages sharing one media_group_id; the caption
-// is only on the first. Process just the first per group to avoid N vision
-// calls + N duplicate reconciles. Tiny bounded LRU of recently-seen group ids.
+// is only on the first. We process the group ONCE (on the first part) but collect
+// up to MAX_ALBUM_IMAGES file_ids across parts so a 2-screenshot bug report is
+// read in full. The first part is debounced briefly so trailing parts' images can
+// join before reconcile runs (Telegram delivers album parts within ~tens of ms).
+const MAX_ALBUM_IMAGES = 2;
+const ALBUM_DEBOUNCE_MS = 1500;
+// media_group_id → file_ids gathered so far (first part owns the dispatch).
+const albumImages = new Map<string, string[]>();
+const ALBUM_CAP = 500;
+
+/** Record an album part's image; returns true if THIS part is the first of its
+ *  group (the one that should dispatch the reconcile). Later parts return false —
+ *  their image is appended to the group's buffer, capped at MAX_ALBUM_IMAGES. */
+function captureAlbumImage(groupId: string, fileId: string | undefined): boolean {
+  const first = !albumImages.has(groupId);
+  if (first) {
+    if (albumImages.size >= ALBUM_CAP) albumImages.clear();
+    albumImages.set(groupId, []);
+  }
+  if (fileId) {
+    const arr = albumImages.get(groupId)!;
+    if (arr.length < MAX_ALBUM_IMAGES) arr.push(fileId);
+  }
+  return first;
+}
+
 const seenAlbums = new Set<string>();
 const SEEN_ALBUMS_CAP = 500;
 function isDuplicateAlbumPart(groupId: string | undefined): boolean {
@@ -112,15 +137,24 @@ function imageFileId(msg: TgMessage): string | undefined {
   return undefined;
 }
 
-/** Map a Telegram message object to our inbound shape, or null if not usable. */
+/** Map a Telegram message to our inbound shape, or null if not usable / a
+ *  non-dispatching album part. For an album, ONLY the first part returns an
+ *  inbound (later parts return null but contribute their image to the buffer);
+ *  the first part's `imageFileIds` is filled later in the handler after debounce. */
 function toInbound(msg: TgMessage | undefined, isEdit: boolean): InboundMessage | null {
   if (!msg || !msg.chat) return null;
   if (msg.from?.is_bot) return null; // never ingest bot messages (incl. our own)
-  // Skip the 2nd+ photos of an album — only the first (with the caption) is
-  // processed, so one album = one reconcile, not N. Edits never carry a new group.
-  if (!isEdit && isDuplicateAlbumPart(msg.media_group_id)) return null;
   const text = msg.text ?? msg.caption ?? '';
   const imageFile = imageFileId(msg);
+
+  // Album: collect this part's image; only the first part dispatches.
+  if (!isEdit && msg.media_group_id) {
+    const isFirst = captureAlbumImage(msg.media_group_id, imageFile);
+    if (!isFirst) return null; // trailing part — image buffered, no separate reconcile
+  } else if (!isEdit && isDuplicateAlbumPart(msg.media_group_id)) {
+    return null;
+  }
+
   // Usable if it has text OR an image. A caption-less photo was previously
   // dropped entirely; now it flows through (the service reads it via vision).
   if (!text && !imageFile) return null;
@@ -128,11 +162,15 @@ function toInbound(msg: TgMessage | undefined, isEdit: boolean): InboundMessage 
     chatId: msg.chat.id,
     msgId: msg.message_id,
     text,
-    imageFileId: imageFile,
+    imageFileIds: imageFile ? [imageFile] : [],
+    mediaGroupId: msg.media_group_id,
     authorUsername: msg.from?.username,
     authorName: msg.from?.first_name,
     isEdit,
     replyToMsgId: msg.reply_to_message?.message_id,
+    // Text of the message being replied to — grounds pronoun/follow-up questions
+    // ("@bot why?", "это точно?") to their actual antecedent. Trimmed/capped later.
+    replyToText: msg.reply_to_message?.text ?? msg.reply_to_message?.caption,
     addressedToBot: isAddressedToBot(msg, text),
     // Topic (forum) scope: trust message_thread_id only for real topic messages;
     // everything else is the General topic (null).
@@ -178,10 +216,25 @@ export function handleTelegramWebhook(req: Request, res: Response): void {
   const inbound = toInbound(update.message, false) ?? toInbound(update.edited_message, true);
   if (!inbound) return;
 
-  // Fire-and-forget; ingestMessage never throws, but guard anyway.
-  void ingestMessage(inbound).catch((err) => {
-    logger.error('[TELEGRAM_TASKS] webhook processing failed', {
-      error: err instanceof Error ? err.message : String(err),
+  const dispatch = (m: InboundMessage): void => {
+    // Fire-and-forget; ingestMessage never throws, but guard anyway.
+    void ingestMessage(m).catch((err) => {
+      logger.error('[TELEGRAM_TASKS] webhook processing failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
-  });
+  };
+
+  // Album first-part: wait briefly for trailing parts' images to arrive, then
+  // dispatch once with up to MAX_ALBUM_IMAGES images. Non-album: dispatch now.
+  if (inbound.mediaGroupId) {
+    const groupId = inbound.mediaGroupId;
+    setTimeout(() => {
+      inbound.imageFileIds = (albumImages.get(groupId) ?? inbound.imageFileIds).slice(0, MAX_ALBUM_IMAGES);
+      albumImages.delete(groupId);
+      dispatch(inbound);
+    }, ALBUM_DEBOUNCE_MS);
+  } else {
+    dispatch(inbound);
+  }
 }
