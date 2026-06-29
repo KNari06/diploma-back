@@ -99,6 +99,13 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
      * Matches the gate in intent-step-lint.service.ts:1227 used by preview.
      */
     disableCaching?: boolean;
+    /**
+     * From `step.options.useScreenshotOnly`. When true the executor skips the
+     * evidence shortcut + compiled fast-path and forces vision-only resolution
+     * via resolveElement's screenshot-only gate. Mirrors the preview gates in
+     * intent-step-lint.service.ts + preview-step-apply.service.ts.
+     */
+    useScreenshotOnly?: boolean;
     /** V13: Content was pasted — use clipboard paste instead of fill/pressSequentially */
     isPaste?: boolean;
     /** V11: Expected outcome for 4xx detection (default: 'success') */
@@ -307,6 +314,8 @@ export function convertIntentStepToCommand(
       stepIndex,
       // V6: Action type for lookahead checks
       actionType: step.type,
+      // Force vision-only resolution flag (screenshot-only steps).
+      useScreenshotOnly: step.options?.useScreenshotOnly,
       // V6: Lookahead wait disable flag
       disableLookaheadWait: step.options?.disableLookaheadWait,
       lookaheadTimeoutMs: step.options?.lookaheadTimeoutMs,

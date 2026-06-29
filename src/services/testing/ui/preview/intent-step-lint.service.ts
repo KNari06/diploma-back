@@ -1292,8 +1292,11 @@ export class IntentStepLintService {
     // trace emission) stay here.
     // ═══════════════════════════════════════════════════════════════════════════
     const disableCaching = stepDraft.options?.disableCaching === true;
+    // Force vision-only steps must skip the evidence shortcut so resolution
+    // falls through to resolveElement's screenshot-only gate (vision-led).
+    const forceVisionOnly = stepDraft.options?.useScreenshotOnly === true;
 
-    if (!disableCaching && stepDraft.evidence?.lastSuccessRef) {
+    if (!disableCaching && !forceVisionOnly && stepDraft.evidence?.lastSuccessRef) {
       // Best-effort session lookup — null when the session has been torn
       // down between snapshot and shortcut (race window). When null the
       // shortcut gracefully degrades to TTL-only behaviour.

@@ -302,6 +302,8 @@ BullMQ enqueue (manual-test-run.job.ts)
 
 ## Element resolution (3-stage waterfall + auto-heal)
 
+> **Force vision-only (`options.useScreenshotOnly`).** Opt-in per step. `resolveElement` short-circuits at the very top (before buildAllowedSets / identity / evidence / compiled / LLM): captures a screenshot, runs `rescueWithGeminiFlash` over ALL visible candidates (vision-led — returns a stable `ref` when it can map the visual match to a captured node, else a bbox → smallest containing node), and HARD-FAILS (`not_found`, `resolverPath:'vision'`) with no text fallback if vision finds nothing. The pre-`resolveElement` fast-paths are gated off the same flag so a forced step always reaches the gate: evidence shortcut in `intent-step-lint`, compiled fast-path in `preview-step-apply`, evidence + compiled in `command-executor` (flag rides on `intentMeta.useScreenshotOnly`). Editor lint and runtime apply share `resolveElement`, so the editor verdict matches the run.
+
 ```
 buildAllowedSets(snapshot, intent, viewport?, recordedFingerprint?)
   → HardAllowed: visible, role/tag matches action type

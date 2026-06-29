@@ -1495,8 +1495,17 @@ async function rescueWithGeminiFlash(params: {
    * still wins where present.
    */
   recordedDescription?: string;
+  /**
+   * Screenshot capture offset (clipPageTop / scrollY). When present alongside a
+   * screenshot, each candidate is annotated with its CENTER in screenshot-image
+   * space (`at=(x,y)`) so the vision model can disambiguate same-text candidates
+   * by where they sit in the picture (e.g. two "Select" buttons in different
+   * cards). Maps viewport → screenshot via the inverse of mapVisionBboxToViewport
+   * (x unchanged; y = viewportY - clipPageTop + scrollY).
+   */
+  screenshotOffset?: { clipPageTop: number; scrollY: number };
 }): Promise<{ ref: string; confidence: number; reason: string; boundingBox?: { x: number; y: number; width: number; height: number } } | null> {
-  const { intentText, actionType, excludedNodes, pageUrl, screenshot, viewport, recordedDescription } = params;
+  const { intentText, actionType, excludedNodes, pageUrl, screenshot, viewport, recordedDescription, screenshotOffset } = params;
 
   // V8: Prioritize candidates by a11y richness (no hardcoded text matching — LLM decides).
   // Elements with more semantic info (labels, roles) are more useful for LLM to evaluate.
@@ -1531,6 +1540,16 @@ async function rescueWithGeminiFlash(params: {
     if (n.autocomplete) attrs.push(`autocomplete="${n.autocomplete}"`);
     if (n.type || n.inputType) attrs.push(`type="${n.type || n.inputType}"`);
     if (n.role) attrs.push(`role="${n.role}"`);
+    // Center of the element in SCREENSHOT-image space — the same pixel space the
+    // model reasons in. Lets vision disambiguate same-text candidates by where
+    // they sit in the picture (which card a "Select" button is in). Only emitted
+    // when a screenshot is attached (positions are useless without the image).
+    if (screenshot && n.boundingBox) {
+      const b = n.boundingBox;
+      const sx = Math.round(b.x + b.width / 2);
+      const sy = Math.round(b.y + b.height / 2 - (screenshotOffset?.clipPageTop ?? 0) + (screenshotOffset?.scrollY ?? 0));
+      attrs.push(`at=(${sx},${sy})`);
+    }
     // Drop list-position prefix to avoid the weak-LLM confusion described
     // at the main resolver's candidateList comment (bi.group incident).
     void i;
@@ -1550,6 +1569,7 @@ ACTION-TYPE SEMANTICS:
 
 RULES:
 1. Match by semantic meaning of the intent to the element's label/aria-label/placeholder/text/title.
+1b. DISAMBIGUATE BY POSITION USING THE SCREENSHOT. Some candidates carry "at=(x,y)" — the element's CENTER in the screenshot image you are looking at (the SAME pixel space as your bounding boxes). When two or more candidates share the SAME own-text (e.g. two buttons both text="Select"), look at the screenshot, locate the region the intent refers to (e.g. the "Legal entity" card), and return the candidate whose "at=(x,y)" falls inside that region. Their "at=" plus the picture tell same-text candidates apart — do not guess blindly or return null when position resolves it.
 2. Consider action type — e.g., for "type", only editable fields are valid.
 3. Use multilingual semantic understanding; do NOT translate literally.
 4. ICON BUTTONS: Elements marked "icon-button" have no text — only an icon. To identify which icon:
@@ -1610,7 +1630,12 @@ Select the single best matching element. If unsure, return ref: null.`;
           mimeType,
           model: AI_TASK_MODELS.visionElementResolution as any,
           temperature: 0,
-          maxTokens: 200,
+          // gemini-2.5-flash is a THINKING model — thinking tokens count toward
+          // maxOutputTokens. A tight budget (200) gets eaten by reasoning and
+          // truncates the JSON mid-string (`{"ref":"e32",` cut off → unparseable
+          // → null → false "not found"). The answer is tiny; a generous budget
+          // only costs the tokens actually emitted.
+          maxTokens: 2048,
           timeout: 6000,
         });
         responseContent = visionResponse.content;
@@ -1639,7 +1664,9 @@ Select the single best matching element. If unsure, return ref: null.`;
           {
             model: FALLBACK,
             temperature: 0,
-            max_tokens: 200,
+            // gpt-5-class reasoning tokens also count toward completion — keep
+            // headroom so the JSON isn't truncated (mirrors the Gemini budget).
+            max_tokens: 2048,
             response_format: { type: 'json_object' },
           },
         );
@@ -3928,6 +3955,138 @@ export async function resolveElement(params: {
   // Step 1: Prepare intent text
   const intentText = sanitizeIntent(stepDraft);
 
+  // ── Force vision-only ("use screenshot") resolution ─────────────────────
+  // When the step opts into useScreenshotOnly, bypass the entire text/DOM
+  // waterfall (identity fast-path, evidence cache, compiled plan, text LLM)
+  // and resolve purely from a screenshot via the vision model. Vision-led: the
+  // model still returns a stable element `ref` when it can map the visual match
+  // to a captured node (Path 1), falling back to a bounding box → smallest
+  // containing node (Path 2). No match → HARD-FAIL (`not_found`) with NO text
+  // fallback. This is the single sanctioned skip of the 3-stage waterfall
+  // (CLAUDE.md Hard invariant #7). The pre-resolveElement fast-paths
+  // (evidence shortcut / compiled plan) in the apply callers are gated on the
+  // same flag so they don't resolve a forced step before it reaches here.
+  if (stepDraft.options?.useScreenshotOnly === true) {
+    const failVisionOnly = (message: string): LintResult => ({
+      status: 'not_found',
+      message,
+      confidence: 0,
+      candidates: [],
+      highlight: [],
+      needsAiFallback: false,
+      resolverPath: 'vision',
+    });
+
+    if (!screenshotOrFn) {
+      logger.warn('[ELEMENT_RESOLVER] useScreenshotOnly set but no screenshot available — hard-fail', {
+        previewSessionId,
+        intentText: intentText.slice(0, 60),
+      });
+      return failVisionOnly('Screenshot-only step: no screenshot was available to resolve the element.');
+    }
+
+    const shot = await resolveScreenshot(screenshotOrFn);
+    if (!shot) {
+      logger.warn('[ELEMENT_RESOLVER] useScreenshotOnly — screenshot capture failed — hard-fail', {
+        previewSessionId,
+        intentText: intentText.slice(0, 60),
+      });
+      return failVisionOnly('Screenshot-only step: failed to capture a screenshot to resolve the element.');
+    }
+
+    // Vision-led: feed ALL visible candidates so the model can return a stable
+    // ref; rescueWithGeminiFlash prioritizes by a11y richness and caps the list.
+    const visionResult = await rescueWithGeminiFlash({
+      intentText,
+      actionType: stepDraft.type,
+      excludedNodes: domNodes,
+      pageUrl,
+      screenshot: shot.base64,
+      screenshotOffset: { clipPageTop: shot.clipPageTop, scrollY: shot.scrollY },
+      recordedDescription: stepDraft.recordedDescription,
+    });
+
+    // Path 1: vision returned a ref → map to the captured node.
+    if (visionResult?.ref) {
+      const pickedNode = domNodes.find((n) => n.ref === visionResult.ref);
+      if (pickedNode) {
+        logger.info('[ELEMENT_RESOLVER] useScreenshotOnly resolved by ref', {
+          previewSessionId,
+          ref: pickedNode.ref,
+          confidence: visionResult.confidence,
+          totalLatencyMs: Date.now() - startTime,
+        });
+        const candidate: LintCandidate = {
+          ref: pickedNode.ref,
+          label: getEffectiveLabel(pickedNode) || `<${pickedNode.tag}>`,
+          reason: `Vision (screenshot-only) match: ${visionResult.reason}`,
+          confidence: visionResult.confidence,
+          boundingBox: pickedNode.boundingBox,
+          node: pickedNode,
+        };
+        return {
+          status: (visionResult.confidence >= 0.5 ? 'resolved' : 'needs_clarification') as LintStatus,
+          message: `Element identified by screenshot analysis: ${visionResult.reason}`,
+          confidence: visionResult.confidence,
+          candidates: [candidate],
+          highlight: [{ ref: pickedNode.ref, boundingBox: pickedNode.boundingBox, type: visionResult.confidence >= 0.5 ? 'success' : 'warning' }],
+          resolverPath: 'vision',
+        };
+      }
+    }
+
+    // Path 2: vision returned a bounding box → map to viewport, pick the
+    // smallest captured node containing the point.
+    if (visionResult?.boundingBox && isVisionBboxReasonable(visionResult.boundingBox)) {
+      const vbb = mapVisionBboxToViewport(visionResult.boundingBox, shot);
+      const cx = vbb.x + vbb.width / 2;
+      const cy = vbb.y + vbb.height / 2;
+      let best: InteractiveNode | undefined;
+      let bestArea = Infinity;
+      for (const n of domNodes) {
+        const nb = n.boundingBox;
+        if (!nb) continue;
+        if (cx >= nb.x && cx <= nb.x + nb.width && cy >= nb.y && cy <= nb.y + nb.height) {
+          const area = nb.width * nb.height;
+          if (area < bestArea) { bestArea = area; best = n; }
+        }
+      }
+      if (best) {
+        const confidence = Math.min(visionResult.confidence, 0.8);
+        logger.info('[ELEMENT_RESOLVER] useScreenshotOnly resolved by bbox', {
+          previewSessionId,
+          ref: best.ref,
+          confidence,
+          totalLatencyMs: Date.now() - startTime,
+        });
+        const candidate: LintCandidate = {
+          ref: best.ref,
+          label: getEffectiveLabel(best) || `<${best.tag}>`,
+          reason: `Vision (screenshot-only) match by coordinates: ${visionResult.reason}`,
+          confidence,
+          boundingBox: best.boundingBox,
+          node: best,
+        };
+        return {
+          status: (confidence >= 0.5 ? 'resolved' : 'needs_clarification') as LintStatus,
+          message: `Element identified by screenshot coordinates: ${visionResult.reason}`,
+          confidence,
+          candidates: [candidate],
+          highlight: [{ ref: best.ref, boundingBox: best.boundingBox, type: confidence >= 0.5 ? 'success' : 'warning' }],
+          resolverPath: 'vision',
+        };
+      }
+    }
+
+    // No usable match → hard-fail, NO text fallback.
+    logger.info('[ELEMENT_RESOLVER] useScreenshotOnly — vision found no match — hard-fail', {
+      previewSessionId,
+      intentText: intentText.slice(0, 60),
+      visionReason: visionResult?.reason?.slice(0, 120),
+    });
+    return failVisionOnly(`Screenshot-only step: the screenshot analysis could not locate "${intentText.slice(0, 80)}".`);
+  }
+
   // Step 2: Build HardAllowed/SoftAllowed sets via deterministic DOM-structural rules (sync)
   const allowedResult = buildAllowedSets(domNodes, stepDraft.type, viewport, stepDraft.recordedFingerprint);
   const { hardAllowed, softAllowed, ruleTrace } = allowedResult;
@@ -4842,6 +5001,7 @@ export async function resolveElement(params: {
         excludedNodes: iconOnlyBlind.map(c => c.node),
         pageUrl,
         screenshot: shot.base64,
+        screenshotOffset: { clipPageTop: shot.clipPageTop, scrollY: shot.scrollY },
         // Etap 1D.4 — proactive vision for icon-only blind candidates.
         recordedDescription: stepDraft.recordedDescription,
       });
