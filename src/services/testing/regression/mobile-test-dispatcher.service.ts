@@ -56,6 +56,12 @@ export class MobileTestDispatcherService {
      * single-case manual dispatch (no batch) — the job skips the update.
      */
     analyticsExecutionId?: string,
+    /**
+     * When launched from chat, the chat session id so the mobile job streams
+     * progress + result into the chat panel (room `chat:<sessionId>`).
+     * Undefined for plan / scheduled / CI runs.
+     */
+    chatSessionId?: string,
   ): Promise<{ testId: string; jobId: string; appBuildId: string | null }> {
     // 0. Plan gate — mobile testing is a Pro feature. This is the single choke
     // point for every mobile dispatch path (single-case run, plan/module
@@ -297,6 +303,8 @@ export class MobileTestDispatcherService {
       userId,
       workspaceId,
       projectId: intentCase.project_id,
+      // Routes WS progress/result to chat:<sessionId> when launched from chat.
+      ...(chatSessionId ? { chatSessionId } : {}),
       platform,
       browser,
       intentSteps: intentSteps as unknown as MobileTestJobData['intentSteps'],

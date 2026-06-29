@@ -65,3 +65,30 @@ describe('MobileRunnerClient.touchSession', () => {
     await expect(client.touchSession('sess-1')).resolves.toBeUndefined();
   });
 });
+
+describe('MobileRunnerClient.getSessionDestroyReason', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('GETs /api/sessions/:id/destroy-reason and returns the reason', async () => {
+    mockFetchOnce({ sessionId: 'sess-1', reason: 'evicted' });
+    const client = new MobileRunnerClient();
+    const reason = await client.getSessionDestroyReason('sess-1');
+
+    const { url, init } = getFetchCall();
+    expect(url).toBe('http://localhost:4100/api/sessions/sess-1/destroy-reason');
+    expect(init.method).toBe('GET');
+    expect(reason).toBe('evicted');
+  });
+
+  it('returns null when the runner reports an unknown cause', async () => {
+    mockFetchOnce({ sessionId: 'sess-1', reason: null });
+    const client = new MobileRunnerClient();
+    await expect(client.getSessionDestroyReason('sess-1')).resolves.toBeNull();
+  });
+
+  it('returns null (never throws) on a transport error', async () => {
+    global.fetch = jest.fn().mockRejectedValue(new Error('ECONNREFUSED'));
+    const client = new MobileRunnerClient();
+    await expect(client.getSessionDestroyReason('sess-1')).resolves.toBeNull();
+  });
+});

@@ -91,6 +91,14 @@ export class TestCaseResolverService {
     workspaceId: string;
     currentUrl?: string;
     config?: Partial<ResolverConfig>;
+    /**
+     * When true, restrict candidates to projects OWNED by `userId` (not the
+     * whole workspace). The chat run flow needs this because the runner
+     * (`getSavedTestCase`) is owner-scoped — surfacing a workspace-mate's test
+     * we can't actually run would dead-end on confirm. Default false preserves
+     * the workspace-wide behavior other callers (Jira) rely on.
+     */
+    ownerOnly?: boolean;
   }): Promise<ResolverResult> {
     const config = { ...DEFAULT_CONFIG, ...params.config };
     const startTime = Date.now();
@@ -98,7 +106,7 @@ export class TestCaseResolverService {
 
     try {
       // 1. Fetch published test cases from workspace projects
-      const candidates = await this.fetchCandidates(params.userId, params.workspaceId, config);
+      const candidates = await this.fetchCandidates(params.userId, params.workspaceId, config, params.ownerOnly);
 
       if (candidates.length === 0) {
         return {
@@ -183,6 +191,47 @@ export class TestCaseResolverService {
     }
   }
 
+  /**
+   * Does this user have ANY runnable saved tests or regression plans (in
+   * projects they OWN within the workspace)? Used by the chat flow to decide
+   * between "confirm an existing test" and "suggest exploration". Owner-scoped
+   * to match the owner-scoped runner + the resolver's ownerOnly run path — so
+   * "you don't have any tests yet" is accurate for THIS user. Counts published
+   * intent_test_cases AND regression plans. Never throws — returns false on any
+   * failure so the caller degrades to the exploration suggestion.
+   */
+  static async userHasAnyTests(userId: string, workspaceId: string): Promise<boolean> {
+    try {
+      const { data: projects } = await supabaseAdmin
+        .from('projects')
+        .select('id')
+        .eq('workspace_id', workspaceId)
+        .eq('user_id', userId);
+
+      const projectIds = (projects || []).map((p) => p.id);
+      if (projectIds.length === 0) return false;
+
+      const [testCases, plans] = await Promise.all([
+        supabaseAdmin
+          .from('intent_test_cases')
+          .select('id', { count: 'exact', head: true })
+          .in('project_id', projectIds)
+          .eq('status', 'published'),
+        supabaseAdmin
+          .from('regression_plans')
+          .select('id', { count: 'exact', head: true })
+          .in('project_id', projectIds),
+      ]);
+
+      return (testCases.count || 0) + (plans.count || 0) > 0;
+    } catch (err) {
+      logger.warn('[RESOLVER] userHasAnyTests failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  }
+
   // ==========================================================================
   // PRIVATE: Fetch Candidates
   // ==========================================================================
@@ -190,16 +239,23 @@ export class TestCaseResolverService {
   private static async fetchCandidates(
     userId: string,
     workspaceId: string,
-    config: ResolverConfig
+    config: ResolverConfig,
+    ownerOnly?: boolean,
   ): Promise<RawCandidate[]> {
-    // Get all projects in the workspace
-    const { data: projects, error: projError } = await supabaseAdmin
+    // Get the projects to scan. ownerOnly restricts to projects the user owns
+    // (so every candidate is runnable by the owner-scoped runner); otherwise
+    // the whole workspace is in scope.
+    let projectQuery = supabaseAdmin
       .from('projects')
       .select('id')
       .eq('workspace_id', workspaceId);
+    if (ownerOnly) {
+      projectQuery = projectQuery.eq('user_id', userId);
+    }
+    const { data: projects, error: projError } = await projectQuery;
 
     if (projError || !projects?.length) {
-      logger.debug('[RESOLVER] No projects in workspace', { workspaceId });
+      logger.debug('[RESOLVER] No projects in scope', { workspaceId, ownerOnly });
       return [];
     }
 
@@ -207,7 +263,7 @@ export class TestCaseResolverService {
 
     const { data, error } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, name, description, url, start_url, commands, steps_json, project_id, flow_id, tags, updated_at')
+      .select('id, name, description, url, start_url, commands, steps_json, project_id, flow_id, tags, platform, updated_at')
       .in('project_id', projectIds)
       .eq('status', 'published')
       .order('updated_at', { ascending: false })
@@ -228,6 +284,7 @@ export class TestCaseResolverService {
       projectId: row.project_id,
       flowId: row.flow_id,
       tags: Array.isArray(row.tags) ? row.tags : [],
+      platform: row.platform || 'web',
       updatedAt: row.updated_at,
     }));
   }
@@ -272,6 +329,7 @@ export class TestCaseResolverService {
         projectId: candidate.projectId,
         flowId: candidate.flowId,
         tags: candidate.tags,
+        platform: candidate.platform,
         score: combinedScore(embeddingSim, nameSim, urlScore),
         matchType: 'none' as MatchType,
         matchReason: scoreReason(embeddingSim, nameSim, urlScore),
@@ -309,6 +367,7 @@ export class TestCaseResolverService {
         projectId: candidate.projectId,
         flowId: candidate.flowId,
         tags: candidate.tags,
+        platform: candidate.platform,
         score,
         matchType: 'none' as MatchType,
         matchReason: `name_only=${score.toFixed(2)}`,
@@ -520,5 +579,6 @@ interface RawCandidate {
   projectId: string;
   flowId?: string;
   tags: string[];
+  platform: string;
   updatedAt: string;
 }

@@ -23,6 +23,8 @@ export class WebTestRequestBuilderService {
     parameters: Record<string, any>,
     browserOverride?: string,
     trigger?: 'manual' | 'chat' | 'scheduled' | 'webhook',
+    /** When set, the job routes progress/result WS events to chat:<sessionId>. */
+    chatSessionId?: string,
   ): Promise<any> {
     // Validate URL exists first (with fallback to start_url)
     const targetUrl = intentCase.url || intentCase.start_url;
@@ -151,6 +153,8 @@ export class WebTestRequestBuilderService {
       commands, // Pre-generated commands
       options: mergedOptions,
       resourceBindings,
+      // Routes WS progress/result to chat:<sessionId> when launched from chat.
+      ...(chatSessionId ? { chatSessionId } : {}),
       metadata: {
         intentTestCaseId: intentCase.id,
         intentTestCaseName: intentCase.name,

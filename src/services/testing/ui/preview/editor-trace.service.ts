@@ -1668,6 +1668,14 @@ export class EditorTraceService {
     surfacedBy: string;
     /** Runner's typed code if any — usually 'none' (the runner just 404s). */
     runnerCode?: string;
+    /**
+     * The runner's destroy tombstone reason (idle_ttl / evicted /
+     * device_disconnected / multiuser_evict / pool_recover / shutdown / …) when
+     * resolvable, else 'unknown'. Tracks WHICH teardown path reclaimed the
+     * session so the recurring "gone ~15s after warmup" incident is diagnosable
+     * from the durable trace, not just live logs.
+     */
+    reason?: string | null;
   }): void {
     this.writer.write({
       stage: 'mobile_lifecycle',

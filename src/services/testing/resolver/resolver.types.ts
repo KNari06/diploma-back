@@ -12,6 +12,8 @@ export interface ResolvedTestCase {
   projectId: string;
   flowId?: string;
   tags?: string[];
+  /** Execution platform — drives web vs mobile dispatch on run. */
+  platform?: string;
   score: number;
   matchType: MatchType;
   matchReason: string;

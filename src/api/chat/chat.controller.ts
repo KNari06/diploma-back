@@ -27,6 +27,7 @@ import { incCounter } from '@/utils/core/mobile-chat-metrics';
 import { checkWorkspace, manageChatSession, validateInput } from './shared/validation';
 import { handlePendingExplorationConfirmation } from './shared/exploration-confirmation';
 import { handlePendingManageConfirmation } from './regression/shared/manage-confirmation';
+import { handlePendingRunExistingConfirmation } from './shared/run-existing-confirmation';
 import {
   beginCompound,
   clearPendingCompound,
@@ -45,6 +46,7 @@ import {
 // catch-block narrow without leaning on type widening.
 import { AccessDeniedError } from '@/services/core/workspace-access.service';
 import { TestCaseChatService } from '@/services/utils/test-case-chat.service';
+import { ChatService } from '@/services/utils/chat.service';
 import { GLOBAL_STORE, TESTCASE_STORE, type ChatStore } from '@/services/utils/chat-store';
 // Used to emit the early "Analyzing..." progress event in the test-case
 // branch — the legacy path gets it from `manageChatSession`, but our
@@ -433,6 +435,18 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         await unregisterActiveRequestWithLogging(chatSessionId, userId);
         return;
       }
+
+      // "Run an existing saved test" confirmation: when the user previously
+      // asked to run a test and we offered matching saved test cases, this
+      // turn's yes/no/pick reply runs the chosen one (web/mobile auto-routed).
+      const runExistingHandled = await handlePendingRunExistingConfirmation(
+        req, res, message, chatSessionId!, userId,
+      );
+      if (runExistingHandled) {
+        const unregisterActiveRequestWithLogging = withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger);
+        await unregisterActiveRequestWithLogging(chatSessionId, userId);
+        return;
+      }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -543,51 +557,112 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 5.5: SMART TEST CASE RESOLVER
-    // Only for platform_test intent — check if existing test cases match
+    // STEP 5.5: CHECK EXISTING TESTS BEFORE LITE-RUNNING (confirm-or-explore)
     // ═══════════════════════════════════════════════════════════════════════
-    // Smart Resolver: only when user did NOT provide an explicit URL.
-    // If parsedIntent.page is set, the user gave a URL → they want a NEW test, not a replay.
-    if (parsedIntent?.intent === 'platform_test' && !parsedIntent?.page) {
+    // When the user asks the global chat to run a test, never silently Lite-run.
+    // First look for matching saved test cases; if any clear the partial floor,
+    // ask the user to confirm (single → yes/no; multiple → pick one) — the next
+    // turn runs the chosen one on its original platform (web/mobile) via
+    // run_regression. If nothing matches, suggest the Explore section.
+    // Runs even when the user gave a URL (the whole point of task #1). Global
+    // chat only; test-case scope keeps its own editor flow.
+    if (
+      parsedIntent?.intent === 'platform_test' &&
+      // The explicit "explore this site" UI/intent must still reach the
+      // exploration confirmation in handlePlatformTest — don't intercept it.
+      parsedIntent?.executionStrategy !== 'exploration' &&
+      // A compound request ("test A and B") is an explicit multi-test run;
+      // intercepting it (or each sub-step) with a confirm would stall the
+      // compound queue. Let compound splitting (STEP 5.9) handle it.
+      !isCompoundContinuation &&
+      toCompoundSteps(parsedIntent?.metadata?.analysis).length < 2 &&
+      chatStore.kind === 'global' &&
+      chatSessionId
+    ) {
       try {
         const { TestCaseResolverService } = await import(
           '@/services/testing/resolver/test-case-resolver.service'
         );
+        const { storePendingRunExisting } = await import(
+          './shared/run-existing-confirmation'
+        );
+
         const resolverResult = await TestCaseResolverService.resolve({
-          message,
+          message: effectiveMessage,
           userId,
           workspaceId: workspace_id,
+          // Only surface tests the user can actually run — the runner
+          // (getSavedTestCase) is owner-scoped, so a workspace-mate's test
+          // would dead-end on confirm. See resolver `ownerOnly`.
+          ownerOnly: true,
         });
 
-        if (resolverResult.matchType === 'exact' && resolverResult.bestMatch) {
-          // Redirect to regression (fast, background)
-          parsedIntent.intent = 'run_regression';
-          parsedIntent.savedTestCaseId = resolverResult.bestMatch.id;
-          logger.info('[CHAT] Smart Resolver: exact match → run_regression', {
-            testCaseId: resolverResult.bestMatch.id,
-            testCaseName: resolverResult.bestMatch.name,
-            score: resolverResult.bestMatch.score,
+        // exact (≥0.85) and partial (≥0.50) both clear the confirm floor.
+        const matched =
+          resolverResult.matchType === 'exact'
+            ? [resolverResult.bestMatch].filter(Boolean)
+            : resolverResult.matchType === 'partial'
+              ? (resolverResult.relatedCases || [])
+              : [];
+
+        if (matched.length > 0) {
+          const candidates = matched
+            .slice(0, 5)
+            .map((c) => ({ id: c!.id, name: c!.name, platform: c!.platform || 'web' }));
+
+          logger.info('[CHAT] Existing-test check: matches found → confirm', {
+            count: candidates.length,
+            matchType: resolverResult.matchType,
+            names: candidates.map((c) => c.name),
           });
-        } else if (resolverResult.matchType === 'partial' && resolverResult.prefilledSteps?.length) {
-          // Enrich with prefilled steps for LiteEngine
-          parsedIntent.resolvedContext = {
-            prefilledSteps: resolverResult.prefilledSteps,
-            sourceTestCases: resolverResult.relatedCases?.map((c) => ({
-              id: c.id,
-              name: c.name,
-              matchScore: c.score,
-            })),
-            resolverStrategy: resolverResult.resolverMeta.strategy,
-          };
-          logger.info('[CHAT] Smart Resolver: partial match → prefilled steps', {
-            prefilledStepsCount: resolverResult.prefilledSteps.length,
-            sourceTestCases: resolverResult.relatedCases?.map(c => c.name),
+
+          const reply = await storePendingRunExisting(chatSessionId, candidates);
+
+          ChatService.saveChatMessages(chatSessionId, [
+            { role: 'user', content: message },
+            { role: 'ai', content: reply, metadata: { mode: 'run_existing_confirmation' } },
+          ]).catch(() => {});
+
+          res.json({
+            success: true,
+            reply,
+            mode: 'run_existing_confirmation',
+            timestamp: new Date().toISOString(),
+            sessionId: chatSessionId,
           });
+          await withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger)(chatSessionId, userId);
+          return;
         }
-        // 'none' → no changes, full LiteEngine
+
+        // No saved test matched → steer the user to exploration instead of
+        // silently Lite-running. Message adapts to whether ANY tests exist.
+        const hasAnyTests = await TestCaseResolverService.userHasAnyTests(userId, workspace_id);
+        logger.info('[CHAT] Existing-test check: no match → suggest exploration', {
+          hasAnyTests,
+        });
+
+        const exploreReply = hasAnyTests
+          ? `I couldn't find a saved test matching that. To create new tests, open the **Explore** section (Execution menu) and add your URL or mobile app build — I'll discover test cases automatically.`
+          : `You don't have any saved tests yet. Open the **Explore** section (Execution menu) and add your URL (web) or upload an APK/IPA/AAB (mobile) — I'll explore the app and generate test cases for you to run.`;
+
+        ChatService.saveChatMessages(chatSessionId, [
+          { role: 'user', content: message },
+          { role: 'ai', content: exploreReply, metadata: { mode: 'suggest_exploration' } },
+        ]).catch(() => {});
+
+        res.json({
+          success: true,
+          reply: exploreReply,
+          mode: 'suggest_exploration',
+          timestamp: new Date().toISOString(),
+          sessionId: chatSessionId,
+        });
+        await withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger)(chatSessionId, userId);
+        return;
       } catch (error) {
-        // Graceful degradation: if resolver fails, continue unchanged
-        logger.warn('[CHAT] Smart Resolver failed, continuing with original intent', {
+        // Graceful degradation: if the check fails, fall through to the normal
+        // platform_test handler rather than blocking the user.
+        logger.warn('[CHAT] Existing-test check failed, continuing with platform_test', {
           error: error instanceof Error ? error.message : String(error),
         });
       }

@@ -109,11 +109,18 @@ export class RegressionRunService {
     parameters?: Record<string, any>;
     /** Optional Playwright browser override (chromium | firefox | webkit). */
     browserOverride?: string;
+    /**
+     * When launched from chat ("run my login test"), the chat session id so the
+     * web/mobile job streams progress + result into the chat panel (room
+     * `chat:<sessionId>`) — same surface as a Lite run. Undefined for the
+     * Runs-screen / API / scheduled paths (no chat to stream to).
+     */
+    chatSessionId?: string;
   }): Promise<{
     runId: string;
     testId: string;
   }> {
-    const { savedTestCaseId: intentTestCaseId, userId, trigger, parameters = {}, browserOverride } = params;
+    const { savedTestCaseId: intentTestCaseId, userId, trigger, parameters = {}, browserOverride, chatSessionId } = params;
 
     try {
       logger.info('[REGRESSION_RUN] Running intent test case', {
@@ -176,11 +183,13 @@ export class RegressionRunService {
             trigger,
             undefined, // no triggerContext for single-case manual run
             parameters,
+            undefined, // no pre-created analyticsExecutionId for single-case run
+            chatSessionId, // stream progress to chat when launched from chat
           );
           testId = mobileResult.testId;
         } else {
           // Web test → dispatch to Playwright queue
-          const testRequest = await WebTestRequestBuilderService.buildTestRequest(intentCase, userId, parameters, browserOverride, trigger);
+          const testRequest = await WebTestRequestBuilderService.buildTestRequest(intentCase, userId, parameters, browserOverride, trigger, chatSessionId);
           const testResult = await ManualTestService.runTest(testRequest);
 
           if (!testResult.success || !testResult.data?.id) {

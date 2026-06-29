@@ -196,6 +196,29 @@ export class MobileRunnerClient {
   }
 
   /**
+   * Why a now-absent session was destroyed, per the runner's tombstone
+   * (idle_ttl / evicted / device_disconnected / multiuser_evict / pool_recover /
+   * shutdown / …), or null when unknown (tombstone aged out / runner restarted).
+   *
+   * Diagnostic-only: called from the lint liveness-precheck after sessionExists
+   * returns false, so the "session no longer has" log can name the real cause
+   * instead of guessing. Best-effort — any error resolves to null (never throws,
+   * never blocks the 410 the caller is about to send).
+   */
+  async getSessionDestroyReason(sessionId: string): Promise<string | null> {
+    try {
+      const res = await this.request<{ reason?: string | null }>(
+        'GET',
+        `/api/sessions/${sessionId}/destroy-reason`,
+        { timeoutMs: 5000 },
+      );
+      return res?.reason ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Bump the session's runner-side `lastActivityAt` so an actively-edited
    * editor session isn't capacity-evicted during pure think-time (editing a
    * step / opening the find UI sends NO device traffic, so the runner's idle

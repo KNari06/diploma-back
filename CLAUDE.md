@@ -159,13 +159,14 @@ Also in the scheduler bundle (24h sweeps, single-instance — now guarded by the
 
 POST `/api/chat/message` → `handleChat()` ([src/api/chat/chat.controller.ts](src/api/chat/chat.controller.ts))
 → pending-state interceptors (run BEFORE parsing, global chat only):
-exploration-confirm → manage-confirm ([regression/shared/manage-confirmation.ts](src/api/chat/regression/shared/manage-confirmation.ts)) → compound-continuation ([shared/compound-queue.ts](src/api/chat/shared/compound-queue.ts))
+exploration-confirm → manage-confirm ([regression/shared/manage-confirmation.ts](src/api/chat/regression/shared/manage-confirmation.ts)) → run-existing-confirm ([shared/run-existing-confirmation.ts](src/api/chat/shared/run-existing-confirmation.ts)) → compound-continuation ([shared/compound-queue.ts](src/api/chat/shared/compound-queue.ts))
 → `parseUserIntent()` ([src/services/ai/intent/intent-parser.service.ts](src/services/ai/intent/intent-parser.service.ts)) — one LLM call now ALSO returns an `analysis` block
 (ANALYZE + IMPROVE folded in, see [src/ai/prompts/request-understanding-prompts.ts](src/ai/prompts/request-understanding-prompts.ts)):
 `targetSelector{type,value}` (descriptor), `executionModifiers{browser,…}`, `isCompound/subRequests`, `manage{…}`, `lookbackDays`.
 → post-parse enrichment ([shared/intent-target-resolution.ts](src/api/chat/shared/intent-target-resolution.ts)):
 `TestQueryResolver` resolves a descriptor → concrete IDs ([src/services/testing/resolver/test-query-resolver.service.ts](src/services/testing/resolver/test-query-resolver.service.ts));
 on ambiguity, a conditional 2nd LLM call (ENRICH) narrows candidates.
+→ **confirm-or-explore guard** (global chat, `platform_test`, non-exploration, non-compound; [chat.controller.ts](src/api/chat/chat.controller.ts) STEP 5.5): `TestCaseResolverService.resolve({…, ownerOnly:true})` → if any saved test case clears the partial floor (≥0.50), store the candidates ([shared/run-existing-confirmation.ts](src/api/chat/shared/run-existing-confirmation.ts) `storePendingRunExisting`) and ASK the user to confirm (single→yes/no, multi→pick N) instead of Lite-running; the next turn's run-existing-confirm interceptor runs the chosen case via `RegressionRunService.runSavedTestCase` (auto web/mobile, threads `chatSessionId` so the run streams progress/result into the chat panel like a Lite run). If nothing matches, reply suggesting the **Explore** section (`TestCaseResolverService.userHasAnyTests` tailors the copy). `ownerOnly`/`userHasAnyTests` are owner-scoped to match the owner-scoped runner (`getSavedTestCase`) — surfacing a workspace-mate's test would dead-end on confirm. NEVER silently Lite-runs a typed "test X". Replaced the old auto-redirect-to-run_regression + prefilled-steps Smart Resolver.
 → compound splitter (if `isCompound`): run step 1, queue the rest; advance-after-success per turn.
 → `routeToHandler()` ([shared/routing.ts](src/api/chat/shared/routing.ts)) → handler from `INTENT_HANDLERS` registry.
 

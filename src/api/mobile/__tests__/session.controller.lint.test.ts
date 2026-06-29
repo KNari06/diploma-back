@@ -15,6 +15,10 @@
 
 jest.mock('@/config/environment/env', () => ({ env: {} }));
 jest.mock('@/config/infrastructure/queues', () => ({ redisConnection: {}, QueueManager: {} }));
+// session.controller transitively imports the dedicated-device service → supabase
+// client (throws without env). Stub both so only the controller logic runs.
+jest.mock('@/db/supabase', () => ({ supabaseAdmin: {}, supabase: {} }));
+jest.mock('@/services/mobile/dedicated-device.service', () => ({ resolveDedicatedDevice: jest.fn() }));
 jest.mock('@/services/mobile/mobile-runner-client', () => ({ getMobileRunnerClient: jest.fn() }));
 jest.mock('@/services/mobile/mobile-runner.types', () => ({ MobileRunnerError: class extends Error {} }));
 jest.mock('@/services/core/project.service', () => ({ ProjectService: {} }));
@@ -65,7 +69,10 @@ describe('lintSession editor-trace contract', () => {
     trace = makeTrace();
     getOrCreateMock.mockReturnValue(trace);
     lintElement = jest.fn();
-    getClientMock.mockReturnValue({ lintElement });
+    // The lint precheck calls sessionExists() before resolving — default it to
+    // alive so these trace-contract tests exercise the resolve path, not the
+    // session-gone 410 branch (covered by its own describe below).
+    getClientMock.mockReturnValue({ lintElement, sessionExists: jest.fn().mockResolvedValue(true) });
   });
 
   it('writes a result with status:error and the request id when the lint throws', async () => {
@@ -127,5 +134,59 @@ describe('lintSession editor-trace contract', () => {
     expect(trace.writeMobileLintRequest).not.toHaveBeenCalled();
     expect(trace.writeMobileLintResult).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(500);
+  });
+});
+
+describe('lintSession liveness precheck (session-gone diagnostics)', () => {
+  let sessionExists: jest.Mock;
+  let getSessionDestroyReason: jest.Mock;
+  let writeMobileSessionExpiredSurfaced: jest.Mock;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    sessionExists = jest.fn();
+    getSessionDestroyReason = jest.fn();
+    writeMobileSessionExpiredSurfaced = jest.fn();
+    getOrCreateMock.mockReturnValue({
+      writeMobileLintRequest: jest.fn(),
+      writeMobileLintResult: jest.fn(),
+      writeMobileSessionExpiredSurfaced,
+    });
+    getClientMock.mockReturnValue({ sessionExists, getSessionDestroyReason, lintElement: jest.fn() });
+  });
+
+  it('returns a typed 410 carrying the runner destroy reason when the session is gone', async () => {
+    sessionExists.mockResolvedValue(false);
+    getSessionDestroyReason.mockResolvedValue('evicted');
+    const res = makeRes();
+
+    await lintSession(makeReq(), res);
+
+    expect(getSessionDestroyReason).toHaveBeenCalledWith('sess-1');
+    expect(res.status).toHaveBeenCalledWith(410);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      code: 'SESSION_EXPIRED',
+      reason: 'evicted',
+    }));
+    // The expiry is traced WITH the reason so it's diagnosable from Supabase.
+    expect(writeMobileSessionExpiredSurfaced).toHaveBeenCalledWith(
+      expect.objectContaining({ surfacedBy: 'lint', reason: 'evicted' }),
+    );
+  });
+
+  it('still 410s (reason omitted, traced as unknown) when the tombstone is gone', async () => {
+    sessionExists.mockResolvedValue(false);
+    getSessionDestroyReason.mockResolvedValue(null);
+    const res = makeRes();
+
+    await lintSession(makeReq(), res);
+
+    expect(res.status).toHaveBeenCalledWith(410);
+    const body = res.json.mock.calls[0][0];
+    expect(body.code).toBe('SESSION_EXPIRED');
+    expect(body).not.toHaveProperty('reason'); // omitted when null
+    expect(writeMobileSessionExpiredSurfaced).toHaveBeenCalledWith(
+      expect.objectContaining({ surfacedBy: 'lint', reason: 'unknown' }),
+    );
   });
 });
