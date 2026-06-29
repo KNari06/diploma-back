@@ -196,6 +196,27 @@ export class MobileRunnerClient {
   }
 
   /**
+   * Bump the session's runner-side `lastActivityAt` so an actively-edited
+   * editor session isn't capacity-evicted during pure think-time (editing a
+   * step / opening the find UI sends NO device traffic, so the runner's idle
+   * clock would otherwise advance and make the session an eviction target).
+   *
+   * Driven by the `mobile:keepalive` WS event, which already means "user is
+   * active in the editor". Best-effort: a 404 (session already gone) or any
+   * transport error is swallowed — keepalive must never throw.
+   */
+  async touchSession(sessionId: string, opts?: { userId?: string }): Promise<void> {
+    try {
+      await this.request('POST', `/api/sessions/${sessionId}/touch`, {
+        timeoutMs: 5000,
+        userId: opts?.userId,
+      });
+    } catch {
+      /* best-effort — never break the keepalive path */
+    }
+  }
+
+  /**
    * Update the runtime-permission policy for a live session.
    *
    * - 'auto_allow' (default): pre-grant on install + ambient watcher auto-Allows

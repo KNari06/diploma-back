@@ -97,9 +97,20 @@ export function sendMobileRunnerError(
   // would then throw ERR_HTTP_HEADERS_SENT (latent before this consolidation).
   // Emit a terminal NDJSON error line + end the stream instead, so the editor
   // gets a real failure event rather than a hung/aborted connection.
+  // Friendly copy for the at-capacity case, reused by both the streaming
+  // (headers-sent) and the normal JSON path below so the developer-facing
+  // "Max sessions limit reached (8)…" never reaches the user on either.
+  const NO_CAPACITY_MESSAGE =
+    'All devices and emulators are busy right now. Please try again in a few minutes.';
+  const isNoCapacity = runnerErr?.code === 'NO_CAPACITY';
+
   if (res.headersSent) {
     try {
-      res.write(JSON.stringify({ type: 'error', error: message || fallback, ...(runnerErr?.code ? { code: runnerErr.code } : {}) }) + '\n');
+      res.write(JSON.stringify({
+        type: 'error',
+        error: isNoCapacity ? NO_CAPACITY_MESSAGE : (message || fallback),
+        ...(runnerErr?.code ? { code: runnerErr.code } : {}),
+      }) + '\n');
     } catch { /* socket already torn down — nothing we can do */ }
     res.end();
     return;
@@ -115,6 +126,21 @@ export function sendMobileRunnerError(
       error: 'Session expired',
       ...(reclaimReason ? { reason: reclaimReason } : {}),
       message: 'The device session is no longer available (reclaimed after inactivity or a restart). Reopen the test case to continue.',
+    });
+    return;
+  }
+
+  // Runner is at capacity — every emulator/device is busy and none could be
+  // freed (NO_CAPACITY, 503). Surface a calm, user-facing "try later" message
+  // instead of the runner's developer-facing "Max sessions limit reached (8)…".
+  // This is the single funnel all mobile editor/run handlers pass through, so
+  // every session-birth path gets the friendly copy at once.
+  if (isNoCapacity) {
+    res.status(503).json({
+      success: false,
+      code: 'NO_CAPACITY',
+      error: NO_CAPACITY_MESSAGE,
+      message: NO_CAPACITY_MESSAGE,
     });
     return;
   }
