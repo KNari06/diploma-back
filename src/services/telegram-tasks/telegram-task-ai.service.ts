@@ -296,7 +296,7 @@ function renderOpenTasks(openTasks: AiTaskView[], nowMs: number): string {
         // an HTML reply they're already safe (a raw < or & would break the tag).
         `- id=${t.id}: ${t.project ? `[${esc(t.project)}] ` : ''}${esc(t.title)}` +
         `${t.owner ? ` (owner ${t.owner})` : ' (unassigned)'}` +
-        `${t.progress !== 'none' ? ` [last status: ${t.progress}${t.progress_note ? ` — ${esc(t.progress_note)}` : ''}]` : ''}` +
+        ` [${t.lifecycle}${t.progress_note ? `: ${esc(t.progress_note)}` : ''}]` +
         renderDeadline(t, nowMs) +
         `${t.link ? ` link=${t.link}` : ''}`,
     )

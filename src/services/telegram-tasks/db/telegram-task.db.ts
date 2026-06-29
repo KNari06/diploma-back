@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
-import type { Lifecycle } from '../telegram-task-ai.service';
+import { progressToLifecycle, type Lifecycle, type ProgressState } from '../telegram-task-ai.service';
+import { canonicalOwner } from '../owner-aliases';
 
 /**
  * db/ sublayer for QAIT Tasker (telegram_tasks / telegram_messages).
@@ -58,7 +59,11 @@ function legacyStatusProgress(lifecycle: Lifecycle): { status: string; progress:
 
 // ── messages ─────────────────────────────────────────────────────────────────
 
-/** Insert a logged message; returns its row id (for the strictly-before window). */
+/** Log a message; returns its row id (for the strictly-before window). Idempotent
+ *  on (chat_id, tg_msg_id): a Telegram retry of the same message, or an
+ *  edited_message (same id, new text), UPSERTS rather than erroring — the edit
+ *  overwrites the stored text, a pure retry is a harmless re-write. A row with no
+ *  tg_msg_id (rare) can't be deduped, so it plain-inserts. */
 export async function logMessage(
   chatId: number,
   tgMsgId: number | undefined,
@@ -66,14 +71,17 @@ export async function logMessage(
   text: string,
   threadId: number | null,
 ): Promise<number | null> {
-  const { data, error } = await supabaseAdmin
-    .from('telegram_messages')
-    // Defensive cap: Telegram messages top out ~4096 chars, but never trust the
-    // wire — keep one fat payload from bloating a row.
-    .insert({ chat_id: chatId, thread_id: threadId, tg_msg_id: tgMsgId ?? null, author: author ?? null, text: text.slice(0, 8000) })
-    .select('id')
-    .single();
-  if (error) return null;
+  // Defensive cap: Telegram tops out ~4096 chars, but never trust the wire.
+  const row = { chat_id: chatId, thread_id: threadId, tg_msg_id: tgMsgId ?? null, author: author ?? null, text: text.slice(0, 8000) };
+  const q =
+    tgMsgId == null
+      ? supabaseAdmin.from('telegram_messages').insert(row)
+      : supabaseAdmin.from('telegram_messages').upsert(row, { onConflict: 'chat_id,tg_msg_id' });
+  const { data, error } = await q.select('id').single();
+  if (error) {
+    logger.warn('[TELEGRAM_TASKS] logMessage failed', { chatId, tgMsgId, error: error.message });
+    return null;
+  }
   return (data as { id: number }).id;
 }
 
@@ -129,9 +137,11 @@ export async function createTask(t: {
   threadId: number | null;
   project: string | null;
   title: string;
-  owner: string | null;
+  owner: string | null; // raw owner words; normalized here at the write boundary
   sourceMsgId: number | undefined;
+  digestLineIndex?: number | null;
 }): Promise<TelegramTaskRow | null> {
+  const { handle, display } = splitOwner(t.owner);
   const { data, error } = await supabaseAdmin
     .from('telegram_tasks')
     .insert({
@@ -139,13 +149,31 @@ export async function createTask(t: {
       thread_id: t.threadId,
       project: t.project,
       title: t.title,
-      owner: t.owner,
+      owner_handle: handle,
+      owner_display: display,
+      lifecycle: 'open',
+      // Legacy dual-write (deploy window): keep status/progress consistent.
+      owner: handle ?? display,
+      status: 'open',
+      progress: 'none',
       source_msg_id: t.sourceMsgId ?? null,
+      digest_line_index: t.digestLineIndex ?? null,
     })
     .select(TASK_COLS)
     .single();
   if (error || !data) return null;
   return data as TelegramTaskRow;
+}
+
+/** Normalize a raw owner string into a canonical @handle (when it resolves to
+ *  one) plus the raw display. A bare name with no alias → handle null, display
+ *  kept. This is the SINGLE owner-normalization point (write boundary). */
+function splitOwner(raw: string | null): { handle: string | null; display: string | null } {
+  if (!raw || !raw.trim()) return { handle: null, display: null };
+  const display = raw.trim();
+  const canonical = canonicalOwner(display); // alias-resolves; returns @handle or the trimmed name
+  const handle = canonical && canonical.startsWith('@') ? canonical : null;
+  return { handle, display };
 }
 
 export async function getTask(id: string): Promise<TelegramTaskRow | null> {
@@ -158,12 +186,18 @@ export async function getTask(id: string): Promise<TelegramTaskRow | null> {
   return data as TelegramTaskRow;
 }
 
-/** All open tasks in a chat+topic, oldest-first. (Morning batch is per-topic.) */
+/** All open tasks in a chat+topic. Ordered by source message then digest line,
+ *  so tasks from one digest appear in the order the manager wrote them (then by
+ *  creation time for non-digest tasks). NB: digest_line_index orders/displays —
+ *  it is NOT a reply key, because a Telegram reply points at the whole message,
+ *  not a line, so there is no inbound per-line signal to resolve against. */
 export async function openTasks(chatId: number, threadId: number | null): Promise<TelegramTaskRow[]> {
   const { data, error } = await byThread(
-    supabaseAdmin.from('telegram_tasks').select(TASK_COLS).eq('chat_id', chatId).eq('status', 'open'),
+    supabaseAdmin.from('telegram_tasks').select(TASK_COLS).eq('chat_id', chatId).in('lifecycle', ACTIVE_LIFECYCLES),
     threadId,
-  ).order('created_at', { ascending: true });
+  )
+    .order('created_at', { ascending: true })
+    .order('digest_line_index', { ascending: true, nullsFirst: true });
   if (error || !data) return [];
   return data as TelegramTaskRow[];
 }
@@ -171,7 +205,7 @@ export async function openTasks(chatId: number, threadId: number | null): Promis
 /** Most-recently-active open tasks in a chat+topic (bounds the per-message prompt). */
 export async function recentOpenTasks(chatId: number, limit: number, threadId: number | null): Promise<TelegramTaskRow[]> {
   const { data, error } = await byThread(
-    supabaseAdmin.from('telegram_tasks').select(TASK_COLS).eq('chat_id', chatId).eq('status', 'open'),
+    supabaseAdmin.from('telegram_tasks').select(TASK_COLS).eq('chat_id', chatId).in('lifecycle', ACTIVE_LIFECYCLES),
     threadId,
   )
     .order('last_activity_at', { ascending: false })
@@ -182,7 +216,7 @@ export async function recentOpenTasks(chatId: number, limit: number, threadId: n
 
 export async function countOpenTasks(chatId: number, threadId: number | null): Promise<number> {
   const { count, error } = await byThread(
-    supabaseAdmin.from('telegram_tasks').select('id', { count: 'exact', head: true }).eq('chat_id', chatId).eq('status', 'open'),
+    supabaseAdmin.from('telegram_tasks').select('id', { count: 'exact', head: true }).eq('chat_id', chatId).in('lifecycle', ACTIVE_LIFECYCLES),
     threadId,
   );
   if (error || count == null) return 0;
@@ -196,7 +230,7 @@ export async function openTaskThreads(chatId: number): Promise<Array<number | nu
     .from('telegram_tasks')
     .select('thread_id')
     .eq('chat_id', chatId)
-    .eq('status', 'open');
+    .in('lifecycle', ACTIVE_LIFECYCLES);
   if (error || !data) return [];
   const set = new Set<number | null>();
   for (const r of data as Array<{ thread_id: number | null }>) set.add(r.thread_id ?? null);
@@ -210,7 +244,7 @@ export async function openTaskIdsBySourceMsg(chatId: number, tgMsgId: number): P
     .select('id')
     .eq('chat_id', chatId)
     .eq('source_msg_id', tgMsgId)
-    .eq('status', 'open');
+    .in('lifecycle', ACTIVE_LIFECYCLES);
   if (error || !data) return [];
   return (data as Array<{ id: string }>).map((r) => r.id);
 }
@@ -222,9 +256,34 @@ export async function updateTask(
   const set: Record<string, unknown> = {};
   if (patch.project !== undefined) set.project = patch.project;
   if (patch.title !== undefined) set.title = patch.title;
-  if (patch.owner !== undefined) set.owner = patch.owner;
+  if (patch.owner !== undefined) {
+    // Normalize owner at the write boundary: canonical handle + raw display.
+    const { handle, display } = splitOwner(patch.owner);
+    set.owner_handle = handle;
+    set.owner_display = display;
+    set.owner = handle ?? display; // legacy dual-write
+  }
   if (Object.keys(set).length === 0) return;
   await supabaseAdmin.from('telegram_tasks').update(set).eq('id', id);
+}
+
+/** Set a task's lifecycle (+ derived legacy status/progress). The single write
+ *  path for state transitions. `extra` carries side-fields (note, deadline,
+ *  close reason). Guarded to ACTIVE rows unless reopening. */
+async function writeLifecycle(
+  id: string,
+  lifecycle: Lifecycle,
+  extra: Record<string, unknown> = {},
+  opts: { onlyActive?: boolean } = { onlyActive: true },
+): Promise<{ error: unknown }> {
+  const legacy = legacyStatusProgress(lifecycle);
+  let q = supabaseAdmin
+    .from('telegram_tasks')
+    .update({ lifecycle, status: legacy.status, progress: legacy.progress, last_activity_at: new Date().toISOString(), ...extra })
+    .eq('id', id);
+  if (opts.onlyActive) q = q.in('lifecycle', ACTIVE_LIFECYCLES);
+  const { error } = await q;
+  return { error };
 }
 
 export async function touchActivity(id: string): Promise<void> {
@@ -236,25 +295,17 @@ export async function touchActivity(id: string): Promise<void> {
 
 export async function setProgress(id: string, progress: ProgressState, note: string | null): Promise<void> {
   const trimmed = note ? note.slice(0, 500) : null;
-  // Skip a true no-op (same state AND same note) so a re-run of the batch over an
-  // overlapping window doesn't churn last_activity_at / progress_note with nothing
-  // new. A genuine note change or state change still writes.
+  const lifecycle = progressToLifecycle(progress);
+  // Skip a true no-op (same lifecycle AND same note) so a re-run of the batch over
+  // an overlapping window doesn't churn last_activity_at / progress_note.
   const current = await getTask(id);
-  if (current && current.progress === progress && (current.progress_note ?? null) === trimmed) return;
-  await supabaseAdmin
-    .from('telegram_tasks')
-    .update({ progress, progress_note: trimmed, last_activity_at: new Date().toISOString() })
-    .eq('id', id)
-    .eq('status', 'open');
+  if (current && current.lifecycle === lifecycle && (current.progress_note ?? null) === trimmed) return;
+  await writeLifecycle(id, lifecycle, { progress_note: trimmed });
 }
 
 /** Mark a task as awaiting a deadline answer (the bot's "when?" question id). */
 export async function setAwaitingDeadline(id: string, questionMsgId: number): Promise<void> {
-  await supabaseAdmin
-    .from('telegram_tasks')
-    .update({ awaiting_deadline_msg_id: questionMsgId, progress: 'in_progress', last_activity_at: new Date().toISOString() })
-    .eq('id', id)
-    .eq('status', 'open');
+  await writeLifecycle(id, 'in_progress', { awaiting_deadline_msg_id: questionMsgId });
 }
 
 /** Record a deadline (parsed + original words); clears the awaiting flag and
@@ -277,17 +328,20 @@ export async function setDeadline(
     if (Number.isFinite(t)) safeDueAt = new Date(t).toISOString();
     else logger.warn('[TELEGRAM_TASKS] unparseable due_at from model, storing null', { id, dueAt });
   }
+  const legacy = legacyStatusProgress('in_progress');
   let q = supabaseAdmin
     .from('telegram_tasks')
     .update({
       due_text: dueText.slice(0, 200),
       due_at: safeDueAt,
       awaiting_deadline_msg_id: null,
-      progress: 'in_progress',
+      lifecycle: 'in_progress', // a stated deadline implies work is underway
+      status: legacy.status,
+      progress: legacy.progress,
       last_activity_at: new Date().toISOString(),
     })
     .eq('id', id)
-    .eq('status', 'open');
+    .in('lifecycle', ACTIVE_LIFECYCLES);
   if (expectAwaitingMsgId !== undefined) q = q.eq('awaiting_deadline_msg_id', expectAwaitingMsgId);
   const { error } = await q;
   if (error) logger.error('[TELEGRAM_TASKS] setDeadline failed', { id, error: error.message });
@@ -301,7 +355,7 @@ export async function findTaskAwaitingDeadline(chatId: number, questionMsgId: nu
     .select('id')
     .eq('chat_id', chatId)
     .eq('awaiting_deadline_msg_id', questionMsgId)
-    .eq('status', 'open')
+    .in('lifecycle', ACTIVE_LIFECYCLES)
     .maybeSingle();
   if (error || !data) return null;
   return (data as { id: string }).id;
@@ -342,18 +396,19 @@ export async function pruneBotMsgRefs(cutoffIso: string): Promise<number> {
 }
 
 export async function closeTask(id: string, reason: string): Promise<void> {
-  await supabaseAdmin
-    .from('telegram_tasks')
-    .update({ status: 'closed', closed_at: new Date().toISOString(), closed_reason: reason.slice(0, 500) })
-    .eq('id', id)
-    .eq('status', 'open');
+  // → done. Clear orphan fields (progress_note, awaiting_deadline) so a closed
+  // task carries no stale state (audit fix #4).
+  await writeLifecycle(id, 'done', {
+    closed_at: new Date().toISOString(),
+    closed_reason: reason.slice(0, 500),
+    progress_note: null,
+    awaiting_deadline_msg_id: null,
+  });
 }
 
 export async function reopenTask(id: string): Promise<void> {
-  await supabaseAdmin
-    .from('telegram_tasks')
-    .update({ status: 'open', closed_at: null, closed_reason: null, last_activity_at: new Date().toISOString() })
-    .eq('id', id);
+  // → open from a terminal state; onlyActive:false so a done/expired task can reopen.
+  await writeLifecycle(id, 'open', { closed_at: null, closed_reason: null }, { onlyActive: false });
 }
 
 export async function markBatched(ids: string[]): Promise<void> {
@@ -364,12 +419,13 @@ export async function markBatched(ids: string[]): Promise<void> {
     .in('id', ids);
 }
 
-/** Auto-archive open tasks with no activity since the cutoff. Returns count. */
+/** Auto-archive active tasks with no activity since the cutoff. Returns count. */
 export async function expireStaleOpenTasks(cutoffIso: string): Promise<number> {
+  const legacy = legacyStatusProgress('expired');
   const { data, error } = await supabaseAdmin
     .from('telegram_tasks')
-    .update({ status: 'expired', closed_at: new Date().toISOString(), closed_reason: 'auto-expired (no activity)' })
-    .eq('status', 'open')
+    .update({ lifecycle: 'expired', status: legacy.status, progress: legacy.progress, closed_at: new Date().toISOString(), closed_reason: 'auto-expired (no activity)' })
+    .in('lifecycle', ACTIVE_LIFECYCLES)
     .lte('last_activity_at', cutoffIso)
     .select('id');
   if (error || !data) return 0;

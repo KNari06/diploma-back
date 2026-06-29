@@ -65,5 +65,11 @@ CREATE INDEX IF NOT EXISTS idx_telegram_tasks_chat_thread_lifecycle
 DELETE FROM telegram_messages a USING telegram_messages b
   WHERE a.id > b.id AND a.chat_id = b.chat_id AND a.tg_msg_id = b.tg_msg_id
     AND a.tg_msg_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_telegram_messages_chat_msg
-  ON telegram_messages(chat_id, tg_msg_id) WHERE tg_msg_id IS NOT NULL;
+-- A real UNIQUE CONSTRAINT (not a partial index) so logMessage's UPSERT can use
+-- it as an ON CONFLICT target — that's what lets an edited_message overwrite
+-- rather than error. Postgres treats each NULL tg_msg_id as distinct, so rows
+-- without a Telegram id never conflict (same effect as a partial predicate).
+DO $$ BEGIN
+  ALTER TABLE telegram_messages
+    ADD CONSTRAINT uq_telegram_messages_chat_msg UNIQUE (chat_id, tg_msg_id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;

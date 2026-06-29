@@ -14,6 +14,7 @@ import {
   validateActions,
   renderDeadline,
   verifyRiskyActions,
+  progressToLifecycle,
   type AiTaskView,
   type Action,
   type ReconcileContext,
@@ -43,7 +44,7 @@ const task = (id: string, over: Partial<AiTaskView> = {}): AiTaskView => ({
   project: null,
   title: 't',
   owner: null,
-  progress: 'none',
+  lifecycle: 'open',
   progress_note: null,
   has_deadline: false,
   due_text: null,
@@ -384,6 +385,16 @@ describe('verifyRiskyActions (second-look on close/reopen/create/reassign)', () 
     mockVerdicts([{ index: 0, justified: false }, { index: 1, justified: false }]);
     const out = await verifyRiskyActions(ctx({ openTasks: open }), [createA, reassignA]);
     expect(out).toEqual([]);
+  });
+});
+
+describe('progressToLifecycle (folds the old progress enum into lifecycle)', () => {
+  it('maps in_progress → in_progress', () => {
+    expect(progressToLifecycle('in_progress')).toBe('in_progress');
+  });
+  it('folds blocked AND needs_investigation → blocked', () => {
+    expect(progressToLifecycle('blocked')).toBe('blocked');
+    expect(progressToLifecycle('needs_investigation')).toBe('blocked');
   });
 });
 

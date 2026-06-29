@@ -34,8 +34,8 @@ function toAiView(t: TelegramTaskRow): AiTaskView {
     id: t.id,
     project: t.project,
     title: t.title,
-    owner: t.owner,
-    progress: t.progress,
+    owner: t.owner_handle ?? t.owner_display, // handle if known, else raw name
+    lifecycle: t.lifecycle,
     progress_note: t.progress_note,
     has_deadline: !!t.due_text || !!t.due_at,
     due_text: t.due_text,
@@ -174,10 +174,14 @@ async function applyActions(
     if (id && !anchorMsgIds.includes(id)) anchorMsgIds.push(id);
   };
   let asked = false;
+  // Per-line anchor: when ONE message creates several tasks (a digest), tag each
+  // with its ordinal so a reply to that message can later disambiguate by line.
+  let createIndex = 0;
   for (const a of actions) {
     switch (a.kind) {
       case 'create': {
-        const row = await db.createTask({ chatId, threadId, project: a.project, title: a.title, owner: canonicalOwner(a.owner), sourceMsgId });
+        // owner is normalized inside db.createTask (the single write boundary).
+        const row = await db.createTask({ chatId, threadId, project: a.project, title: a.title, owner: a.owner, sourceMsgId, digestLineIndex: createIndex++ });
         if (row) {
           created.push(row.id);
           if (a.initialState) await db.setProgress(row.id, a.initialState, a.initialNote ?? null);
@@ -196,12 +200,12 @@ async function applyActions(
       }
       case 'reopen': await db.reopenTask(a.task_id); break;
       case 'update':
-        // Pass ONLY the patchable fields (not kind/task_id) so updateTask can't
-        // be polluted by future action properties. owner is alias-canonicalized.
+        // Pass ONLY the patchable fields (not kind/task_id). owner is normalized
+        // inside db.updateTask (the single write boundary).
         await db.updateTask(a.task_id, {
           project: a.project,
           title: a.title,
-          owner: a.owner !== undefined ? canonicalOwner(a.owner) : undefined,
+          owner: a.owner,
         });
         await db.touchActivity(a.task_id);
         break;
@@ -468,18 +472,20 @@ async function runMorningBatchForThread(chatId: number, threadId: number | null)
     const due = Date.parse(t.due_at);
     return !Number.isNaN(due) && due < nowMs;
   };
-  // Chase a task when it has no status signal yet (progress 'none'), OR its
-  // deadline has passed regardless of status — an overdue in_progress/blocked
-  // task is exactly what must be re-asked. Tasks with a status AND no passed
-  // deadline are "known" and left alone. (Previously only progress==='none' was
-  // chased, so a stalled or overdue in_progress task was silently ignored.)
-  const chase = remaining.filter((t) => t.progress === 'none' || isOverdue(t));
-  const known = remaining.filter((t) => !(t.progress === 'none' || isOverdue(t)));
+  // Chase a task when it has no status signal yet (lifecycle 'open'), OR its
+  // deadline has passed regardless of state — an overdue in_progress/blocked task
+  // is exactly what must be re-asked. Tasks that are in_progress/blocked with no
+  // passed deadline are "known" and left alone. (`remaining` is already only the
+  // active lifecycles, so done/expired never appear here.)
+  const needsChase = (t: TelegramTaskRow): boolean => t.lifecycle === 'open' || isOverdue(t);
+  const chase = remaining.filter(needsChase);
+  const known = remaining.filter((t) => !needsChase(t));
   if (chase.length === 0) return;
 
   const byOwner = new Map<string, TelegramTaskRow[]>();
   for (const t of chase) {
-    const k = t.owner ?? 'unassigned';
+    // @mention by canonical handle when known; else group under the raw name.
+    const k = t.owner_handle ?? t.owner_display ?? 'unassigned';
     (byOwner.get(k) ?? byOwner.set(k, []).get(k)!).push(t);
   }
 
@@ -493,7 +499,7 @@ async function runMorningBatchForThread(chatId: number, threadId: number | null)
       // Flag overdue + show the current status so the owner sees why it's chased.
       const tags: string[] = [];
       if (isOverdue(t)) tags.push(`⚠️ OVERDUE${t.due_text ? ` (said "${escapeHtml(t.due_text)}")` : ''}`);
-      if (t.progress !== 'none') tags.push(escapeHtml(t.progress));
+      if (t.lifecycle !== 'open') tags.push(escapeHtml(t.lifecycle));
       const suffix = tags.length ? ` — ${tags.join(', ')}` : '';
       lines.push(`• ${t.project ? `[${escapeHtml(t.project)}] ` : ''}${escapeHtml(t.title)}${suffix}`);
     }
