@@ -111,6 +111,8 @@ rg "functionNameOrPattern" src/ --type ts
 
 3-stage waterfall: compiled plan → LLM resolver → smart locator. Never skip stages — each catches cases the previous misses.
 
+Exception: `options.useScreenshotOnly` forces vision-only resolution (per-step, opt-in). `resolveElement` short-circuits to a screenshot/vision pass at the very top and hard-fails if vision misses; the pre-resolveElement fast-paths (evidence/compiled) are gated off the same flag. See CLAUDE.md Hard invariant #7.
+
 Upload fallback chain: `setInputFiles` → nearby hidden input + shadow DOM → `fileChooser` (3s) → synthetic drag-drop.
 
 ## 9. OpenAI role mapping

@@ -223,6 +223,18 @@ async function onIdleFire(userId: string, io: SocketIOServer): Promise<void> {
     sessionIds = await getUserWarmupSessionIds(userId);
   } catch { /* proceed without trace context */ }
 
+  // Keyed audit (Loki) FIRST — the idle timer firing IS the expiry, so this must
+  // be queryable even if the Redis cleanup below throws. Don't bury it inside the
+  // try that depends on `deleteUserMobileKeys` succeeding.
+  logger.warn('[MOBILE] session expired', {
+    event: 'session.expired',
+    severity: 'warning',
+    code: 'SESSION_EXPIRED',
+    reason: 'idle',
+    surfacedBy: 'mobile_idle_timer',
+    userId,
+  });
+
   try {
     const deletedKeys = await deleteUserMobileKeys(userId);
 

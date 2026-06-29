@@ -4585,13 +4585,16 @@ export class PreviewStepApplyService {
         compiledPageUrl,
         currentPageUrl,
         locatorCount: stepDraft.compiled?.locatorPlan?.length,
-        ...(params.skipCompiled || compiledUrlStale ? { fellThroughTo: 'skipped' as const } : {}),
+        ...(params.skipCompiled || compiledUrlStale || stepDraft.options?.useScreenshotOnly === true ? { fellThroughTo: 'skipped' as const } : {}),
       });
 
       if (
         stepDraft.compiled && stepDraft.compiled.locatorPlan && stepDraft.compiled.locatorPlan.length > 0
         && !params.skipCompiled
         && !compiledUrlStale
+        // Force vision-only: skip the compiled fast-path so apply falls through
+        // to lintStepWithAI → resolveElement's screenshot-only gate.
+        && stepDraft.options?.useScreenshotOnly !== true
       ) {
         logger.debug('[PREVIEW_APPLY] Trying compiled locator plan before lint', {
           previewSessionId,
@@ -6159,7 +6162,12 @@ export class PreviewStepApplyService {
           // pinning a compiled plan would lock the step onto a possibly-wrong
           // element AND promote it out of manual-add status, which would
           // bypass this same soft-validation guard on the next run.
-          if (candidate.node && !softPassedOnNoEffect) {
+          // Vision-only steps deliberately never persist a compiled plan: it would
+          // contradict the step's "always vision" contract, cost a buildCompiledPlan
+          // every run for nothing (the compiled fast-path + evidence shortcut are
+          // gated off useScreenshotOnly on read), and become a stale-plan trap if
+          // the step is later switched off the flag. Mirrors the soft-pass skip below.
+          if (candidate.node && !softPassedOnNoEffect && stepDraft.options?.useScreenshotOnly !== true) {
             try {
               // Get pageSignature from session if available
               const session = sessionService.getSession(previewSessionId);
