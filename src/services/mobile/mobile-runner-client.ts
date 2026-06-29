@@ -186,9 +186,20 @@ export class MobileRunnerClient {
 
   async sessionExists(sessionId: string): Promise<boolean> {
     try {
-      const sessions = await this.request<{ id: string }[]>('GET', '/api/sessions', {
-        timeoutMs: 5000,
-      });
+      // The runner returns `{ sessions: [...] }` (an OBJECT), NOT a bare array.
+      // The previous code typed the response as `{ id }[]` and did
+      // `Array.isArray(resp)` — which is ALWAYS false on an object, so
+      // sessionExists returned false for EVERY live session. That turned the
+      // lint liveness-precheck into an unconditional 410 SESSION_EXPIRED on the
+      // first Find, even though the runner was actively serving the session
+      // (2026-06-29 incident: `5sqwlc`/`apb33k`/`kbicui`/`otltsk` were all alive
+      // on the runner; only this parse lied). Tolerate both shapes defensively.
+      const resp = await this.request<{ sessions?: { id: string }[] } | { id: string }[]>(
+        'GET',
+        '/api/sessions',
+        { timeoutMs: 5000 },
+      );
+      const sessions = Array.isArray(resp) ? resp : (resp?.sessions ?? []);
       return Array.isArray(sessions) && sessions.some((s) => s.id === sessionId);
     } catch {
       return false;

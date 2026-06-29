@@ -66,6 +66,38 @@ describe('MobileRunnerClient.touchSession', () => {
   });
 });
 
+describe('MobileRunnerClient.sessionExists', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  // REGRESSION (2026-06-29): the runner returns `{ sessions: [...] }`, but the
+  // client used to parse it as a bare array and `Array.isArray` it — always
+  // false on an object → sessionExists returned false for EVERY live session →
+  // unconditional 410 on the first lint + perpetual "creating fresh" warmup.
+  it('returns true for a live session in the runner\'s { sessions: [...] } envelope', async () => {
+    mockFetchOnce({ sessions: [{ id: 'sess-1' }, { id: 'sess-2' }] });
+    const client = new MobileRunnerClient();
+    await expect(client.sessionExists('sess-1')).resolves.toBe(true);
+  });
+
+  it('returns false when the session id is absent from the list', async () => {
+    mockFetchOnce({ sessions: [{ id: 'other' }] });
+    const client = new MobileRunnerClient();
+    await expect(client.sessionExists('sess-1')).resolves.toBe(false);
+  });
+
+  it('still tolerates a bare-array response (defensive — older/forward shape)', async () => {
+    mockFetchOnce([{ id: 'sess-1' }]);
+    const client = new MobileRunnerClient();
+    await expect(client.sessionExists('sess-1')).resolves.toBe(true);
+  });
+
+  it('returns false (never throws) on a transport error', async () => {
+    global.fetch = jest.fn().mockRejectedValue(new Error('ECONNREFUSED'));
+    const client = new MobileRunnerClient();
+    await expect(client.sessionExists('sess-1')).resolves.toBe(false);
+  });
+});
+
 describe('MobileRunnerClient.getSessionDestroyReason', () => {
   beforeEach(() => jest.clearAllMocks());
 
