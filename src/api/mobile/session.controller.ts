@@ -538,6 +538,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           runnerApiKey: getRunnerAuth(),
           platform: reusedSession.platform,
           reused: true,
+          createdAt: reusedSession.createdAt,
         });
         return;
       }
@@ -621,6 +622,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             runnerApiKey: getRunnerAuth(),
             platform: refreshed.platform,
             reused: true,
+            createdAt: refreshed.createdAt,
           });
           return;
         }
@@ -779,6 +781,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             runnerApiKey: getRunnerAuth(),
             platform: existing.platform,
             reused: true,
+            createdAt: existing.createdAt,
           });
 
           return;
@@ -1033,6 +1036,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       runnerApiKey: getRunnerAuth(),
       platform,
       reused: false,
+      createdAt: warmupData.createdAt,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
