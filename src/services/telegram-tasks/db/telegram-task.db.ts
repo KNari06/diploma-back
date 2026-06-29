@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
-import type { ProgressState } from '../telegram-task-ai.service';
+import type { Lifecycle } from '../telegram-task-ai.service';
 
 /**
  * db/ sublayer for QAIT Tasker (telegram_tasks / telegram_messages).
@@ -8,16 +8,26 @@ import type { ProgressState } from '../telegram-task-ai.service';
  * intent; this maps it to queries and rows. Service-role client → bypasses RLS.
  */
 
+/** Apply a forum-topic filter to a query: an exact topic id, or IS NULL for the
+ *  General topic. Centralizes the eq-vs-is split so every topic-scoped read is
+ *  consistent. `q` is a Supabase filter builder (typed `any` — its generic type
+ *  is too deep for the compiler; call sites stay typed). */
+function byThread(q: any, threadId: number | null): any {
+  return threadId == null ? q.is('thread_id', null) : q.eq('thread_id', threadId);
+}
+
 export interface TelegramTaskRow {
   id: string;
   chat_id: number;
+  thread_id: number | null;
   project: string | null;
   title: string;
-  owner: string | null;
-  status: 'open' | 'closed' | 'expired';
-  progress: 'none' | ProgressState;
+  owner_handle: string | null; // canonical @handle (normalized) — used for @mention / "tasks for X"
+  owner_display: string | null; // raw owner words as written (e.g. a bare name "Serzhan")
+  lifecycle: Lifecycle; // single state — replaces the old status+progress pair
   progress_note: string | null;
   source_msg_id: number | null;
+  digest_line_index: number | null; // which line of source_msg created this task (per-line anchor)
   created_at: string;
   last_activity_at: string;
   last_batch_at: string | null;
@@ -29,7 +39,22 @@ export interface TelegramTaskRow {
 }
 
 const TASK_COLS =
-  'id, chat_id, project, title, owner, status, progress, progress_note, source_msg_id, created_at, last_activity_at, last_batch_at, closed_at, closed_reason, due_at, due_text, awaiting_deadline_msg_id';
+  'id, chat_id, thread_id, project, title, owner_handle, owner_display, lifecycle, progress_note, source_msg_id, digest_line_index, created_at, last_activity_at, last_batch_at, closed_at, closed_reason, due_at, due_text, awaiting_deadline_msg_id';
+
+/** Lifecycle states a task is in (exactly one). `done`/`expired` are terminal.
+ *  `expired` = auto-archived for inactivity; `done` = genuinely completed. */
+const ACTIVE_LIFECYCLES = ['open', 'in_progress', 'blocked'] as const;
+
+/** Old status/progress columns still exist during the deploy dual-write window.
+ *  Derive them from `lifecycle` so an overlapping old-code instance stays sane.
+ *  Dropped in a follow-up migration once new code is fully rolled out. */
+function legacyStatusProgress(lifecycle: Lifecycle): { status: string; progress: string } {
+  if (lifecycle === 'done') return { status: 'closed', progress: 'none' };
+  if (lifecycle === 'expired') return { status: 'expired', progress: 'none' };
+  if (lifecycle === 'in_progress') return { status: 'open', progress: 'in_progress' };
+  if (lifecycle === 'blocked') return { status: 'open', progress: 'blocked' };
+  return { status: 'open', progress: 'none' }; // open
+}
 
 // ── messages ─────────────────────────────────────────────────────────────────
 
@@ -39,28 +64,30 @@ export async function logMessage(
   tgMsgId: number | undefined,
   author: string | undefined,
   text: string,
+  threadId: number | null,
 ): Promise<number | null> {
   const { data, error } = await supabaseAdmin
     .from('telegram_messages')
     // Defensive cap: Telegram messages top out ~4096 chars, but never trust the
     // wire — keep one fat payload from bloating a row.
-    .insert({ chat_id: chatId, tg_msg_id: tgMsgId ?? null, author: author ?? null, text: text.slice(0, 8000) })
+    .insert({ chat_id: chatId, thread_id: threadId, tg_msg_id: tgMsgId ?? null, author: author ?? null, text: text.slice(0, 8000) })
     .select('id')
     .single();
   if (error) return null;
   return (data as { id: number }).id;
 }
 
-/** Last N messages in a chat with id < beforeId, returned oldest-first. */
+/** Last N messages in a chat+topic with id < beforeId, returned oldest-first. */
 export async function recentMessages(
   chatId: number,
   limit: number,
   beforeId: number,
+  threadId: number | null,
 ): Promise<Array<{ author: string | null; text: string }>> {
-  const { data, error } = await supabaseAdmin
-    .from('telegram_messages')
-    .select('author, text')
-    .eq('chat_id', chatId)
+  const { data, error } = await byThread(
+    supabaseAdmin.from('telegram_messages').select('author, text').eq('chat_id', chatId),
+    threadId,
+  )
     .lt('id', beforeId)
     .order('id', { ascending: false })
     .limit(limit);
@@ -68,15 +95,16 @@ export async function recentMessages(
   return (data as Array<{ author: string | null; text: string }>).reverse();
 }
 
-/** Messages in a chat since an ISO timestamp, oldest-first (batch lookback). */
+/** Messages in a chat+topic since an ISO timestamp, oldest-first (batch lookback). */
 export async function messagesSince(
   chatId: number,
   sinceIso: string,
+  threadId: number | null,
 ): Promise<Array<{ author: string | null; text: string }>> {
-  const { data, error } = await supabaseAdmin
-    .from('telegram_messages')
-    .select('author, text')
-    .eq('chat_id', chatId)
+  const { data, error } = await byThread(
+    supabaseAdmin.from('telegram_messages').select('author, text').eq('chat_id', chatId),
+    threadId,
+  )
     .gte('created_at', sinceIso)
     .order('id', { ascending: true });
   if (error || !data) return [];
@@ -98,6 +126,7 @@ export async function pruneMessages(cutoffIso: string): Promise<number> {
 
 export async function createTask(t: {
   chatId: number;
+  threadId: number | null;
   project: string | null;
   title: string;
   owner: string | null;
@@ -107,6 +136,7 @@ export async function createTask(t: {
     .from('telegram_tasks')
     .insert({
       chat_id: t.chatId,
+      thread_id: t.threadId,
       project: t.project,
       title: t.title,
       owner: t.owner,
@@ -128,38 +158,49 @@ export async function getTask(id: string): Promise<TelegramTaskRow | null> {
   return data as TelegramTaskRow;
 }
 
-export async function openTasks(chatId: number): Promise<TelegramTaskRow[]> {
-  const { data, error } = await supabaseAdmin
-    .from('telegram_tasks')
-    .select(TASK_COLS)
-    .eq('chat_id', chatId)
-    .eq('status', 'open')
-    .order('created_at', { ascending: true });
+/** All open tasks in a chat+topic, oldest-first. (Morning batch is per-topic.) */
+export async function openTasks(chatId: number, threadId: number | null): Promise<TelegramTaskRow[]> {
+  const { data, error } = await byThread(
+    supabaseAdmin.from('telegram_tasks').select(TASK_COLS).eq('chat_id', chatId).eq('status', 'open'),
+    threadId,
+  ).order('created_at', { ascending: true });
   if (error || !data) return [];
   return data as TelegramTaskRow[];
 }
 
-/** Most-recently-active open tasks (bounds the per-message prompt). */
-export async function recentOpenTasks(chatId: number, limit: number): Promise<TelegramTaskRow[]> {
-  const { data, error } = await supabaseAdmin
-    .from('telegram_tasks')
-    .select(TASK_COLS)
-    .eq('chat_id', chatId)
-    .eq('status', 'open')
+/** Most-recently-active open tasks in a chat+topic (bounds the per-message prompt). */
+export async function recentOpenTasks(chatId: number, limit: number, threadId: number | null): Promise<TelegramTaskRow[]> {
+  const { data, error } = await byThread(
+    supabaseAdmin.from('telegram_tasks').select(TASK_COLS).eq('chat_id', chatId).eq('status', 'open'),
+    threadId,
+  )
     .order('last_activity_at', { ascending: false })
     .limit(limit);
   if (error || !data) return [];
   return data as TelegramTaskRow[];
 }
 
-export async function countOpenTasks(chatId: number): Promise<number> {
-  const { count, error } = await supabaseAdmin
-    .from('telegram_tasks')
-    .select('id', { count: 'exact', head: true })
-    .eq('chat_id', chatId)
-    .eq('status', 'open');
+export async function countOpenTasks(chatId: number, threadId: number | null): Promise<number> {
+  const { count, error } = await byThread(
+    supabaseAdmin.from('telegram_tasks').select('id', { count: 'exact', head: true }).eq('chat_id', chatId).eq('status', 'open'),
+    threadId,
+  );
   if (error || count == null) return 0;
   return count;
+}
+
+/** Distinct topic thread ids (incl. null=General) that have OPEN tasks in this
+ *  chat — the per-topic units the morning batch iterates. */
+export async function openTaskThreads(chatId: number): Promise<Array<number | null>> {
+  const { data, error } = await supabaseAdmin
+    .from('telegram_tasks')
+    .select('thread_id')
+    .eq('chat_id', chatId)
+    .eq('status', 'open');
+  if (error || !data) return [];
+  const set = new Set<number | null>();
+  for (const r of data as Array<{ thread_id: number | null }>) set.add(r.thread_id ?? null);
+  return [...set];
 }
 
 /** Open task ids whose source message is the given Telegram message id. */

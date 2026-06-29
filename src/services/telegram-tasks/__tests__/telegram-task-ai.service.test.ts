@@ -9,7 +9,34 @@ jest.mock('@/services/ai/core/openai.service', () => ({
   getChatCompletionWithMessages: jest.fn(),
 }));
 
-import { validateActions, renderDeadline, type AiTaskView } from '../telegram-task-ai.service';
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import {
+  validateActions,
+  renderDeadline,
+  verifyRiskyActions,
+  type AiTaskView,
+  type Action,
+  type ReconcileContext,
+} from '../telegram-task-ai.service';
+
+const mockLLM = getChatCompletionWithMessages as jest.MockedFunction<typeof getChatCompletionWithMessages>;
+/** Make the mocked verifier return the given verdicts (index → justified). */
+const mockVerdicts = (verdicts: Array<{ index: number; justified: boolean }>): void => {
+  mockLLM.mockResolvedValueOnce({
+    tool_calls: [{ function: { arguments: JSON.stringify({ verdicts }) } }],
+  } as never);
+};
+const ctx = (over: Partial<ReconcileContext> = {}): ReconcileContext => ({
+  text: 'merged',
+  author: '@x',
+  isManager: false,
+  replyToTaskIds: [],
+  openTasks: [],
+  hiddenOpenCount: 0,
+  recentMessages: [],
+  addressedToBot: false,
+  ...over,
+});
 
 const task = (id: string, over: Partial<AiTaskView> = {}): AiTaskView => ({
   id,
@@ -240,6 +267,50 @@ describe('validateActions', () => {
   });
 });
 
+describe('close/reopen reply-link enforcement (live path)', () => {
+  const owner = { owner: '@x', isManager: true };
+  const open = [task('t1', { owner: '@x' }), task('t2', { owner: '@x' })];
+  const enforce = { enforceReplyForClose: true };
+
+  it('drops a guessed close when the message did not reply to that task (bare "fixed")', () => {
+    // "fixed" / "pushed into dev" with no reply → model guessed t1 → suppressed.
+    const out = validateActions([{ kind: 'close', task_id: 't1', reason: 'fixed' }], open, 'r', owner, [], {
+      replyLinkedIds: [],
+      ...enforce,
+    });
+    expect(out).toEqual([]);
+  });
+
+  it('allows a close when the message replies to that exact task', () => {
+    const out = validateActions([{ kind: 'close', task_id: 't1', reason: 'fixed' }], open, 'r', owner, ['t1'], {
+      replyLinkedIds: ['t1'],
+      ...enforce,
+    });
+    expect(out).toEqual([{ kind: 'close', task_id: 't1', reason: 'fixed' }]);
+  });
+
+  it('drops a reopen on a non-reply-linked task too', () => {
+    const out = validateActions([{ kind: 'reopen', task_id: 't2' }], open, 'r', owner, ['t1'], {
+      replyLinkedIds: ['t1'],
+      ...enforce,
+    });
+    expect(out).toEqual([]);
+  });
+
+  it('does NOT affect progress/update/touch (only close/reopen are reply-gated)', () => {
+    const out = validateActions(
+      [{ kind: 'progress', task_id: 't1', state: 'in_progress' }, { kind: 'touch', task_id: 't2' }],
+      open, 'r', owner, [], { replyLinkedIds: [], ...enforce },
+    );
+    expect(out.map((a) => a.kind).sort()).toEqual(['progress', 'touch']);
+  });
+
+  it('batch path (no opts) is unaffected — close survives without a reply link', () => {
+    const out = validateActions([{ kind: 'close', task_id: 't1', reason: 'done' }], open, 'batch');
+    expect(out).toEqual([{ kind: 'close', task_id: 't1', reason: 'done' }]);
+  });
+});
+
 describe('renderDeadline (what the model sees about a task deadline)', () => {
   const NOW = Date.parse('2026-06-29T12:00:00Z');
   const v = (over: Partial<AiTaskView>): AiTaskView => task('x', over);
@@ -264,6 +335,55 @@ describe('renderDeadline (what the model sees about a task deadline)', () => {
   it('shows the words but no overdue verdict when due_at is unknown/unparsed', () => {
     const out = renderDeadline(v({ has_deadline: true, due_text: 'soon', due_at: null }), NOW);
     expect(out).toBe(' [deadline "soon"]');
+  });
+});
+
+describe('verifyRiskyActions (second-look on close/reopen/create/reassign)', () => {
+  beforeEach(() => mockLLM.mockReset());
+
+  const closeA: Action = { kind: 'close', task_id: 't1', reason: 'merged' };
+  const progressA: Action = { kind: 'progress', task_id: 't1', state: 'in_progress', note: 'wip' };
+  const open = [task('t1', { project: 'JP', title: 'Have 1 big JP regression' })];
+
+  it('makes NO extra LLM call when there are no risky actions', async () => {
+    const out = await verifyRiskyActions(ctx({ openTasks: open }), [progressA]);
+    expect(out).toEqual([progressA]);
+    expect(mockLLM).not.toHaveBeenCalled();
+  });
+
+  it('drops a risky action the verifier rejects, keeps non-risky ones', async () => {
+    mockVerdicts([{ index: 0, justified: false }]);
+    const out = await verifyRiskyActions(ctx({ openTasks: open, text: 'merged MR 139 about runner steps' }), [
+      closeA,
+      progressA,
+    ]);
+    expect(out).toEqual([progressA]); // close dropped, progress kept
+  });
+
+  it('keeps a risky action the verifier confirms', async () => {
+    mockVerdicts([{ index: 0, justified: true }]);
+    const out = await verifyRiskyActions(ctx({ openTasks: open }), [closeA]);
+    expect(out).toEqual([closeA]);
+  });
+
+  it('fails OPEN: a verifier error applies actions unverified', async () => {
+    mockLLM.mockRejectedValueOnce(new Error('boom'));
+    const out = await verifyRiskyActions(ctx({ openTasks: open }), [closeA]);
+    expect(out).toEqual([closeA]);
+  });
+
+  it('treats a missing verdict as justified (per-item fail-open)', async () => {
+    mockVerdicts([]); // verifier returned no verdict for index 0
+    const out = await verifyRiskyActions(ctx({ openTasks: open }), [closeA]);
+    expect(out).toEqual([closeA]);
+  });
+
+  it('verifies create and owner-reassign too', async () => {
+    const createA: Action = { kind: 'create', project: null, title: 'I am doing USB run', owner: '@x' };
+    const reassignA: Action = { kind: 'update', task_id: 't1', owner: '@y' };
+    mockVerdicts([{ index: 0, justified: false }, { index: 1, justified: false }]);
+    const out = await verifyRiskyActions(ctx({ openTasks: open }), [createA, reassignA]);
+    expect(out).toEqual([]);
   });
 });
 

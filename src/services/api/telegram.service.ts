@@ -131,7 +131,7 @@ export async function sendMessage(
   chatId: string | number,
   text: string,
   parseMode: 'HTML' | 'Markdown' | 'MarkdownV2' = 'HTML',
-  options?: { disableLinkPreview?: boolean; replyToMessageId?: number },
+  options?: { disableLinkPreview?: boolean; replyToMessageId?: number; messageThreadId?: number },
 ): Promise<TelegramMessage> {
   try {
     logger.info('[TELEGRAM_SERVICE] Sending message', { chatId, textLength: text.length });
@@ -143,6 +143,8 @@ export async function sendMessage(
         chat_id: chatId,
         text,
         parse_mode: parseMode,
+        // Post into a forum topic when given (omit → General topic).
+        ...(options?.messageThreadId && { message_thread_id: options.messageThreadId }),
         ...(options?.disableLinkPreview && {
           link_preview_options: { is_disabled: true },
         }),

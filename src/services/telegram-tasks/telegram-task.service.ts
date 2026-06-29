@@ -82,14 +82,17 @@ export function renderReplyTokens(reply: string, tasks: TelegramTaskRow[]): stri
 // (400) and would otherwise be silently dropped. Cap with headroom.
 const TG_MAX_CHARS = 3900;
 
-async function send(chatId: number, text: string, replyTo?: number): Promise<void> {
+async function send(chatId: number, text: string, replyTo?: number, threadId?: number | null): Promise<void> {
   if (!env.TELEGRAM_BOT_TOKEN) return;
   const safe = text.length > TG_MAX_CHARS ? `${text.slice(0, TG_MAX_CHARS)}…` : text;
   try {
     // replyTo threads the bot's message under the user's, so the answer/ack links
     // back to what it's about. allow_sending_without_reply (in sendMessage) keeps
-    // it from failing if the original was deleted.
-    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, safe, 'HTML', replyTo ? { replyToMessageId: replyTo } : undefined);
+    // it from failing if the original was deleted. threadId posts into a forum topic.
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, safe, 'HTML', {
+      ...(replyTo ? { replyToMessageId: replyTo } : {}),
+      ...(threadId != null ? { messageThreadId: threadId } : {}),
+    });
   } catch (err) {
     logger.warn('[TELEGRAM_TASKS] send failed', { chatId, error: err instanceof Error ? err.message : String(err) });
   }
@@ -148,6 +151,7 @@ async function sendReturningId(chatId: number, text: string, replyTo?: number): 
  *  set_deadline write conditional, so racing replies can't both win. */
 async function applyActions(
   chatId: number,
+  threadId: number | null, // topic a newly-created task belongs to
   actions: Action[],
   sourceMsgId: number | undefined,
   askReplyTo?: number,
@@ -173,7 +177,7 @@ async function applyActions(
   for (const a of actions) {
     switch (a.kind) {
       case 'create': {
-        const row = await db.createTask({ chatId, project: a.project, title: a.title, owner: canonicalOwner(a.owner), sourceMsgId });
+        const row = await db.createTask({ chatId, threadId, project: a.project, title: a.title, owner: canonicalOwner(a.owner), sourceMsgId });
         if (row) {
           created.push(row.id);
           if (a.initialState) await db.setProgress(row.id, a.initialState, a.initialNote ?? null);
@@ -272,6 +276,7 @@ export interface InboundMessage {
   replyToMsgId: number | undefined;
   addressedToBot: boolean; // @mention of the bot or reply to a bot message — the model decides question vs action
   imageFileId: string | undefined; // attached photo/image-doc → read via vision
+  threadId: number | null; // Telegram forum topic id (null = General topic) — scopes fuzzy context
 }
 
 /**
@@ -301,13 +306,16 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
     : baseText;
   const author = m.authorUsername ? `@${m.authorUsername}` : m.authorName;
 
-  const msgRowId = await db.logMessage(m.chatId, m.msgId, author, text);
+  const msgRowId = await db.logMessage(m.chatId, m.msgId, author, text, m.threadId);
 
   try {
+    // Fuzzy context (recent messages, open-task list, count) is scoped to THIS
+    // topic so a "done" in one topic can't match a task from another. Reply
+    // resolution stays chat-wide — a reply pins an exact task regardless of topic.
     const [contextTasks, totalOpen, recent, replyTaskIds, deadlineTaskId, botMsgTaskIds] = await Promise.all([
-      db.recentOpenTasks(m.chatId, MAX_CONTEXT_TASKS),
-      db.countOpenTasks(m.chatId),
-      msgRowId ? db.recentMessages(m.chatId, RECENT_MSG_WINDOW, msgRowId) : Promise.resolve([]),
+      db.recentOpenTasks(m.chatId, MAX_CONTEXT_TASKS, m.threadId),
+      db.countOpenTasks(m.chatId, m.threadId),
+      msgRowId ? db.recentMessages(m.chatId, RECENT_MSG_WINDOW, msgRowId, m.threadId) : Promise.resolve([]),
       m.replyToMsgId ? db.openTaskIdsBySourceMsg(m.chatId, m.replyToMsgId) : Promise.resolve([]),
       // Deterministic deadline link: did this message reply to the bot's "when?"
       // question for a specific task?
@@ -352,6 +360,7 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
     // claimant = the canonical author, so a `claim` reassigns the task to them.
     const r = await applyActions(
       m.chatId,
+      m.threadId,
       actions,
       m.msgId,
       m.msgId,
@@ -416,28 +425,43 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
 }
 
 /**
- * Morning batch for one chat: analyze the day's messages against all open tasks,
- * apply resolved statuses, then post ONE grouped status check tagging owners of
- * tasks the conversation did NOT clarify (still open + progress 'none').
+ * Morning batch for one chat. The group runs in forum (Topics) mode, so we batch
+ * PER TOPIC: each topic's day of messages is analyzed against only that topic's
+ * open tasks, and its chase message is posted into that topic. This prevents a
+ * "done" in one topic from resolving a task in another.
  */
 export async function runMorningBatch(chatId: number): Promise<void> {
-  const open = await db.openTasks(chatId);
+  const threads = await db.openTaskThreads(chatId);
+  for (const threadId of threads) {
+    try {
+      await runMorningBatchForThread(chatId, threadId);
+    } catch (err) {
+      logger.error('[TELEGRAM_TASKS] morning batch failed for topic', {
+        chatId, threadId, error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+/** One topic's morning batch: analyze its day, apply statuses, post its chase. */
+async function runMorningBatchForThread(chatId: number, threadId: number | null): Promise<void> {
+  const open = await db.openTasks(chatId, threadId);
   if (open.length === 0) return;
 
   const sinceIso = new Date(Date.now() - BATCH_LOOKBACK_HOURS * 3600_000).toISOString();
-  const msgs = await db.messagesSince(chatId, sinceIso);
+  const msgs = await db.messagesSince(chatId, sinceIso, threadId);
   try {
     const actions = await batchAnalyze(open.map(toAiView), msgs);
-    await applyActions(chatId, actions, undefined);
+    await applyActions(chatId, threadId, actions, undefined);
   } catch (err) {
-    logger.error('[TELEGRAM_TASKS] batch analyze failed', { chatId, error: err instanceof Error ? err.message : String(err) });
+    logger.error('[TELEGRAM_TASKS] batch analyze failed', { chatId, threadId, error: err instanceof Error ? err.message : String(err) });
   }
   // Mark the pre-analysis snapshot as batched. Tasks that applyActions just
   // closed get a harmless extra last_batch_at write — intentional, simpler than
   // re-querying which survived.
   await db.markBatched(open.map((t) => t.id));
 
-  const remaining = await db.openTasks(chatId);
+  const remaining = await db.openTasks(chatId, threadId);
   const nowMs = Date.now();
   const isOverdue = (t: TelegramTaskRow): boolean => {
     if (!t.due_at) return false;
@@ -480,7 +504,7 @@ export async function runMorningBatch(chatId: number): Promise<void> {
   }
   lines.push('');
   lines.push('<i>Reply (per task or in one go) with the date + blockers; or just say "done" if it\'s finished.</i>');
-  await send(chatId, lines.join('\n'));
+  await send(chatId, lines.join('\n'), undefined, threadId);
 }
 
 /**
