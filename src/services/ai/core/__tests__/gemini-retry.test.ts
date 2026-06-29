@@ -35,6 +35,16 @@ describe('isTransientGeminiError', () => {
     expect(isTransientGeminiError(new Error('401 Unauthorized: bad key'))).toBe(false);
     expect(isTransientGeminiError(new Error('Unexpected token in JSON'))).toBe(false);
   });
+
+  // 2026-06-29: a pure request TIMEOUT (this service throws
+  // 'Gemini request timeout') used to be NON-transient → no retry, and at the
+  // provider layer no fall-over to OpenAI. It must now be transient so a slow
+  // Gemini retries once and the provider layer can hop to GPT.
+  it('classifies a request timeout as transient', () => {
+    expect(isTransientGeminiError(new Error('Gemini request timeout'))).toBe(true);
+    expect(isTransientGeminiError(new Error('request timed out'))).toBe(true);
+    expect(isTransientGeminiError(new Error('socket hang up'))).toBe(true);
+  });
 });
 
 describe('callGeminiWithRetry', () => {

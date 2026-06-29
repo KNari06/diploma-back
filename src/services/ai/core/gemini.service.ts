@@ -51,7 +51,15 @@ function isTransientGeminiError(err: unknown): boolean {
     msg.includes('service unavailable') ||
     msg.includes('high demand') ||
     msg.includes('overloaded') ||
-    msg.includes('rate limit')
+    msg.includes('rate limit') ||
+    // A request TIMEOUT (this service throws 'Gemini request timeout') means we
+    // got no answer in budget — worth a retry and, at the provider layer, a
+    // fall-over to OpenAI. Caller-cancellation ('aborted before send') is
+    // handled separately via `signal?.aborted` and intentionally NOT matched
+    // here, so a user who cancels doesn't trigger a pointless retry/fallback.
+    msg.includes('timeout') ||
+    msg.includes('timed out') ||
+    msg.includes('socket hang up')
   );
 }
 
