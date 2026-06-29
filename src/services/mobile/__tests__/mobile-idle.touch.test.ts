@@ -32,7 +32,8 @@ jest.mock('@/utils/core/logger', () => ({
 }));
 
 // Import AFTER mocks so the module binds to them.
-import { touchRunnerSessions, cancelIdle } from '../mobile-idle.service';
+import { logger } from '@/utils/core/logger';
+import { touchRunnerSessions, refreshIdle, cancelIdle } from '../mobile-idle.service';
 
 const USER = 'user-1234567890';
 
@@ -96,5 +97,39 @@ describe('touchRunnerSessions', () => {
     await touchRunnerSessions('');
     expect(mockScanStream).not.toHaveBeenCalled();
     expect(mockTouchSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('mobile idle expiry logging', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.clearAllMocks();
+    cancelIdle(USER);
+  });
+
+  afterEach(() => {
+    cancelIdle(USER);
+    jest.useRealTimers();
+  });
+
+  it('emits the browser expiry event and a keyed session.expired log when idle fires', async () => {
+    mockScanStream.mockImplementation(streamReturning([]));
+    const emit = jest.fn();
+    const to = jest.fn(() => ({ emit }));
+
+    refreshIdle(USER, { to } as never, 'test');
+    expect(jest.getTimerCount()).toBe(1);
+    await jest.runAllTimersAsync();
+
+    expect(to).toHaveBeenCalledWith(`user:${USER}`);
+    expect(emit).toHaveBeenCalledWith('mobile:session:expired', { reason: 'idle' });
+    expect(logger.warn).toHaveBeenCalledWith('[MOBILE] session expired', expect.objectContaining({
+      event: 'session.expired',
+      severity: 'warning',
+      code: 'SESSION_EXPIRED',
+      reason: 'idle',
+      surfacedBy: 'mobile_idle_timer',
+      userId: USER,
+    }));
   });
 });
