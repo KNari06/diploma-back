@@ -278,8 +278,10 @@ export interface InboundMessage {
   authorName: string | undefined; // display/first name fallback
   isEdit: boolean;
   replyToMsgId: number | undefined;
+  replyToText: string | undefined; // text of the replied-to message — grounds "why?" / pronoun questions
   addressedToBot: boolean; // @mention of the bot or reply to a bot message — the model decides question vs action
-  imageFileId: string | undefined; // attached photo/image-doc → read via vision
+  imageFileIds: string[]; // attached image(s) → read via vision (up to 2 for albums)
+  mediaGroupId: string | undefined; // Telegram album id (parts share it); undefined if not an album
   threadId: number | null; // Telegram forum topic id (null = General topic) — scopes fuzzy context
 }
 
@@ -295,13 +297,17 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
   // treats the image content seamlessly alongside any caption. Fail-open: a
   // vision error leaves the text as-is.
   let baseText = m.text;
-  if (m.imageFileId && env.TELEGRAM_BOT_TOKEN) {
-    try {
-      const file = await getFileBase64(env.TELEGRAM_BOT_TOKEN, m.imageFileId);
-      const desc = file ? await describeImage(file.base64, file.mime) : '';
-      if (desc) baseText = baseText ? `${baseText}\n${desc}` : desc;
-    } catch {
-      /* vision failed — keep whatever text we have (may be empty) */
+  if (m.imageFileIds.length && env.TELEGRAM_BOT_TOKEN) {
+    // Read each attached image (up to 2, e.g. an album) and append its description.
+    // Per-image fail-open: one bad image never blocks the others or the text.
+    for (const fileId of m.imageFileIds) {
+      try {
+        const file = await getFileBase64(env.TELEGRAM_BOT_TOKEN, fileId);
+        const desc = file ? await describeImage(file.base64, file.mime) : '';
+        if (desc) baseText = baseText ? `${baseText}\n${desc}` : desc;
+      } catch {
+        /* this image failed — keep going */
+      }
     }
   }
 
@@ -345,13 +351,14 @@ export async function ingestMessage(m: InboundMessage): Promise<void> {
     // Use the enriched `text` (includes any image description) and never skip a
     // message that carried an image — a screenshot can assign/clarify work.
     const isSingleToken = !/\s/.test(text.trim());
-    if (totalOpen === 0 && !m.addressedToBot && !m.imageFileId && isSingleToken) return;
+    if (totalOpen === 0 && !m.addressedToBot && m.imageFileIds.length === 0 && isSingleToken) return;
 
     const { actions, reply } = await reconcile({
       text,
       author,
       isManager: isManagerUsername(m.authorUsername),
       replyToTaskIds: allReplyTaskIds,
+      replyToText: m.replyToText,
       openTasks: contextTasks.map(toAiView),
       hiddenOpenCount: Math.max(0, totalOpen - contextTasks.length),
       recentMessages: recent,
