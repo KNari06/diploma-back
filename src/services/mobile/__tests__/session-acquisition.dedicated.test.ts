@@ -3,6 +3,7 @@ import { resolveDedicatedDevice } from '../dedicated-device.service';
 import { DedicatedDeviceFeature } from '@/config/features/dedicated-device';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { logger } from '@/utils/core/logger';
+import { storeSessionRunnerBinding, getSessionRunnerBinding } from '../session-runner-routing';
 
 jest.mock('../dedicated-device.service', () => ({
   resolveDedicatedDevice: jest.fn(),
@@ -19,11 +20,17 @@ jest.mock('@/websocket/core/websocket.service', () => ({
 jest.mock('@/utils/core/logger', () => ({
   logger: { info: jest.fn(), warn: jest.fn(), debug: jest.fn(), error: jest.fn() },
 }));
+jest.mock('../session-runner-routing', () => ({
+  storeSessionRunnerBinding: jest.fn().mockResolvedValue(undefined),
+  getSessionRunnerBinding: jest.fn().mockResolvedValue(null),
+}));
 
 const mockResolve = resolveDedicatedDevice as jest.Mock;
 const mockFlag = DedicatedDeviceFeature.isEnabled as jest.Mock;
 const mockWarmed = claimWarmedSession as jest.Mock;
 const mockWarn = logger.warn as jest.Mock;
+const mockStoreBinding = storeSessionRunnerBinding as jest.Mock;
+const mockGetBinding = getSessionRunnerBinding as jest.Mock;
 
 function makeClient() {
   return {
@@ -66,6 +73,12 @@ describe('acquireSession — dedicated intercept', () => {
       userId: 'user-1',
       dedicated: true,
     });
+    // Binding stored so getMobileRunnerClientForSession resolves the dedicated runner.
+    expect(mockStoreBinding).toHaveBeenCalledWith(
+      'sess-ded',
+      { runnerUrl: null, runnerApiKey: undefined },
+      900,
+    );
     // The shared ladder is never touched.
     expect(client.claimSession).not.toHaveBeenCalled();
     expect(mockWarmed).not.toHaveBeenCalled();
@@ -94,6 +107,50 @@ describe('acquireSession — dedicated intercept', () => {
     expect(r.sessionSource).toBe('pool');
     expect(r.sessionId).toBe('sess-pool');
     expect(client.claimSession).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('acquireSession — warmup runner-binding refresh', () => {
+  // Falls through the dedicated intercept (flag off) to the shared ladder, pool
+  // claim fails, a matching warmed session is claimed.
+  function warmupScenario(binding: unknown) {
+    mockFlag.mockReturnValue(false); // no dedicated intercept
+    mockGetBinding.mockResolvedValue(binding);
+    const client = makeClient();
+    client.claimSession.mockRejectedValue(new Error('pool empty'));
+    mockWarmed.mockResolvedValue({ sessionId: 'warm-1', platform: 'android' });
+    return client;
+  }
+
+  it('re-stores an existing binding (companion/dedicated-URL warmup) with a fresh TTL', async () => {
+    const binding = { kind: 'companion', userId: 'user-1' };
+    const client = warmupScenario(binding);
+
+    const r = await MobileSessionAcquisitionService.acquireSession(baseParams(client));
+
+    expect(r.sessionSource).toBe('warmup');
+    expect(mockGetBinding).toHaveBeenCalledWith('warm-1');
+    expect(mockStoreBinding).toHaveBeenCalledWith('warm-1', binding, 900);
+  });
+
+  it('does NOT store a binding for a shared-pool warmup (no binding present)', async () => {
+    const client = warmupScenario(null);
+
+    const r = await MobileSessionAcquisitionService.acquireSession(baseParams(client));
+
+    expect(r.sessionSource).toBe('warmup');
+    expect(mockGetBinding).toHaveBeenCalledWith('warm-1');
+    expect(mockStoreBinding).not.toHaveBeenCalled();
+  });
+
+  it('does not fail the run if the binding refresh throws', async () => {
+    const client = warmupScenario({ kind: 'companion', userId: 'user-1' });
+    mockStoreBinding.mockRejectedValueOnce(new Error('redis down'));
+
+    const r = await MobileSessionAcquisitionService.acquireSession(baseParams(client));
+
+    expect(r.sessionSource).toBe('warmup');
+    expect(r.sessionId).toBe('warm-1');
   });
 });
 

@@ -28,7 +28,9 @@ import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { sanitizeMobileAppPackageSteps } from '@/services/testing/regression/intent-step-dispatch.service';
 import { describeDeviceError, type DeviceFailureCategory } from '@/services/testing/regression/device-error-catalog';
-import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { MobileRunnerClient, type IMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { CompanionRunnerClient } from '@/services/mobile/companion/companion-runner-client';
+import { getSessionRunnerBinding } from '@/services/mobile/session-runner-routing';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
@@ -290,6 +292,11 @@ export class MobileTestRunJobHandler {
 
     let sessionId: string | null = null;
     let sessionSource: 'pool' | 'warmup' | 'cold' | 'dedicated' = 'cold';
+    // The runner client used for all session-scoped calls. Starts as the shared
+    // env-runner `client`; swapped after acquisition when the session is bound
+    // to a companion/dedicated runner. Hoisted here so the cleanup `finally`
+    // (release/end/destroy) also routes to the right runner.
+    let activeClient: IMobileRunnerClient = client;
     // Fast-auth: filled from compileResult.fastAuthRestores. Each entry is a
     // snapshot the worker will restore via runner HTTP between Phase 3b
     // (prepApp) and Phase 4 (runSteps). Empty array (not undefined) so the
@@ -425,6 +432,32 @@ export class MobileTestRunJobHandler {
       tlm.sessionClaimMs = sessionAcq.sessionClaimMs;
       tlm.coldStartUsed = sessionAcq.coldStartUsed;
 
+      // The session may have been BORN on a companion or dedicated runner (e.g.
+      // an editor warmup claimed at Try-2, or the tier-0 dedicated intercept).
+      // The job's `client` points at the shared env runner, so every later
+      // session-scoped call (prepApp, runSteps, attachFlutter, cleanup) would
+      // hit the WRONG runner. Re-resolve from the session binding and swap.
+      //
+      // A binding only exists for warmup/dedicated/companion births — pool and
+      // cold sessions never store one — so skip the Redis read entirely for
+      // those. We construct the bound client HERE (rather than calling
+      // getMobileRunnerClientForSession) so the shared-pool case keeps the
+      // job's OWN `client`: that helper returns the env SINGLETON for unbound
+      // sessions, and calling setGeminiApiKey on the singleton would leak this
+      // job's key into other concurrent jobs.
+      if (sessionSource === 'warmup' || sessionSource === 'dedicated') {
+        const binding = await getSessionRunnerBinding(sessionId);
+        if (binding?.kind === 'companion') {
+          activeClient = new CompanionRunnerClient(binding.userId);
+          if (geminiApiKey) activeClient.setGeminiApiKey(geminiApiKey);
+          logger.info('[MOBILE-TEST] Routing job through companion runner', { testId, sessionId });
+        } else if (binding && binding.runnerUrl) {
+          activeClient = new MobileRunnerClient({ baseUrl: binding.runnerUrl, apiKey: binding.runnerApiKey ?? '' });
+          if (geminiApiKey) activeClient.setGeminiApiKey(geminiApiKey);
+          logger.info('[MOBILE-TEST] Routing job through dedicated runner', { testId, sessionId, runnerUrl: binding.runnerUrl });
+        }
+      }
+
 
       // ── Phase 3a: Apply project-level runtime-permission policy ────
       // Editor warmup applies this during the warmup HTTP handler, but
@@ -448,7 +481,7 @@ export class MobileTestRunJobHandler {
       if (sessionId && projectId) {
         const { applyProjectPolicyToSession } = await import('@/services/mobile/permission-policy.service');
         const appliedPolicy = await applyProjectPolicyToSession({
-          client,
+          client: activeClient,
           sessionId,
           projectId,
           userId,
@@ -522,7 +555,7 @@ export class MobileTestRunJobHandler {
           // long success would have taken", which is honest analytics.
           const appSetupT0 = Date.now();
           await MobileAppPrepService.prepApp({
-            client,
+            client: activeClient,
             sessionId,
             projectId,
             userId,
@@ -558,7 +591,7 @@ export class MobileTestRunJobHandler {
       // ── Phase 3c: Fast-auth restore (May 2026) ────────────────────
       if (sessionId && fastAuthRestores.length > 0) {
         const fastAuthResult = await FastAuthOrchestratorService.restoreSnapshots({
-          client,
+          client: activeClient,
           sessionId,
           fastAuthRestores,
           testId,
@@ -588,7 +621,7 @@ export class MobileTestRunJobHandler {
         if (!appPackage) {
           throw new Error('Flutter test has no resolved package name — cannot attach the Dart VM Service.');
         }
-        await client.attachFlutter(sessionId, { packageName: appPackage }, { userId });
+        await activeClient.attachFlutter(sessionId, { packageName: appPackage }, { userId });
         logger.info('[MOBILE-TEST] Flutter session attached', { testId, sessionId, appPackage });
       }
 
@@ -649,7 +682,7 @@ export class MobileTestRunJobHandler {
 
       let runResult: MobileRunStepsResponse;
       try {
-        runResult = await client.runSteps(sessionId, intentSteps, {
+        runResult = await activeClient.runSteps(sessionId, intentSteps, {
           screenshotEachStep: true,
           metadata,
           // Forward the test's user-defined triggers verbatim (no-op when
@@ -1359,13 +1392,13 @@ export class MobileTestRunJobHandler {
       if (sessionId) {
         try {
           if (sessionSource === 'pool') {
-            await client.releaseSession(sessionId, { userId });
+            await activeClient.releaseSession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Pool session released', { testId, sessionId });
           } else if (sessionSource === 'dedicated') {
-            await client.endDedicatedSession(sessionId, { userId });
+            await activeClient.endDedicatedSession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Dedicated session ended (container preserved)', { testId, sessionId });
           } else {
-            await client.destroySession(sessionId, { userId });
+            await activeClient.destroySession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Session destroyed', { testId, sessionId, sessionSource });
           }
         } catch (err) {

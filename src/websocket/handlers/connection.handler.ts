@@ -21,7 +21,7 @@ import {
   getUserWarmupSessionIds,
 } from '@/services/mobile/mobile-idle.service';
 import { cancelIdle as cancelPreviewIdle } from '@/services/testing/ui/preview/preview-idle.service';
-import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { getMobileRunnerClientForSession } from '@/services/mobile/session-runner-routing';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
 
@@ -46,10 +46,13 @@ async function performDisconnectCleanup(userId: string, disconnectReason?: strin
     const sessionIds = await getUserWarmupSessionIds(userId);
 
     if (sessionIds.length > 0) {
-      const client = getMobileRunnerClient();
       await Promise.allSettled(
         sessionIds.map(async (sid) => {
           try {
+            // Resolve per-session: a companion/dedicated session must be
+            // destroyed through its OWN runner, not the shared singleton —
+            // otherwise the destroy hits a runner that never held the session.
+            const client = await getMobileRunnerClientForSession(sid);
             await client.destroySession(sid, { userId });
           } catch (err) {
             logger.warn('[WebSocket] Cleanup destroy failed (runner TTL will reclaim)', {

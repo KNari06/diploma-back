@@ -5634,8 +5634,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           return;
         }
 
-        const { getMobileRunnerClient } = await import('@/services/mobile');
-        const mobileClient = getMobileRunnerClient();
+        const { getMobileRunnerClientForSession } = await import('@/services/mobile/session-runner-routing');
+        const mobileClient = await getMobileRunnerClientForSession(mobileSessionId);
         const { buildMetadataFromTestCase } = await import('@/services/mobile/mobile-runner.types');
         const { sanitizeTriggers } = await import('@/services/mobile/trigger-validation.util');
 

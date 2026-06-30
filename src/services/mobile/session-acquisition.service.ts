@@ -4,6 +4,7 @@ import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileRunnerClient } from './mobile-runner-client';
 import type { MobilePlatform } from './mobile-runner.types';
 import { resolveDedicatedDevice } from './dedicated-device.service';
+import { storeSessionRunnerBinding, getSessionRunnerBinding } from './session-runner-routing';
 import { DedicatedDeviceFeature } from '@/config/features/dedicated-device';
 import { env } from '@/config/environment/env';
 
@@ -120,6 +121,14 @@ export class MobileSessionAcquisitionService {
         platform,
         workspaceId,
       });
+      // Store binding so getMobileRunnerClientForSession resolves the right runner
+      // for session-scoped calls (runSteps, destroySession, etc.) during the job.
+      // TTL matches the editor warmup TTL (15 min) — regression jobs are bounded.
+      await storeSessionRunnerBinding(
+        session.sessionId,
+        { runnerUrl: dedicated.runnerUrl, runnerApiKey: dedicated.runnerApiKey },
+        900,
+      );
       return {
         sessionId: session.sessionId,
         sessionSource: 'dedicated',
@@ -177,6 +186,26 @@ export class MobileSessionAcquisitionService {
           sessionId = warmed.sessionId;
           sessionSource = 'warmup';
           logger.info('[MOBILE-TEST] Warmed session claimed', { testId, sessionId, platform });
+          // Refresh the per-session runner binding so a companion / dedicated-URL
+          // warmup can't lose its routing if the original 15-min TTL lapses before
+          // the job's session-scoped calls (runSteps, destroySession) —
+          // getMobileRunnerClientForSession would otherwise silently fall back to
+          // the shared env runner and hit the WRONG runner. The dedicated tier-0
+          // branch already re-stores its binding; mirror that here. Shared-pool
+          // warmups carry NO binding and are left untouched (default runner is
+          // correct for them). Best-effort: a Redis hiccup must not fail the run.
+          try {
+            const warmupBinding = await getSessionRunnerBinding(sessionId);
+            if (warmupBinding) {
+              await storeSessionRunnerBinding(sessionId, warmupBinding, 900);
+            }
+          } catch (bindErr) {
+            logger.warn('[MOBILE-TEST] Warmup binding refresh failed (non-fatal)', {
+              testId,
+              sessionId,
+              error: bindErr instanceof Error ? bindErr.message : String(bindErr),
+            });
+          }
         } else if (warmed && warmed.platform !== platform) {
           // Pre-fix this branch was silent — a warmup existed but for a
           // different platform (e.g. user warmed mobile_android in the

@@ -26,7 +26,7 @@
  */
 
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
-import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { getMobileRunnerClientForSession } from '@/services/mobile/session-runner-routing';
 import { redactPii } from '@/services/chat/pii-redactor';
 import { wrapUntrusted } from '@/services/chat/untrusted-content-wrapper';
 import { env } from '@/config/environment/env';
@@ -929,7 +929,7 @@ async function runObserveMobilePage(
     return { ok: true, content: formatSnapshotForLlm(cached, { cached: true }), data: cached };
   }
 
-  const client = getMobileRunnerClient();
+  const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
   try {
     const snap = await client.fetchUiState(bb.mobileSessionId, {
       includeTree: false,
@@ -1583,7 +1583,7 @@ async function runMobileRunDraftSteps(
   // Execute as a single batch. Runner serialises per-session anyway, so
   // batching beats N separate calls — we get one round-trip with built-in
   // smart-wait + per-step results.
-  const client = getMobileRunnerClient();
+  const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
   let runnerResults: unknown[] = [];
   let batchError: string | null = null;
   try {
@@ -2356,7 +2356,7 @@ async function runSwitchToWebview(
     };
   }
 
-  const client = getMobileRunnerClient();
+  const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
   try {
     // The runner accepts `switch_context({context: 'WEB'})` — pre-Phase-8
     // it threw "unknown command" because the schema rejected it; the
@@ -2433,7 +2433,7 @@ async function runSwitchToNative(
     };
   }
 
-  const client = getMobileRunnerClient();
+  const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
   try {
     await client.executeBatchCommands(
       bb.mobileSessionId,
@@ -2487,7 +2487,7 @@ async function runWebEvaluate(
   }
 
   const startedAt = Date.now();
-  const client = getMobileRunnerClient();
+  const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
   try {
     const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
@@ -2566,7 +2566,7 @@ async function dispatchSingleCommand(
   opts: DispatchOpts,
 ): Promise<ToolResult> {
   const startedAt = Date.now();
-  const client = getMobileRunnerClient();
+  const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
 
   try {
     const { results } = await client.executeBatchCommands(
@@ -2678,7 +2678,7 @@ async function ensureScreenDims(
   if (snap?.screenSize) return snap.screenSize;
 
   try {
-    const fresh = await getMobileRunnerClient().fetchUiState(bb.mobileSessionId, {
+    const fresh = await (await getMobileRunnerClientForSession(bb.mobileSessionId)).fetchUiState(bb.mobileSessionId, {
       includeTree: false,
       includeScreenshot: false,
       signal,
@@ -2765,7 +2765,7 @@ async function runGetForeground(
   bb: MobileBlackboard,
   opts?: { abortSignal?: AbortSignal },
 ): Promise<ToolResult> {
-  const client = getMobileRunnerClient();
+  const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
   try {
     const res = await client.fetchForeground(bb.mobileSessionId, {
       userId: bb.userId,
@@ -2823,7 +2823,7 @@ async function runGetStepHistory(
   // call doesn't even hit the runner with garbage.
   const limit = Math.max(1, Math.min(Math.floor(rawLimit), 50));
 
-  const client = getMobileRunnerClient();
+  const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
   try {
     // includeRawInputs is HARDCODED to false from the chat path. Raw
     // typed text is only exposed by explicit operator/debug tools —
@@ -2897,7 +2897,7 @@ async function runGetRecentLogs(
   const rawLimit = typeof args.limit === 'number' ? args.limit : 100;
   const limit = Math.max(1, Math.min(Math.floor(rawLimit), 500));
 
-  const client = getMobileRunnerClient();
+  const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
   try {
     const res = await client.fetchRecentLogs(bb.mobileSessionId, {
       level,
@@ -2968,7 +2968,7 @@ async function runTakeScreenshot(
     };
   }
 
-  const client = getMobileRunnerClient();
+  const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
   try {
     // Fetch the screenshot via /ui-state — tree omitted because the
     // LLM didn't ask for it. Screenshot ON, tree OFF → cheaper than a

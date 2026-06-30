@@ -16,7 +16,7 @@
  *   - Auto-persist to DB (backend decides based on transport/caller).
  */
 
-import { getMobileRunnerClient } from './mobile-runner-client';
+import { getMobileRunnerClientForSession } from './session-runner-routing';
 import type { MobileCompiledPlan } from './mobile-runner.types';
 import { logger } from '@/utils/core/logger';
 
@@ -243,7 +243,7 @@ export class MobileStepApplyService {
    */
   static async apply(input: MobileApplyInput): Promise<MobileApplyOutput> {
     const { sessionId, stepDraft, signal, userId } = input;
-    const client = getMobileRunnerClient();
+    const client = await getMobileRunnerClientForSession(sessionId);
 
     const rawStepType = stepDraft.type || stepDraft.kind || 'click';
     const stepType = STEP_TYPE_MAP[rawStepType] || rawStepType;
