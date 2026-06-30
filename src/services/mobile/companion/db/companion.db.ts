@@ -59,3 +59,14 @@ export async function revokeCompanionDevice(deviceId: string, userId: string): P
   if (error) throw new Error(`Failed to revoke companion device: ${error.message}`);
   return !!data;
 }
+
+// Stamp a device's last activity. Called from the token-refresh path (the
+// companion refreshes ~every 25 min), so `last_seen_at` reflects a live device
+// instead of staying null forever. Best-effort — callers fire-and-forget.
+export async function touchCompanionDeviceLastSeen(deviceId: string): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from('companion_devices')
+    .update({ last_seen_at: new Date().toISOString() })
+    .eq('id', deviceId);
+  if (error) throw new Error(`Failed to touch companion device last_seen_at: ${error.message}`);
+}

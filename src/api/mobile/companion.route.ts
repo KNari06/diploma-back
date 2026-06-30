@@ -1,7 +1,6 @@
-import type { NextFunction, Request, Response } from 'express';
-import { Router } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import { requireAuth, requireApproved } from '@/middleware/auth.middleware';
-import { createIpRateLimiter } from '@/middleware/rate-limiter.middleware';
+import { createIpRateLimiter, createRateLimiter } from '@/middleware/rate-limiter.middleware';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { CompanionFeature } from '@/config/features/companion';
 import {
@@ -33,11 +32,20 @@ const companionPairRateLimiter = createIpRateLimiter({
   keyPrefix: 'companion-pair',
 });
 
+// Per-user limiter for pair-code minting. requireAuth alone left this unbounded:
+// a logged-in user could spam codes (each is a Redis write + a single-use slot).
+// Generous cap — pairing a device is a once-in-a-while action, far under this.
+const companionPairCodeRateLimiter = createRateLimiter({
+  windowMs: 60_000,
+  maxRequests: 10,
+  keyPrefix: 'companion-pair-code',
+});
+
 // ── Authenticated (user's QAIT session) ──────────────────────────────────────
 
 // POST /api/v1/companion/pair-code
 // Generates a short-lived pairing code the user pastes into the companion CLI.
-router.post('/pair-code', requireAuth, requireApproved, asyncHandler(generatePairingCode));
+router.post('/pair-code', requireAuth, requireApproved, companionPairCodeRateLimiter, asyncHandler(generatePairingCode));
 
 // GET /api/v1/companion/status
 // Reports whether the user's companion is connected + its last device snapshot,

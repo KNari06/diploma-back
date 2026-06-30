@@ -4,6 +4,7 @@ import {
   createCompanionDevice,
   getCompanionDeviceByRefreshHash,
   revokeCompanionDevice,
+  touchCompanionDeviceLastSeen,
 } from '../db/companion.db';
 
 jest.mock('@/config/infrastructure/queues', () => ({
@@ -20,6 +21,7 @@ jest.mock('../db/companion.db', () => ({
   createCompanionDevice: jest.fn(),
   getCompanionDeviceByRefreshHash: jest.fn(),
   revokeCompanionDevice: jest.fn(),
+  touchCompanionDeviceLastSeen: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('@/config/environment/env', () => ({
@@ -32,6 +34,7 @@ const { redisConnection } = require('@/config/infrastructure/queues') as {
 const mockCreate = createCompanionDevice as jest.Mock;
 const mockGetByHash = getCompanionDeviceByRefreshHash as jest.Mock;
 const mockRevoke = revokeCompanionDevice as jest.Mock;
+const mockTouchLastSeen = touchCompanionDeviceLastSeen as jest.Mock;
 
 beforeEach(() => jest.clearAllMocks());
 
@@ -144,6 +147,19 @@ describe('refreshAccessToken', () => {
     mockGetByHash.mockResolvedValue(null);
     await expect(CompanionAuthService.refreshAccessToken('bad-token'))
       .rejects.toThrow(/invalid.*refresh.*token/i);
+  });
+
+  it('stamps last_seen_at for the device on a successful refresh', async () => {
+    mockGetByHash.mockResolvedValue({ id: 'device-7', userId: 'user-1', revokedAt: null });
+    await CompanionAuthService.refreshAccessToken('tok');
+    expect(mockTouchLastSeen).toHaveBeenCalledWith('device-7');
+  });
+
+  it('still returns a token if the last_seen_at write fails (fire-and-forget)', async () => {
+    mockGetByHash.mockResolvedValue({ id: 'device-1', userId: 'user-1', revokedAt: null });
+    mockTouchLastSeen.mockRejectedValueOnce(new Error('db down'));
+    const result = await CompanionAuthService.refreshAccessToken('tok');
+    expect(result.accessToken).toMatch(/^.+\.\d+\.[a-f0-9]{64}$/);
   });
 
   it('throws RevokedDeviceError when the device has been revoked', async () => {
