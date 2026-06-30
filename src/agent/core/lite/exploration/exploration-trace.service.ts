@@ -128,6 +128,64 @@ export class ExplorationTraceService {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // RESULT BUILD + PERSISTENCE EVENTS (END of the URL→test-cases path)
+  // Previously the trace went silent after the last flow_end; these surface
+  // what test cases were produced and whether they were saved — the part the
+  // user cares most about ("did I get ready-to-use tests?").
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writeTestCaseDiscovered(data: {
+    name: string;
+    category?: string;
+    stepsCount: number;
+    assertionsCount?: number;
+    hasCompiledLocators?: boolean;
+    sourceEntryPointId?: string;
+    isNegative?: boolean;
+  }): void {
+    this.writer.write({
+      stage: 'build',
+      eventType: 'test_case_discovered',
+      payload: data,
+    });
+  }
+
+  writeResultBuilt(data: {
+    testCasesCount: number;
+    negativeCount?: number;
+    totalSteps: number;
+    categories?: string[];
+  }): void {
+    this.writer.write({
+      stage: 'build',
+      eventType: 'result_built',
+      payload: data,
+    });
+  }
+
+  writeTestCasesSaved(data: {
+    requestedCount: number;
+    savedCount: number;
+    projectId: string;
+    savedIds?: string[];
+    error?: string;
+  }): void {
+    this.writer.write({
+      stage: 'persistence',
+      eventType: 'test_cases_saved',
+      payload: data,
+    });
+  }
+
+  writeRunCompleted(data: { explorationId: string; testCasesCount: number; durationMs: number }): void {
+    this.writer.write({
+      stage: 'persistence',
+      eventType: 'run_completed',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // SURVEY EVENTS (Phase 1)
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -651,8 +709,81 @@ export class ExplorationTraceService {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // PAGE HEALTH + ELEMENT RESOLUTION (per-action diagnostics)
+  // Surface the RAW signals behind a health verdict and the locator waterfall,
+  // so a reader can answer "why did the agent click that / why did it fail".
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writePageHealth(data: {
+    entryPointId?: string;
+    round?: number;
+    url: string;
+    serverErrorStatus?: number;
+    hasServerError: boolean;
+    sessionLost: boolean;
+    consoleErrorCount: number;
+    networkErrors?: Array<{ url: string; method: string; status?: number }>;
+    consoleErrors?: string[];
+  }): void {
+    this.writer.write({
+      stage: 'flow',
+      eventType: 'page_health',
+      payload: data,
+    });
+  }
+
+  writeElementResolution(data: {
+    entryPointId?: string;
+    round?: number;
+    ref: string;
+    command: string;
+    stage: 'compiled' | 'evidence' | 'llm' | 'smart_locator' | 'screenshot' | 'identity';
+    success: boolean;
+    reason?: string;
+    durationMs?: number;
+    resolved?: { tag?: string; role?: string; name?: string; text?: string; visible?: boolean; covered?: boolean; disabled?: boolean };
+  }): void {
+    this.writer.write({
+      stage: 'flow',
+      eventType: 'element_resolution',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // PRE-ENGINE LIFECYCLE (START of the path — controller/job/browser)
+  // Captures the previously-blind window between "URL dropped" and the first
+  // in-engine event, including crashes before the engine ever runs.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writeJobStart(data: { explorationId: string; entryUrl: string; isResume: boolean; resumeCount?: number }): void {
+    this.writer.write({
+      stage: 'lifecycle',
+      eventType: 'job_start',
+      payload: data,
+    });
+  }
+
+  writeBrowserLaunched(data: { headless: boolean; durationMs: number }): void {
+    this.writer.write({
+      stage: 'lifecycle',
+      eventType: 'browser_launched',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // ERROR & WARNING
   // ─────────────────────────────────────────────────────────────────────────
+
+  /** Capture a crash with stack so a failed run is diagnosable from the trace alone. */
+  writeFatal(data: { phase: string; error: string; stack?: string }): void {
+    this.writer.write({
+      stage: 'error',
+      eventType: 'fatal',
+      payload: data,
+    });
+  }
 
   writeError(error: string, context?: Record<string, any>): void {
     this.writer.write({

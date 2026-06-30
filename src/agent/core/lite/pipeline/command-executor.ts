@@ -235,6 +235,26 @@ export class CommandExecutor {
       // now-healthy flow forever. A clean window must clear the prior verdict.
       this.blackboard.setPageHealth(pageHealthHasSignal(health) ? health : undefined);
 
+      // Trace the RAW signals behind the verdict (not just the later
+      // reviewer_fast_path decision), so a reader can see WHICH request 5xx'd /
+      // what console errors fired. Only on signal — clean rounds aren't traced.
+      if (pageHealthHasSignal(health)) {
+        this.integrations.traceWriter?.write({
+          stage: 'flow',
+          eventType: 'page_health',
+          spanId: this.integrations.traceWriter.generateSpanId(),
+          payload: {
+            entryPointId: this.config.entryPointId,
+            url: currentUrl,
+            serverErrorStatus: health.serverErrorStatus,
+            hasServerError: health.hasServerError,
+            sessionLost: health.sessionLost,
+            consoleErrorCount: health.consoleErrorCount,
+            networkErrors: networkErrorsSince.slice(0, 5).map((e) => ({ url: e.url, method: e.method, status: e.status })),
+          },
+        });
+      }
+
       const body = formatPageHealth(health);
       return body ? `\nPAGE HEALTH:\n${body}` : '';
     } catch {

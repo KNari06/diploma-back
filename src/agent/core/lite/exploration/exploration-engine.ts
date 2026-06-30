@@ -157,7 +157,17 @@ export class ExplorationEngine {
    *   Phase 2:   Flow Execution (TestPipeline + Scout per flow)
    *   Phase 2.5: Coverage Evaluation (Sentinel assesses gaps)
    */
-  async run(): Promise<ExplorationResult> {
+  /**
+   * @param onResultReady Optional async hook invoked with the built result
+   *   AFTER the test cases are produced but BEFORE the trace is finalized and
+   *   closed. The job uses it to persist test cases so the save is part of the
+   *   single traced lifecycle (fixes the old bug where trace.close() ran before
+   *   persistence, so a failed save still showed "completed"). It returns the
+   *   persistence outcome which is folded into the exploration_end status.
+   */
+  async run(
+    onResultReady?: (result: ExplorationResult) => Promise<{ savedCount: number; error?: string } | void>,
+  ): Promise<ExplorationResult> {
     const startTime = Date.now();
     const budget = new BudgetTracker(this.config.budget);
     const rateLimiter = new RateLimiter(this.config.rateLimiting, budget);
@@ -530,6 +540,27 @@ export class ExplorationEngine {
     const builder = new TestCaseBuilder();
     const result = builder.build(bb.tree, flowTasks, budget, this.config, startTime, skippedEntryPoints);
 
+    // Trace each discovered test case + the result summary so the END of the
+    // path (what tests were produced) is visible, not just silence after the
+    // last flow_end. Best-effort — tracing must never affect the result.
+    try {
+      for (const tc of result.testCases) {
+        trace.writeTestCaseDiscovered({
+          name: tc.name,
+          category: tc.category,
+          stepsCount: tc.steps?.length ?? 0,
+          assertionsCount: (tc as any).assertions?.length,
+          hasCompiledLocators: tc.steps?.some((s: any) => !!s.compiled) ?? false,
+          isNegative: (tc as any).isNegative ?? false,
+        });
+      }
+      trace.writeResultBuilt({
+        testCasesCount: result.testCases.length,
+        totalSteps: result.summary.totalStepsDiscovered,
+        categories: result.summary.categories,
+      });
+    } catch { /* tracing is best-effort */ }
+
     // Attach Sentinel assessment to result
     if (bb.coverageAssessment) {
       result.summary.coverageScore = bb.coverageAssessment.coverageScore;
@@ -555,13 +586,47 @@ export class ExplorationEngine {
       continueExploring: false,
     }, 100);
 
+    // Persist BEFORE finalizing the trace so the save (and any failure) is part
+    // of the single traced lifecycle — fixes the old ordering where the trace
+    // closed first and a failed save still showed "completed".
+    let persistError: string | undefined;
+    if (onResultReady) {
+      try {
+        const outcome = await onResultReady(result);
+        if (outcome) {
+          trace.writeTestCasesSaved({
+            requestedCount: result.testCases.length,
+            savedCount: outcome.savedCount,
+            projectId: this.config.projectId,
+            error: outcome.error,
+          });
+          persistError = outcome.error;
+        }
+      } catch (err) {
+        persistError = err instanceof Error ? err.message : String(err);
+        trace.writeTestCasesSaved({
+          requestedCount: result.testCases.length,
+          savedCount: 0,
+          projectId: this.config.projectId,
+          error: persistError,
+        });
+      }
+    }
+
     trace.writeExplorationEnd({
-      status: 'completed',
+      status: persistError ? 'failed' : 'completed',
       durationMs: result.durationMs,
       testCasesCount: result.testCases.length,
       summary: result.summary,
+      error: persistError,
     });
     await trace.close();
+
+    // A failed persist is a failed run: surface it so the job marks the run
+    // failed and does NOT charge / report success for tests that weren't saved.
+    if (persistError) {
+      throw new Error(`Exploration persistence failed: ${persistError}`);
+    }
 
     logger.info('[EXPLORATION] Exploration complete', {
       explorationId: this.config.explorationId,
