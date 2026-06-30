@@ -42,6 +42,8 @@ import type { CommandName, CommandResult, PipelineConfig } from './types';
 import { checkDomainBoundary } from '../exploration/domain-boundary';
 import { evaluateOverlayGate } from '../exploration/intra-flow-overlay-gate';
 import { OverlayDismisser } from '../exploration/overlay-dismisser';
+import { redactCredentialValues } from '@/utils/interpolation/redact-secrets';
+import { classifyPageHealth, formatPageHealth, pageHealthHasSignal } from '../collectors/page-health';
 
 /**
  * PR-Hybrid: Commands that carry a `ref` parameter and can be intercepted
@@ -73,6 +75,12 @@ export const REF_BASED_COMMANDS: ReadonlySet<CommandName> = new Set<CommandName>
  * events, insights) never sees plaintext credentials.
  */
 const SENSITIVE_VALUE_PLACEHOLDER = '[SENSITIVE]';
+
+/**
+ * How many recent console errors to surface in observe_page output. Enough to
+ * signal "the page is erroring" without flooding the prompt with a noisy log.
+ */
+const OBSERVE_CONSOLE_ERROR_LIMIT = 3;
 
 /**
  * PR-Hybrid: Build a preliminary AICommand from tool-call args. Used by
@@ -176,6 +184,14 @@ export class CommandExecutor {
    */
   private safetyInterceptorDisabled = false;
 
+  /**
+   * Timestamp marking the start of the current health window. Network/console
+   * errors AFTER this point are attributed to the latest action when building
+   * the page-health verdict. Advanced on every health check so each verdict
+   * reflects only the most recent activity, not the whole run.
+   */
+  private lastHealthCheckTs = Date.now();
+
   constructor(
     private page: Page,
     private actionExecutor: ActionExecutor,
@@ -183,6 +199,48 @@ export class CommandExecutor {
     private blackboard: TestBlackboard,
     private integrations: CommandExecutorIntegrations = {},
   ) {}
+
+  /**
+   * Build a page-health verdict from collector signals since the last check,
+   * store it on the blackboard (Reviewer + auditDone read it), and return a
+   * compact prompt-section body for inline enrichment. Best-effort: any
+   * failure returns '' and never throws (CLAUDE.md invariant #11).
+   */
+  private collectPageHealth(previousUrl: string | undefined, currentUrl: string): string {
+    try {
+      // The window spans everything since the previous health check (i.e. the
+      // previous observe_page). Errors that arrived during intervening
+      // click/navigate/wait commands are correctly attributed to THIS check —
+      // the next observe_page picks up exactly what happened since this one.
+      const since = this.lastHealthCheckTs;
+      this.lastHealthCheckTs = Date.now();
+
+      const networkErrorsSince = this.integrations.networkTracker?.getErrorsSince(since) ?? [];
+      const consoleErrorCount = this.integrations.consoleCollector
+        ? this.integrations.consoleCollector.getErrorsSince(since).length
+        : 0;
+
+      const health = classifyPageHealth({
+        networkErrorsSince,
+        consoleErrorCount,
+        previousUrl,
+        currentUrl,
+        flowIsAuth: this.config.flowIsAuth,
+      });
+
+      // ALWAYS overwrite the blackboard verdict so each window stands alone.
+      // Persisting only on signal would leave a stale server-error / session-
+      // lost verdict from an earlier round to keep tripping the Reviewer's
+      // deterministic health gate after the app has recovered — blocking a
+      // now-healthy flow forever. A clean window must clear the prior verdict.
+      this.blackboard.setPageHealth(pageHealthHasSignal(health) ? health : undefined);
+
+      const body = formatPageHealth(health);
+      return body ? `\nPAGE HEALTH:\n${body}` : '';
+    } catch {
+      return '';
+    }
+  }
 
   /**
    * Execute a single Playwright command.
@@ -303,6 +361,9 @@ export class CommandExecutor {
 
   private async observePage(): Promise<CommandResult> {
     try {
+      // Capture the URL the blackboard knew BEFORE this observation so the
+      // page-health check can detect a mid-flow redirect (e.g. → /login).
+      const previousUrl = this.blackboard.getCurrentUrl();
       let snapshot = await SnapshotRouter.collect(this.page, { context: 'pipeline-observe', fullPage: true });
 
       // Intra-flow overlay gate: cheap check on the snapshot we just took.
@@ -400,15 +461,24 @@ export class CommandExecutor {
         try {
           const errorCount = this.integrations.consoleCollector.getErrorCount();
           if (errorCount > 0) {
-            const recentErrors = this.integrations.consoleCollector.getFormattedErrors(3);
+            const recentErrors = this.integrations.consoleCollector.getFormattedErrors(OBSERVE_CONSOLE_ERROR_LIMIT);
             if (recentErrors !== 'No console errors') {
-              consoleInfo = `\nCONSOLE ERRORS:\n${recentErrors}`;
+              // Redact any credential value a site may have echoed to the
+              // console before it reaches the LLM prompt / JSONL trace
+              // (CLAUDE.md hard invariant #10 — never surface plaintext creds).
+              consoleInfo = `\nCONSOLE ERRORS:\n${this.redactCredentials(recentErrors)}`;
             }
           }
         } catch {
           // Non-critical
         }
       }
+
+      // Page health: server error / session-lost / console errors since the
+      // last check. Stored on the blackboard (Reviewer + auditDone read it)
+      // and surfaced inline so the LLM can build the causal link
+      // (e.g. HTTP 500 + thin DOM ⇒ server broke, not goal achieved).
+      const healthInfo = this.collectPageHealth(previousUrl, snapshot.url);
 
       // Emit graph page node for page observation
       if (this.integrations.graphBuilder) {
@@ -436,7 +506,7 @@ export class CommandExecutor {
 
       return {
         success: true,
-        output: formatted + progressInfo + networkInfo + consoleInfo,
+        output: formatted + progressInfo + networkInfo + consoleInfo + healthInfo,
       };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
@@ -1224,6 +1294,16 @@ export class CommandExecutor {
       allowed: false,
       reason: `Navigation to external origin blocked: ${decision.targetOrigin ?? url} (test site: ${(() => { try { return new URL(this.blackboard.getUrl()).origin; } catch { return this.blackboard.getUrl(); } })()}). Use on-page links instead.`,
     };
+  }
+
+  /**
+   * Strip configured credential values out of an LLM-facing / trace-bound
+   * string before it leaves the executor. Thin delegate to the shared
+   * `redactCredentialValues` (single source — see redact-secrets.ts,
+   * CLAUDE.md invariant #10).
+   */
+  private redactCredentials(text: string): string {
+    return redactCredentialValues(text, this.config.credentials);
   }
 
   /**

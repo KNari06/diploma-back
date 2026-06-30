@@ -15,6 +15,7 @@
  */
 
 import { TestBlackboard } from './blackboard';
+import { formatPageHealth } from '../collectors/page-health';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PLANNER PROMPT
@@ -35,6 +36,16 @@ export function buildPlannerPrompt(bb: TestBlackboard): string {
   // Goal
   sections.push(`GOAL: ${bb.getGoal()}`);
   sections.push(`URL: ${bb.getCurrentUrl() || bb.getUrl()}`);
+
+  // Progress + remaining budget — lets the Planner trade thoroughness for
+  // speed and recognise a stuck flow (low progress + few rounds left).
+  const roundInfo = bb.getRoundInfo();
+  if (roundInfo) {
+    const remaining = Math.max(0, roundInfo.max - roundInfo.current);
+    sections.push(
+      `PROGRESS: ${bb.getProgressScore()}% toward goal (round ${roundInfo.current}/${roundInfo.max}, ${remaining} left)`,
+    );
+  }
 
   // Credential hint
   if (bb.getHasCredentials()) {
@@ -88,6 +99,9 @@ INSTRUCTIONS:
 - For forms: list each field to fill, then the submit action
 - If replanning after failure: adjust the approach based on reviewer feedback
 - Keep steps concise and actionable
+- If PROGRESS is low AND few rounds remain: do NOT repeat a failed approach — try a
+  different element/path, or if the goal is clearly unreachable (server error, hard
+  block) instruct a report_blocked rather than burning the last rounds.
 
 Respond with JSON:
 {
@@ -239,6 +253,14 @@ export function buildReviewerPrompt(bb: TestBlackboard): string {
   // Progress score
   sections.push(`PROGRESS: ${bb.getProgressScore()}%`);
 
+  // Page health — technical-health verdict (server error / session lost /
+  // console errors). Lets the Reviewer build the causal link instead of
+  // mistaking a 500 error page for goal achievement.
+  const healthBody = formatPageHealth(bb.getPageHealth());
+  if (healthBody) {
+    sections.push(`PAGE HEALTH:\n${healthBody}`);
+  }
+
   return `You are a TEST REVIEWER. Evaluate whether the execution achieved the goal.
 
 ${sections.join('\n\n')}
@@ -249,6 +271,8 @@ Analyze:
 3. Are there errors or unexpected states on the page (check PAGE ALERTS section)?
 4. If PAGE ALERTS mention CAPTCHA/reCAPTCHA/hCaptcha/Turnstile/bot verification, the verdict should be "blocked" — CAPTCHAs cannot be automated.
 5. If credentials were used and page shows authentication errors (invalid, wrong, incorrect), the verdict should be "blocked" — user-provided credentials appear wrong.
+6. If PAGE HEALTH reports a SERVER ERROR (HTTP 5xx), the page is broken — this is NOT goal achievement even if the DOM looks thin/empty. Verdict "replan" (retry) or "blocked" (app down), never "done".
+7. If PAGE HEALTH reports SESSION LOST (redirected to login mid-flow), the user was logged out — the goal was NOT achieved. Verdict "blocked".
 
 Respond with JSON:
 {

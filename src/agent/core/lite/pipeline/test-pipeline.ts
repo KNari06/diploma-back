@@ -157,6 +157,15 @@ export class TestPipeline {
       this.blackboard.setGoalUrl(config.goalUrl);
     }
 
+    // Seed the Planner's contextual hints with the Cartographer's page
+    // understanding (forms/entities) so round 1 plans against known structure
+    // instead of re-deriving it from raw DOM. GoalDetector replaces hints in
+    // later rounds (per-round navigation guidance), by which point the Planner
+    // also has the live snapshot — so seeding once, up front, is the right scope.
+    if (config.pageInsightContext) {
+      this.blackboard.setContextualHints([config.pageInsightContext]);
+    }
+
     // PR-Hybrid: Create SupervisorAgent ONCE per run when hybrid safety is on.
     // State accumulates across all rounds — intervention counts, state hashes,
     // known-good URLs, and per-run Tier 2 budget are never reset mid-run.
@@ -271,6 +280,9 @@ export class TestPipeline {
         // ════════════════════════════════════════════════════════════
 
         this.blackboard.setPhase('planning');
+        // Give the Planner budget awareness so it can change strategy or give
+        // up when rounds run low (closes the "stuck at low progress" link).
+        this.blackboard.setRoundInfo(pipelineRound, maxRounds);
         this.emitProgress(
           pipelineRound,
           maxRounds,

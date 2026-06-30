@@ -45,6 +45,7 @@ import {
   isClickable,
   bestLabel,
 } from '../analysis/interactive-element-signals';
+import { isLoginUrl } from './auth-url-patterns';
 
 /** Max hidden navigation links to follow per page (Cartographer-discovered links have no limit) */
 const MAX_NAV_LINKS_PER_PAGE = 15;
@@ -57,12 +58,6 @@ const MAX_FALLBACK_ENTRY_POINTS = 20;
 
 /** Max SPA route clicks per page during BFS (raised from 5 for tab-heavy SPAs) */
 const MAX_SPA_CLICKS_PER_PAGE = 10;
-
-/** Common login URL patterns */
-const LOGIN_URL_PATTERNS = [
-  /\/login/i, /\/signin/i, /\/sign-in/i, /\/auth/i,
-  /\/log-in/i, /\/sso/i,
-];
 
 export class SurveyAgent {
   private tree: ExplorationTree;
@@ -1055,10 +1050,11 @@ export class SurveyAgent {
   }
 
   /**
-   * Check if a URL looks like a login page.
+   * Check if a URL looks like a login page. Thin delegate to the shared
+   * auth-url-patterns util (single source — see auth-url-patterns.ts).
    */
   private isLoginUrl(url: string): boolean {
-    return LOGIN_URL_PATTERNS.some((pattern) => pattern.test(url));
+    return isLoginUrl(url);
   }
 
   /**
@@ -1066,7 +1062,7 @@ export class SurveyAgent {
    */
   private inferPageTypeFromUrl(url: string): string {
     const path = new URL(url).pathname.toLowerCase();
-    if (LOGIN_URL_PATTERNS.some((p) => p.test(path))) return 'login';
+    if (isLoginUrl(path)) return 'login';
     if (/register|signup|sign-up/i.test(path)) return 'registration';
     if (/dashboard/i.test(path)) return 'dashboard';
     if (/product|item|catalog/i.test(path)) return 'product_list';

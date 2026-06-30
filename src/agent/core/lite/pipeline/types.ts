@@ -107,6 +107,15 @@ export interface TestBlackboardState {
   // ── Contextual hints (from GoalDetector, updated per round) ──
   contextualHints?: string[];         // navigation hints (e.g. "registration form not visible, click Sign Up")
 
+  // ── Page health (from CommandExecutor via page-health classifier) ──
+  // Technical-health verdict so Planner/Reviewer can tell "server broke" /
+  // "logged out" from "goal not yet reached". Best-effort; may be absent.
+  pageHealth?: import('../collectors/page-health').PageHealth;
+
+  // ── Round budget awareness (set by TestPipeline before each Planner call) ──
+  // Lets the Planner trade thoroughness for speed when rounds run low.
+  roundInfo?: { current: number; max: number };
+
   // ══════════════════════════════════════════════════════════════════════
   // HYBRID EXECUTOR FIELDS (only populated when enableHybridExecutor=true)
   // ══════════════════════════════════════════════════════════════════════
@@ -253,6 +262,19 @@ export interface PipelineConfig {
    * Default: false. Decided by LiteEngine based on enableHybridExecutor flag.
    */
   enableHybridSafety?: boolean;
+  /**
+   * Whether THIS flow is an auth/login flow. Used by the page-health check so
+   * landing on a login URL is treated as the GOAL (not a "session lost"
+   * regression). Exploration sets it from the entry point's category.
+   */
+  flowIsAuth?: boolean;
+  /**
+   * Condensed Cartographer page understanding (forms, entities, interactive
+   * areas) for the flow's starting page. Threaded into the Planner's
+   * contextual hints so it doesn't re-derive page structure from raw DOM.
+   * Optional — absent for non-exploration callers.
+   */
+  pageInsightContext?: string;
 }
 
 /** Result returned by the pipeline */

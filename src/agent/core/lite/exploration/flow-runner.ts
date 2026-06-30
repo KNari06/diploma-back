@@ -58,6 +58,7 @@ import type { ExplorationTraceService } from './exploration-trace.service';
 import { Scout } from './agents/scout';
 import type { ScoutInput, ExplorationBlackboard, CartographerInsight } from './agents/agent-types';
 import { normalizeUrlWithPattern } from './url-pattern';
+import { redactCredentialValues } from '@/utils/interpolation/redact-secrets';
 
 /**
  * Navigation timeout for flow execution (entry-point + login navigations).
@@ -72,6 +73,13 @@ const FLOW_NAV_TIMEOUT_MS = 15_000;
  * against a non-interactive page and flake.
  */
 const FLOW_NAV_WAIT_UNTIL = 'load' as const;
+
+/**
+ * Page-insight hint sent to the Planner (forms / interactive areas / entities).
+ * Caps keep the hint compact so it informs without bloating the prompt budget.
+ */
+const PAGE_INSIGHT_MAX_ITEMS_PER_LIST = 4;
+const PAGE_INSIGHT_MAX_CHARS = 300;
 
 // Step-extraction (rounds → DiscoveredStep + compiled plans) now lives in the
 // shared pipeline-step-extractor so the editor iterative-authoring service
@@ -605,6 +613,12 @@ export class FlowRunner {
         timeoutMs: Math.max(5_000, flowTimeoutMs),
         skipDbCancellationCheck: true, // Exploration uses non-UUID testIds (ep-0, ep-1)
         entryPointId: entryPoint.id,
+        // Auth flows EXPECT to land on a login URL — tell the page-health
+        // check so it doesn't misread that as a "session lost" regression.
+        flowIsAuth: entryPoint.category === 'authentication',
+        // Hand the Planner the Cartographer's understanding of this page so it
+        // plans against known forms/entities instead of re-deriving from DOM.
+        pageInsightContext: this.formatPageInsightContext(page.url()),
       };
 
       this.trace?.writeFlowPipelineStart({
@@ -791,6 +805,11 @@ export class FlowRunner {
                 testId: entryPoint.id,
                 maxRounds: Math.max(1, Math.min(5, allocatedRounds)),
                 timeoutMs: Math.max(5_000, flowTimeoutMs - (Date.now() - startTime)),
+                // Keep page-health context consistent with the primary config so
+                // an auth flow's login landing isn't misread as "session lost"
+                // and the Planner keeps its page understanding on retry too.
+                flowIsAuth: entryPoint.category === 'authentication',
+                pageInsightContext: this.formatPageInsightContext(page.url()),
               };
               const retryStartTime = Date.now();
               const retryNetworkTracker = retryIntegrations.networkTracker;
@@ -1324,6 +1343,30 @@ export class FlowRunner {
     }
 
     return undefined;
+  }
+
+  /**
+   * Condense the Cartographer insight for a page into a short hint string for
+   * the Planner (forms / interactive areas / data entities). Mirrors the
+   * Scout prompt's "CURRENT PAGE CONTEXT" shape. Returns undefined when the
+   * page wasn't surveyed. Length-capped so it can't bloat the Planner prompt.
+   */
+  private formatPageInsightContext(url: string): string | undefined {
+    const insight = this.findPageInsight(url);
+    if (!insight) return undefined;
+    const formCount = insight.forms?.length ?? 0;
+    const cap = PAGE_INSIGHT_MAX_ITEMS_PER_LIST;
+    const parts = [
+      `Page understanding (from survey): ${insight.pageType}, complexity ${insight.complexity}`,
+      formCount > 0 ? `forms: ${formCount}` : '',
+      insight.interactiveAreas?.length ? `interactive: ${insight.interactiveAreas.slice(0, cap).join(', ')}` : '',
+      insight.dataEntities?.length ? `entities: ${insight.dataEntities.slice(0, cap).join(', ')}` : '',
+    ].filter(Boolean);
+    // Redact any credential value the surveyed page may have echoed into its
+    // form labels / entity names before this string reaches the Planner prompt
+    // (CLAUDE.md invariant #10 — the insight is page-derived, LLM-facing text).
+    const text = redactCredentialValues(parts.join(' | '), this.config.credentials);
+    return text.length > PAGE_INSIGHT_MAX_CHARS ? text.slice(0, PAGE_INSIGHT_MAX_CHARS) : text;
   }
 
   private normalizeUrl(url: string): string {

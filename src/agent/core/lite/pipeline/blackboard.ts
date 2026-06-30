@@ -275,6 +275,32 @@ export class TestBlackboard {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // PAGE HEALTH (written by CommandExecutor per action/round, read by
+  // Reviewer prompt + auditDone gate). Best-effort technical-health verdict.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setPageHealth(health: import('../collectors/page-health').PageHealth | undefined): void {
+    this.state.pageHealth = health;
+  }
+
+  getPageHealth(): import('../collectors/page-health').PageHealth | undefined {
+    return this.state.pageHealth;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // ROUND INFO (set by TestPipeline before each Planner call so the Planner
+  // knows how much budget remains and can change strategy / give up).
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setRoundInfo(current: number, max: number): void {
+    this.state.roundInfo = { current, max };
+  }
+
+  getRoundInfo(): { current: number; max: number } | undefined {
+    return this.state.roundInfo;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // PR-HYBRID: SUPERVISOR BLACKBOARD (written by TestPipeline per round,
   // read by CommandExecutor for forbidden-action enforcement)
   // ═══════════════════════════════════════════════════════════════════════
