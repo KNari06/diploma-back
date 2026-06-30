@@ -5,6 +5,7 @@ import {
   createCompanionDevice,
   getCompanionDeviceByRefreshHash,
   revokeCompanionDevice,
+  touchCompanionDeviceLastSeen,
 } from './db/companion.db';
 
 const PAIRING_CODE_TTL_S = 300; // 5 minutes, single-use
@@ -96,6 +97,9 @@ export class CompanionAuthService {
     const device = await getCompanionDeviceByRefreshHash(hashToken(refreshToken));
     if (!device) throw new InvalidRefreshTokenError();
     if (device.revokedAt) throw new RevokedDeviceError('Device has been revoked');
+    // Best-effort activity stamp (gives last_seen_at a writer). Fire-and-forget
+    // and fully swallowed — a write hiccup must never break a token refresh.
+    void touchCompanionDeviceLastSeen(device.id).catch(() => {});
     return { accessToken: CompanionAuthService.mintAccessToken(device.userId) };
   }
 
