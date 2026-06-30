@@ -4,6 +4,7 @@ import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileRunnerClient } from './mobile-runner-client';
 import type { MobilePlatform } from './mobile-runner.types';
 import { resolveDedicatedDevice } from './dedicated-device.service';
+import { storeSessionRunnerBinding } from './session-runner-routing';
 import { DedicatedDeviceFeature } from '@/config/features/dedicated-device';
 import { env } from '@/config/environment/env';
 
@@ -120,6 +121,14 @@ export class MobileSessionAcquisitionService {
         platform,
         workspaceId,
       });
+      // Store binding so getMobileRunnerClientForSession resolves the right runner
+      // for session-scoped calls (runSteps, destroySession, etc.) during the job.
+      // TTL matches the editor warmup TTL (15 min) — regression jobs are bounded.
+      await storeSessionRunnerBinding(
+        session.sessionId,
+        { runnerUrl: dedicated.runnerUrl, runnerApiKey: dedicated.runnerApiKey },
+        900,
+      );
       return {
         sessionId: session.sessionId,
         sessionSource: 'dedicated',

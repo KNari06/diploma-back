@@ -144,9 +144,25 @@ export async function refreshWarmupTtl(userId: string): Promise<void> {
 
     await Promise.all(toExtend.map((k) => redisConnection.expire(k, ttlSeconds)));
 
+    // Also re-arm the per-session runner binding(s). The binding is written
+    // with a FIXED 900s TTL at session birth and — like the warmup key before
+    // this — is otherwise never extended. Without this an active companion/
+    // dedicated editor session keeps its warmup key alive here but loses its
+    // `mobile_session_runner:<sessionId>` binding at 900s, after which
+    // getMobileRunnerClientForSession falls back to the shared env runner and
+    // routes interactive actions to the WRONG runner.
+    const { SESSION_RUNNER_PREFIX } = await import('@/services/mobile/session-runner-routing');
+    const sessionIds = await getUserWarmupSessionIds(userId);
+    if (sessionIds.length > 0) {
+      await Promise.all(
+        sessionIds.map((sid) => redisConnection.expire(`${SESSION_RUNNER_PREFIX}${sid}`, ttlSeconds)),
+      );
+    }
+
     logger.debug('[MOBILE_IDLE] warmup TTL refreshed', {
       userId: userId.substring(0, 8) + '...',
       keys: toExtend.length,
+      bindings: sessionIds.length,
       ttlSeconds,
     });
   } catch (error) {
@@ -180,10 +196,16 @@ export async function touchRunnerSessions(userId: string): Promise<void> {
     const sessionIds = await getUserWarmupSessionIds(userId);
     if (sessionIds.length === 0) return;
 
-    const { getMobileRunnerClient } = await import('@/services/mobile/mobile-runner-client');
-    const client = getMobileRunnerClient();
+    // Resolve the runner PER SESSION — a companion/dedicated session must be
+    // touched on its OWN runner, not the shared singleton. Touching the
+    // singleton leaves the companion phone's lastActivityAt un-bumped, so it's
+    // idle-evicted mid-edit (the 2026-06-29 lint-410 incident, for companion).
+    const { getMobileRunnerClientForSession } = await import('@/services/mobile/session-runner-routing');
     // touchSession is itself best-effort (swallows 404/transport errors).
-    await Promise.all(sessionIds.map((sid) => client.touchSession(sid, { userId })));
+    await Promise.all(sessionIds.map(async (sid) => {
+      const client = await getMobileRunnerClientForSession(sid);
+      await client.touchSession(sid, { userId });
+    }));
 
     logger.debug('[MOBILE_IDLE] runner sessions touched', {
       userId: userId.substring(0, 8) + '...',

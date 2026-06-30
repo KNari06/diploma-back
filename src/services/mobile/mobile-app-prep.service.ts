@@ -40,7 +40,7 @@
  * not provided, progress callbacks are silently dropped.
  */
 
-import type { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import type { IMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { redisConnection } from '@/config/infrastructure/queues';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { ProjectService } from '@/services/core/project.service';
@@ -64,7 +64,7 @@ import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 export type AppPrepStage = 'installing_app' | 'launching_app' | 'ready';
 
 export interface PrepAppArgs {
-  client: MobileRunnerClient;
+  client: IMobileRunnerClient;
   sessionId: string;
   projectId: string;
   userId: string;
@@ -145,7 +145,7 @@ export class MobileAppPrepService {
    * safer than trusting a cache an emulator wipe may have silently invalidated.
    */
   private static async isPackageOnDevice(
-    client: MobileRunnerClient,
+    client: IMobileRunnerClient,
     sessionId: string,
     userId: string,
     packageName: string,

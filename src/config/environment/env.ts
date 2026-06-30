@@ -287,6 +287,24 @@ const envSchema = z.object({
   // MUST match the runner's `RUNNER_USER_TOKEN_SECRET`. Rotate via deploy.
   RUNNER_USER_TOKEN_SECRET: z.string().optional().default(''),
 
+  // Backend → runner proxy timeout for `POST /attach-flutter` (both the direct
+  // MobileRunnerClient and the companion relay). The runner's attach is
+  // force-stop → cold launch → VM detect (≤20s) → driver connect →
+  // waitForReadableTree (≤ runner's FLUTTER_TREE_READY_TIMEOUT_MS, default 15s,
+  // tunable up to 60s on slow physical devices). On a slow phone the whole
+  // attach legitimately takes ~50s; a too-short backend timeout makes warmup
+  // return TIMEOUT while the runner keeps going, the frontend retries, and the
+  // retry's cold-start force-stops the app the runner just finished attaching —
+  // an endless relaunch storm. Default 120s gives headroom over the worst case.
+  MOBILE_ATTACH_FLUTTER_TIMEOUT_MS: z.string().transform(Number).default('120000'),
+
+  // Max single Socket.IO message size (bytes). The companion relay carries full
+  // runner HTTP responses, and a per-step apply result includes a base64 device
+  // screenshot (several MB on a high-res phone) + a11y tree — the old 2MB cap
+  // made engine.io drop the companion socket on send. 16MB default carries a
+  // screenshot-bearing response with headroom; raise for very large screens.
+  WS_MAX_HTTP_BUFFER_SIZE: z.string().transform(Number).default(String(16 * 1024 * 1024)),
+
   // Multi-user isolation: when ON, the runner creates a dedicated Android
   // user per backend user via `pm create-user` so apps installed by one
   // user are invisible to another. This costs 5-15s on the cold claim path
@@ -302,6 +320,14 @@ const envSchema = z.object({
   // — the resolver short-circuits to null, so behaviour is unchanged until a
   // deploy flips this AND ops provisions a dedicated container + DB row.
   DEDICATED_MOBILE_EMULATOR_ENABLED: z.string().transform(v => v === 'true').default('false'),
+
+  // Companion relay — per-user launch-and-go physical device support (ADR-0009).
+  // COMPANION_TOKEN_SECRET: separate HMAC secret from RUNNER_USER_TOKEN_SECRET
+  // (separate audience — a companion token must not be replayable as a runner
+  // request token). Empty = companion feature disabled (verifyAccessToken always
+  // returns null, mintAccessToken throws). Rotate via deploy independently.
+  COMPANION_ENABLED: z.string().transform(v => v === 'true').default('false'),
+  COMPANION_TOKEN_SECRET: z.string().optional().default(''),
 
   // Intent classifier fast-path — set to 'true' to disable the deterministic
   // whitelist that short-circuits trivial messages (greetings, cancels, yes/no

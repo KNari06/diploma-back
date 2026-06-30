@@ -3,6 +3,7 @@ import { resolveDedicatedDevice } from '../dedicated-device.service';
 import { DedicatedDeviceFeature } from '@/config/features/dedicated-device';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { logger } from '@/utils/core/logger';
+import { storeSessionRunnerBinding } from '../session-runner-routing';
 
 jest.mock('../dedicated-device.service', () => ({
   resolveDedicatedDevice: jest.fn(),
@@ -19,11 +20,15 @@ jest.mock('@/websocket/core/websocket.service', () => ({
 jest.mock('@/utils/core/logger', () => ({
   logger: { info: jest.fn(), warn: jest.fn(), debug: jest.fn(), error: jest.fn() },
 }));
+jest.mock('../session-runner-routing', () => ({
+  storeSessionRunnerBinding: jest.fn().mockResolvedValue(undefined),
+}));
 
 const mockResolve = resolveDedicatedDevice as jest.Mock;
 const mockFlag = DedicatedDeviceFeature.isEnabled as jest.Mock;
 const mockWarmed = claimWarmedSession as jest.Mock;
 const mockWarn = logger.warn as jest.Mock;
+const mockStoreBinding = storeSessionRunnerBinding as jest.Mock;
 
 function makeClient() {
   return {
@@ -66,6 +71,12 @@ describe('acquireSession — dedicated intercept', () => {
       userId: 'user-1',
       dedicated: true,
     });
+    // Binding stored so getMobileRunnerClientForSession resolves the dedicated runner.
+    expect(mockStoreBinding).toHaveBeenCalledWith(
+      'sess-ded',
+      { runnerUrl: null, runnerApiKey: undefined },
+      900,
+    );
     // The shared ladder is never touched.
     expect(client.claimSession).not.toHaveBeenCalled();
     expect(mockWarmed).not.toHaveBeenCalled();

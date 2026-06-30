@@ -664,7 +664,7 @@ export class MobileRunnerClient {
       `/api/sessions/${sessionId}/attach-flutter`,
       {
         body: input,
-        timeoutMs: 45_000,
+        timeoutMs: env.MOBILE_ATTACH_FLUTTER_TIMEOUT_MS,
         noRetry: true,
         userId: opts?.userId,
       },
@@ -1190,6 +1190,19 @@ export class MobileRunnerClient {
     throw lastError || new MobileRunnerError('Unknown error', 500);
   }
 }
+
+/**
+ * The public runner-client contract. `MobileRunnerClient` is the canonical
+ * implementation (HTTP to a runner URL); `CompanionRunnerClient` is a second
+ * implementation that proxies over a companion socket. Both `implements` this
+ * so the compiler catches any method the companion adapter forgets — without
+ * it, an `as unknown as MobileRunnerClient` cast hid two missing methods
+ * (`getSessionDestroyReason`, `touchSession`) that crashed companion sessions.
+ *
+ * Derived from the class's public surface via `Pick<…, keyof …>` (keyof omits
+ * private members) so it stays in lockstep automatically.
+ */
+export type IMobileRunnerClient = Pick<MobileRunnerClient, keyof MobileRunnerClient>;
 
 // ── Singleton ──────────────────────────────────────────────────────
 
