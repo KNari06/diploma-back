@@ -74,7 +74,7 @@ export async function storePendingRunExisting(
     const c = candidates[0];
     return (
       `I found a saved test that matches: **${c.name}** (${platformLabel(c.platform)}).\n\n` +
-      `Run it now? Reply **yes** to run, or **no** to skip.`
+      `Want me to run it?`
     );
   }
 

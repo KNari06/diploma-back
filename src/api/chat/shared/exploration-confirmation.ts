@@ -12,7 +12,13 @@ import { logger } from '@/utils/core/logger';
 import { DEFAULT_EXPLORATION_BUDGET, generateExplorationId } from '@/agent/core/lite/exploration/types';
 import { classifyConfirmation } from './confirmation-classifier';
 
-const PENDING_EXPLORATION_PREFIX = 'pending_exploration:';
+export const PENDING_EXPLORATION_PREFIX = 'pending_exploration:';
+
+/**
+ * TTL for the pending-exploration confirmation window. Single source so the
+ * creator (ai_test handler) and the clarify-re-arm here can't drift.
+ */
+export const PENDING_EXPLORATION_TTL_SEC = 600; // 10 min
 
 interface PendingExplorationData {
   entryUrl: string;
@@ -151,8 +157,42 @@ export async function handlePendingExplorationConfirmation(
     return true;
   }
 
-  // Message doesn't match yes/no → clear pending and let normal flow handle it
-  // (user probably changed their mind and is asking something else)
-  await redisConnection.del(pendingKey);
-  return false;
+  // intent === 'other' → genuinely ambiguous. Do NOT silently drop the pending
+  // state (that re-triggered the same confirmation prompt and looked like a
+  // loop). Instead KEEP the pending and ASK the user to clarify yes/no — the
+  // next reply re-enters this handler with the pending still set. We refresh
+  // the key's TTL so the clarify window doesn't expire mid-conversation.
+  let pending: PendingExplorationData;
+  try {
+    pending = JSON.parse(pendingRaw);
+  } catch {
+    // Corrupt pending → drop it and fall through to normal chat.
+    await redisConnection.del(pendingKey);
+    return false;
+  }
+
+  // Re-arm the pending state (preserve it + refresh TTL) so the clarification
+  // reply is still treated as a confirmation answer.
+  try {
+    await redisConnection.set(pendingKey, pendingRaw, 'EX', PENDING_EXPLORATION_TTL_SEC);
+  } catch {
+    // If Redis write fails, fall through rather than trap the user.
+    return false;
+  }
+
+  const replyMessage =
+    `Just to confirm — should I start the autonomous exploration of **${pending.entryUrl}**?`;
+  if (chatSessionId) {
+    ChatService.saveChatMessages(chatSessionId, [
+      { role: 'user', content: message },
+      { role: 'ai', content: replyMessage },
+    ]).catch(() => {});
+  }
+  res.json({
+    success: true,
+    reply: replyMessage,
+    timestamp: new Date().toISOString(),
+    sessionId: chatSessionId,
+  });
+  return true;
 }
