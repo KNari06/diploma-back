@@ -45,6 +45,7 @@ import platformsRoutes from '@/api/platforms/platforms.route';
 import playwrightRoutes from '@/api/playwright/playwright.route';
 import previewRoutes from '@/api/preview/preview.route';
 import mobileRoutes, { logWarmupOutcome } from '@/api/mobile/mobile.route';
+import companionRoutes from '@/api/mobile/companion.route';
 import projectRoutes from '@/api/project/project.routes';
 import regressionPlansRoutes from '@/api/regression-plans/plans.route';
 import regressionRoutes from '@/api/regression/regression.route';
@@ -1379,6 +1380,9 @@ app.use(`/api/${env.API_VERSION}/projects`, requireAuth, requireApproved, projec
 // "start session" outcome is recorded even when a gate rejects it (expired-token
 // 401, not-approved 403, paid-plan 403) — those middlewares only log at debug.
 app.use(`/api/${env.API_VERSION}/mobile`, logWarmupOutcome, requireAuth, requireApproved, mobileRoutes);
+// Companion relay routes — mix of authenticated + unauthenticated endpoints;
+// auth is applied per-route inside companionRoutes, not at the mount level.
+app.use(`/api/${env.API_VERSION}/companion`, companionRoutes);
 app.use(`/api/${env.API_VERSION}/manual-test`, requireAuth, requireApproved, manualTestRoutes);
 app.use(`/api/${env.API_VERSION}/intelligent-test`, requireAuth, requireApproved, intelligentTestRoutes);
 app.use(`/api/${env.API_VERSION}/test-case`, requireAuth, requireApproved, testCaseRoutes);

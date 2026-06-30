@@ -24,7 +24,7 @@
  */
 
 import { ProjectService } from '@/services/core/project.service';
-import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import type { IMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { logger } from '@/utils/core/logger';
 
 export type MobilePermissionPolicy = 'auto_allow' | 'auto_deny' | 'manual';
@@ -94,7 +94,7 @@ export async function resolveProjectPermissionPolicy(
  * @returns the policy that was actually applied, or `null` if none.
  */
 export async function applyProjectPolicyToSession(params: {
-  client: MobileRunnerClient;
+  client: IMobileRunnerClient;
   sessionId: string;
   projectId: string | null | undefined;
   userId: string;

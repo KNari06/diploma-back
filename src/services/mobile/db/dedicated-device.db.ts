@@ -15,6 +15,7 @@ export interface DedicatedDeviceRow {
   platform: 'android' | 'ios';
   runnerSerial: string;
   runnerUrl: string | null;
+  runnerApiKey: string | null;
 }
 
 /**
@@ -31,7 +32,7 @@ export async function getActiveDedicatedDevice(
 
   const { data, error } = await supabaseAdmin
     .from('workspace_dedicated_device')
-    .select('platform, runner_serial, runner_url')
+    .select('platform, runner_serial, runner_url, runner_api_key')
     .eq('workspace_id', workspaceId)
     .eq('is_active', true)
     .maybeSingle();
@@ -49,5 +50,6 @@ export async function getActiveDedicatedDevice(
     platform: data.platform as 'android' | 'ios',
     runnerSerial: data.runner_serial,
     runnerUrl: data.runner_url ?? null,
+    runnerApiKey: data.runner_api_key ?? null,
   };
 }

@@ -45,7 +45,7 @@ import {
   emitMobileAgentThinking,
   emitMobileToolStep,
 } from '../mobile_agent/progress';
-import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { getMobileRunnerClientForSession } from '@/services/mobile/session-runner-routing';
 import { redactPii } from '@/services/chat/pii-redactor';
 import { wrapUntrusted, UNTRUSTED_CONTENT_INSTRUCTION } from '@/services/chat/untrusted-content-wrapper';
 import { env } from '@/config/environment/env';
@@ -183,7 +183,7 @@ export async function handleMobileAction(
   // ── Step 1: snapshot the screen so the LLM has context ─────────────
   let snapshotHeader = '';
   try {
-    const snap = await getMobileRunnerClient().fetchUiState(mobileSessionId, {
+    const snap = await (await getMobileRunnerClientForSession(mobileSessionId)).fetchUiState(mobileSessionId, {
       includeTree: false,
       includeScreenshot: false, // fast-path skips the screenshot — text tree is enough
       signal: abortSignal,

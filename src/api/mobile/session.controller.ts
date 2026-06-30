@@ -14,7 +14,15 @@
 import { randomUUID } from 'crypto';
 import { env } from '@/config/environment/env';
 import { redisConnection, QueueManager } from '@/config/infrastructure/queues';
-import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { getMobileRunnerClient, MobileRunnerClient, type IMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { CompanionRunnerClient } from '@/services/mobile/companion/companion-runner-client';
+import { companionRegistry } from '@/services/mobile/companion/companion-registry';
+import {
+  getMobileRunnerClientForSession,
+  storeSessionRunnerBinding,
+  clearSessionRunnerBinding,
+  runnerUrlToSocketUrl,
+} from '@/services/mobile/session-runner-routing';
 import { resolveDedicatedDevice } from '@/services/mobile/dedicated-device.service';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
@@ -36,6 +44,7 @@ import { Request, Response } from 'express';
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { applyProjectPolicyToSession } from '@/services/mobile/permission-policy.service';
+import { CompanionFeature } from '@/config/features/companion';
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -76,6 +85,39 @@ function getRunnerAuth(): string {
  */
 function currentRunnerSocketUrl(): string {
   return env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');
+}
+
+/**
+ * Return the Socket.IO URL for a session's runner.
+ *
+ * For shared-pool sessions: recompute from live env (2026-04-21 stale-URL
+ * lesson — cached WarmupData.runnerSocketUrl can lag if the env changes).
+ * For dedicated-runner sessions: use WarmupData.runnerSocketUrl; the
+ * dedicated URL comes from the DB row, not an env var, so there is no
+ * env-drift concern and the cached value is authoritative.
+ */
+function getEffectiveRunnerSocketUrl(
+  warmupData?: Pick<WarmupData, 'isDedicated' | 'runnerBindingKind' | 'runnerSocketUrl'>,
+): string | null {
+  if (warmupData?.runnerBindingKind === 'companion') {
+    return null;
+  }
+  if (warmupData?.isDedicated) {
+    return warmupData.runnerSocketUrl;
+  }
+  return currentRunnerSocketUrl();
+}
+
+function getEffectiveRunnerApiKey(
+  warmupData?: Pick<WarmupData, 'isDedicated' | 'runnerBindingKind' | 'runnerApiKey'>,
+): string {
+  if (warmupData?.runnerBindingKind === 'companion') {
+    return '';
+  }
+  if (warmupData?.isDedicated) {
+    return warmupData.runnerApiKey ?? '';
+  }
+  return getRunnerAuth();
 }
 
 /**
@@ -153,8 +195,14 @@ async function releaseWarmupLock(lockKey: string, token: string | null): Promise
 
 export interface WarmupData {
   sessionId: string;
+  /** True when the session lives on a dedicated runner (workspace_dedicated_device). */
+  isDedicated?: boolean;
+  /** Companion-backed sessions route through the user's outbound companion socket. */
+  runnerBindingKind?: 'direct' | 'companion';
+  companionUserId?: string;
   runnerUrl: string;
-  runnerSocketUrl: string;
+  runnerSocketUrl: string | null;
+  runnerApiKey?: string;
   platform: MobilePlatform;
   createdAt: string;
   /** Package name currently installed on the emulator */
@@ -431,6 +479,30 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       platform,
     });
   }
+  // Route to the companion when the user either explicitly pinned their physical
+  // phone OR left the picker on "Default/auto" — because on auto the frontend
+  // sends no deviceSelector, yet pairing a companion is itself an explicit act
+  // (ran the CLI + entered a code), so auto should prefer the paired phone.
+  // Explicitly picking the emulator (source: 'local-emulator'/'cloud') opts out.
+  // `useCompanionRunner` still gates on an actually-connected companion, so this
+  // is a no-op for anyone without one. Flutter qualifies — sessionCreatePlatform
+  // is 'android' for it (Flutter runs on an Android session + attach-flutter).
+  const wantsPhysicalOrAuto = !deviceSelector?.source
+    || deviceSelector.source === 'local-physical';
+  const companionRequested = !dedicated
+    && sessionCreatePlatform === 'android'
+    && wantsPhysicalOrAuto;
+  const useCompanionRunner = companionRequested
+    && CompanionFeature.isEnabled()
+    && companionRegistry.isConnected(userId);
+  if (useCompanionRunner) {
+    logger.info('[MOBILE_SESSION] warmup routing through connected companion', {
+      userId,
+      projectId,
+      platform,
+      deviceSelector,
+    });
+  }
 
   logger.info('[MOBILE_SESSION] warmup request', {
     userId,
@@ -521,7 +593,9 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       }
 
       if (reusedSession) {
-        const runnerSocketUrl = currentRunnerSocketUrl();
+        // Companion/dedicated-aware: a reused session may be bound to a companion
+        // (runnerSocketUrl null) or a dedicated runner — honor its binding.
+        const runnerSocketUrl = getEffectiveRunnerSocketUrl(reusedSession);
         logger.info('[MOBILE_SESSION] warmup response (path=concurrent_wait)', {
           userId, projectId,
           sessionId: reusedSession.sessionId,
@@ -535,7 +609,8 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           success: true,
           sessionId: reusedSession.sessionId,
           runnerSocketUrl,
-          runnerApiKey: getRunnerAuth(),
+          runnerApiKey: getEffectiveRunnerApiKey(reusedSession),
+          runnerBindingKind: reusedSession.runnerBindingKind ?? 'direct',
           platform: reusedSession.platform,
           reused: true,
           createdAt: reusedSession.createdAt,
@@ -606,7 +681,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         if (bootedSessionId) {
           const refreshRaw = await redisConnection.get(redisKey);
           const refreshed: WarmupData = refreshRaw ? JSON.parse(refreshRaw) : existing;
-          const runnerSocketUrl = currentRunnerSocketUrl();
+          const runnerSocketUrl = getEffectiveRunnerSocketUrl(refreshed);
           logger.info('[MOBILE_SESSION] warmup response (path=booting_wait)', {
             userId, projectId,
             sessionId: bootedSessionId,
@@ -619,7 +694,8 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             success: true,
             sessionId: bootedSessionId,
             runnerSocketUrl,
-            runnerApiKey: getRunnerAuth(),
+            runnerApiKey: getEffectiveRunnerApiKey(refreshed),
+            runnerBindingKind: refreshed.runnerBindingKind ?? 'direct',
             platform: refreshed.platform,
             reused: true,
             createdAt: refreshed.createdAt,
@@ -633,7 +709,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       } else {
         // Verify the session still exists on the runner (it may have been
         // destroyed if the runner restarted or the session TTL expired).
-        const client = getMobileRunnerClient();
+        const client = await getMobileRunnerClientForSession(existing.sessionId);
         const stillAlive = await time('session_exists_check', () => client.sessionExists(existing.sessionId));
 
         if (!stillAlive) {
@@ -686,10 +762,39 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // (errors already swallowed) — at worst we leak a session
           // that the runner's TTL/unplug-watchdog will reap anyway.
           await redisConnection.del(redisKey);
+          clearSessionRunnerBinding(existing.sessionId).catch(() => {});
           try {
             await client.destroySession(existing.sessionId, { userId });
           } catch (err) {
             logger.warn('[MOBILE_SESSION] destroySession during selector-switch failed (non-fatal)', {
+              sessionId: existing.sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          // Fall through to create a new session below
+        } else if (
+          // Routing mismatch: the cached session was born on a different runner
+          // than this request now wants. The common case: a session created on
+          // the shared/direct runner BEFORE a companion connected — now the gate
+          // wants the companion, but reusing the cached session would keep
+          // handing back the direct socket URL and run on the wrong runner
+          // (the "Reset doesn't switch to my phone" bug). Recreate so the
+          // session's runner matches the routing decision.
+          (useCompanionRunner ? 'companion' : 'direct') !== (existing.runnerBindingKind ?? 'direct')
+        ) {
+          logger.info('[MOBILE_SESSION] Runner routing changed — invalidating cached session', {
+            projectId,
+            userId,
+            staleSessionId: existing.sessionId,
+            cachedBindingKind: existing.runnerBindingKind ?? 'direct',
+            wantCompanion: useCompanionRunner,
+          });
+          await redisConnection.del(redisKey);
+          clearSessionRunnerBinding(existing.sessionId).catch(() => {});
+          try {
+            await client.destroySession(existing.sessionId, { userId });
+          } catch (err) {
+            logger.warn('[MOBILE_SESSION] destroySession during routing-switch failed (non-fatal)', {
               sessionId: existing.sessionId,
               error: err instanceof Error ? err.message : String(err),
             });
@@ -715,6 +820,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             requestedPlatform: platform,
           });
           await redisConnection.del(redisKey);
+          clearSessionRunnerBinding(existing.sessionId).catch(() => {});
           try {
             await client.destroySession(existing.sessionId, { userId });
           } catch (err) {
@@ -765,7 +871,24 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // itself on the first real frame, so we stop at 95% here.
           emitWarmupProgress(userId, 'waiting_first_frame', 95);
 
-          const runnerSocketUrl = currentRunnerSocketUrl();
+          // Refresh the per-session binding TTL for dedicated-runner sessions so
+          // calls that follow this warmup reuse (tap/apply/lint) keep routing to
+          // the right runner even when the original binding has expired.
+          if (existing.runnerBindingKind === 'companion' && existing.companionUserId) {
+            storeSessionRunnerBinding(
+              existing.sessionId,
+              { kind: 'companion', userId: existing.companionUserId },
+              WARMUP_TTL,
+            ).catch(() => {});
+          } else if (existing.isDedicated) {
+            storeSessionRunnerBinding(
+              existing.sessionId,
+              { runnerUrl: existing.runnerUrl, runnerApiKey: existing.runnerApiKey ?? null },
+              WARMUP_TTL,
+            ).catch(() => {});
+          }
+
+          const runnerSocketUrl = getEffectiveRunnerSocketUrl(existing);
           logger.info('[MOBILE_SESSION] warmup response (path=cached_reuse)', {
             userId, projectId,
             sessionId: existing.sessionId,
@@ -778,7 +901,8 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             success: true,
             sessionId: existing.sessionId,
             runnerSocketUrl,
-            runnerApiKey: getRunnerAuth(),
+            runnerApiKey: getEffectiveRunnerApiKey(existing),
+            runnerBindingKind: existing.runnerBindingKind ?? 'direct',
             platform: existing.platform,
             reused: true,
             createdAt: existing.createdAt,
@@ -789,8 +913,15 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       }
     }
 
-    // Health check
-    const client = getMobileRunnerClient();
+    // Health check — use the dedicated runner if one is configured, otherwise
+    // fall back to the env-singleton. dedicated is already resolved above.
+    const dedicatedRunnerUrl = dedicated?.runnerUrl ?? null;
+    const dedicatedRunnerApiKey = dedicated?.runnerApiKey ?? null;
+    const client: IMobileRunnerClient = useCompanionRunner
+      ? new CompanionRunnerClient(userId)
+      : dedicatedRunnerUrl
+      ? new MobileRunnerClient({ baseUrl: dedicatedRunnerUrl, apiKey: dedicatedRunnerApiKey ?? '' })
+      : getMobileRunnerClient();
     const healthy = await time('runner_health_check', () => client.isHealthy());
     if (!healthy) {
       // isHealthy() swallows the underlying cause (timeout / ECONNREFUSED /
@@ -906,13 +1037,26 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       context: { source: 'warmup' },
     }));
 
-    const runnerSocketUrl = currentRunnerSocketUrl();
+    // Determine effective runner URL/socket/key for this session.
+    // Dedicated runner: use the row's values so the frontend connects to the
+    // right socket without staleness risk (dedicated URL is DB-sourced, not an
+    // env var that can drift). Shared pool: derive socket URL from live env
+    // (2026-04-21 stale-cache lesson).
+    const effectiveRunnerUrl = dedicatedRunnerUrl ?? env.MOBILE_RUNNER_URL;
+    const effectiveRunnerSocketUrl = useCompanionRunner
+      ? null
+      : dedicatedRunnerUrl
+      ? runnerUrlToSocketUrl(dedicatedRunnerUrl)
+      : currentRunnerSocketUrl();
 
     // Store mapping in Redis
     const warmupData: WarmupData = {
       sessionId: session.sessionId,
-      runnerUrl: env.MOBILE_RUNNER_URL,
-      runnerSocketUrl,
+      isDedicated: !!dedicatedRunnerUrl,
+      ...(useCompanionRunner ? { runnerBindingKind: 'companion' as const, companionUserId: userId } : {}),
+      runnerUrl: effectiveRunnerUrl,
+      runnerSocketUrl: effectiveRunnerSocketUrl,
+      runnerApiKey: dedicatedRunnerApiKey ?? undefined,
       platform,
       createdAt: new Date().toISOString(),
       // Audit BUG-1 fix: persist the selector so the next warmup can
@@ -921,6 +1065,22 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       // stored when a non-default selector was actually used.
       ...(deviceSelector ? { deviceSelector } : {}),
     };
+
+    // Write the per-session binding BEFORE the warmup key so any concurrent
+    // claimWarmedSession that sees the warmup key always finds the binding too.
+    if (dedicatedRunnerUrl) {
+      await storeSessionRunnerBinding(
+        session.sessionId,
+        { runnerUrl: dedicatedRunnerUrl, runnerApiKey: dedicatedRunnerApiKey },
+        WARMUP_TTL,
+      );
+    } else if (useCompanionRunner) {
+      await storeSessionRunnerBinding(
+        session.sessionId,
+        { kind: 'companion', userId },
+        WARMUP_TTL,
+      );
+    }
 
     await redisConnection.set(
       `${WARMUP_PREFIX}${projectId}:${userId}`,
@@ -1023,7 +1183,8 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     logger.info('[MOBILE_SESSION] warmup response (path=fresh_create)', {
       userId, projectId,
       sessionId: session.sessionId,
-      runnerSocketUrl,
+      runnerSocketUrl: effectiveRunnerSocketUrl,
+      runnerBindingKind: useCompanionRunner ? 'companion' : undefined,
       tookMs: Date.now() - warmupStart,
       timings,
     });
@@ -1032,8 +1193,9 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     res.status(201).json({
       success: true,
       sessionId: session.sessionId,
-      runnerSocketUrl,
-      runnerApiKey: getRunnerAuth(),
+      runnerSocketUrl: effectiveRunnerSocketUrl,
+      runnerApiKey: getEffectiveRunnerApiKey(warmupData),
+      runnerBindingKind: useCompanionRunner ? 'companion' : 'direct',
       platform,
       reused: false,
       createdAt: warmupData.createdAt,
@@ -1087,8 +1249,8 @@ export async function destroySession(req: Request, res: Response): Promise<void>
   }
 
   try {
-    // Destroy on runner
-    const client = getMobileRunnerClient();
+    // Destroy on runner — use the session's bound runner (dedicated or shared).
+    const client = await getMobileRunnerClientForSession(sessionId);
     try {
       await client.destroySession(sessionId, { userId });
     } catch (err) {
@@ -1098,6 +1260,9 @@ export async function destroySession(req: Request, res: Response): Promise<void>
         error: err instanceof Error ? err.message : String(err),
       });
     }
+
+    // Clear per-session runner binding (best-effort).
+    clearSessionRunnerBinding(sessionId).catch(() => {});
 
     // Remove Redis mapping (best effort — might not match exactly)
     if (projectId) {
@@ -1166,7 +1331,7 @@ export async function tapSession(req: Request, res: Response): Promise<void> {
   }
 
   try {
-    const client = getMobileRunnerClient();
+    const client = await getMobileRunnerClientForSession(sessionId);
     await client.executeBatchCommands(sessionId, [
       { type: 'tap', params: { x: Math.round(x), y: Math.round(y) }, _skipWait: true },
     ], { interactive: true, userId: req.user.id });
@@ -1218,7 +1383,7 @@ export async function swipeSession(req: Request, res: Response): Promise<void> {
   }
 
   try {
-    const client = getMobileRunnerClient();
+    const client = await getMobileRunnerClientForSession(sessionId);
     await client.executeBatchCommands(sessionId, [
       {
         type: 'swipe',
@@ -1260,7 +1425,7 @@ export async function goHomeSession(req: Request, res: Response): Promise<void> 
   }
 
   try {
-    const client = getMobileRunnerClient();
+    const client = await getMobileRunnerClientForSession(sessionId);
     await client.executeBatchCommands(sessionId, [
       { type: 'go_home', params: {}, _skipWait: true },
     ], { interactive: true, userId: req.user.id });
@@ -1292,7 +1457,7 @@ export async function goBackSession(req: Request, res: Response): Promise<void> 
   }
 
   try {
-    const client = getMobileRunnerClient();
+    const client = await getMobileRunnerClientForSession(sessionId);
     await client.executeBatchCommands(sessionId, [
       { type: 'go_back', params: {}, _skipWait: true },
     ], { interactive: true, userId: req.user.id });
@@ -1331,7 +1496,7 @@ export async function typeSession(req: Request, res: Response): Promise<void> {
   }
 
   try {
-    const client = getMobileRunnerClient();
+    const client = await getMobileRunnerClientForSession(sessionId);
     await client.executeBatchCommands(sessionId, [
       { type: 'type_text', params: { text }, _skipWait: true },
     ], { interactive: true, userId: req.user.id });
@@ -1370,7 +1535,7 @@ export async function keySession(req: Request, res: Response): Promise<void> {
   }
 
   try {
-    const client = getMobileRunnerClient();
+    const client = await getMobileRunnerClientForSession(sessionId);
     await client.executeBatchCommands(sessionId, [
       { type: 'press_key', params: { keycode }, _skipWait: true },
     ], { interactive: true, userId: req.user.id });
@@ -1410,7 +1575,7 @@ export async function commandSession(req: Request, res: Response): Promise<void>
   }
 
   try {
-    const client = getMobileRunnerClient();
+    const client = await getMobileRunnerClientForSession(sessionId);
     const result = await client.executeBatchCommands(sessionId, [
       { type, params: params ?? {}, _skipWait: true },
     ], { interactive: true, userId: req.user.id });
@@ -1460,7 +1625,7 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
   let lintActionType = 'tap';
 
   try {
-    const client = getMobileRunnerClient();
+    const client = await getMobileRunnerClientForSession(sessionId);
 
     // Liveness guard. Unlike warmup/apply/run (which call sessionExists), lint
     // used to forward straight to the runner with whatever sessionId the editor
@@ -1708,9 +1873,9 @@ export async function applySession(req: Request, res: Response): Promise<void> {
   const { triggers: applyTriggers } = req.body as { triggers?: unknown };
   if (Array.isArray(applyTriggers)) {
     try {
-      const { getMobileRunnerClient } = await import('@/services/mobile');
       const { sanitizeTriggers } = await import('@/services/mobile/trigger-validation.util');
-      await getMobileRunnerClient().setTriggers(sessionId, sanitizeTriggers(applyTriggers), { userId: req.user!.id });
+      const triggersClient = await getMobileRunnerClientForSession(sessionId);
+      await triggersClient.setTriggers(sessionId, sanitizeTriggers(applyTriggers), { userId: req.user!.id });
     } catch (err) {
       logger.warn('[applySession] failed to set triggers (non-fatal)', {
         sessionId, error: err instanceof Error ? err.message : String(err),
@@ -1881,7 +2046,6 @@ export async function autoBootAndInstall(
   try {
     if (!env.MOBILE_RUNNER_ENABLED) return;
 
-    const client = getMobileRunnerClient();
     const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
 
     // Load app so we know which storagePath to pend if we fail early.
@@ -1903,15 +2067,49 @@ export async function autoBootAndInstall(
     const legacyApp = (project?.settings as any)?.mobileApp;
     const appStoragePath = projectAppForPend?.storagePath ?? legacyApp?.storagePath;
 
+    // Resolve dedicated device early so we can use the right runner client for
+    // both the sessionExists check and session creation below.
+    const autoBootWorkspaceId: string | undefined = project.workspace_id ?? undefined;
+    const autoBootDedicated = await resolveDedicatedDevice(autoBootWorkspaceId, platform);
+    const autoBootRunnerUrl = autoBootDedicated?.runnerUrl ?? null;
+    const autoBootRunnerApiKey = autoBootDedicated?.runnerApiKey ?? null;
+    const client = autoBootRunnerUrl
+      ? new MobileRunnerClient({ baseUrl: autoBootRunnerUrl, apiKey: autoBootRunnerApiKey ?? '' })
+      : getMobileRunnerClient();
+
     // Check for existing session
     let sessionId: string | null = null;
     const existingRaw = await redisConnection.get(redisKey);
     if (existingRaw) {
       const existing: WarmupData = JSON.parse(existingRaw);
       if (existing.sessionId && existing.sessionId !== '_booting') {
-        const alive = await client.sessionExists(existing.sessionId);
+        // Use the runner the existing session was BORN on, not the current dedicated
+        // config. If the config changed (e.g. workspace gained a dedicated runner after
+        // session creation), querying the new dedicated runner for a shared-pool session
+        // would always return false and force an unnecessary cold-boot.
+        const existingClient: IMobileRunnerClient = existing.runnerBindingKind === 'companion' && existing.companionUserId
+          ? new CompanionRunnerClient(existing.companionUserId)
+          : existing.isDedicated && existing.runnerUrl
+          ? new MobileRunnerClient({ baseUrl: existing.runnerUrl, apiKey: existing.runnerApiKey ?? '' })
+          : getMobileRunnerClient();
+        const alive = await existingClient.sessionExists(existing.sessionId);
         if (alive) {
           sessionId = existing.sessionId;
+          // Refresh the binding TTL so subsequent calls (install, launch, tap) resolve
+          // the right runner even when the original binding has expired.
+          if (existing.runnerBindingKind === 'companion' && existing.companionUserId) {
+            storeSessionRunnerBinding(
+              existing.sessionId,
+              { kind: 'companion', userId: existing.companionUserId },
+              WARMUP_TTL,
+            ).catch(() => {});
+          } else if (existing.isDedicated) {
+            storeSessionRunnerBinding(
+              existing.sessionId,
+              { runnerUrl: existing.runnerUrl, runnerApiKey: existing.runnerApiKey ?? null },
+              WARMUP_TTL,
+            ).catch(() => {});
+          }
           logger.info('[MOBILE_AUTO_BOOT] Reusing existing session for reinstall', { projectId, sessionId });
         }
       }
@@ -1934,35 +2132,43 @@ export async function autoBootAndInstall(
       // Set a "booting" placeholder in Redis BEFORE starting the emulator.
       // This prevents warmupSession from creating a duplicate emulator if
       // the user opens the editor while the boot is still in progress.
-      const runnerSocketUrl = currentRunnerSocketUrl();
+      const autoBootEffectiveRunnerUrl = autoBootRunnerUrl ?? env.MOBILE_RUNNER_URL;
+      const autoBootEffectiveSocketUrl = autoBootRunnerUrl
+        ? runnerUrlToSocketUrl(autoBootRunnerUrl)
+        : currentRunnerSocketUrl();
       const bootingData: WarmupData = {
         sessionId: '_booting',
-        runnerUrl: env.MOBILE_RUNNER_URL,
-        runnerSocketUrl,
+        isDedicated: !!autoBootRunnerUrl,
+        runnerUrl: autoBootEffectiveRunnerUrl,
+        runnerSocketUrl: autoBootEffectiveSocketUrl,
+        runnerApiKey: autoBootRunnerApiKey ?? undefined,
         platform,
         createdAt: new Date().toISOString(),
       };
       await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
 
-      // Dedicated emulator: pin auto-boot to the workspace's dedicated device
-      // when one exists. workspaceId comes from the access-checked project
-      // (never the request). Forces ownerId=workspaceId; inert unless the flag
-      // is on AND a row exists.
-      const autoBootWorkspaceId: string | undefined = project.workspace_id ?? undefined;
-      const dedicated = await resolveDedicatedDevice(autoBootWorkspaceId, platform);
-      const autoBootOwnerId = dedicated
+      const autoBootOwnerId = autoBootDedicated
         ? autoBootWorkspaceId
         : (env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined);
       const session = await client.createSession(platform, {
         ownerId: autoBootOwnerId,
         userId,
-        ...(dedicated ? { deviceSelector: { serial: dedicated.serial }, dedicated: true } : {}),
+        ...(autoBootDedicated ? { deviceSelector: { serial: autoBootDedicated.serial }, dedicated: true } : {}),
       });
       sessionId = session.sessionId;
 
       // Update Redis with the real session ID
       bootingData.sessionId = sessionId;
       await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
+
+      // Store per-session runner binding only for dedicated sessions.
+      if (autoBootRunnerUrl) {
+        await storeSessionRunnerBinding(
+          sessionId,
+          { runnerUrl: autoBootRunnerUrl, runnerApiKey: autoBootRunnerApiKey },
+          WARMUP_TTL,
+        );
+      }
 
       logger.info('[MOBILE_AUTO_BOOT] Emulator created', {
         projectId,
@@ -2123,12 +2329,10 @@ export async function claimWarmedSession(
     }
 
     // Liveness check — ask the runner whether it still has this session.
-    // If the runner says no, the Redis row was stale and we MUST NOT hand
-    // the dead id back. Use the same `getMobileRunnerClient()` instance
-    // the warmup created the session with so the URL/auth match.
+    // Use the session's bound runner (dedicated or shared) so URL/auth match.
     let alive = false;
     try {
-      const client = getMobileRunnerClient();
+      const client = await getMobileRunnerClientForSession(data.sessionId);
       alive = await client.sessionExists(data.sessionId);
     } catch (probeErr) {
       // Probe fail → treat as not-alive. Worker will cold-start. Better
@@ -2232,7 +2436,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
       })),
     });
 
-    const client = getMobileRunnerClient();
+    const client = await getMobileRunnerClientForSession(sessionId);
     const runStart = Date.now();
 
     // Stream NDJSON so frontend can show per-step progress

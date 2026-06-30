@@ -26,6 +26,7 @@ import type { MobilePlatform } from './mobile-runner.types';
 export interface ResolvedDedicatedDevice {
   serial: string;
   runnerUrl: string | null;
+  runnerApiKey: string | null;
 }
 
 const CACHE_TTL_MS = 60_000;
@@ -68,7 +69,7 @@ export async function resolveDedicatedDevice(
 
   let resolved: ResolvedDedicatedDevice | null = null;
   if (row && row.platform === wantPlatform) {
-    resolved = { serial: row.runnerSerial, runnerUrl: row.runnerUrl };
+    resolved = { serial: row.runnerSerial, runnerUrl: row.runnerUrl, runnerApiKey: row.runnerApiKey };
   } else if (row && row.platform !== wantPlatform) {
     // A device exists but for a different platform — log so ops can spot a
     // misprovisioned workspace (e.g. android row, ios run). Falls back to shared.

@@ -1,6 +1,6 @@
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
-import { MobileRunnerClient } from './mobile-runner-client';
+import type { IMobileRunnerClient } from './mobile-runner-client';
 import { MobileRunnerError } from './mobile-runner.types';
 import type { FastAuthRestore } from '@/services/test-resource/resource-step-compiler.service';
 import { categorizeFastAuthError } from './fast-auth-error-classifier';
@@ -33,7 +33,7 @@ export class FastAuthOrchestratorService {
    * @param params.checkCancelled  - Async callback returning true when the test was cancelled
    */
   static async restoreSnapshots(params: {
-    client: MobileRunnerClient;
+    client: IMobileRunnerClient;
     sessionId: string;
     fastAuthRestores: FastAuthRestore[];
     testId: string;

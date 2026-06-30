@@ -3,11 +3,12 @@
  * Main Socket.IO server configuration and setup
  */
 
-import { isDevelopment } from '@/config/environment/env';
+import { isDevelopment, env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { Server as HTTPServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import { handleConnection } from '../handlers/connection.handler';
+import { initCompanionNamespace } from '../handlers/companion.handler';
 import { authenticateSocket } from '../middleware/middleware';
 import { refreshIdle } from '@/services/mobile/mobile-idle.service';
 import { refreshIdle as refreshPreviewIdle } from '@/services/testing/ui/preview/preview-idle.service';
@@ -112,7 +113,15 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
       allowUpgrades: true, // Allow upgrade from polling to websocket
       // Additional polling optimization
       httpCompression: true, // Compress polling responses
-      maxHttpBufferSize: 2e6, // 2MB max message size (base64 video frames can reach ~900KB + JSON envelope)
+      // Max single-message size. Browser video frames are ~900KB, but the
+      // COMPANION relay carries full runner HTTP responses end-to-end —
+      // a per-step apply result includes a base64 device SCREENSHOT (a rich
+      // phone screen PNG is several MB) + the a11y/inspector tree. At 2MB those
+      // exceeded the buffer, so engine.io closed the companion socket the moment
+      // it sent the response (client saw `transport close`) — and the relay then
+      // flapped as the lost response was re-delivered. 16MB carries a
+      // screenshot-bearing response with headroom; env-tunable for larger screens.
+      maxHttpBufferSize: env.WS_MAX_HTTP_BUFFER_SIZE,
     }
   );
 
@@ -193,6 +202,10 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
       socket.disconnect(true);
     });
   });
+
+  // Companion relay namespace — companions connect here with their HMAC access
+  // token. Requires COMPANION_ENABLED=true; no-op otherwise.
+  initCompanionNamespace(io);
 
   logger.debug('[WebSocket] WebSocket server initialized successfully');
 
