@@ -1378,15 +1378,25 @@ export class ActionExecutor {
     // otherwise burn the full 15-20s Playwright retry and then fail anyway:
     //   (a) ref no longer in the DOM  → "waiting for locator" for 15s
     //   (b) element present but disabled → "waiting to be enabled" (29× observed)
-    // A couple of instant/cheap live probes let us fail in ~300ms with an
-    // actionable message so the planner replans instead of re-queuing a dead
-    // click. Fail-soft: probe errors fall through to the normal click.
+    // These let us fail in well under a second with an actionable message so the
+    // agent replans instead of re-queuing a dead click.
+    //
+    // SAFETY (shared with the AI editor's replay path, not just exploration): a
+    // framework re-render can momentarily detach an element that IS valid, so a
+    // single count()===0 would false-fail a legit click. We therefore re-check
+    // after a short grace wait and only declare the ref stale if it's STILL
+    // absent. A genuinely dead ref still fails fast (~grace, not 15s); a
+    // transiently re-rendering element survives. Fail-soft: probe errors (the
+    // page navigated, context detached) fall through to the normal click.
     try {
-      // (a) Stale ref — element gone from the live DOM. count() is instant.
       if ((await locator.count()) === 0) {
-        throw new Error('stale ref — element no longer present in the DOM; re-observe the page and pick a current element');
+        // Grace: give a re-rendering framework a beat, then re-check ONCE.
+        await this.page.waitForTimeout(400);
+        if ((await locator.count()) === 0) {
+          throw new Error('stale ref — element no longer present in the DOM; re-observe the page and pick a current element');
+        }
       }
-      // (b) Present but disabled.
+      // Present but disabled (a disabled control stays disabled — safe to fail fast).
       if (await locator.isDisabled({ timeout: 300 })) {
         throw new Error(
           'element is disabled — a required field is likely empty or validation is pending; ' +
