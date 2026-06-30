@@ -305,6 +305,12 @@ export interface InteractiveNode {
   sizeHint?: 'small' | 'medium' | 'large';
   /** Source iframe name/id if element is inside a same-origin iframe */
   iframeSource?: string;
+  /**
+   * Durable CSS selector for the owning <iframe> in the parent document.
+   * Threaded from `LiteElement.iframeSelector` so the compiled-plan builder
+   * can persist a frame-scoped replay locator (`action.options.iframe`).
+   */
+  iframeSelector?: string;
 }
 
 /**

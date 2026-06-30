@@ -21,6 +21,8 @@
 
 import { logger } from '@/utils/core/logger';
 import type { LiteSnapshot } from '../lite-types';
+import type { DismissalAttempt } from '../exploration/overlay-dismisser';
+import type { RecordedDismissal } from '../exploration/overlay-step.util';
 import type {
   ExecutionRound,
   PipelinePhase,
@@ -33,6 +35,9 @@ import type {
 
 /** Maximum insights before oldest are trimmed */
 const MAX_INSIGHTS = 15;
+/** Bound on recorded overlay dismissals (mirrors MAX_INSIGHTS — a flow that
+ *  dismisses more than this many distinct overlays is pathological). */
+const MAX_DISMISSALS = 15;
 
 export class TestBlackboard {
   private state: TestBlackboardState;
@@ -47,6 +52,7 @@ export class TestBlackboard {
       pipelineStartedAt: Date.now(),
       rounds: [],
       insights: [],
+      dismissals: [],
       progressScore: 0,
     };
   }
@@ -239,6 +245,26 @@ export class TestBlackboard {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // OVERLAY DISMISSALS (recorded so the flow runner can replay them as steps)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /** Record successful overlay dismissals that happened during a round. Only
+   *  `dismissed` attempts are kept (the rest aren't replayable). Bounded. */
+  addDismissals(attempts: readonly DismissalAttempt[], pageUrl: string): void {
+    for (const attempt of attempts) {
+      if (!attempt.dismissed) continue;
+      this.state.dismissals.push({ attempt, pageUrl });
+    }
+    if (this.state.dismissals.length > MAX_DISMISSALS) {
+      this.state.dismissals = this.state.dismissals.slice(-MAX_DISMISSALS);
+    }
+  }
+
+  getDismissals(): readonly RecordedDismissal[] {
+    return this.state.dismissals;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // PROGRESS
   // ═══════════════════════════════════════════════════════════════════════
 
@@ -321,6 +347,7 @@ export class TestBlackboard {
         commands: r.commands.map(c => ({ ...c })),
       })),
       insights: [...this.state.insights],
+      dismissals: this.state.dismissals.map(d => ({ ...d, attempt: { ...d.attempt } })),
     });
   }
 

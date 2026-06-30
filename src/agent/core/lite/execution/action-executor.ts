@@ -17,6 +17,7 @@ import {
 } from '@/agent/utils/selectors/modal-detection';
 import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { isNavigationSafe, logUrlSafetyDecision } from '@/utils/security/url-safety';
+import { resolveIframeFrame, VALID_REF_RE } from './iframe-ref.util';
 import type { Locator, Page } from 'playwright';
 import { VisualAnchorManager } from '../analysis/visual-anchor-manager';
 import { ShadowDOMHandler } from './shadow-dom-handler';
@@ -159,6 +160,7 @@ export class ActionExecutor {
         tag: el.tag,
         type: el.type,
         role: el.role, // ✅ FIX: Include role for Phase 0 dropdown selection
+        iframeSource: el.iframeSource, // iframe elements → frame-scoped locator
       });
     });
 
@@ -352,8 +354,8 @@ export class ActionExecutor {
    * Validate command before execution
    */
   private validateCommand(command: AICommand): void {
-    // Validate ref format if present (e-prefix for light DOM, s-prefix for shadow DOM)
-    if (command.ref && !/^[es]\d+$/.test(command.ref)) {
+    // Validate ref format if present (e=light DOM, s=shadow DOM, ifr{N}_{M}=iframe).
+    if (command.ref && !VALID_REF_RE.test(command.ref)) {
       throw new Error(`Invalid ref format: ${command.ref}`);
     }
 
@@ -415,7 +417,7 @@ export class ActionExecutor {
 
     // Validate scroll extras
     if (command.action === 'scroll') {
-      if (command.targetRef && !/^[es]\d+$/.test(command.targetRef)) {
+      if (command.targetRef && !VALID_REF_RE.test(command.targetRef)) {
         throw new Error(`Invalid targetRef format: ${command.targetRef}`);
       }
       if (command.amount !== undefined) {
@@ -428,10 +430,43 @@ export class ActionExecutor {
   }
 
   /**
+   * Resolve the locator context for a ref. Iframe-scoped refs (collector emits
+   * `ifr{frameIndex}_{idx}` and stamps the matching `data-agent-ref` INSIDE
+   * that frame) must resolve against the Frame, not the main page —
+   * `page.locator()` does not cross frame boundaries. Resolution logic lives in
+   * the pure `iframe-ref.util` helper (unit-tested without a browser). Falls
+   * back to `currentContext` for main-page refs or any miss (then the existing
+   * fallback chain takes over).
+   */
+  private resolveContextForRef(ref: string | undefined): Page | import('playwright').Frame {
+    const expectedSource = ref ? this.elementMap.get(ref)?.iframeSource : undefined;
+    const frame = resolveIframeFrame(this.page, ref, expectedSource);
+    if (!frame && ref && ref.startsWith('ifr')) {
+      // Iframe ref but the frame is gone (reloaded / detached) and the
+      // name/url fallback also missed. Degrade to the main page — the locator
+      // simply won't find the ref there and the fuzzy fallback chain takes
+      // over. Logged so this shows up when iframe replay gets flaky.
+      logger.debug('[ACTION_EXECUTOR] iframe ref did not resolve to a frame, using main page', {
+        ref,
+        expectedSource,
+        frameCount: this.page.frames().length,
+      });
+    }
+    return frame ?? this.currentContext;
+  }
+
+  /**
    * Safe switch/case execution - only whitelisted Playwright methods
    * PHASE B: Pre-scroll to ensure element is in viewport before interaction
    */
   private async executeCommand(cmd: AICommand): Promise<void> {
+    // Iframe-scoped refs (ifr{N}_…) target their Frame. Switch currentContext
+    // for the whole command so every downstream `currentContext.locator(...)`
+    // sub-case (scroll targetRef, select option, drag targetRef) resolves in
+    // the same frame. Main-page refs leave currentContext untouched.
+    if (cmd.ref) {
+      this.currentContext = this.resolveContextForRef(cmd.ref);
+    }
     const locator = cmd.ref
       ? this.currentContext.locator(`[data-agent-ref="${cmd.ref}"]`)
       : null;

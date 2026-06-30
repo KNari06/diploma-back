@@ -13,6 +13,9 @@
  */
 
 import type { AICommand, LiteSnapshot, LiteElement } from '../lite-types';
+// Type-only import (erased at compile time → no runtime cycle) for the overlay
+// dismissal record the blackboard accumulates.
+import type { RecordedDismissal } from '../exploration/overlay-step.util';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PLAYWRIGHT COMMANDS (what the Executor LLM calls to control the browser)
@@ -97,6 +100,11 @@ export interface TestBlackboardState {
 
   // ── Shared insights (any agent can append, bounded to MAX_INSIGHTS) ──
   insights: string[];
+
+  // ── Overlay dismissals recorded during the flow (pre-pipeline + intra-round)
+  //    so the flow runner can prepend them as replayable steps. Bounded to
+  //    MAX_DISMISSALS. ──
+  dismissals: RecordedDismissal[];
 
   // ── Progress tracking ──
   progressScore: number;              // 0-100, updated by observe_page via GoalDetector
@@ -275,6 +283,9 @@ export interface TestPipelineResult {
   rounds: ExecutionRound[];
   /** Accumulated insights from all agents */
   insights: string[];
+  /** Overlay dismissals recorded during the flow (intra-round) so the flow
+   *  runner can prepend them as replayable steps. */
+  dismissals: RecordedDismissal[];
   /** Final page snapshot (for reporting) */
   finalSnapshot?: LiteSnapshot;
   /** Blocked info if test was blocked */

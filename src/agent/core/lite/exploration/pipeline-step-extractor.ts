@@ -202,11 +202,18 @@ export async function attachCompiledPlan(
     // Carry value only for replay-meaningful actions, never credentials.
     const carriesValue =
       VALUE_CARRYING_ACTIONS.has(step.action) && !step.isSensitive && !!step.value;
+    // When the resolved element lives inside a same-origin iframe, carry the
+    // durable iframe selector into the step options. buildCompiledPlan copies
+    // `step.options` onto `compiled.action.options`, so replay's compiled
+    // executor (and live-apply's getLocatorContext) re-enter the frame via
+    // `page.frameLocator(selector)` instead of failing on the main page.
+    const iframeSelector = node.iframeSelector;
     const planStep: IntentStep = {
       id: `step-${step.stepNumber}`,
       type: intentType,
       description: step.description,
       ...(carriesValue ? { value: step.value } : {}),
+      ...(iframeSelector ? { options: { iframe: { selector: iframeSelector } } } : {}),
     };
 
     const compiled = await LocatorPlanBuilder.buildCompiledPlan({

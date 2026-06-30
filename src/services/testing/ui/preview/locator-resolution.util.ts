@@ -12,10 +12,17 @@
  * function, one codepath, no drift.
  */
 
-import { Frame, Locator, Page } from 'playwright';
+import { Frame, FrameLocator, Locator, Page } from 'playwright';
 import type { LocatorEntry } from './preview.types';
 
 export type PageLike = Page | Frame;
+/**
+ * Anything a strategy locator can be resolved against: a page/frame, a
+ * `Locator` (landmark prefilter scope), or a `FrameLocator` (iframe-scoped
+ * replay — `page.frameLocator(sel)`). All three expose the same
+ * `locator`/`getBy*` builders this util calls.
+ */
+export type LocatorScope = PageLike | Locator | FrameLocator;
 
 /**
  * Convert a LocatorEntry into a Playwright Locator.
@@ -31,7 +38,7 @@ export type PageLike = Page | Frame;
 export function buildStrategyLocator(
   page: PageLike,
   entry: LocatorEntry,
-  scope: Locator | PageLike = page,
+  scope: LocatorScope = page,
 ): Locator | null {
   switch (entry.strategy) {
     case 'ref':
