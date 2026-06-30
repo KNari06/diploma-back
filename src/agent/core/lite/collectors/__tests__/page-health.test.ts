@@ -2,8 +2,8 @@ import { classifyPageHealth, pageHealthHasSignal, formatPageHealth } from '../pa
 import type { NetworkError } from '../network-tracker';
 import { TestBlackboard } from '../../pipeline/blackboard';
 
-function netErr(status: number): NetworkError {
-  return { url: 'https://app.test/x', method: 'GET', status, error: `HTTP ${status}`, timestamp: 1 };
+function netErr(status: number, url = 'https://app.test/x'): NetworkError {
+  return { url, method: 'GET', status, error: `HTTP ${status}`, timestamp: 1 };
 }
 
 describe('classifyPageHealth — server errors', () => {
@@ -45,6 +45,41 @@ describe('classifyPageHealth — server errors', () => {
     expect(h.hasServerError).toBe(false);
     expect(h.sessionLost).toBe(false);
     expect(pageHealthHasSignal(h)).toBe(false);
+  });
+});
+
+describe('classifyPageHealth — third-party noise filtering (same-site only)', () => {
+  it('IGNORES a cross-site analytics/CDN error (not the app under test)', () => {
+    // Reproduces the live bug: amplitude/CDN 404s flagged a healthy page broken.
+    const h = classifyPageHealth({
+      networkErrorsSince: [netErr(404, 'https://api2.amplitude.com/2/httpapi')],
+      consoleErrorCount: 0,
+      currentUrl: 'https://bi.group/ru/compare',
+    });
+    expect(h.hasServerError).toBe(false);
+  });
+
+  it('KEEPS a same-site subdomain server error (real app failure)', () => {
+    // account.bi.group 500 during a login redirect — genuinely the app failing.
+    const h = classifyPageHealth({
+      networkErrorsSince: [netErr(500, 'https://account.bi.group/?backUrl=x')],
+      consoleErrorCount: 0,
+      currentUrl: 'https://bi.group/ru/compare',
+    });
+    expect(h.hasServerError).toBe(true);
+    expect(h.serverErrorStatus).toBe(500);
+  });
+
+  it('keeps same-site error, drops cross-site error when both present', () => {
+    const h = classifyPageHealth({
+      networkErrorsSince: [
+        netErr(404, 'https://api2.amplitude.com/x'),
+        netErr(503, 'https://account.bi.group/y'),
+      ],
+      consoleErrorCount: 0,
+      currentUrl: 'https://bi.group/ru/compare',
+    });
+    expect(h.serverErrorStatus).toBe(503);
   });
 });
 

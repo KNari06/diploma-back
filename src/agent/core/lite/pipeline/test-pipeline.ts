@@ -413,6 +413,9 @@ export class TestPipeline {
           this.consecutiveSameStateRounds = 0;
         }
         this.previousSnapshotHash = currentHash;
+        // Surface the count to the Reviewer (read before its verdict) so a
+        // repeatedly-no-effect action escalates to pivot/blocked, not a loop.
+        this.blackboard.setNoProgressRounds(this.consecutiveSameStateRounds);
 
         // ════════════════════════════════════════════════════════════
         // POST-EXECUTION: Check for new tabs/popups

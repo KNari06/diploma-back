@@ -90,6 +90,8 @@ export async function setNativeInputValue(locator: Locator, value: string): Prom
     const input = el as {
       focus?: () => void;
       value?: string;
+      tagName?: string;
+      type?: string;
       dispatchEvent: (event: Event) => boolean;
     };
     const domGlobals = globalThis as {
@@ -100,11 +102,20 @@ export async function setNativeInputValue(locator: Locator, value: string): Prom
     // 1. Focus the element first (some frameworks only listen when focused)
     if (typeof input.focus === 'function') input.focus();
 
-    // 2. Use native prototype setter to bypass React/Vue/Angular value tracking
+    // 2. Use native prototype setter to bypass React/Vue/Angular value tracking.
+    //    GUARD: the native HTMLInputElement value setter throws "Illegal
+    //    invocation" if called on anything that isn't a real <input> (e.g. a
+    //    custom <div>-based slider the planner mistargeted). Only use the
+    //    native setter when the element actually IS an HTMLInputElement;
+    //    otherwise fall back to a plain assignment so the action degrades
+    //    instead of crashing the round.
     const nativeSetter = Object.getOwnPropertyDescriptor(
       domGlobals.HTMLInputElement?.prototype || {}, 'value',
     )?.set;
-    if (nativeSetter) {
+    // The native setter is bound to HTMLInputElement.prototype; calling it on a
+    // non-<input> (e.g. a custom div slider) throws "Illegal invocation".
+    const isRealInput = (input.tagName || '').toUpperCase() === 'INPUT';
+    if (nativeSetter && isRealInput) {
       nativeSetter.call(input, val);
     } else {
       input.value = val;

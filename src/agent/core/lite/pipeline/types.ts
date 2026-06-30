@@ -116,6 +116,11 @@ export interface TestBlackboardState {
   // Lets the Planner trade thoroughness for speed when rounds run low.
   roundInfo?: { current: number; max: number };
 
+  // ── No-progress counter (set by TestPipeline same-state detection) ──
+  // Consecutive rounds where page state did not meaningfully change. Lets the
+  // Reviewer tell "the action had no effect, stop repeating it" from "progressing".
+  noProgressRounds?: number;
+
   // ══════════════════════════════════════════════════════════════════════
   // HYBRID EXECUTOR FIELDS (only populated when enableHybridExecutor=true)
   // ══════════════════════════════════════════════════════════════════════

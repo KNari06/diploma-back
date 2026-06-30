@@ -20,6 +20,7 @@
 
 import type { NetworkError } from './network-tracker';
 import { isLoginUrl } from '../exploration/auth-url-patterns';
+import { isSameSite } from '@/utils/security/url-safety';
 
 export interface PageHealth {
   /** Highest server-error status (>=500) seen in the window, if any. */
@@ -59,15 +60,21 @@ export function classifyPageHealth(input: PageHealthInput): PageHealth {
   // ① server error — highest status >= 400 in the window. We surface 4xx too
   // (auth/permission walls show as 401/403 on the document) but flag 5xx as
   // the hard "server broke" signal via serverErrorStatus.
+  //
+  // ONLY count errors from the SAME SITE as the current page (eTLD+1 match).
+  // A real run is full of third-party 404s/POSTs (amplitude, CDNs, pixel
+  // trackers) that are NOT the app under test failing — counting them flagged
+  // healthy pages as broken and polluted the Reviewer signal (observed live).
   let serverErrorStatus: number | undefined;
   let hasServerError = false;
   for (const err of networkErrorsSince) {
     if (typeof err.status !== 'number') continue;
-    if (err.status >= CLIENT_ERROR_MIN) {
-      hasServerError = true;
-      if (err.status >= SERVER_ERROR_MIN) {
-        serverErrorStatus = Math.max(serverErrorStatus ?? 0, err.status);
-      }
+    if (err.status < CLIENT_ERROR_MIN) continue;
+    // Skip third-party / cross-site errors — they aren't this app's failure.
+    if (err.url && !isSameSite(err.url, currentUrl)) continue;
+    hasServerError = true;
+    if (err.status >= SERVER_ERROR_MIN) {
+      serverErrorStatus = Math.max(serverErrorStatus ?? 0, err.status);
     }
   }
 

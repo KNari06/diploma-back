@@ -443,8 +443,17 @@ export class ActionExecutor {
         // PHASE B: Pre-scroll to ensure element is visible before click
         // ═══════════════════════════════════════════════════════════════════
         await this.ensureElementVisible(locator);
-        // ✅ FIX: Use longer timeout for clicks (may trigger navigation/modals)
-        await locator.click({ timeout: this.NAVIGATION_TIMEOUT });
+        // Route through the staged self-healing click instead of a raw
+        // locator.click(): a raw click throws on "intercepts pointer events"
+        // (overlay/cookie/modal in front of the target) and the agent then
+        // burns whole rounds re-picking elements. stagedClickWithSelfHealing
+        // identifies the blocker (Layer 3), dismisses it, and retries — only
+        // throwing if all stages fail (so a genuinely dead element still
+        // surfaces as a real failure). cmd.ref is the target ref Layer 3 needs.
+        await this.stagedClickWithSelfHealing(locator, {
+          targetRef: cmd.ref,
+          stage1Timeout: this.NAVIGATION_TIMEOUT,
+        });
         break;
 
       case 'fill':
@@ -1362,11 +1371,13 @@ export class ActionExecutor {
    */
   private async stagedClickWithSelfHealing(
     locator: Locator,
-    options?: ExecuteOptions & { targetRef?: string }
+    options?: ExecuteOptions & { targetRef?: string; stage1Timeout?: number }
   ): Promise<{ usedForce: boolean; blockerInfo?: BlockerInfo }> {
-    // Stage 1: Normal click
+    // Stage 1: Normal click. The primary click path passes NAVIGATION_TIMEOUT
+    // (15s) so a slow navigation-triggering click isn't cut short and mistaken
+    // for an interception; fallback callers keep the shorter FALLBACK_TIMEOUT.
     try {
-      await locator.click({ timeout: this.FALLBACK_TIMEOUT });
+      await locator.click({ timeout: options?.stage1Timeout ?? this.FALLBACK_TIMEOUT });
       return { usedForce: false }; // No force needed
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);

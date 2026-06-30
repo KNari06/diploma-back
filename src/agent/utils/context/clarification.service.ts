@@ -12,6 +12,15 @@ import { connection } from '@/config/infrastructure/queues';
 
 export type ClarificationType = 'url' | 'credentials' | 'test_data' | 'payment_approval' | 'captcha_solve' | '2fa_code';
 
+/**
+ * Sentinel answer the frontend sends when the user clicks "Skip flow" on a
+ * captcha/2FA prompt. The poll loop treats it as an immediate skip — it stops
+ * waiting and returns null (same downstream handling as a timeout) instead of
+ * blocking for the full clarification timeout. Must match the literal sent by
+ * the frontend ExplorationClarificationModal.
+ */
+export const CLARIFICATION_SKIP_SENTINEL = '__skip__';
+
 export interface ClarificationRequest {
   testId: string;
   questionId: string;
@@ -293,6 +302,16 @@ export class ClarificationService {
         const answer = await redis.get(redisKey);
         if (answer) {
           await redis.del(redisKey);
+          // User chose to skip — stop polling now instead of waiting out the
+          // full timeout. Returning null reuses the existing "unresolved
+          // blocker" path in the FlowRunner (no retry, flow stays blocked).
+          if (answer === CLARIFICATION_SKIP_SENTINEL) {
+            logger.info('[CLARIFICATION_SERVICE] User skipped clarification', {
+              questionId,
+              explorationId: params.explorationId,
+            });
+            return null;
+          }
           logger.info('[CLARIFICATION_SERVICE] Received Redis clarification answer', {
             questionId,
             explorationId: params.explorationId,

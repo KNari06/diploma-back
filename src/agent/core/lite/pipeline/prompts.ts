@@ -47,6 +47,15 @@ export function buildPlannerPrompt(bb: TestBlackboard): string {
     );
   }
 
+  // No-effect signal — same as the Reviewer sees, so the Planner pivots away
+  // from a dead element instead of re-planning the same click (observed loop).
+  const noProgress = bb.getNoProgressRounds();
+  if (noProgress >= 1) {
+    sections.push(
+      `NO STATE CHANGE: page unchanged for ${noProgress} round(s) — your last action had NO effect. Do NOT repeat it; choose a DIFFERENT element or path, or report_blocked if none exists.`,
+    );
+  }
+
   // Credential hint
   if (bb.getHasCredentials()) {
     sections.push(`CREDENTIALS: Available. Plan to fill credential fields (email/username, password) using the fill_field command with is_sensitive=true.`);
@@ -261,6 +270,15 @@ export function buildReviewerPrompt(bb: TestBlackboard): string {
     sections.push(`PAGE HEALTH:\n${healthBody}`);
   }
 
+  // No-effect signal — consecutive rounds where the page didn't meaningfully
+  // change. Stops the "click → no effect → click again" loop seen in practice.
+  const noProgress = bb.getNoProgressRounds();
+  if (noProgress >= 1) {
+    sections.push(
+      `NO STATE CHANGE: the page has not meaningfully changed for ${noProgress} consecutive round(s) — the last action(s) had NO visible effect.`,
+    );
+  }
+
   return `You are a TEST REVIEWER. Evaluate whether the execution achieved the goal.
 
 ${sections.join('\n\n')}
@@ -273,6 +291,7 @@ Analyze:
 5. If credentials were used and page shows authentication errors (invalid, wrong, incorrect), the verdict should be "blocked" — user-provided credentials appear wrong.
 6. If PAGE HEALTH reports a SERVER ERROR (HTTP 5xx), the page is broken — this is NOT goal achievement even if the DOM looks thin/empty. Verdict "replan" (retry) or "blocked" (app down), never "done".
 7. If PAGE HEALTH reports SESSION LOST (redirected to login mid-flow), the user was logged out — the goal was NOT achieved. Verdict "blocked".
+8. If NO STATE CHANGE is reported (the action had no visible effect for 2+ rounds): do NOT verdict "continue" to repeat the same action. The element is likely dead, covered, or opens content elsewhere. Verdict "replan" with guidance to try a DIFFERENT element/path; if 3+ rounds with no effect and no alternative, verdict "blocked".
 
 Respond with JSON:
 {

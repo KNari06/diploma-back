@@ -263,6 +263,37 @@ export class CommandExecutor {
   }
 
   /**
+   * Cheap DOM signature for before/after change detection. NOT a full snapshot
+   * collect (that's heavy) — a fast evaluate of url + element count + body text
+   * length + title. Lets the trace PROVE whether an action changed the page
+   * ("click had no effect" is the single most common agent-fault pattern).
+   * Returns '' on failure — never throws, never blocks the action.
+   */
+  private async domSignature(): Promise<string> {
+    try {
+      // String-body evaluate (matches the alerts-evaluate pattern below) so the
+      // browser-context globals (document/location) aren't type-checked as Node.
+      const sig = await this.page.evaluate(`
+        (() => {
+          const d = document;
+          const interactive = d.querySelectorAll('button, a, input, select, textarea, [role="button"]').length;
+          const textLen = (d.body && d.body.innerText ? d.body.innerText.length : 0);
+          return location.href + '|' + d.title + '|' + interactive + '|' + textLen;
+        })()
+      `);
+      return typeof sig === 'string' ? sig : '';
+    } catch {
+      return '';
+    }
+  }
+
+  /** Commands that change page state — worth a before/after DOM-change check. */
+  private static readonly MUTATING_COMMANDS: ReadonlySet<string> = new Set([
+    'click_element', 'fill_field', 'select_option', 'press_key', 'toggle_element',
+    'set_range', 'select_date', 'clear_field', 'navigate_to',
+  ]);
+
+  /**
    * Execute a single Playwright command.
    * 1. (PR-Hybrid) Run SafetyInterceptor for ref-based commands if enableHybridSafety=true
    * 2. Run deterministic safety checks (checkRefExists)
@@ -303,6 +334,11 @@ export class CommandExecutor {
           return safetyBlockResult;
         }
       }
+
+      // Capture a cheap DOM signature before mutating commands so the trace can
+      // show whether the action actually changed the page (no-effect detection).
+      const isMutating = CommandExecutor.MUTATING_COMMANDS.has(name);
+      const sigBefore = isMutating ? await this.domSignature() : '';
 
       let result: CommandResult;
 
@@ -359,8 +395,14 @@ export class CommandExecutor {
           result = { success: false, output: '', error: `Unknown command: ${commandName}` };
       }
 
+      // After a mutating command, re-capture the signature to detect no-effect.
+      const sigAfter = isMutating ? await this.domSignature() : '';
+      const domChanged = isMutating && sigBefore !== '' && sigAfter !== ''
+        ? sigBefore !== sigAfter
+        : undefined;
+
       // Trace command execution
-      this.traceCommand(name, args, result, Date.now() - startMs);
+      this.traceCommand(name, args, result, Date.now() - startMs, domChanged);
 
       // Emit graph action node (for non-meta commands)
       this.emitGraphActionNode(name, args, result, Date.now() - startMs);
@@ -1403,8 +1445,23 @@ export class CommandExecutor {
     args: Record<string, any>,
     result: CommandResult,
     durationMs: number,
+    domChanged?: boolean,
   ): void {
     try {
+      // Resolve WHAT element the ref pointed at (tag/role/name/visible/covered),
+      // so a reader sees the agent clicked e.g. a hidden div, not just "ref e310".
+      // Cheap in-memory lookup against the current snapshot.
+      let targetElement: Record<string, unknown> | undefined;
+      const ref = args.ref as string | undefined;
+      if (ref) {
+        const el = this.blackboard.getCurrentPageSnapshot()?.elements.find(e => e.ref === ref);
+        if (el) {
+          targetElement = {
+            ref: el.ref, tag: el.tag, role: el.role, name: el.name,
+            visible: el.visible, disabled: el.disabled, topmost: el.isTopMostAtCenter,
+          };
+        }
+      }
       this.integrations.traceWriter?.write({
         iteration: this.blackboard.getRounds().length,
         stage: 'command_execution',
@@ -1420,6 +1477,10 @@ export class CommandExecutor {
           done: result.done,
           blocked: result.blocked,
           durationMs,
+          // No-effect signal: did the action change the page? (mutating cmds only)
+          // undefined when not applicable / signature unavailable.
+          domChanged,
+          targetElement,
         },
       });
     } catch {

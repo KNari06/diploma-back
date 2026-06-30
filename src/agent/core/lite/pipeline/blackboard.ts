@@ -301,6 +301,21 @@ export class TestBlackboard {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // NO-PROGRESS COUNTER (set by TestPipeline from same-state detection).
+  // Number of consecutive rounds where the page state did NOT meaningfully
+  // change. Read by the Reviewer to escalate from "retry same action" to
+  // "the action has no effect — pivot or report_blocked" instead of looping.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setNoProgressRounds(n: number): void {
+    this.state.noProgressRounds = n;
+  }
+
+  getNoProgressRounds(): number {
+    return this.state.noProgressRounds ?? 0;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // PR-HYBRID: SUPERVISOR BLACKBOARD (written by TestPipeline per round,
   // read by CommandExecutor for forbidden-action enforcement)
   // ═══════════════════════════════════════════════════════════════════════
