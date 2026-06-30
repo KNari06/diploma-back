@@ -26,7 +26,22 @@ export const LOGIN_URL_PATTERNS: readonly RegExp[] = [
   /\/sso/i,
 ];
 
+/**
+ * Auth/identity HOST prefixes. Many apps host login on a dedicated subdomain
+ * with a non-auth path (e.g. `account.bi.group/?backUrl=…`, `auth.example.com/`),
+ * so the path-only patterns above miss them. A redirect to such a host mid-flow
+ * is a strong "you must log in" signal. Matched against the hostname only.
+ */
+const AUTH_HOST_PREFIXES = ['account.', 'accounts.', 'auth.', 'login.', 'signin.', 'id.', 'sso.'];
+
 /** True if the URL (or pathname) looks like a login/auth page. */
 export function isLoginUrl(url: string): boolean {
-  return LOGIN_URL_PATTERNS.some((pattern) => pattern.test(url));
+  if (LOGIN_URL_PATTERNS.some((pattern) => pattern.test(url))) return true;
+  // Host-based: a dedicated auth subdomain even when the path is just "/".
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return AUTH_HOST_PREFIXES.some((p) => host.startsWith(p));
+  } catch {
+    return false; // not a full URL (e.g. a bare pathname) → path check above already ran
+  }
 }

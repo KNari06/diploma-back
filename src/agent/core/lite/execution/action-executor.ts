@@ -1373,6 +1373,34 @@ export class ActionExecutor {
     locator: Locator,
     options?: ExecuteOptions & { targetRef?: string; stage1Timeout?: number }
   ): Promise<{ usedForce: boolean; blockerInfo?: BlockerInfo }> {
+    // Stage 0: LIVE fast-fail probes. The snapshot-based checkRefExists can be
+    // STALE by click time — the DOM changed after the snapshot — so two cases
+    // otherwise burn the full 15-20s Playwright retry and then fail anyway:
+    //   (a) ref no longer in the DOM  → "waiting for locator" for 15s
+    //   (b) element present but disabled → "waiting to be enabled" (29× observed)
+    // A couple of instant/cheap live probes let us fail in ~300ms with an
+    // actionable message so the planner replans instead of re-queuing a dead
+    // click. Fail-soft: probe errors fall through to the normal click.
+    try {
+      // (a) Stale ref — element gone from the live DOM. count() is instant.
+      if ((await locator.count()) === 0) {
+        throw new Error('stale ref — element no longer present in the DOM; re-observe the page and pick a current element');
+      }
+      // (b) Present but disabled.
+      if (await locator.isDisabled({ timeout: 300 })) {
+        throw new Error(
+          'element is disabled — a required field is likely empty or validation is pending; ' +
+          'complete prerequisites first or report blocked',
+        );
+      }
+    } catch (probeErr) {
+      // Re-throw OUR fast-fail errors; swallow probe failures (timeout/detached).
+      const m = probeErr instanceof Error ? probeErr.message : '';
+      if (m.startsWith('stale ref') || m.startsWith('element is disabled')) {
+        throw probeErr;
+      }
+    }
+
     // Stage 1: Normal click. The primary click path passes NAVIGATION_TIMEOUT
     // (15s) so a slow navigation-triggering click isn't cut short and mistaken
     // for an interception; fallback callers keep the shorter FALLBACK_TIMEOUT.

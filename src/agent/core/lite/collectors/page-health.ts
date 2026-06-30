@@ -9,7 +9,7 @@
  * structured verdict that closes two causal links the agents could otherwise
  * never build:
  *
- *   ① HTTP 5xx/4xx on the document  +  thin DOM  ⇒  "server error", not PASS
+ *   ① HTTP 5xx (genuine server failure) on a same-site request  ⇒  not a PASS
  *   ② navigated back to a login URL mid-flow      ⇒  "session lost", not "new page"
  *
  * Pure + deterministic: takes already-collected inputs, returns a verdict.
@@ -25,7 +25,7 @@ import { isSameSite } from '@/utils/security/url-safety';
 export interface PageHealth {
   /** Highest server-error status (>=500) seen in the window, if any. */
   serverErrorStatus?: number;
-  /** A 4xx/5xx on a document/navigation-class request was observed. */
+  /** A genuine server failure (HTTP 5xx) on a same-site request was observed. */
   hasServerError: boolean;
   /** Console errors collected in the window. */
   consoleErrorCount: number;
@@ -34,7 +34,6 @@ export interface PageHealth {
 }
 
 const SERVER_ERROR_MIN = 500;
-const CLIENT_ERROR_MIN = 400;
 
 export interface PageHealthInput {
   /** Network errors observed since the action/round started. */
@@ -65,17 +64,20 @@ export function classifyPageHealth(input: PageHealthInput): PageHealth {
   // A real run is full of third-party 404s/POSTs (amplitude, CDNs, pixel
   // trackers) that are NOT the app under test failing — counting them flagged
   // healthy pages as broken and polluted the Reviewer signal (observed live).
+  // `hasServerError` now means a genuine SERVER failure (5xx) — that is the
+  // signal the Reviewer's deterministic gate acts on. Same-site 4xx (e.g. a
+  // missing promo image at content-sales.<site>/...) is NOT the app failing and
+  // was over-flagging healthy pages as broken; it no longer sets hasServerError.
+  // (Cross-site errors — amplitude, CDNs — are skipped entirely.)
   let serverErrorStatus: number | undefined;
   let hasServerError = false;
   for (const err of networkErrorsSince) {
     if (typeof err.status !== 'number') continue;
-    if (err.status < CLIENT_ERROR_MIN) continue;
+    if (err.status < SERVER_ERROR_MIN) continue; // only 5xx is a real server error
     // Skip third-party / cross-site errors — they aren't this app's failure.
     if (err.url && !isSameSite(err.url, currentUrl)) continue;
     hasServerError = true;
-    if (err.status >= SERVER_ERROR_MIN) {
-      serverErrorStatus = Math.max(serverErrorStatus ?? 0, err.status);
-    }
+    serverErrorStatus = Math.max(serverErrorStatus ?? 0, err.status);
   }
 
   // ② session lost — we MOVED to a login URL from a non-login URL, and this
@@ -111,8 +113,6 @@ export function formatPageHealth(h: PageHealth | undefined): string {
   const lines: string[] = [];
   if (h.serverErrorStatus) {
     lines.push(`- SERVER ERROR: HTTP ${h.serverErrorStatus} — the app failed to respond correctly`);
-  } else if (h.hasServerError) {
-    lines.push(`- request error (4xx) observed on this page`);
   }
   if (h.sessionLost) {
     lines.push(`- SESSION LOST: redirected to a login page mid-flow (likely logged out)`);

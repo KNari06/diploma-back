@@ -26,13 +26,15 @@ describe('classifyPageHealth — server errors', () => {
     expect(h.serverErrorStatus).toBe(503);
   });
 
-  it('marks a 4xx as an error but does not set serverErrorStatus', () => {
+  it('does NOT flag a same-site 4xx as a server error (sub-resource 404 is noise)', () => {
+    // Tightened semantics: only 5xx is a genuine server failure. A 404 on a
+    // missing image / sub-resource was over-flagging healthy pages as broken.
     const h = classifyPageHealth({
       networkErrorsSince: [netErr(404)],
       consoleErrorCount: 0,
       currentUrl: 'https://app.test/x',
     });
-    expect(h.hasServerError).toBe(true);
+    expect(h.hasServerError).toBe(false);
     expect(h.serverErrorStatus).toBeUndefined();
   });
 

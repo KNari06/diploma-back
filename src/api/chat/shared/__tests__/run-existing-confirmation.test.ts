@@ -231,7 +231,9 @@ describe('storePendingRunExisting', () => {
       expect.any(Number),
     );
     expect(reply).toMatch(/Login flow/);
-    expect(reply).toMatch(/yes/i);
+    // Asks a confirmation question (no longer the literal "reply yes" copy —
+    // confirmation is LLM-classified now, so the prompt is phrased naturally).
+    expect(reply).toMatch(/run it\?/i);
   });
 
   it('returns a numbered list for multiple matches', async () => {
