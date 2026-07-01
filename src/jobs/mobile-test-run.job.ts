@@ -135,7 +135,7 @@ export class MobileTestRunJobHandler {
       // in the run-steps call below (matched before the built-in permission
       // policy).
       triggers,
-      // `intent_test_cases.id`. Required for `persistCompiledPlansFromRun`
+      // `intent_test_cases.id`. Required for `CompiledPlanPersistenceService.persistFromRun`
       // to find the test case row and merge per-step compiled plans back
       // into `intent_test_cases.steps_json`. Pre-fix the worker passed
       // `testId` (which is `tests.id`) and the persist silently failed

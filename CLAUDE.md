@@ -126,7 +126,7 @@ POST `/api/v1/regression/run` or `/run-plan`
 → [mobile-test-run.job.ts](src/jobs/mobile-test-run.job.ts) — `MobileTestRunJobHandler.process()`
 → `MobileRunnerClient.runSteps(sessionId, intentSteps, { screenshotEachStep:true })` (REST to qait-mobile-runner)
 → runner returns `RunStepsResult` per-step with screenshot + evidence
-→ `persistCompiledPlansFromRun()` writes compiled plans back to `intent_test_cases.steps_json`
+→ `CompiledPlanPersistenceService.persistFromRun` writes compiled plans back to `intent_test_cases.steps_json`
 → per-step screenshots uploaded base64→URL (`uploadMobileStepScreenshots` in [step-screenshot.service.ts](src/services/storage/step-screenshot.service.ts), gated by `SCREENSHOT_EACH_STEP_ENABLED`) → `runtimeMeta.stepScreenshotUrl` + `metadata.steps[].screenshot`
 → `createTestResult()` inserts into `test_results` with aggregated stats
 → **Phase 2 telemetry** ([20260516_mobile_telemetry.sql](supabase-migrations/20260516_mobile_telemetry.sql)): per-test wallclock (`app_setup_ms`, `scenario_steps_ms`, `test_steps_ms`, `session_claim_ms`, `cold_start_used`) written into `test_executions` in `mobile-test-run.job.ts` finally block; aggregated into `regression_runs.total_*` by `TestCompletionHandlerService.recomputeRunStatus()` at run finalisation. Best-effort, NEVER fails the test path.
@@ -136,7 +136,7 @@ POST `/api/v1/regression/run` or `/run-plan`
 not per-step apply; (2) hardcoded `screenshotEachStep: true`; (3) NO heal layer
 above the runner — mobile relies solely on the runner's per-step retry +
 stabilization-retry tail; (4) compiled-plan persistence happens explicitly via
-`persistCompiledPlansFromRun()` (web persists differently); (5) sessions claimed
+`CompiledPlanPersistenceService.persistFromRun` (web persists differently); (5) sessions claimed
 from a runner-side pool (warmup → cold-start fallback) and released in the
 finally block. See `mobile-test-run.job.ts` for the full lifecycle.
 
