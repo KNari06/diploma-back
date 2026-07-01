@@ -226,8 +226,12 @@ EXECUTION RULES:
 1. If CURRENT PAGE STATE is already provided above, DO NOT call observe_page — you already have the page state. Only call observe_page after navigation/submit or when refs are stale.
 2. Follow the plan steps in order
 3. Plan steps may include element refs like [e1]. Use these refs directly when available. If a ref is stale (element not found), infer from the description and call observe_page to get fresh refs.
-4. You CAN call MULTIPLE commands in one response (batch fill + click together)
-5. After submit/navigation: call wait_for_page then observe_page
+4. BATCH aggressively — issue MULTIPLE commands in ONE response instead of one-at-a-time. This is the fast path; a single command per response wastes a full plan/execute/review cycle.
+   - Forms: fill EVERY field then click submit, all in one response — do NOT observe_page between fills.
+     Example: fill_field(email) + fill_field(password) + toggle_element(consent) + click_element(submit).
+   - Chains: scroll_to_element(ref) + click_element(ref) together; hover_element + click together.
+   - Only the LAST command in a batch may navigate/submit; put non-navigating actions before it.
+5. After a submit/navigation happens: the NEXT response calls wait_for_page then observe_page (one verification per navigation, not per field).
 6. If a command fails, try a different approach
 7. For credential fields: set is_sensitive=true, use any placeholder value
 8. Call mark_done ONLY after verifying goal with observe_page
@@ -235,7 +239,10 @@ EXECUTION RULES:
 10. Use hover_element to reveal tooltips or dropdown menus before interacting
 11. Use scroll_to_element(ref) to bring off-screen elements into view
 12. report_blocked should include blocker_type and can_user_help when possible
-13. If [POST-ACTION] shows PAGE ALERTS with errors — call observe_page to get full page state before deciding next action
+13. Use [POST-ACTION] signals to decide WHETHER to observe — do NOT reflexively observe_page after every command:
+    - [POST-ACTION] empty (no alert, no URL change) → keep batching more commands, no observe needed.
+    - [POST-ACTION] shows a URL change → a navigation happened; next response does wait_for_page + observe_page.
+    - [POST-ACTION] shows validation errors that block progress → THEN call observe_page for the full state.
 14. CRITICAL: If observe_page shows PAGE ALERTS with authentication errors like "Invalid email or password", "Wrong credentials", "Incorrect password", or "Account locked" after a login attempt: call report_blocked with reason="credentials_invalid", blocker_type="auth_failure", can_user_help=true. Do NOT retry — the user-provided credentials are wrong.
 15. CAPTCHA DETECTION: If observe_page shows a checkbox inside an [IFRAME] with empty name (CAPTCHA widget), or if PAGE ALERTS mention "reCAPTCHA", "CAPTCHA", "hCaptcha", "Turnstile", or "bot verification" — immediately call report_blocked with blocker_type="captcha". Do NOT retry form submission.`;
 }
