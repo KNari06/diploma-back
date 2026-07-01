@@ -153,6 +153,7 @@ export class PreflightCheckAgent {
     // later is cleared — the page may have changed and it's live again.
     const failCounts = new Map<string, number>();
     const deterministicDead = new Set<string>();
+    const disabledRefs = new Set<string>();
     const succeededRefs = new Set<string>();
     for (const round of blackboard.getRounds()) {
       for (const cmd of round.commands) {
@@ -166,6 +167,9 @@ export class PreflightCheckAgent {
         if (PreflightCheckAgent.isDeterministicFailure(cmd.result.error)) {
           deterministicDead.add(ref);
         }
+        if (typeof cmd.result.error === 'string' && cmd.result.error.toLowerCase().includes('element is disabled')) {
+          disabledRefs.add(ref);
+        }
       }
     }
 
@@ -177,10 +181,26 @@ export class PreflightCheckAgent {
     );
     if (deadRefs.length === 0) return null;
 
+    // A repeatedly-disabled control (e.g. a Submit button) is NOT a dead end to
+    // abandon — it's gated on an unmet PRECONDITION (empty required field,
+    // pending validation). Steer the Planner to satisfy the prerequisite first,
+    // not to pick a different element. This is the log's top failure (a Submit
+    // ref clicked 9× while disabled). NON-disabled dead refs get the usual
+    // "try a different element" guidance.
+    const disabledDead = deadRefs.filter((ref) => disabledRefs.has(ref));
+    const otherDead = deadRefs.filter((ref) => !disabledRefs.has(ref));
+    if (disabledDead.length > 0 && otherDead.length === 0) {
+      return {
+        verdict: 'revise',
+        reason: `Plan re-targets disabled control(s) that stayed disabled across rounds: ${disabledDead.join(', ')}`,
+        guidance: `${disabledDead.join(', ')} is DISABLED — do NOT keep clicking it. First satisfy its precondition (fill every required field / clear validation errors), THEN target it. If prerequisites are already met and it's still disabled, report_blocked.`,
+      };
+    }
+
     return {
       verdict: 'revise',
       reason: `Plan re-targets ref(s) that already failed and won't succeed on retry: ${deadRefs.join(', ')}`,
-      guidance: `Do NOT reuse ${deadRefs.join(', ')} — they failed before (blocked/not-fillable/not-visible). Choose a DIFFERENT element or path toward the goal.`,
+      guidance: `Do NOT reuse ${otherDead.join(', ') || deadRefs.join(', ')} — they failed before (blocked/not-fillable/not-visible). Choose a DIFFERENT element or path toward the goal.${disabledDead.length ? ` Also, ${disabledDead.join(', ')} is disabled — satisfy its preconditions before clicking.` : ''}`,
     };
   }
 

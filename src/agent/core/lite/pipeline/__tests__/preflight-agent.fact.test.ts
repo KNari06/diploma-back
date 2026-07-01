@@ -130,6 +130,37 @@ describe('PreflightCheckAgent FACT — repeated failures', () => {
   });
 });
 
+describe('PreflightCheckAgent FACT — disabled control (precondition, not dead end)', () => {
+  const disabledErr = 'element is disabled — a required field is likely empty or validation is pending';
+
+  it('after repeated disabled failures, steers to satisfy the precondition (not abandon the button)', async () => {
+    const b = bb();
+    b.setCurrentSnapshot('f', 'https://app.test/', snapshotWithRefs(['e12']));
+    b.addRound(round(1, [{ ref: 'e12', success: false, error: disabledErr }]));
+    b.addRound(round(2, [{ ref: 'e12', success: false, error: disabledErr }]));
+    b.setPlan(planTargeting(['e12']));
+
+    const r = await PreflightCheckAgent.inspect(b);
+    expect(r.verdict).toBe('revise');
+    expect(r.guidance).toMatch(/precondition|required field|disabled/i);
+    // Must NOT tell the agent to pick a different element — the button is right,
+    // the prerequisite is missing.
+    expect(r.guidance).not.toMatch(/different element/i);
+    expect(mockLlm).not.toHaveBeenCalled();
+  });
+
+  it('does NOT flag a control disabled only once (legitimately gated before the form is filled) → go', async () => {
+    const b = bb();
+    b.setCurrentSnapshot('f', 'https://app.test/', snapshotWithRefs(['e12']));
+    b.addRound(round(1, [{ ref: 'e12', success: false, error: disabledErr }]));
+    b.setPlan(planTargeting(['e12']));
+
+    const r = await PreflightCheckAgent.inspect(b);
+    expect(r.verdict).toBe('go'); // one disabled hit is below threshold — normal
+    expect(mockLlm).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('PreflightCheckAgent — fail-open', () => {
   it('returns go when the LLM layer throws (never blocks a flow it could not evaluate)', async () => {
     mockLlm.mockRejectedValue(new Error('network down'));
