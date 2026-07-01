@@ -1,4 +1,35 @@
+// In-memory Redis stub so the cross-replica layer (presence / snapshot / pub-sub)
+// round-trips without a real Redis. Local-socket tests exercise the fast path;
+// presence/relay tests read+assert against this store.
+jest.mock('@/config/infrastructure/queues', () => {
+  const store = new Map<string, string>();
+  return {
+    redisConnection: {
+      __store: store,
+      get: jest.fn((k: string) => Promise.resolve(store.get(k) ?? null)),
+      set: jest.fn((k: string, v: string) => { store.set(k, v); return Promise.resolve('OK'); }),
+      del: jest.fn((k: string) => { store.delete(k); return Promise.resolve(1); }),
+      publish: jest.fn(() => Promise.resolve(1)),
+      // Atomic RELEASE_IF_OWNER used on grace expiry: del presence+snapshot if owned.
+      eval: jest.fn((_script: string, _numKeys: number, presenceKey: string, snapKey: string, owner: string) => {
+        if (store.get(presenceKey) === owner) { store.delete(presenceKey); store.delete(snapKey); return Promise.resolve(1); }
+        return Promise.resolve(0);
+      }),
+      duplicate: () => ({ on: jest.fn(), subscribe: jest.fn(() => Promise.resolve(undefined)) }),
+    },
+  };
+});
+
 import { companionRegistry } from '../companion-registry';
+
+const { redisConnection } = require('@/config/infrastructure/queues') as {
+  redisConnection: { __store: Map<string, string>; get: jest.Mock; set: jest.Mock; del: jest.Mock; publish: jest.Mock; eval: jest.Mock };
+};
+
+// Flush pending microtasks (real timers stay fake) so awaited Redis-mock promises settle.
+async function flush(n = 8): Promise<void> {
+  for (let i = 0; i < n; i++) await Promise.resolve();
+}
 
 type FakeSocket = import('socket.io').Socket & {
   connected: boolean;
@@ -16,6 +47,8 @@ function makeSocket(connected = true): FakeSocket {
 
 beforeEach(() => {
   // Each test gets a clean registry state by using unique user IDs.
+  redisConnection.__store.clear();
+  redisConnection.publish.mockClear();
   jest.useFakeTimers();
 });
 
@@ -24,11 +57,11 @@ afterEach(() => {
 });
 
 describe('CompanionRegistry', () => {
-  it('reports isConnected after register', () => {
+  it('reports isConnected after register', async () => {
     const userId = 'user-reg-1';
     const socket = makeSocket();
     companionRegistry.register(userId, socket);
-    expect(companionRegistry.isConnected(userId)).toBe(true);
+    expect(await companionRegistry.isConnected(userId)).toBe(true);
   });
 
   it('returns the entry via get after register', () => {
@@ -74,7 +107,7 @@ describe('CompanionRegistry', () => {
     expect(companionRegistry.get(userId)?.socket).toBe(socket2);
   });
 
-  it('ignores a stale disconnect after a newer socket registers', () => {
+  it('ignores a stale disconnect after a newer socket registers', async () => {
     const userId = 'user-reconnect-2';
     const socket1 = makeSocket();
     const socket2 = makeSocket();
@@ -86,56 +119,106 @@ describe('CompanionRegistry', () => {
     jest.advanceTimersByTime(30_001);
 
     expect(companionRegistry.get(userId)?.socket).toBe(socket2);
-    expect(companionRegistry.isConnected(userId)).toBe(true);
+    expect(await companionRegistry.isConnected(userId)).toBe(true);
   });
 
-  describe('device snapshot cache', () => {
-    it('returns null snapshot before any is set', () => {
-      expect(companionRegistry.getDeviceSnapshot('user-snap-0')).toBeNull();
+  describe('device snapshot cache (Redis-backed, cross-replica)', () => {
+    it('returns null snapshot before any is set', async () => {
+      expect(await companionRegistry.getDeviceSnapshot('user-snap-0')).toBeNull();
     });
 
-    it('stores and returns the latest device snapshot for a user', () => {
+    it('caches the latest snapshot via forwardDeviceEvent and returns it', async () => {
       const userId = 'user-snap-1';
       const snap = { timestamp: 't1', devices: [{ id: 'd1', source: 'local-physical' }] };
-      companionRegistry.setDeviceSnapshot(userId, snap);
-      expect(companionRegistry.getDeviceSnapshot(userId)).toEqual(snap);
+      companionRegistry.forwardDeviceEvent(userId, 'devices:snapshot', snap);
+      expect(await companionRegistry.getDeviceSnapshot(userId)).toEqual(snap);
     });
 
-    it('overwrites an older snapshot with a newer one', () => {
+    it('overwrites an older snapshot with a newer one', async () => {
       const userId = 'user-snap-2';
-      companionRegistry.setDeviceSnapshot(userId, { timestamp: 't1', devices: [] });
+      companionRegistry.forwardDeviceEvent(userId, 'devices:snapshot', { timestamp: 't1', devices: [] });
       const newer = { timestamp: 't2', devices: [{ id: 'd2' }] };
-      companionRegistry.setDeviceSnapshot(userId, newer);
-      expect(companionRegistry.getDeviceSnapshot(userId)).toEqual(newer);
+      companionRegistry.forwardDeviceEvent(userId, 'devices:snapshot', newer);
+      expect(await companionRegistry.getDeviceSnapshot(userId)).toEqual(newer);
     });
 
-    it('isolates snapshots per user', () => {
-      companionRegistry.setDeviceSnapshot('user-snap-a', { timestamp: 'ta', devices: [] });
-      expect(companionRegistry.getDeviceSnapshot('user-snap-b')).toBeNull();
+    it('isolates snapshots per user', async () => {
+      companionRegistry.forwardDeviceEvent('user-snap-a', 'devices:snapshot', { timestamp: 'ta', devices: [] });
+      expect(await companionRegistry.getDeviceSnapshot('user-snap-b')).toBeNull();
     });
 
-    it('clears the snapshot when the companion fully disconnects after grace', () => {
-      const userId = 'user-snap-3';
-      const socket = makeSocket();
-      companionRegistry.register(userId, socket);
-      companionRegistry.setDeviceSnapshot(userId, { timestamp: 't1', devices: [{ id: 'd1' }] });
-      socket.connected = false;
-      companionRegistry.deregister(userId, socket.id);
-      jest.advanceTimersByTime(30_001);
-      expect(companionRegistry.getDeviceSnapshot(userId)).toBeNull();
+    it('does NOT cache non-snapshot device events, but does fan them out', async () => {
+      const userId = 'user-snap-5';
+      companionRegistry.forwardDeviceEvent(userId, 'device:connected', { id: 'd9' });
+      expect(await companionRegistry.getDeviceSnapshot(userId)).toBeNull();
+      // Every device event is published for cross-replica room fan-out.
+      expect(redisConnection.publish).toHaveBeenCalledWith(
+        'companion:dev',
+        expect.stringContaining('device:connected'),
+      );
+    });
+  });
+
+  describe('cross-replica routing', () => {
+    it('isConnected reflects presence a companion set on ANOTHER replica', async () => {
+      // No local socket; presence written by a different instance.
+      redisConnection.__store.set('companion:presence:user-remote-1', 'other-instance-id');
+      expect(await companionRegistry.isConnected('user-remote-1')).toBe(true);
+      expect(await companionRegistry.isConnected('user-remote-none')).toBe(false);
     });
 
-    it('keeps the snapshot through a within-grace reconnect', () => {
-      const userId = 'user-snap-4';
-      const socket1 = makeSocket();
-      const socket2 = makeSocket();
-      companionRegistry.register(userId, socket1);
-      companionRegistry.setDeviceSnapshot(userId, { timestamp: 't1', devices: [{ id: 'd1' }] });
-      socket1.connected = false;
-      companionRegistry.deregister(userId, socket1.id);
-      companionRegistry.register(userId, socket2);
-      jest.advanceTimersByTime(30_001);
-      expect(companionRegistry.getDeviceSnapshot(userId)).toEqual({ timestamp: 't1', devices: [{ id: 'd1' }] });
+    it('relays proxyRequest to the socket-holding replica when the companion is remote', async () => {
+      const userId = 'user-remote-2';
+      // Companion socketed on another replica → presence points there, no local entry.
+      redisConnection.__store.set(`companion:presence:${userId}`, 'replica-B');
+
+      const p = companionRegistry.proxyRequest(userId, 'POST', '/api/runs/s1/run-steps', { a: 1 });
+      p.catch(() => {}); // it will time out here (no subscriber to answer) — we only assert the relay
+
+      // Let ensureSubscriber + the async presence lookup + publish run.
+      await flush();
+
+      expect(redisConnection.publish).toHaveBeenCalledWith(
+        'companion:req:replica-B',
+        expect.stringContaining('"originInstance"'),
+      );
+      const call = redisConnection.publish.mock.calls.find((c) => c[0] === 'companion:req:replica-B');
+      expect(JSON.parse(call![1] as string)).toMatchObject({
+        userId,
+        request: { method: 'POST', path: '/api/runs/s1/run-steps' },
+      });
+    });
+
+    // Regression: a socket migrating replicas mid-run must be transparent, not a
+    // terminal failure. RELAY_MOVED → re-look up presence + re-relay (bounded).
+    it('retries a cross-replica request when the target replies RELAY_MOVED', async () => {
+      const userId = 'user-remote-3';
+      redisConnection.__store.set(`companion:presence:${userId}`, 'replica-X');
+
+      const p = companionRegistry.proxyRequest(userId, 'POST', '/api/runs/s1/run-steps', {});
+      p.catch(() => {});
+      await flush();
+
+      // First relay went out; grab its requestId and simulate a RELAY_MOVED reply.
+      const first = redisConnection.publish.mock.calls.find((c) => c[0] === 'companion:req:replica-X');
+      const req1 = JSON.parse(first![1] as string) as { requestId: string };
+      companionRegistry.resolveRpc(req1.requestId, userId, {
+        status: 0, ok: false, body: { code: 'RELAY_MOVED' },
+      });
+
+      // Retry waits RELAY_RETRY_DELAY_MS (250) then re-relays a NEW request.
+      await flush();
+      jest.advanceTimersByTime(300);
+      await flush();
+
+      const relayCalls = redisConnection.publish.mock.calls.filter((c) => c[0] === 'companion:req:replica-X');
+      expect(relayCalls.length).toBeGreaterThanOrEqual(2); // re-relayed, not surfaced as terminal
+      const req2 = JSON.parse(relayCalls[relayCalls.length - 1][1] as string) as { requestId: string };
+      expect(req2.requestId).not.toBe(req1.requestId); // fresh request on retry
+
+      // Second attempt succeeds → proxyRequest resolves with it.
+      companionRegistry.resolveRpc(req2.requestId, userId, { status: 200, ok: true, body: { ok: true } });
+      await expect(p).resolves.toEqual({ status: 200, ok: true, body: { ok: true } });
     });
   });
 
@@ -199,6 +282,7 @@ describe('CompanionRegistry', () => {
     companionRegistry.deregister(userId, socket1.id);
 
     const responsePromise = companionRegistry.proxyRequest(userId, 'GET', '/api/health');
+    await flush(); // the queued pending is established after the async presence lookup
     expect(socket1.emit).not.toHaveBeenCalled();
 
     companionRegistry.register(userId, socket2);
@@ -277,6 +361,7 @@ describe('CompanionRegistry', () => {
     companionRegistry.deregister(userId, socket.id);
 
     const responsePromise = companionRegistry.proxyRequest(userId, 'GET', '/api/health');
+    await flush(); // establish the queued pending before grace expires
     expect(socket.emit).not.toHaveBeenCalled();
 
     jest.advanceTimersByTime(30_001);

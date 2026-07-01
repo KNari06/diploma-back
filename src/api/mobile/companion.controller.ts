@@ -19,8 +19,8 @@ export async function generatePairingCode(req: Request, res: Response): Promise<
 // and bootstrap its device picker from the last forwarded device snapshot.
 export async function getCompanionStatus(req: Request, res: Response): Promise<void> {
   const userId = req.user!.id;
-  const connected = companionRegistry.isConnected(userId);
-  const snapshot = connected ? companionRegistry.getDeviceSnapshot(userId) : null;
+  const connected = await companionRegistry.isConnected(userId);
+  const snapshot = connected ? await companionRegistry.getDeviceSnapshot(userId) : null;
   res.json({ connected, snapshot });
 }
 

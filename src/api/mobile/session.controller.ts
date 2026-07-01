@@ -494,7 +494,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     && wantsPhysicalOrAuto;
   const useCompanionRunner = companionRequested
     && CompanionFeature.isEnabled()
-    && companionRegistry.isConnected(userId);
+    && await companionRegistry.isConnected(userId);
   if (useCompanionRunner) {
     logger.info('[MOBILE_SESSION] warmup routing through connected companion', {
       userId,
