@@ -78,6 +78,22 @@ export interface ExecuteOptions {
   activeFrame?: import('playwright').Frame;
 }
 
+/**
+ * Timeout profile for action waits. 'default' preserves the long, human-facing
+ * waits used by the AI editor / live preview. 'fast' is for autonomous
+ * exploration where no human is watching and a dead action must fail in seconds
+ * instead of walking the whole self-heal ladder at full timeout (~53s observed).
+ */
+export type ActionTimeoutProfile = 'default' | 'fast';
+
+const TIMEOUT_PROFILES: Record<ActionTimeoutProfile, { default: number; navigation: number; fallback: number }> = {
+  // Editor / preview — unchanged from the original hardcoded values.
+  default: { default: 10_000, navigation: 15_000, fallback: 8_000 },
+  // Exploration — balanced fail-fast: a dead 5-stage click drops from ~53s to
+  // ~18s while a genuinely slow-but-live element on a sluggish site still lands.
+  fast: { default: 4_000, navigation: 6_000, fallback: 3_000 },
+};
+
 export class ActionExecutor {
   private page: Page;
   private elementMap: Map<string, ElementInfo> = new Map();
@@ -101,17 +117,29 @@ export class ActionExecutor {
   /** Test ID for safety-decision audit log entries. */
   private testId?: string;
 
-  // ✅ FIX: Configurable timeouts for different action types
-  private readonly DEFAULT_TIMEOUT = 10000; // 10s for most actions (increased from 5s)
-  private readonly NAVIGATION_TIMEOUT = 15000; // 15s for actions that may trigger navigation
-  private readonly FALLBACK_TIMEOUT = 8000; // 8s for fallback attempts
+  // Action timeouts. Set from the timeout profile in the constructor — the
+  // 'staged self-heal' click walks up to 5 stages, each waiting a full timeout,
+  // so on a DEAD element these compound (default profile ≈ 53s observed).
+  //   - 'default' (AI editor / live preview): a human is watching and forms can
+  //     be genuinely slow, so we wait long before giving up. Unchanged behaviour.
+  //   - 'fast' (autonomous exploration): no human waiting; a dead action should
+  //     fail in seconds, not burn ~53s of the run's budget walking the ladder.
+  // The self-heal STAGES are unchanged — only how long each waits before the
+  // next tries. Values named/centralized here, never inlined (see TIMEOUT_PROFILES).
+  private readonly DEFAULT_TIMEOUT: number;
+  private readonly NAVIGATION_TIMEOUT: number;
+  private readonly FALLBACK_TIMEOUT: number;
 
   // ✅ REMOVED: Hardcoded ENTRY_POINT_KEYWORDS
   // Now passed dynamically via execute() options from GoalDetector's AI-generated strategy
 
-  constructor(page: Page) {
+  constructor(page: Page, options?: { timeoutProfile?: ActionTimeoutProfile }) {
     this.page = page;
     this.currentContext = page;
+    const profile = TIMEOUT_PROFILES[options?.timeoutProfile ?? 'default'];
+    this.DEFAULT_TIMEOUT = profile.default;
+    this.NAVIGATION_TIMEOUT = profile.navigation;
+    this.FALLBACK_TIMEOUT = profile.fallback;
   }
 
   /**

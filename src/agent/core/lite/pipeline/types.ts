@@ -222,6 +222,29 @@ export interface ReviewResult {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PREFLIGHT RESULT (written by PreflightCheck agent, read by TestPipeline)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * PreflightCheck verdict — a PRE-action gate that inspects the Planner's plan
+ * BEFORE the Executor runs it. Reactive review (Reviewer) catches a bad action
+ * only AFTER it burned a round; this catches it before.
+ * - 'go'     → plan is sound, execute it.
+ * - 'revise' → plan is flawed but fixable; replan next round with `guidance`.
+ * - 'block'  → the goal is unreachable / plan is unsafe; stop the flow.
+ */
+export type PreflightVerdict = 'go' | 'revise' | 'block';
+
+export interface PreflightResult {
+  /** Gate decision. */
+  verdict: PreflightVerdict;
+  /** Human-readable reason (surfaced as an insight + trace). */
+  reason: string;
+  /** Guidance for the Planner on how to fix the plan (for 'revise'). */
+  guidance?: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // PIPELINE CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 

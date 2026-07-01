@@ -597,7 +597,7 @@ export class FlowRunner {
       }
 
       // 3. Create pipeline integrations
-      const actionExecutor = new ActionExecutor(page);
+      const actionExecutor = new ActionExecutor(page, { timeoutProfile: 'fast' });
       const networkTracker = new NetworkTracker(page);
       const goalDetector = new GoalDetector(entryPoint.goal, entryPoint.id);
 
@@ -803,7 +803,7 @@ export class FlowRunner {
               // Re-run pipeline from current state
               const retryIntegrations: PipelineIntegrations = {
                 page,
-                actionExecutor: new ActionExecutor(page),
+                actionExecutor: new ActionExecutor(page, { timeoutProfile: 'fast' }),
                 networkTracker: new NetworkTracker(page),
                 goalDetector: new GoalDetector(entryPoint.goal, entryPoint.id),
                 browserContext: context,
@@ -990,7 +990,7 @@ export class FlowRunner {
         });
       } catch { /* non-fatal */ }
 
-      const actionExecutor = new ActionExecutor(page);
+      const actionExecutor = new ActionExecutor(page, { timeoutProfile: 'fast' });
       const networkTracker = new NetworkTracker(page);
 
       const integrations: PipelineIntegrations = {
