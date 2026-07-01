@@ -275,6 +275,19 @@ export class TestBlackboard {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // PRIOR CROSS-FLOW LEARNINGS (set once at pipeline start from config;
+  // read-only summary of sibling flows' accomplishments / blockers + strategy).
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setPriorLearnings(text: string): void {
+    this.state.priorLearnings = text;
+  }
+
+  getPriorLearnings(): string | undefined {
+    return this.state.priorLearnings;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // PAGE HEALTH (written by CommandExecutor per action/round, read by
   // Reviewer prompt + auditDone gate). Best-effort technical-health verdict.
   // ═══════════════════════════════════════════════════════════════════════

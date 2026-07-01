@@ -121,6 +121,12 @@ export interface TestBlackboardState {
   // Reviewer tell "the action had no effect, stop repeating it" from "progressing".
   noProgressRounds?: number;
 
+  // ── Prior cross-flow learnings (set once at pipeline start from config) ──
+  // Compact summary of what OTHER flows already accomplished / got blocked on
+  // + the active strategy focus. Read-only context for the Planner so it reuses
+  // sibling flows' outcomes instead of re-discovering them. Absent for flow #1.
+  priorLearnings?: string;
+
   // ══════════════════════════════════════════════════════════════════════
   // HYBRID EXECUTOR FIELDS (only populated when enableHybridExecutor=true)
   // ══════════════════════════════════════════════════════════════════════
@@ -280,6 +286,15 @@ export interface PipelineConfig {
    * Optional — absent for non-exploration callers.
    */
   pageInsightContext?: string;
+  /**
+   * Condensed cross-flow learnings from OTHER flows in the same exploration:
+   * what's already been accomplished (cookies accepted, logged in), which
+   * categories just got blocked and why, and the active strategy focus. Lets
+   * this flow's Planner skip solved obstacles and avoid a dead end a sibling
+   * flow already hit, instead of re-deriving everything per flow. Optional —
+   * absent for non-exploration callers and for the very first flow.
+   */
+  priorLearnings?: string;
 }
 
 /** Result returned by the pipeline */

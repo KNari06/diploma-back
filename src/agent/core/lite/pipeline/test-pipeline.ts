@@ -166,6 +166,13 @@ export class TestPipeline {
       this.blackboard.setContextualHints([config.pageInsightContext]);
     }
 
+    // Seed cross-flow learnings (what sibling flows accomplished / got blocked
+    // on + active strategy). Read-only, set once — the Planner reuses solved
+    // obstacles instead of re-hitting a dead end another flow already found.
+    if (config.priorLearnings) {
+      this.blackboard.setPriorLearnings(config.priorLearnings);
+    }
+
     // PR-Hybrid: Create SupervisorAgent ONCE per run when hybrid safety is on.
     // State accumulates across all rounds — intervention counts, state hashes,
     // known-good URLs, and per-run Tier 2 budget are never reset mid-run.

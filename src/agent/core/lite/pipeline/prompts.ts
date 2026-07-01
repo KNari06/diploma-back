@@ -56,6 +56,16 @@ export function buildPlannerPrompt(bb: TestBlackboard): string {
     );
   }
 
+  // Page health — technical-health verdict (server error / session lost /
+  // console errors), same signal the Reviewer reads. Without it the Planner
+  // would plan a fresh round against a 500 page / logged-out state and only the
+  // Reviewer would catch it after the fact; here the Planner can go straight to
+  // report_blocked instead of burning a round.
+  const plannerHealth = formatPageHealth(bb.getPageHealth());
+  if (plannerHealth) {
+    sections.push(`PAGE HEALTH:\n${plannerHealth}`);
+  }
+
   // Credential hint
   if (bb.getHasCredentials()) {
     sections.push(`CREDENTIALS: Available. Plan to fill credential fields (email/username, password) using the fill_field command with is_sensitive=true.`);
@@ -93,6 +103,15 @@ export function buildPlannerPrompt(bb: TestBlackboard): string {
     sections.push(`CONTEXTUAL HINTS:\n${contextualHints.join('\n')}`);
   }
 
+  // Cross-flow learnings from OTHER flows in this exploration (accomplishments
+  // already done, categories that got blocked + why, active strategy focus).
+  // Read-only context — lets the Planner skip solved obstacles and steer clear
+  // of a dead end a sibling flow already hit, instead of re-deriving per flow.
+  const priorLearnings = bb.getPriorLearnings();
+  if (priorLearnings) {
+    sections.push(`LEARNINGS FROM OTHER FLOWS (context — do NOT redo what's done, avoid known blockers):\n${priorLearnings}`);
+  }
+
   // Shared team insights
   if (insights.length > 0) {
     sections.push(`TEAM INSIGHTS:\n${insights.map((i, idx) => `  ${idx + 1}. ${i}`).join('\n')}`);
@@ -106,6 +125,10 @@ INSTRUCTIONS:
 - Analyze the page structure: forms, buttons, links, modals, errors
 - Create concrete steps in DOM order (top-to-bottom for form fields)
 - For forms: list each field to fill, then the submit action
+- If the goal targets a form BUT CURRENT PAGE STATE does not yet list the form's
+  fields (only a container or a trigger button is visible), make the FIRST step
+  observe_page (or a click/scroll that reveals the form) so the next plan can
+  target the real field refs — do NOT invent field steps against refs you cannot see
 - If replanning after failure: adjust the approach based on reviewer feedback
 - Keep steps concise and actionable
 - If PROGRESS is low AND few rounds remain: do NOT repeat a failed approach — try a

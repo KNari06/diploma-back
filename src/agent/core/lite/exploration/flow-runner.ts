@@ -81,6 +81,12 @@ const FLOW_NAV_WAIT_UNTIL = 'load' as const;
 const PAGE_INSIGHT_MAX_ITEMS_PER_LIST = 4;
 const PAGE_INSIGHT_MAX_CHARS = 300;
 
+// Cross-flow learnings slice handed to each flow's Planner. Kept tight so it
+// stays a useful signal, not prompt bloat (recency-ordered, capped both ways).
+const PRIOR_LEARNINGS_MAX_ACCOMPLISHMENTS = 5;
+const PRIOR_LEARNINGS_MAX_BLOCKERS = 4;
+const PRIOR_LEARNINGS_MAX_CHARS = 500;
+
 // Step-extraction (rounds → DiscoveredStep + compiled plans) now lives in the
 // shared pipeline-step-extractor so the editor iterative-authoring service
 // builds steps identically. Re-export the gate constants for backward compat
@@ -622,6 +628,9 @@ export class FlowRunner {
         // Hand the Planner the Cartographer's understanding of this page so it
         // plans against known forms/entities instead of re-deriving from DOM.
         pageInsightContext: this.formatPageInsightContext(page.url()),
+        // Cross-flow memory: what sibling flows accomplished / got blocked on +
+        // strategy focus, so the Planner reuses their outcomes (invariant #10 safe).
+        priorLearnings: this.formatPriorLearnings(),
       };
 
       this.trace?.writeFlowPipelineStart({
@@ -813,6 +822,7 @@ export class FlowRunner {
                 // and the Planner keeps its page understanding on retry too.
                 flowIsAuth: entryPoint.category === 'authentication',
                 pageInsightContext: this.formatPageInsightContext(page.url()),
+                priorLearnings: this.formatPriorLearnings(),
               };
               const retryStartTime = Date.now();
               const retryNetworkTracker = retryIntegrations.networkTracker;
@@ -1376,6 +1386,51 @@ export class FlowRunner {
     // (CLAUDE.md invariant #10 — the insight is page-derived, LLM-facing text).
     const text = redactCredentialValues(parts.join(' | '), this.config.credentials);
     return text.length > PAGE_INSIGHT_MAX_CHARS ? text.slice(0, PAGE_INSIGHT_MAX_CHARS) : text;
+  }
+
+  /**
+   * Condense what OTHER flows in this exploration already learned into a short,
+   * Planner-facing slice: recent accomplishments (cookies accepted, logged in),
+   * the most recent blockers per category (so this flow doesn't re-hit a dead
+   * end), and the active strategy focus. Returns undefined for the first flow
+   * (nothing learned yet) or when there's no blackboard. Recency-ordered and
+   * capped both ways so it's a signal, not prompt bloat. Credential-redacted
+   * (invariant #10 — accomplishments/blocker reasons are LLM-facing text).
+   */
+  private formatPriorLearnings(): string | undefined {
+    if (!this.blackboard) return undefined;
+    const parts: string[] = [];
+
+    // Active strategy focus (one line — what the Strategist told everyone to prioritise).
+    const focus = this.blackboard.currentStrategy?.focusAreas;
+    if (focus?.length) {
+      parts.push(`Strategy focus: ${focus.slice(0, PAGE_INSIGHT_MAX_ITEMS_PER_LIST).join(', ')}`);
+    }
+
+    // Recent accomplishments — most recent last in the array, so take the tail.
+    const accomplishments = this.blackboard.workingMemory?.accomplishments ?? [];
+    if (accomplishments.length) {
+      const recent = accomplishments.slice(-PRIOR_LEARNINGS_MAX_ACCOMPLISHMENTS);
+      parts.push(`Already done by earlier flows: ${recent.join('; ')}`);
+    }
+
+    // Most recent blocked flows + reason (dedup by category — one dead end per
+    // category is enough signal; repeating them just eats the budget).
+    const blockedByCategory = new Map<string, string>();
+    for (const flow of this.blackboard.completedFlows) {
+      if (flow.status !== 'blocked' || !flow.blockedReason) continue;
+      blockedByCategory.set(flow.category, flow.blockedReason); // keep-last = most recent
+    }
+    if (blockedByCategory.size) {
+      const blockers = Array.from(blockedByCategory.entries())
+        .slice(-PRIOR_LEARNINGS_MAX_BLOCKERS)
+        .map(([cat, reason]) => `${cat}: ${reason}`);
+      parts.push(`Blockers other flows hit: ${blockers.join(' | ')}`);
+    }
+
+    if (!parts.length) return undefined;
+    const text = redactCredentialValues(parts.join('\n'), this.config.credentials);
+    return text.length > PRIOR_LEARNINGS_MAX_CHARS ? text.slice(0, PRIOR_LEARNINGS_MAX_CHARS) : text;
   }
 
   private normalizeUrl(url: string): string {

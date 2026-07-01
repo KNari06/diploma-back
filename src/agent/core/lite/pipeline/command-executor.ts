@@ -83,6 +83,20 @@ const SENSITIVE_VALUE_PLACEHOLDER = '[SENSITIVE]';
 const OBSERVE_CONSOLE_ERROR_LIMIT = 3;
 
 /**
+ * Vision escalation (observe_page). The per-flow agents read a TEXT render of
+ * the DOM — blind to canvas/SVG widgets, image-only controls, and "why is the
+ * page stuck". When a trigger fires we take ONE screenshot and enrich the
+ * snapshot with a VISION section. Vision calls are ~5-10x the cost/latency of a
+ * text round, so this is strictly rate-limited and never runs on ordinary pages.
+ */
+/** Min rounds between two vision escalations on the same flow (cooldown). */
+const VISION_ESCALATION_COOLDOWN_ROUNDS = 2;
+/** Hard cap on vision escalations per flow — a backstop against cost blow-up. */
+const VISION_ESCALATION_MAX_PER_FLOW = 3;
+/** No-progress rounds that, on their own, justify a vision look ("stuck, DOM can't explain why"). */
+const VISION_ESCALATION_NO_PROGRESS_ROUNDS = 2;
+
+/**
  * PR-Hybrid: Build a preliminary AICommand from tool-call args. Used by
  * runSafetyInterceptor to validate the shape before dispatch. Returns
  * null for non-ref commands or malformed args.
@@ -192,6 +206,11 @@ export class CommandExecutor {
    */
   private lastHealthCheckTs = Date.now();
 
+  /** How many vision escalations this flow has spent (capped at VISION_ESCALATION_MAX_PER_FLOW). */
+  private visionEscalationCount = 0;
+  /** Round index of the last vision escalation, for the cooldown gate. -Infinity = never. */
+  private lastVisionEscalationRound = -Infinity;
+
   constructor(
     private page: Page,
     private actionExecutor: ActionExecutor,
@@ -260,6 +279,101 @@ export class CommandExecutor {
     } catch {
       return '';
     }
+  }
+
+  /**
+   * Decide whether THIS observe_page should spend a vision look, given the
+   * snapshot we just took. The per-flow agents read a text render of the DOM;
+   * a screenshot only earns its cost when the text is likely misleading:
+   *   - the snapshot itself recommends vision (canvas/SVG-heavy or thin DOM —
+   *     SnapshotCollector already computes this in metadata.recommendVision), OR
+   *   - the flow has made no progress for a couple of rounds (the DOM can't
+   *     explain why it's stuck; a picture might).
+   * Guarded by a per-flow cap + a cooldown so a stuck loop can't fire vision
+   * every round. Pure/read-only — never throws.
+   */
+  private shouldEscalateToVision(snapshot: LiteSnapshot): boolean {
+    if (this.visionEscalationCount >= VISION_ESCALATION_MAX_PER_FLOW) return false;
+    const currentRound = this.blackboard.getRounds().length;
+    if (currentRound - this.lastVisionEscalationRound < VISION_ESCALATION_COOLDOWN_ROUNDS) return false;
+
+    const domRecommends = snapshot.metadata?.recommendVision === true;
+    const stuck = this.blackboard.getNoProgressRounds() >= VISION_ESCALATION_NO_PROGRESS_ROUNDS;
+    return domRecommends || stuck;
+  }
+
+  /**
+   * Take ONE screenshot and analyze it with vision, returning a compact prompt
+   * section for the observe_page output. Reuses the same producer LiteEngine's
+   * L5 vision fallback uses (`analyzeScreenshotWithVision`) — no new model call
+   * shape, cost tracking already centralized there. Best-effort: any failure
+   * returns '' and never throws (CLAUDE.md invariant #11). The caller only
+   * invokes this after shouldEscalateToVision() has gated on cost.
+   */
+  private async collectVisionInsight(snapshot: LiteSnapshot): Promise<string> {
+    try {
+      this.visionEscalationCount += 1;
+      this.lastVisionEscalationRound = this.blackboard.getRounds().length;
+
+      const screenshot = await this.page.screenshot({ type: 'png' });
+      const base64 = screenshot.toString('base64');
+
+      const { analyzeScreenshotWithVision } = await import('@/services/ai/analysis/vision-analyzer.service');
+      const analysis = await analyzeScreenshotWithVision(base64, {
+        scope: this.blackboard.getGoal(),
+        url: snapshot.url,
+      });
+
+      const body = this.formatVisionInsight(analysis);
+      if (!body) return '';
+
+      this.integrations.traceWriter?.write({
+        stage: 'flow',
+        eventType: 'vision_escalation',
+        spanId: this.integrations.traceWriter.generateSpanId(),
+        payload: {
+          entryPointId: this.config.entryPointId,
+          url: snapshot.url,
+          round: this.lastVisionEscalationRound,
+          reason: snapshot.metadata?.recommendVision === true ? 'dom_weak_or_visual' : 'no_progress',
+          escalationCount: this.visionEscalationCount,
+          pageType: analysis.pageType,
+          elementsSeen: analysis.elements.length,
+          modalsSeen: analysis.modals?.length ?? 0,
+        },
+      });
+
+      return `\n${body}`;
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Render a vision analysis into a compact, credential-safe VISION section.
+   * Only surfaces what the text DOM tends to miss: CTAs / form fields the
+   * screenshot shows, active modals, and the layout. Returns '' when vision
+   * found nothing useful, so a failed/empty look adds no noise to the prompt.
+   */
+  private formatVisionInsight(
+    analysis: Awaited<ReturnType<typeof import('@/services/ai/analysis/vision-analyzer.service').analyzeScreenshotWithVision>>,
+  ): string {
+    const buttons = analysis.elements.filter((e) => e.isCTA).map((e) => `"${e.text}" (${e.location})`);
+    const fields = analysis.elements.filter((e) => e.type === 'input').map((e) => `${e.text || e.purpose} (${e.type})`);
+    const modal = analysis.modals?.[0];
+
+    const lines: string[] = [];
+    if (buttons.length) lines.push(`Visible buttons: ${buttons.join(', ')}`);
+    if (fields.length) lines.push(`Form fields: ${fields.join(', ')}`);
+    if (modal) lines.push(`Active modal: ${modal.description}${modal.hasCloseButton ? ' (has close button)' : ''}`);
+    if (analysis.layout && analysis.layout !== 'Unknown layout') lines.push(`Layout: ${analysis.layout}`);
+    if (!lines.length) return '';
+
+    // Vision text can echo whatever the page renders — redact any credential
+    // value before it reaches the LLM prompt / JSONL trace (invariant #10).
+    return this.redactCredentials(
+      `VISION (DOM was weak or the flow was stuck, so a screenshot was analyzed):\n${lines.join('\n')}`,
+    );
   }
 
   /**
@@ -542,6 +656,13 @@ export class CommandExecutor {
       // (e.g. HTTP 500 + thin DOM ⇒ server broke, not goal achieved).
       const healthInfo = this.collectPageHealth(previousUrl, snapshot.url);
 
+      // Vision escalation: only when the text DOM is likely misleading
+      // (canvas/SVG-heavy, thin DOM) or the flow is stuck. Gated on a per-flow
+      // cap + cooldown so it never runs on ordinary pages. Best-effort → ''.
+      const visionInfo = this.shouldEscalateToVision(snapshot)
+        ? await this.collectVisionInsight(snapshot)
+        : '';
+
       // Emit graph page node for page observation
       if (this.integrations.graphBuilder) {
         try {
@@ -568,7 +689,7 @@ export class CommandExecutor {
 
       return {
         success: true,
-        output: formatted + progressInfo + networkInfo + consoleInfo + healthInfo,
+        output: formatted + progressInfo + networkInfo + consoleInfo + healthInfo + visionInfo,
       };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
