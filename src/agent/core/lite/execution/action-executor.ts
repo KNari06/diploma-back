@@ -468,6 +468,19 @@ export class ActionExecutor {
           (el) => (el as HTMLInputElement).type?.toLowerCase() || ''
         ).catch(() => '');
 
+        // Guard: never `fill` a checkbox/radio — Playwright waits the full
+        // timeout ("element is not editable") then fails anyway. This fires
+        // when a stale ref that was a text/tel input at snapshot time now
+        // resolves to a consent checkbox after a re-render (observed: a phone
+        // value filled into `agreeToProcessing`). Fail fast with a message that
+        // tells the agent to use toggle_element instead of re-queuing the fill.
+        if (inputType === 'checkbox' || inputType === 'radio') {
+          throw new Error(
+            `cannot fill a ${inputType} — this is a toggle control, not a text field; ` +
+            'use toggle_element, and re-observe if you meant a different (text/tel) input',
+          );
+        }
+
         if (inputType === 'range') {
           // Range inputs: fill()/pressSequentially() don't work — use evaluate
           logger.debug('[ACTION_EXECUTOR] Detected range input, using evaluate to set value');

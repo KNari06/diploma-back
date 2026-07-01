@@ -420,7 +420,10 @@ export class FlowRunner {
         task.status = 'blocked';
         task.blockedReason = 'CAPTCHA required';
         task.canUserHelp = true;
-      } else if (lowerErr.includes('2fa') || lowerErr.includes('two-factor') || lowerErr.includes('verification code') || lowerErr.includes('otp')) {
+        // 2FA — strong authenticator-2FA anchors only. "verification code"/"otp"
+        // are ambiguous (SMS/phone confirmation, password recovery) and were
+        // mislabelling those as 2FA. Kept in sync with extractBlockerInfo below.
+      } else if (lowerErr.includes('2fa') || lowerErr.includes('two-factor') || lowerErr.includes('two factor') || lowerErr.includes('authenticator') || lowerErr.includes('totp')) {
         task.blockerType = '2fa';
         task.status = 'blocked';
         task.blockedReason = '2FA verification required';
@@ -1213,7 +1216,13 @@ export class FlowRunner {
       return { type: 'captcha', canUserHelp: true };
     }
 
-    if (searchText.includes('2fa') || searchText.includes('two-factor') || searchText.includes('verification code') || searchText.includes('authenticator'))
+    // 2FA — match only STRONG authenticator-2FA anchors. "verification code" /
+    // "otp" alone are ambiguous: SMS/phone-confirmation and password-recovery
+    // flows use them too, and mislabelling those as "2FA" showed a confusing
+    // "2FA verification required" modal on sites that have no 2FA. A generic
+    // code the agent can't obtain still blocks the flow — as a truthful
+    // 'other' (user-help), not a wrong 2FA label.
+    if (searchText.includes('2fa') || searchText.includes('two-factor') || searchText.includes('two factor') || searchText.includes('authenticator') || searchText.includes('totp'))
       return { type: '2fa', canUserHelp: true };
     if (searchText.includes('payment') || searchText.includes('credit card') || searchText.includes('stripe'))
       return { type: 'payment', canUserHelp: false };
