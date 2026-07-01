@@ -27,6 +27,10 @@ export interface PageHealth {
   serverErrorStatus?: number;
   /** A genuine server failure (HTTP 5xx) on a same-site request was observed. */
   hasServerError: boolean;
+  /** The site throttled us (HTTP 429) on a same-site request. NOT a server
+   *  failure — the app is alive and asking us to slow down. Distinct from
+   *  hasServerError so the reaction differs (back off, don't declare "broken"). */
+  rateLimited: boolean;
   /** Console errors collected in the window. */
   consoleErrorCount: number;
   /** Flow landed on a login/auth URL after starting elsewhere (logged out). */
@@ -34,6 +38,7 @@ export interface PageHealth {
 }
 
 const SERVER_ERROR_MIN = 500;
+const RATE_LIMIT_STATUS = 429;
 
 export interface PageHealthInput {
   /** Network errors observed since the action/round started. */
@@ -71,11 +76,18 @@ export function classifyPageHealth(input: PageHealthInput): PageHealth {
   // (Cross-site errors — amplitude, CDNs — are skipped entirely.)
   let serverErrorStatus: number | undefined;
   let hasServerError = false;
+  let rateLimited = false;
   for (const err of networkErrorsSince) {
     if (typeof err.status !== 'number') continue;
-    if (err.status < SERVER_ERROR_MIN) continue; // only 5xx is a real server error
     // Skip third-party / cross-site errors — they aren't this app's failure.
     if (err.url && !isSameSite(err.url, currentUrl)) continue;
+    // 429 = the site is throttling us. NOT a server failure — handled as its
+    // own signal so the reaction is "back off", not "app is broken".
+    if (err.status === RATE_LIMIT_STATUS) {
+      rateLimited = true;
+      continue;
+    }
+    if (err.status < SERVER_ERROR_MIN) continue; // only 5xx is a real server error
     hasServerError = true;
     serverErrorStatus = Math.max(serverErrorStatus ?? 0, err.status);
   }
@@ -93,6 +105,7 @@ export function classifyPageHealth(input: PageHealthInput): PageHealth {
   return {
     serverErrorStatus,
     hasServerError,
+    rateLimited,
     consoleErrorCount,
     sessionLost,
   };
@@ -101,7 +114,7 @@ export function classifyPageHealth(input: PageHealthInput): PageHealth {
 /** True when the health verdict carries anything worth telling the agents. */
 export function pageHealthHasSignal(h: PageHealth | undefined): h is PageHealth {
   if (!h) return false;
-  return h.hasServerError || h.sessionLost || h.consoleErrorCount > 0;
+  return h.hasServerError || h.rateLimited || h.sessionLost || h.consoleErrorCount > 0;
 }
 
 /**
@@ -113,6 +126,9 @@ export function formatPageHealth(h: PageHealth | undefined): string {
   const lines: string[] = [];
   if (h.serverErrorStatus) {
     lines.push(`- SERVER ERROR: HTTP ${h.serverErrorStatus} — the app failed to respond correctly`);
+  }
+  if (h.rateLimited) {
+    lines.push(`- RATE LIMITED: HTTP 429 — the site is throttling requests. This is NOT an app failure; slow down (wait before retrying), do not treat it as goal failure.`);
   }
   if (h.sessionLost) {
     lines.push(`- SESSION LOST: redirected to a login page mid-flow (likely logged out)`);

@@ -62,6 +62,12 @@ const REVIEWER_CONFIG = {
    * Stops a hard-down server from burning the whole round budget on retries.
    */
   serverErrorBlockAfter: 2,
+  /**
+   * Consecutive rate-limited (HTTP 429) rounds before the gate escalates from
+   * "replan + back off" to "blocked". More lenient than 5xx: throttling often
+   * clears if we simply wait, so we give it more rounds before giving up.
+   */
+  rateLimitBlockAfter: 3,
 } as const;
 
 export class ReviewerAgent {
@@ -78,6 +84,9 @@ export class ReviewerAgent {
    * so a recovered app starts the streak over.
    */
   private static serverErrorStreaks = new WeakMap<TestBlackboard, number>();
+
+  /** Per-blackboard count of CONSECUTIVE rate-limited (429) rounds. */
+  private static rateLimitStreaks = new WeakMap<TestBlackboard, number>();
 
   /** Get cooldown remaining for a specific test (via its blackboard) */
   private static getCooldown(bb: TestBlackboard): number {
@@ -96,6 +105,15 @@ export class ReviewerAgent {
 
   private static setServerErrorStreak(bb: TestBlackboard, value: number): void {
     ReviewerAgent.serverErrorStreaks.set(bb, value);
+  }
+
+  /** Consecutive 429 streak for a specific test (via its blackboard). */
+  private static getRateLimitStreak(bb: TestBlackboard): number {
+    return ReviewerAgent.rateLimitStreaks.get(bb) || 0;
+  }
+
+  private static setRateLimitStreak(bb: TestBlackboard, value: number): void {
+    ReviewerAgent.rateLimitStreaks.set(bb, value);
   }
 
   /**
@@ -153,6 +171,33 @@ export class ReviewerAgent {
     // Clean round (no 5xx): reset the streak so a later transient error starts
     // a fresh count and a recovered app isn't escalated on stale history.
     ReviewerAgent.setServerErrorStreak(blackboard, 0);
+
+    // Rate limited (429): the app is ALIVE but throttling us — not a failure.
+    // Back off and retry; escalate to blocked only if it persists (the site is
+    // refusing us for now). More lenient than 5xx (rateLimitBlockAfter > 5xx).
+    if (health?.rateLimited) {
+      const streak = ReviewerAgent.getRateLimitStreak(blackboard) + 1;
+      ReviewerAgent.setRateLimitStreak(blackboard, streak);
+      const escalate = streak >= REVIEWER_CONFIG.rateLimitBlockAfter;
+      const result: ReviewResult = escalate
+        ? {
+            verdict: 'blocked',
+            reason: `Rate limited (HTTP 429) for ${streak} rounds — the site keeps throttling; goal not achievable right now`,
+            goalAlignment: 0,
+          }
+        : {
+            verdict: 'replan',
+            reason: `Rate limited (HTTP 429) — the site is throttling requests, not failing`,
+            goalAlignment: blackboard.getProgressScore() / 100,
+            guidance: 'The site returned HTTP 429 (too many requests). Wait before retrying and slow the pace — do NOT treat this as goal failure or keep hammering the same action.',
+          };
+      ReviewerAgent.trace(traceWriter, 'reviewer_fast_path', {
+        round, path: 'health_rate_limited', verdict: result.verdict, streak,
+      });
+      return result;
+    }
+    ReviewerAgent.setRateLimitStreak(blackboard, 0);
+
     if (health?.sessionLost) {
       logger.debug('[REVIEWER] Health gate: session lost → blocked');
       const result: ReviewResult = {

@@ -50,6 +50,40 @@ describe('classifyPageHealth — server errors', () => {
   });
 });
 
+describe('classifyPageHealth — rate limiting (429)', () => {
+  it('flags a same-site 429 as rateLimited, NOT as a server error', () => {
+    const h = classifyPageHealth({
+      networkErrorsSince: [netErr(429)],
+      consoleErrorCount: 0,
+      currentUrl: 'https://app.test/x',
+    });
+    expect(h.rateLimited).toBe(true);
+    expect(h.hasServerError).toBe(false); // 429 must not be mistaken for a 5xx
+    expect(pageHealthHasSignal(h)).toBe(true);
+    expect(formatPageHealth(h)).toMatch(/429|throttl/i);
+  });
+
+  it('ignores a cross-site 429 (third-party throttling is not the app under test)', () => {
+    const h = classifyPageHealth({
+      networkErrorsSince: [netErr(429, 'https://analytics.other.com/e')],
+      consoleErrorCount: 0,
+      currentUrl: 'https://app.test/x',
+    });
+    expect(h.rateLimited).toBe(false);
+  });
+
+  it('reports both a 429 and a 5xx independently when both occur', () => {
+    const h = classifyPageHealth({
+      networkErrorsSince: [netErr(429), netErr(500)],
+      consoleErrorCount: 0,
+      currentUrl: 'https://app.test/x',
+    });
+    expect(h.rateLimited).toBe(true);
+    expect(h.hasServerError).toBe(true);
+    expect(h.serverErrorStatus).toBe(500);
+  });
+});
+
 describe('classifyPageHealth — third-party noise filtering (same-site only)', () => {
   it('IGNORES a cross-site analytics/CDN error (not the app under test)', () => {
     // Reproduces the live bug: amplitude/CDN 404s flagged a healthy page broken.

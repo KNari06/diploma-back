@@ -17,6 +17,7 @@ function bbWithHealth(health: PageHealth | undefined): TestBlackboard {
 const serverError = (status = 500): PageHealth => ({
   serverErrorStatus: status,
   hasServerError: true,
+  rateLimited: false,
   consoleErrorCount: 0,
   sessionLost: false,
 });
@@ -54,10 +55,45 @@ describe('ReviewerAgent health gate — server error escalation', () => {
   });
 });
 
+const rateLimited = (): PageHealth => ({
+  hasServerError: false,
+  rateLimited: true,
+  consoleErrorCount: 0,
+  sessionLost: false,
+});
+
+describe('ReviewerAgent health gate — rate limit (429)', () => {
+  it('returns replan (back off), NOT blocked, on the first 429 round', async () => {
+    const bb = bbWithHealth(rateLimited());
+    const r = await ReviewerAgent.review(bb);
+    expect(r.verdict).toBe('replan');
+    expect(r.reason).toMatch(/429|throttl/i);
+    expect(r.guidance).toMatch(/wait|slow/i);
+  });
+
+  it('escalates to blocked only after the 429 persists past the threshold', async () => {
+    const bb = bbWithHealth(rateLimited());
+    expect((await ReviewerAgent.review(bb)).verdict).toBe('replan'); // 1
+    expect((await ReviewerAgent.review(bb)).verdict).toBe('replan'); // 2
+    expect((await ReviewerAgent.review(bb)).verdict).toBe('blocked'); // 3 → threshold
+  });
+
+  it('resets the 429 streak after a clean round (throttling cleared)', async () => {
+    const bb = bbWithHealth(rateLimited());
+    await ReviewerAgent.review(bb); // 1
+    bb.setPageHealth(undefined);
+    const clean = await ReviewerAgent.review(bb);
+    expect(clean.verdict).not.toBe('blocked');
+    bb.setPageHealth(rateLimited());
+    expect((await ReviewerAgent.review(bb)).verdict).toBe('replan'); // fresh streak
+  });
+});
+
 describe('ReviewerAgent health gate — session lost', () => {
   it('returns blocked when the flow was redirected to login', async () => {
     const bb = bbWithHealth({
       hasServerError: false,
+      rateLimited: false,
       consoleErrorCount: 0,
       sessionLost: true,
     });
