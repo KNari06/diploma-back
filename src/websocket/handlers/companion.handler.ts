@@ -13,8 +13,6 @@ const DEVICE_EVENTS = [
   'device:state',
 ] as const;
 
-type DeviceEvent = typeof DEVICE_EVENTS[number];
-
 function authenticateCompanion(
   socket: Socket,
   next: (err?: Error) => void,
@@ -44,6 +42,11 @@ export function initCompanionNamespace(io: SocketIOServer): void {
     return;
   }
 
+  // Wire the registry's cross-replica coordination (Redis pub/sub + presence)
+  // to this Socket.IO server so a companion socketed on one replica is reachable
+  // from any replica handling the browser / warmup / run requests.
+  companionRegistry.init(io);
+
   const companion = io.of('/companion');
   companion.use(authenticateCompanion);
 
@@ -52,15 +55,11 @@ export function initCompanionNamespace(io: SocketIOServer): void {
     companionRegistry.register(userId, socket);
 
     // Forward device events from the companion to all browser sockets in the
-    // user's room so the device picker stays live without a direct connection.
+    // user's room — via Redis fan-out so browsers on OTHER replicas get them too,
+    // and cache snapshots in Redis so a later browser bootstraps over REST.
     for (const event of DEVICE_EVENTS) {
       socket.on(event, (data: unknown) => {
-        // Cache full snapshots so a browser that opens later can bootstrap its
-        // device picker over REST (GET /companion/status) before the next relay.
-        if (event === 'devices:snapshot') {
-          companionRegistry.setDeviceSnapshot(userId, data);
-        }
-        io.to(`user:${userId}`).emit(event as DeviceEvent, data);
+        companionRegistry.forwardDeviceEvent(userId, event, data);
         logger.debug('[CompanionHandler] Forwarded device event to user room', {
           event,
           userId: userId.substring(0, 8),

@@ -494,7 +494,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     && wantsPhysicalOrAuto;
   const useCompanionRunner = companionRequested
     && CompanionFeature.isEnabled()
-    && companionRegistry.isConnected(userId);
+    && await companionRegistry.isConnected(userId);
   if (useCompanionRunner) {
     logger.info('[MOBILE_SESSION] warmup routing through connected companion', {
       userId,
@@ -719,6 +719,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             staleSessionId: existing.sessionId,
           });
           await redisConnection.del(redisKey);
+          try { cancelIdle(userId); } catch { /* non-fatal */ }
           // Fall through to create a new session below
         } else if (
           // Audit BUG-1 fix: when the caller pinned a new
@@ -771,6 +772,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
               error: err instanceof Error ? err.message : String(err),
             });
           }
+          try { cancelIdle(userId); } catch { /* non-fatal */ }
           // Fall through to create a new session below
         } else if (
           // Routing mismatch: the cached session was born on a different runner
@@ -799,6 +801,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
               error: err instanceof Error ? err.message : String(err),
             });
           }
+          try { cancelIdle(userId); } catch { /* non-fatal */ }
           // Fall through to create a new session below
         } else if (existing.platform !== platform) {
           // Platform mismatch — the cached session's platform must match the
@@ -829,6 +832,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
               error: err instanceof Error ? err.message : String(err),
             });
           }
+          try { cancelIdle(userId); } catch { /* non-fatal */ }
           // Fall through to create a new session below
         } else {
           logger.debug('[MOBILE_SESSION] Reusing existing warmed session', {
