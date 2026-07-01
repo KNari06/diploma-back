@@ -153,6 +153,11 @@ export interface MobileIntentStepOptions {
   typeMode?: 'auto' | 'human' | 'instant';
   scrollDirection?: 'up' | 'down' | 'left' | 'right';
   scrollAmount?: number;
+  /** Natural-language description of a scrollable container to scroll INSIDE
+   *  (e.g. "the comments list"). The runner resolves it semantically and
+   *  swipes within the resolved element; empty → full-screen scroll. Mirrors
+   *  the web editor's options.scrollContainerDescription. */
+  scrollContainerDescription?: string;
   /** Swipe direction (mobile swipe step). Distinct from scrollDirection so
    *  editor swipe steps don't conflict with scroll steps semantically.
    *  Forwarded by the frontend; runner reads it via resolveDirection(). */

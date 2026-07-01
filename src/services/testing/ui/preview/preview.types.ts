@@ -1291,6 +1291,14 @@ export interface StepOptions {
   };
   /** CSS selector of scrollable container (for container scroll vs page scroll) */
   scrollContainer?: string;
+  /**
+   * Natural-language description of a scrollable container to scroll INSIDE.
+   * When set, the scroll step resolves this container via the element resolver
+   * (LLM/vision, same as click/fill targeting) and scrolls the resolved element
+   * by the recorded delta instead of the page. Empty → page / recorded-CSS-container
+   * scroll (legacy behaviour). NOT interpolated (see preview CLAUDE.md invariant #11).
+   */
+  scrollContainerDescription?: string;
 }
 
 /**

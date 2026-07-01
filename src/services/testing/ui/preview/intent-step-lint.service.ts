@@ -713,7 +713,16 @@ export class IntentStepLintService {
     pageRef?: string;
     userId: string;
   }): Promise<LintResult> {
-    const { previewSessionId, stepDraft, userId } = params;
+    const { previewSessionId, userId } = params;
+
+    // Scroll-by-container (degraded/rule-based path): mirror `_lintStepWithAIImpl`
+    // — a scroll step naming a container by description resolves that container,
+    // with the container description fed in as the intent (see the AI path).
+    const isScrollContainerResolve = params.stepDraft.type === 'scroll'
+      && !!params.stepDraft.options?.scrollContainerDescription?.trim();
+    const stepDraft: IntentStep = isScrollContainerResolve
+      ? { ...params.stepDraft, description: params.stepDraft.options!.scrollContainerDescription!.trim() }
+      : params.stepDraft;
 
     logger.debug('[INTENT_LINT] Linting step', {
       previewSessionId,
@@ -742,7 +751,7 @@ export class IntentStepLintService {
       const domNodes = snapshot.domNodes ?? [];
 
       // Non-targeting actions — page-level steps that don't target a specific DOM element
-      if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
+      if (!isScrollContainerResolve && ['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
         return {
           status: 'resolved',
           message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -1092,17 +1101,29 @@ export class IntentStepLintService {
     forceFreshSnapshot?: boolean;
     auditTrigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'pick_dry_run' | 'other';
   }, onContext?: (url: string | undefined, domNodeCount: number) => void): Promise<LintResult> {
-    const { previewSessionId, stepDraft, userId, includeAlternatives = false, forceFreshSnapshot = false } = params;
+    const { previewSessionId, userId, includeAlternatives = false, forceFreshSnapshot = false } = params;
+
+    // Scroll-by-container: a scroll step that names a scrollable container by
+    // description resolves that container like any targeting action — we feed
+    // the container description in as the intent (the recorded scroll delta
+    // still drives the actual scroll in the executor). `scroll` is otherwise
+    // non-targeting and returns early below.
+    const isScrollContainerResolve = params.stepDraft.type === 'scroll'
+      && !!params.stepDraft.options?.scrollContainerDescription?.trim();
+    const stepDraft: IntentStep = isScrollContainerResolve
+      ? { ...params.stepDraft, description: params.stepDraft.options!.scrollContainerDescription!.trim() }
+      : params.stepDraft;
 
     logger.debug('[INTENT_LINT] Linting step with LLM resolver', {
       previewSessionId,
       stepType: stepDraft.type,
       description: stepDraft.description.slice(0, 50),
       includeAlternatives,
+      scrollContainerResolve: isScrollContainerResolve,
     });
 
     // Non-targeting actions don't need element resolution
-    if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
+    if (!isScrollContainerResolve && ['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
       return {
         status: 'resolved',
         message: `Action "${stepDraft.type}" does not require element targeting`,

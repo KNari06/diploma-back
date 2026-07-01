@@ -1373,7 +1373,31 @@ export class CommandExecutor {
           break;
         }
 
-        case 'scroll':
+        case 'scroll': {
+          // Container scroll by description — resolve the named container (same
+          // LLM/vision resolver as click/fill) and scroll INSIDE it by the
+          // recorded delta, matching the editor's scroll-by-container behaviour.
+          const scrollContainerDesc = (command as any).intentMeta?.scrollContainerDescription as string | undefined;
+          if (scrollContainerDesc && isIntentCommand && intentCommand.intentMeta) {
+            const cParts = (typeof command.value === 'string' ? command.value : String(command.value ?? '')).split(',');
+            const cDy = parseFloat(cParts[0] || '') || 300;
+            const cDx = cParts.length > 1 ? (parseFloat(cParts[1] || '') || 0) : 0;
+            const containerCmd = {
+              ...intentCommand,
+              intentMeta: {
+                ...intentCommand.intentMeta,
+                intentDescription: scrollContainerDesc,
+                actionType: 'scroll',
+                compiled: undefined,
+              },
+            } as IntentPlaywrightCommand;
+            const { locator: containerLoc } = await this.getLocatorForIntentCommand(containerCmd, 'scroll', timeout || 30000);
+            await containerLoc.evaluate(
+              (el, { dx, dy }: { dx: number; dy: number }) => { (el as unknown as { scrollBy: (x: number, y: number) => void }).scrollBy(dx, dy); },
+              { dx: cDx, dy: cDy },
+            );
+            break;
+          }
           if (selector) {
             const scrollLocator = this.getLocatorInternal(selector);
             await scrollLocator.scrollIntoViewIfNeeded();
@@ -1410,6 +1434,7 @@ export class CommandExecutor {
             });
           }
           break;
+        }
 
         case 'screenshot': {
           const screenshot = await this.page.screenshot({ type: 'png', fullPage: false });
