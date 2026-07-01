@@ -41,6 +41,7 @@ import {
   type ErrorClassification,
   type BlockerType,
   type ExplorationProgressCallback,
+  DEFAULT_MAX_CONCURRENCY,
 } from './types';
 import type { NetworkSuccess } from '../lite-types';
 import { attributeCallsToSteps } from './network-assertions';
@@ -214,7 +215,7 @@ export class FlowRunner {
    * Returns completed FlowExplorationTask[] (including failed ones).
    */
   async runAll(queue: FlowQueue): Promise<FlowExplorationTask[]> {
-    const maxConcurrency = this.config.maxConcurrency || 5;
+    const maxConcurrency = this.config.maxConcurrency || DEFAULT_MAX_CONCURRENCY;
     const semaphore = new Semaphore(maxConcurrency);
     const results: FlowExplorationTask[] = [];
     const inFlight: Set<Promise<void>> = new Set();
