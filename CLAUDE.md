@@ -74,6 +74,7 @@ Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 | …change a user's plan/tier (any write site)                           | `src/services/core/plan.service.ts` (`PlanService.setUserPlan`) — the SINGLE funnel for user-level plan writes (keeps `users.{plan_id,plan,plan_status}` + `user_credits.{subscription_plan,subscription_status,grace_limit}` in sync). Stripe webhooks, admin grant (`assignPlanToUser` is now a thin wrapper), and self-serve all route through it. Workspace B2B plans stay in `workspace-credits.service.ts` (already atomic). |
 | …send a transactional email (welcome/approval/invite/purchase/report) | `src/services/core/email.service.ts` (`EmailService`) — see "Transactional email" flow below                                                                                                         |
 | …check DB schema                                                      | `supabase-migrations/supabase-schema.sql`                                                                                                                                                            |
+| …add/change a **prod** env var (not just `env.ts`)                    | See "Env vars: local vs prod" below — prod env lives in `qait-infra/azure/terraform/.env`, NOT here                                                                                                   |
 | …read a runtime trace / log                                           | `test_logs/<feature>/<YYYY-MM-DD_HH-MM-SS>_<testId>.jsonl` — `editor/` (preview traces), `chat_test/` (per-test-case chat). Always-on JSONL; auto-pruned after `EDITOR_LOG_RETENTION_DAYS` (default 3) by `src/jobs/artifact-retention.job.ts` |
 
 ---
@@ -258,6 +259,37 @@ See [.claude/rules/architecture.md](.claude/rules/architecture.md) — layer bre
 See [.claude/rules/testing.md](.claude/rules/testing.md) — mock boundary, what to test and where, file placement, naming.
 
 ---
+
+## Env vars: local vs prod (how to actually change a prod value)
+
+Adding a var to [env.ts](src/config/environment/env.ts) makes it exist in code — it
+does **NOT** set it in prod. Local and prod are two separate places:
+
+- **Local:** `qai-backend/.env` (dotenv). Only affects your machine.
+- **Prod:** the backend runs on **Azure Container Apps**, and its env is managed in
+  **`qait-infra/azure/terraform/`**, NOT here and NOT in the deploy pipeline (the
+  GitLab `deploy:api` job only swaps the image). A dev edits **one** file —
+  `qait-infra/azure/terraform/.env` — and the terraform CI ([azure/terraform/.gitlab-ci.yml](../qait-infra/azure/terraform/.gitlab-ci.yml))
+  buckets every line into three:
+  1. **`SECRET_KEYS`** (in that `.gitlab-ci.yml`) → a top-level tfvar feeding a
+     `secret {}` block. A secret ALSO needs a `variable` + `secret {}` +
+     `env { secret_name }` in [container-apps.tf](../qait-infra/azure/terraform/container-apps.tf)
+     (see how `jwt-secret` is wired).
+  2. **`INFRA_KEYS`** → skipped (terraform-controlled OR already a hardcoded `env {}`
+     block in `container-apps.tf`; a name that's hardcoded there MUST be in
+     `INFRA_KEYS` or you get a duplicate-env error).
+  3. **everything else** → an `app_env` map → a `dynamic "env"` block on BOTH
+     containers. **So a plain flag = just add `NAME=value` to that `.env`, nothing
+     else.** (`MOBILE_RUNNER_ENABLED` / `COMPANION_ENABLED` are the examples.)
+
+  Merge to the branch the infra pipeline watches → it runs `terraform plan` →
+  `apply` → the Container App rolls a new revision with the value. No image rebuild.
+
+**The trap (see [../LESSONS.md](../LESSONS.md)):** a feature gated by a
+default-off flag is **dark in prod until the flag is set in that shared `.env`** —
+having it `true` in your local `.env` proves nothing about prod. "Done" isn't done
+until the prod value is wired there. This is exactly how the companion relay shipped
+to prod but returned 503 until `COMPANION_ENABLED=true` was added to the infra `.env`.
 
 ## Pre-commit checks
 
