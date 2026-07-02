@@ -51,6 +51,7 @@
     "@azure/identity": "^4.13.1",
     "@azure/storage-blob": "^12.32.0",
     "@google/generative-ai": "^0.24.1",
+    "@sentry/node": "^10.63.0",
     "@supabase/supabase-js": "^2.38.4",
     "@types/multer": "^2.0.0",
     "@types/pdf-parse": "^1.1.5",
