@@ -161,6 +161,11 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
   LOG_FORMAT: z.enum(['combined', 'common', 'dev', 'short', 'tiny']).default('combined'),
 
+  // Monitoring — Sentry (errors + tracing + logs). Empty DSN ⇒ SDK disabled
+  // (see src/instrument.ts). Traces rate is 0..1; lower it in production.
+  SENTRY_DSN: z.string().optional(),
+  SENTRY_TRACES_SAMPLE_RATE: z.string().transform(Number).default('1.0'),
+
   // Documentation
   DOCS_PASSWORD: z.string().optional(),
 
