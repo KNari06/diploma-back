@@ -511,12 +511,15 @@ export class ExplorationEngine {
 
       if (bb.queue && !bb.queue.isEmpty()) {
         const extraFlowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter, trace, bb);
-        // Pass accumulated flow names from Phase 2 so Scout knows what's already been tested
+        // Pass accumulated flow names from Phase 2 so Scout knows what's already been tested,
+        // AND the cached auth state so auth-gated extra flows reuse the session instead of
+        // running logged-out (loginCompleted=true without cookies = silent unauthenticated runs).
         extraFlowRunner.restoreFromCheckpoint({
           loginCompleted: flowRunner.isLoginCompleted(),
           knownFlowNames: flowRunner.getKnownFlowNames(),
           flowsCompleted: flowTasks.length,
           completedTasks: flowTasks,
+          authState: flowRunner.getAuthState(),
         });
         try {
           const extraTasks = await extraFlowRunner.runAll(bb.queue);
@@ -680,6 +683,14 @@ export class ExplorationEngine {
     bb.tree = tree;
     if (checkpoint.pageInsights) {
       bb.pageInsights = new Map(checkpoint.pageInsights);
+    }
+    // Rehydrate completedFlows from the checkpoint so the blackboard matches the
+    // non-resume path (which fills it at Phase 2 end). Today the resume path goes
+    // straight to builder.build and skips Sentinel/Phase 2.5, so nothing reads
+    // this yet — but leaving it empty is a latent trap: any future coverage/
+    // re-strategy step added to resume would see 0 prior flows. Cheap to keep sound.
+    for (const task of checkpoint.flowRunner?.completedTasks ?? []) {
+      bb.completedFlows.push(taskToFlowResult(task));
     }
 
     // Check if budget is already exhausted (stale checkpoint)

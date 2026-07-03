@@ -178,10 +178,22 @@ export class FlowRunner {
     return [...this.knownFlowNames];
   }
 
+  /** Cached auth storageState from this runner's login, for handoff to another runner. Null before login. */
+  getAuthState(): object | null {
+    return this.stateManager.getAuthState();
+  }
+
   restoreFromCheckpoint(cp: FlowRunnerCheckpoint): void {
     this.loginCompleted = cp.loginCompleted;
     this.knownFlowNames = [...cp.knownFlowNames];
     this.flowsCompleted = cp.flowsCompleted;
+    // Reuse the prior runner's session: preload auth state so a runner that
+    // inherits loginCompleted=true actually has the cookies to back it up
+    // (otherwise createAuthenticatedContext falls through to a clean, logged-out
+    // context and every auth-gated flow silently runs unauthenticated).
+    if (cp.authState) {
+      this.stateManager.preloadAuthState(cp.authState);
+    }
   }
 
   private emitProgress(
