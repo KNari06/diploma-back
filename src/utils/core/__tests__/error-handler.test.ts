@@ -270,21 +270,37 @@ describe('error-handler', () => {
       expect(mockRes.status).toHaveBeenCalledWith(502);
     });
 
-    it('should handle ECONNRESET as 502', () => {
+    it('should NOT treat ECONNRESET as 502 (usually a client disconnect, not an upstream failure)', () => {
       const error = new Error('Connection reset') as any;
       error.code = 'ECONNRESET';
 
       errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
-      expect(mockRes.status).toHaveBeenCalledWith(502);
+      // Falls through to a generic 500 rather than mislabelling a client-side
+      // reset as a gateway failure.
+      expect(mockRes.status).toHaveBeenCalledWith(500);
     });
 
-    it('should handle 502 message as 502', () => {
+    it('should NOT turn an error whose message merely contains "502" into a 502 response', () => {
+      // e.g. an upstream error text we logged, or a URL/id/test name with 502.
       const error = new Error('502 Bad Gateway from upstream');
 
       errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
+      // No 502 status code on the error → generic 500, not a phantom gateway error.
+      expect(mockRes.status).toHaveBeenCalledWith(500);
+    });
+
+    it('should return 502 when the error explicitly carries status 502', () => {
+      const error = new Error('upstream failed') as any;
+      error.status = 502;
+
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
+
       expect(mockRes.status).toHaveBeenCalledWith(502);
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({ code: 'BAD_GATEWAY' })
+      );
     });
 
     it('should return 500 for unknown errors', () => {

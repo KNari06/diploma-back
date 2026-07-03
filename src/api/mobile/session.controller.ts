@@ -2741,10 +2741,13 @@ export async function explorationReadiness(req: Request, res: Response): Promise
     logger.warn('[MOBILE_SESSION] Exploration readiness probe failed', {
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(502).json({
-      success: false,
-      error: 'Runner readiness check failed',
-      message: error instanceof Error ? error.message : String(error),
+    // Route through the shared runner-error mapper instead of a blanket 502:
+    // it forwards the runner's own status (503 at-capacity, 4xx config, 410
+    // session-gone) so the launcher can tell "runner unreachable" from "runner
+    // busy". A truly unreachable runner still surfaces as its connection error.
+    sendMobileRunnerError(res, error, 'Runner readiness check failed', {
+      userId: req.user.id,
+      surfacedBy: 'exploration_readiness',
     });
   }
 }
