@@ -76,21 +76,22 @@ export function buildPreflightPrompt(bb: TestBlackboard): string {
 
 ${sections.join('\n\n')}
 
-Decide whether this plan should run. Judge ONLY these — do not nitpick style:
-1. REPEAT DEAD END: does the plan repeat an action that WHAT-ALREADY-HAPPENED shows had no effect (esp. under NO STATE CHANGE)? If so, "revise" with guidance to try a DIFFERENT element/path.
-2. WRONG DIRECTION: does the plan clearly move AWAY from the goal (e.g. navigating off to unrelated pages when the goal is on this page)? If so, "revise".
-3. UNREACHABLE: does PAGE HEALTH show a server error / session lost, or does a LEARNINGS blocker make the goal impossible right now? If so, "block".
-4. Otherwise the plan is reasonable → "go". A first attempt, a plausible new approach, or normal form-filling is ALWAYS "go" — you cannot know a fresh action's result in advance.
+Decide whether this plan should run. Check these HARD triggers first — each is a CONCRETE reason that overrides any leaning toward "go":
+1. REPEAT DEAD END (hard "revise"): the plan repeats an action that WHAT-ALREADY-HAPPENED shows had no effect. If NO STATE CHANGE reports 2+ consecutive rounds and the plan re-issues the same/similar action → "revise" with guidance to try a DIFFERENT element/path. This is NOT a "might fail" guess — the history already proved it does nothing.
+2. WRONG DIRECTION (hard "revise"): the plan clearly moves AWAY from the goal (e.g. navigating off to unrelated pages when the goal is on this page) → "revise".
+3. UNREACHABLE (hard "block"): PAGE HEALTH shows a server error / session lost, or a LEARNINGS blocker makes the goal impossible right now → "block".
+
+If NONE of the hard triggers fire, default to "go": a first attempt, a plausible new approach, a single no-effect round (not yet 2+), or normal form-filling is ALWAYS "go" — you cannot know a fresh action's result in advance.
 
 Respond with JSON:
 {
   "verdict": "go" | "revise" | "block",
   "reason": "Brief explanation",
-  "guidance": "For 'revise' only — how the Planner should change the plan"
+  "guidance": "Include ONLY when verdict is 'revise' — how the Planner should change the plan; omit otherwise"
 }
 
 RULES:
-- Bias toward "go". Only "revise"/"block" when the history or health gives a CONCRETE reason.
-- Never "revise" a plan just because it might fail — failure is discovered by running it, that's the Reviewer's job.
-- "block" is for genuinely unreachable goals (server down, logged out, known hard blocker), not for "this looks hard".`;
+- The hard triggers above win. When one fires, its verdict is correct even though you'd otherwise lean "go".
+- When NO hard trigger fires, bias toward "go": do NOT "revise" a plan merely because it MIGHT fail — an untried action's failure is discovered by running it (the Reviewer's job), not pre-judged here.
+- "block" is only for genuinely unreachable goals (server down, logged out, known hard blocker), never for "this looks hard".`;
 }

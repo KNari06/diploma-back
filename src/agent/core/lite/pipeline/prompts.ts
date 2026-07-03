@@ -47,12 +47,20 @@ export function buildPlannerPrompt(bb: TestBlackboard): string {
     );
   }
 
-  // No-effect signal — same as the Reviewer sees, so the Planner pivots away
-  // from a dead element instead of re-planning the same click (observed loop).
+  // No-effect signal — graduated to match the Reviewer's threshold: a single
+  // no-effect round is a soft caution (the action may just need a beat), but
+  // 2+ consecutive rounds is the same hard "dead element, pivot" line the
+  // Reviewer acts on (2+ → replan, 3+ → blocked). Keeping the thresholds in
+  // sync stops the Planner from confidently re-queuing a click the Reviewer
+  // is about to reject.
   const noProgress = bb.getNoProgressRounds();
-  if (noProgress >= 1) {
+  if (noProgress >= 2) {
     sections.push(
-      `NO STATE CHANGE: page unchanged for ${noProgress} round(s) — your last action had NO effect. Do NOT repeat it; choose a DIFFERENT element or path, or report_blocked if none exists.`,
+      `NO STATE CHANGE: page unchanged for ${noProgress} consecutive rounds — the last action(s) had NO effect. Do NOT repeat them; choose a DIFFERENT element or path, or report_blocked if none exists.`,
+    );
+  } else if (noProgress === 1) {
+    sections.push(
+      `CAUTION: the page did not change after the last action. If your plan repeats that action, prefer a DIFFERENT element/path unless you have a concrete reason it will work this time.`,
     );
   }
 
@@ -231,6 +239,7 @@ EXECUTION RULES:
      Example: fill_field(email) + fill_field(password) + toggle_element(consent) + click_element(submit).
    - Chains: scroll_to_element(ref) + click_element(ref) together; hover_element + click together.
    - Only the LAST command in a batch may navigate/submit; put non-navigating actions before it.
+   - NEVER batch observe_page with commands that use refs it would reveal. If the plan's first step is observe_page (e.g. to expose a form's fields), run observe_page ALONE this response, then batch the fills next response using the fresh refs. Batching observe_page with fills = the fills fire against stale/absent refs.
 5. After a submit/navigation happens: the NEXT response calls wait_for_page then observe_page (one verification per navigation, not per field).
 6. If a command fails, try a different approach
 7. For credential fields: set is_sensitive=true, use any placeholder value
