@@ -231,7 +231,7 @@ COMMANDS AVAILABLE:
 - report_blocked(reason) — signal blocked (CAPTCHA, 2FA, etc.)
 
 EXECUTION RULES:
-1. If CURRENT PAGE STATE is already provided above, DO NOT call observe_page — you already have the page state. Only call observe_page after navigation/submit or when refs are stale.
+1. If CURRENT PAGE STATE is already provided above, DO NOT call a redundant observe_page — you already have the page state. Legitimate observe_page cases: (a) the PLAN explicitly includes an observe_page step (execute it as planned — it's there to reveal refs), (b) after navigation/submit, (c) after an action revealed NEW content (modal/accordion/form opened) whose refs you don't have, (d) refs went stale.
 2. Follow the plan steps in order
 3. Plan steps may include element refs like [e1]. Use these refs directly when available. If a ref is stale (element not found), infer from the description and call observe_page to get fresh refs.
 4. BATCH aggressively — issue MULTIPLE commands in ONE response instead of one-at-a-time. This is the fast path; a single command per response wastes a full plan/execute/review cycle.

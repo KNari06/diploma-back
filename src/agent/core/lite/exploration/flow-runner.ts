@@ -184,7 +184,6 @@ export class FlowRunner {
   }
 
   restoreFromCheckpoint(cp: FlowRunnerCheckpoint): void {
-    this.loginCompleted = cp.loginCompleted;
     this.knownFlowNames = [...cp.knownFlowNames];
     this.flowsCompleted = cp.flowsCompleted;
     // Reuse the prior runner's session: preload auth state so a runner that
@@ -193,6 +192,17 @@ export class FlowRunner {
     // context and every auth-gated flow silently runs unauthenticated).
     if (cp.authState) {
       this.stateManager.preloadAuthState(cp.authState);
+    }
+    // Honor loginCompleted ONLY when a session actually backs it — either the
+    // authState we just preloaded (Phase 2.5 in-process handoff) or a fixture
+    // preloaded by the constructor. The ON-DISK checkpoint deliberately does
+    // NOT persist authState (session cookies at rest), so a crash-resume lands
+    // here with loginCompleted=true and no cookies; keeping the flag would skip
+    // performLogin AND get a clean context = every auth flow silently logged
+    // out. Dropping the flag costs one re-login on demand instead.
+    this.loginCompleted = cp.loginCompleted && this.stateManager.hasAuthState();
+    if (cp.loginCompleted && !this.loginCompleted) {
+      logger.info('[FLOW_RUNNER] Checkpoint had loginCompleted but no auth state — will re-login on demand');
     }
   }
 
