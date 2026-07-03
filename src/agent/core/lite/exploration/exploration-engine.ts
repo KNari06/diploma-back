@@ -190,6 +190,14 @@ export class ExplorationEngine {
       totalTimeoutMs: this.config.budget.totalTimeoutMs,
     });
 
+    // Guarantee the trace is flushed + uploaded on EVERY exit — including a
+    // mid-run throw (survey/strategist crash), which is exactly the trace we
+    // most want on prod. close() is idempotent (uploaded-once guard), so the
+    // explicit close() calls on the normal return paths below are harmless
+    // and this finally simply backstops the throw paths. Mirrors LiteEngine's
+    // `finally { traceWriter.close() }` pattern.
+    try {
+
     // ════════════════════════════════════════════════════════════════════
     // PHASE 1: SURVEY
     // BFS page discovery — Cartographer analyzes each page
@@ -672,6 +680,11 @@ export class ExplorationEngine {
     });
 
     return result;
+    } finally {
+      // Backstop: close (→ upload) the trace even if a phase threw above.
+      // Idempotent, so a normal-path close() already having run is fine.
+      await trace.close();
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -701,6 +714,10 @@ export class ExplorationEngine {
 
     trace.writeExplorationStart(config);
 
+    // Same guarantee as run(): close (→ upload) the trace on EVERY exit,
+    // including a mid-resume throw. Idempotent, so the explicit close() calls
+    // on the return paths below stay harmless.
+    try {
     // Restore tree and budget from checkpoint
     const tree = ExplorationTree.fromCheckpoint(checkpoint.tree);
     const budget = BudgetTracker.fromCheckpoint(config.budget, checkpoint.budget);
@@ -875,6 +892,10 @@ export class ExplorationEngine {
     });
     await trace.close();
     return result;
+    } finally {
+      // Backstop: close (→ upload) the trace even if resume threw above.
+      await trace.close();
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
