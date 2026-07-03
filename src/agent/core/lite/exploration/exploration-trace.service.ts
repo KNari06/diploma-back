@@ -43,21 +43,52 @@ const EXPLORATION_MAX_PAYLOAD_CHARS = 30_000; // prompts can be long
 // SERVICE
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** Owner context needed to upload the trace to Supabase Storage on prod. */
+export interface ExplorationTraceUploadContext {
+  explorationId: string;
+  /** Server-derived run owner. Absent/non-UUID → anonymous upload, no DB record. */
+  userId?: string;
+}
+
 export class ExplorationTraceService {
   private writer: LiteTraceWriter;
+  private readonly uploadContext: ExplorationTraceUploadContext;
+  private uploaded = false;
 
-  constructor(explorationId: string) {
+  constructor(explorationId: string, uploadContext?: ExplorationTraceUploadContext) {
     this.writer = new LiteTraceWriter({
       testId: `exploration_${explorationId}`,
       logsDir: EXPLORATION_LOGS_DIR,
       maxFileSizeBytes: EXPLORATION_MAX_FILE_SIZE,
       maxPayloadChars: EXPLORATION_MAX_PAYLOAD_CHARS,
     });
+    this.uploadContext = uploadContext ?? { explorationId };
   }
 
+  /**
+   * Flush + close the trace file, then (on prod) upload it to Supabase Storage
+   * so the run leaves the same trace we get locally. The upload is
+   * fire-and-forget and idempotent (guarded by `uploaded`) — the engine has
+   * several close() call sites across its return paths, and this must run
+   * exactly once regardless of which one fires. Returns the local file path
+   * (unchanged contract) WITHOUT waiting on the storage round-trip.
+   */
   async close(): Promise<string> {
     const filePath = this.writer.getFilePath();
     await this.writer.close();
+    if (!this.uploaded) {
+      this.uploaded = true;
+      // Fire-and-forget: never let a storage hiccup delay or fail the run.
+      import('./exploration-trace-upload')
+        .then(({ uploadExplorationTrace }) =>
+          uploadExplorationTrace({
+            filePath,
+            userId: this.uploadContext.userId,
+            explorationId: this.uploadContext.explorationId,
+          }),
+        )
+        .catch(() => { /* best-effort — upload module logs its own failures */ });
+    }
     return filePath;
   }
 

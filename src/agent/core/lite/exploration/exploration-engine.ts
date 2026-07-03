@@ -171,7 +171,10 @@ export class ExplorationEngine {
     const startTime = Date.now();
     const budget = new BudgetTracker(this.config.budget);
     const rateLimiter = new RateLimiter(this.config.rateLimiting, budget);
-    const trace = new ExplorationTraceService(this.config.explorationId);
+    const trace = new ExplorationTraceService(this.config.explorationId, {
+      explorationId: this.config.explorationId,
+      userId: this.config.userId,
+    });
     const emitProgress = this.onProgress || (() => {});
 
     // Create shared blackboard for all agents
@@ -685,7 +688,10 @@ export class ExplorationEngine {
     checkpoint: ExplorationCheckpoint,
   ): Promise<ExplorationResult> {
     const engine = new ExplorationEngine(browser, config);
-    const trace = new ExplorationTraceService(config.explorationId);
+    const trace = new ExplorationTraceService(config.explorationId, {
+      explorationId: config.explorationId,
+      userId: config.userId,
+    });
 
     logger.info('[EXPLORATION] Resuming from checkpoint', {
       explorationId: config.explorationId,
