@@ -339,8 +339,21 @@ export class ExplorationEngine {
           await targetedSurveyContext.close();
         }
       } catch (err) {
-        logger.warn('[EXPLORATION] Targeted survey failed, continuing with existing queue', {
-          error: err instanceof Error ? err.message : String(err),
+        // Targeted survey failed → some Strategist-requested pages are NOT in
+        // the queue, so coverage will be incomplete. Continuing is right (one
+        // failed sub-survey shouldn't kill the whole run), but it must be
+        // VISIBLE — otherwise the user sees "exploration complete" believing
+        // full coverage when pages were unreachable.
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn('[EXPLORATION] Targeted survey failed, continuing with existing queue', { error: msg });
+        trace.writeWarning('targeted_survey_failed', {
+          phase: 'strategizing',
+          targets: bb.currentStrategy.surveyTargets,
+          error: msg,
+        });
+        this.emitProgress('strategizing', 'agent_warning', {
+          message: 'Some requested pages could not be surveyed — coverage may be incomplete.',
+          targets: bb.currentStrategy.surveyTargets,
         });
       }
     }
@@ -499,8 +512,19 @@ export class ExplorationEngine {
             await targetedSurveyContext.close();
           }
         } catch (err) {
-          logger.warn('[EXPLORATION] Phase 2.5: Targeted survey failed, continuing with existing queue', {
-            error: err instanceof Error ? err.message : String(err),
+          // Same rationale as the Phase 1.5 targeted-survey catch: continue, but
+          // make the incomplete coverage visible rather than reporting a clean
+          // "complete".
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn('[EXPLORATION] Phase 2.5: Targeted survey failed, continuing with existing queue', { error: msg });
+          trace.writeWarning('targeted_survey_failed', {
+            phase: 'evaluating',
+            targets: focused.surveyTargets,
+            error: msg,
+          });
+          this.emitProgress('evaluating', 'agent_warning', {
+            message: 'Some follow-up pages could not be surveyed — coverage may be incomplete.',
+            targets: focused.surveyTargets,
           });
         }
       }

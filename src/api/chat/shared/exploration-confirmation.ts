@@ -20,6 +20,15 @@ export const PENDING_EXPLORATION_PREFIX = 'pending_exploration:';
  */
 export const PENDING_EXPLORATION_TTL_SEC = 600; // 10 min
 
+/**
+ * Max consecutive "other" (ambiguous) replies before we stop re-asking and let
+ * the message flow to normal chat. Without a cap the user could be trapped
+ * answering the same yes/no prompt forever (only the 10-min TTL would release
+ * it). Mirrors the bounded-retry pattern used across the branch
+ * (MAX_PREFLIGHT_REVISES, serverErrorBlockAfter).
+ */
+export const MAX_EXPLORATION_CLARIFY_REASKS = 2;
+
 interface PendingExplorationData {
   entryUrl: string;
   projectId: string;
@@ -28,6 +37,8 @@ interface PendingExplorationData {
   workspaceId?: string;
   scopeHint?: string;
   credentials?: { email?: string; username?: string; phone?: string; password: string };
+  /** Consecutive ambiguous ("other") replies so far — bounds the re-ask loop. */
+  otherCount?: number;
 }
 
 
@@ -171,10 +182,25 @@ export async function handlePendingExplorationConfirmation(
     return false;
   }
 
-  // Re-arm the pending state (preserve it + refresh TTL) so the clarification
-  // reply is still treated as a confirmation answer.
+  // Bound the clarify loop: after MAX_EXPLORATION_CLARIFY_REASKS ambiguous
+  // replies, the user clearly isn't answering yes/no (they're asking something
+  // else). Drop the pending and let the message flow to normal chat instead of
+  // trapping them on the same prompt until the TTL expires.
+  const otherCount = (pending.otherCount ?? 0) + 1;
+  if (otherCount > MAX_EXPLORATION_CLARIFY_REASKS) {
+    await redisConnection.del(pendingKey);
+    return false;
+  }
+
+  // Re-arm the pending state (preserve it + bump the counter + refresh TTL) so
+  // the clarification reply is still treated as a confirmation answer.
   try {
-    await redisConnection.set(pendingKey, pendingRaw, 'EX', PENDING_EXPLORATION_TTL_SEC);
+    await redisConnection.set(
+      pendingKey,
+      JSON.stringify({ ...pending, otherCount }),
+      'EX',
+      PENDING_EXPLORATION_TTL_SEC,
+    );
   } catch {
     // If Redis write fails, fall through rather than trap the user.
     return false;
