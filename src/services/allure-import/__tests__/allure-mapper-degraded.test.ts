@@ -66,15 +66,44 @@ describe('convertImportedStepsWithAI — degraded detection', () => {
     expect(result.steps[0].description).toBe('Open the login page');
   });
 
-  it('returns degraded=false (not true) when AI returns unparseable JSON', async () => {
-    // A bad-JSON response yields an empty batch — no fabricated steps, so it is
-    // NOT degraded (degraded means wrong types were invented, not zero steps).
+  it('retries then falls back to 1:1 (degraded) when AI keeps returning unparseable JSON', async () => {
+    // Unparseable JSON is usually a truncated (max_tokens) response. It must NOT
+    // be treated as "the model found no steps" — that silently deleted whole
+    // batches in production. The converter retries once, then falls back to the
+    // deterministic 1:1 mapping and flags the test degraded.
     mockGetChatCompletion.mockResolvedValue({ content: 'not json at all {' });
 
     const result = await convertImportedStepsWithAI('Login', steps);
 
+    expect(result.degraded).toBe(true);
+    expect(result.steps).toHaveLength(2);
+    expect(result.steps.every((s) => s.type === 'click')).toBe(true);
+    expect(result.steps[0].description).toBe('Open the login page');
+    // One initial call + one corrective retry before falling back.
+    expect(mockGetChatCompletion).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries when the model drops steps, and keeps the corrected fuller response', async () => {
+    // First response drops a step (1 of 2 → below the 0.6 floor); the retry
+    // returns both. The corrected response is kept and the test is NOT degraded.
+    mockGetChatCompletion
+      .mockResolvedValueOnce({
+        content: JSON.stringify({ steps: [{ type: 'navigate', description: 'Open login page' }] }),
+      })
+      .mockResolvedValueOnce({
+        content: JSON.stringify({
+          steps: [
+            { type: 'navigate', description: 'Open login page' },
+            { type: 'type', description: 'Enter username' },
+          ],
+        }),
+      });
+
+    const result = await convertImportedStepsWithAI('Login', steps);
+
     expect(result.degraded).toBe(false);
-    expect(result.steps).toHaveLength(0);
+    expect(result.steps).toHaveLength(2);
+    expect(mockGetChatCompletion).toHaveBeenCalledTimes(2);
   });
 
   it('returns degraded=false for an empty step list (no AI call)', async () => {
