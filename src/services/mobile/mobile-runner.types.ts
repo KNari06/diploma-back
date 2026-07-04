@@ -110,7 +110,7 @@ export interface MobileSessionConfig {
 export type MobileIntentActionType =
   // Web-compatible actions (mapped to mobile commands by runner)
   | 'click' | 'type' | 'scroll' | 'press' | 'hover'
-  | 'assert' | 'ai_check' | 'navigate' | 'wait' | 'screenshot'
+  | 'assert' | 'ai_check' | 'extract_text' | 'navigate' | 'wait' | 'screenshot'
   | 'select' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'wait_for'
   // Mobile-specific actions
   | 'open_app'           // launch app by package/bundle ID
@@ -202,6 +202,10 @@ export interface MobileIntentStepOptions {
   /** Free-text hint for `dismiss` steps ("Reading settings sheet"). Advisory
    *  only — the runner always closes the top-most active layer it sees. */
   dismissTarget?: string;
+  /** `extract_text` steps only — variable name the runner's scratchpad
+   *  stores the resolved element's text under, namespaced as
+   *  `extracted.<name>` and referenceable via `{{extracted.<name>}}`. */
+  extractVariable?: string;
 }
 
 export interface MobileIntentStep {
