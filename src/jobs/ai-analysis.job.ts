@@ -642,6 +642,22 @@ export class AIAnalysisJobHandler {
             out.errors.push(`${label} alert: ${ev.systemAlert.text}`);
           }
         }
+
+        // Per-step AI visual issues (text truncation, overlap, contrast, blank
+        // screen, …) → high-signal errors channel so the analyzer reasons over
+        // them alongside functional failures. Sibling of evidence on the step.
+        const visualIssues = step?.visualIssues;
+        if (Array.isArray(visualIssues)) {
+          for (const v of visualIssues as Array<Record<string, unknown>>) {
+            const sev = v.severity === 'critical' ? 'CRITICAL' : 'warning';
+            const desc = typeof v.description === 'string' ? v.description : '';
+            if (!desc) continue;
+            out.errors.push(
+              `${label} visual-issue (${sev}) [${v.type ?? 'other'}]: ${desc}` +
+              (typeof v.location === 'string' && v.location ? ` @ ${v.location}` : ''),
+            );
+          }
+        }
       });
     } catch (err) {
       logger.debug('[AI-ANALYSIS] extractMobileEvidence failed (non-fatal)', {

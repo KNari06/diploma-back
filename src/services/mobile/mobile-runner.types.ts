@@ -145,6 +145,15 @@ export interface MobileIntentStepOptions {
   replaceContent?: boolean;
   pressEnter?: boolean;
   /**
+   * Opt-in per-step AI VISUAL check (mirror of the runner's
+   * IntentStepOptions.visualCheck). When `enabled`, the runner runs a vision
+   * pass over the post-step screenshot for defects the a11y-tree / rule path
+   * can't see (text truncation, overlap, contrast, blank/stuck screen,
+   * keyboard-over-input, …) and returns them in `MobileStepResult.visualIssues`.
+   * Non-fatal by default; `failOnIssue` fails the step on a detected issue.
+   */
+  visualCheck?: { enabled: boolean; failOnIssue?: boolean };
+  /**
    * Typing realism for a type step (editor "type like a human" toggle).
    * 'human' = per-character, 'instant' = atomic, 'auto'/undefined = the runner's
    * heuristic. Forwarded verbatim into the runner type_text command's typeMode.
@@ -316,6 +325,19 @@ export interface MobileStepResult {
     environment: Record<string, unknown>;
     detectedAt: number;
   };
+  /**
+   * Visual defects the opt-in per-step AI visual check found in the post-step
+   * screenshot (mirror of the runner's CommandResult.visualIssues). Present
+   * only when the step opted in (`options.visualCheck`) and ≥1 issue was found.
+   * Persisted into `metadata.steps[]` and folded into the AI-analysis input.
+   */
+  visualIssues?: Array<{
+    type: string;
+    severity: 'warning' | 'critical';
+    description: string;
+    location?: string;
+    confidence: number;
+  }>;
   /**
    * Non-blocking, advisory messages raised by the runner for this step (e.g.
    * `install_app` warns when the APK is a release build without WebView

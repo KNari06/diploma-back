@@ -1557,6 +1557,7 @@ export class MobileTestRunJobHandler {
             evidence: s.evidence,
             errorClassification: s.errorClassification,
             bugReport: s.bugReport,
+            visualIssues: s.visualIssues,
           })),
           bugReports: runResult.bugReports,
         },
