@@ -1,5 +1,6 @@
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
+import { computeUiStepCredits } from './credit-estimate.util';
 import { BUG_REPORT_CREDITS } from '@/jobs/ai-analysis.job';
 import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { NotFoundError, ValidationError, InsufficientCreditsError } from '@/types';
@@ -254,37 +255,21 @@ export class RegressionRunService {
     const apiCount = testCases.filter((tc) => tc.testType === 'api').length;
     const apiCreditCost = TokenCalculatorService.getTestCreditCost('api');
 
-    // Fetch step counts for UI test cases (1 credit per step)
+    // Fetch step counts for UI test cases. Web = 1 credit/step; MOBILE steps
+    // cost MOBILE_STEP_CREDIT_MULTIPLIER× (emulator COGS) and are charged at
+    // that rate after the run in mobile-test-run.job. The pre-flight must apply
+    // the SAME multiplier or a mobile run passes the gate on a 1× estimate and
+    // then gets charged 4× — the user hits "insufficient credits" (or an
+    // unexpected balance drop) despite a green pre-flight. Mobile cases are
+    // `testType:'ui'` distinguished by `platform` (mobile_*), so read platform
+    // off the case, not the row.
     let uiStepCredits = 0;
     if (uiCases.length > 0) {
       const uiIds = uiCases.map((tc) => tc.testCaseId);
       const rows = await RegressionTestQueryService.getUiStepCountRows(uiIds);
-
-      for (const row of rows) {
-        let stepCount = 0;
-        if (row.replay_strategy === 'commands' && Array.isArray(row.commands)) {
-          stepCount = row.commands.length;
-        } else if (row.replay_strategy === 'graph_extract' && row.graph_ref?.steps) {
-          stepCount = Array.isArray(row.graph_ref.steps) ? row.graph_ref.steps.length : 0;
-        } else if (Array.isArray(row.steps_json)) {
-          // Step editor test cases: count steps_json (+ 1 for initial goto)
-          stepCount = row.steps_json.length + 1;
-        }
-        // Phase 3: setup_steps and teardown_steps are prepended / appended
-        // at dispatch time by stitchPhases(). The user is billed for what
-        // runs, so count those too. Empty arrays (default for pre-Phase-3
-        // rows) contribute 0 — byte-identical credit to before.
-        const setupCount = Array.isArray(row.setup_steps) ? row.setup_steps.length : 0;
-        const teardownCount = Array.isArray(row.teardown_steps) ? row.teardown_steps.length : 0;
-        stepCount += setupCount + teardownCount;
-        // Minimum 1 credit per test case even if steps can't be counted
-        uiStepCredits += Math.max(stepCount, 1);
-      }
-
-      // If some test case IDs weren't found in DB, charge 1 credit each as minimum
-      const foundIds = new Set((rows || []).map((r: any) => r.id));
-      const missingCount = uiIds.filter((id) => !foundIds.has(id)).length;
-      uiStepCredits += missingCount;
+      // Pure arithmetic lives in computeUiStepCredits (unit-tested) — web 1×,
+      // mobile MOBILE_STEP_CREDIT_MULTIPLIER×, matching the post-run charge.
+      uiStepCredits = computeUiStepCredits(uiCases, rows);
     }
 
     // ai-analysis.job charges BUG_REPORT_CREDITS per UI test_result where bugs

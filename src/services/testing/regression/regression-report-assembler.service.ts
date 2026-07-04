@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import {
   getRunWithOwnership,
   getRunByShareToken,
@@ -137,6 +138,53 @@ export class RegressionReportAssemblerService {
     const run = await this.getRunByShareToken(shareToken);
     if (!run) return null;
     return RegressionReportAssemblerService.assembleReport(run);
+  }
+
+  /**
+   * Deterministic identity of a bug for cross-execution dedup. Same shape of
+   * defect → same fingerprint. Keyed on severity + category + a normalized
+   * title (lowercased, whitespace-collapsed, trailing digits/ids stripped so
+   * "Login button not found (attempt 2)" ≡ "Login button not found") + selector.
+   * SHA-1 hex — mirrors `regression_doctor_findings.pattern_hash`. Title is the
+   * stable identity here (not steps/actual, which vary run-to-run).
+   */
+  private static fingerprintBug(bug: EnrichedBug): string {
+    const normTitle = (bug.title || '')
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .replace(/[#(]?\s*(attempt|try|run|step)\s*\d+\)?/g, '') // drop "(attempt 2)" style suffixes
+      .replace(/\b\d{2,}\b/g, '')                              // drop long numbers (ids/timestamps)
+      .trim();
+    const key = [bug.severity, bug.category, normTitle, bug.selector || ''].join('␟');
+    return createHash('sha1').update(key).digest('hex');
+  }
+
+  /**
+   * Collapse duplicate bugs across a run's executions. Keeps the FIRST instance
+   * of each fingerprint (preserving its execution/test-case linkage for
+   * drill-down) and annotates it with `occurrences` + the distinct
+   * `seenInExecutions`. Order-preserving so the report's bug order is stable.
+   */
+  private static dedupeBugs(bugs: EnrichedBug[]): EnrichedBug[] {
+    const byFp = new Map<string, EnrichedBug>();
+    for (const bug of bugs) {
+      const fp = RegressionReportAssemblerService.fingerprintBug(bug);
+      const existing = byFp.get(fp);
+      if (!existing) {
+        byFp.set(fp, {
+          ...bug,
+          fingerprint: fp,
+          occurrences: 1,
+          seenInExecutions: bug.executionId ? [bug.executionId] : [],
+        });
+        continue;
+      }
+      existing.occurrences = (existing.occurrences || 1) + 1;
+      if (bug.executionId && !existing.seenInExecutions!.includes(bug.executionId)) {
+        existing.seenInExecutions!.push(bug.executionId);
+      }
+    }
+    return [...byFp.values()];
   }
 
   /**
@@ -617,10 +665,22 @@ export class RegressionReportAssemblerService {
       });
     }
 
-    // Build merged summary (stats + bugs breakdown)
+    // Dedup bugs across the run's executions. The AI analysis job runs once per
+    // execution and has no cross-run memory, so the SAME underlying issue (e.g.
+    // "Login button not found") surfaces as a separate bug in every execution
+    // that hit it — 10 executions → 10 identical entries the user has to wade
+    // through. Collapse by a deterministic fingerprint (see fingerprintBug),
+    // keeping the first instance and recording how many collapsed + which
+    // executions they came from, so the UI can show "seen in N runs" instead of
+    // N duplicate cards. Done at assembly (not storage) so each execution's
+    // ai_summary stays intact for drill-down.
+    const dedupedBugs = RegressionReportAssemblerService.dedupeBugs(allBugs);
+
+    // Build merged summary (stats + bugs breakdown) — over the DEDUPED set so
+    // the severity/category counts match what the user actually sees.
     const bySeverity: Record<string, number> = {};
     const byCategory: Record<string, number> = {};
-    for (const bug of allBugs) {
+    for (const bug of dedupedBugs) {
       bySeverity[bug.severity] = (bySeverity[bug.severity] || 0) + 1;
       byCategory[bug.category] = (byCategory[bug.category] || 0) + 1;
     }
@@ -668,7 +728,7 @@ export class RegressionReportAssemblerService {
       failed: stats.failed,
       skipped: stats.skipped,
       flaky: byClassification['flaky'] || 0,
-      totalBugs: allBugs.length,
+      totalBugs: dedupedBugs.length,
       bySeverity,
       byCategory,
       byClassification,
@@ -718,7 +778,7 @@ export class RegressionReportAssemblerService {
       aiConfidence: confidenceCount > 0 ? Math.round(totalConfidence / confidenceCount) : null,
       summary,
       executions: positiveExecutions,
-      bugs: allBugs,
+      bugs: dedupedBugs,
       recommendations: [...allRecommendations],
       artifactsSummary: aggArtifacts,
       healthSummary,

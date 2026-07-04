@@ -409,5 +409,46 @@ describe('auth.middleware', () => {
       expect(mockUserCreditsService.getOrCreateUserCredits).toHaveBeenCalledWith('user-123');
       expect(mockNext).toHaveBeenCalled();
     });
+
+    // Split-brain regression guard: a request that carries a workspace id used
+    // to route the credit GATE to the workspace pool, while the run always
+    // CHARGED the user's personal balance — so a mobile run could pass the gate
+    // on workspace credits it never touched. The fix removed the workspace
+    // branch: the gate now reads the SAME personal account that gets charged,
+    // regardless of any workspace_id on the request.
+    const personalCredits = (balance: number) => ({
+      id: 'uc-1', user_id: 'user-123', credits_balance: balance,
+      total_purchased: balance, total_used: 0, subscription_plan: 'pro' as const,
+      subscription_status: 'active' as const, subscription_expires_at: null,
+      grace_limit: 0, overage_balance: 0, grace_started_at: null,
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    });
+
+    it('gates on PERSONAL credits even when the request carries a workspace_id', async () => {
+      mockReq.user = { id: 'user-123', email: 'test@test.com', role: 'user' };
+      mockReq.body = { workspace_id: 'ws-999' };
+      mockReq.headers = { ...mockReq.headers, 'x-workspace-id': 'ws-999' };
+      mockUserCreditsService.getUserCredits.mockResolvedValue(personalCredits(100));
+
+      const middleware = requireCredits(10);
+      await middleware(mockReq as Request, mockRes as Response, mockNext);
+
+      // Read the user's personal balance, not a workspace pool.
+      expect(mockUserCreditsService.getUserCredits).toHaveBeenCalledWith('user-123');
+      expect(mockNext).toHaveBeenCalled();
+      expect(mockRes.status).not.toHaveBeenCalled();
+    });
+
+    it('rejects a workspace-scoped request on insufficient PERSONAL balance (not workspace)', async () => {
+      mockReq.user = { id: 'user-123', email: 'test@test.com', role: 'user' };
+      mockReq.body = { workspace_id: 'ws-999' };
+      mockUserCreditsService.getUserCredits.mockResolvedValue(personalCredits(5));
+
+      const middleware = requireCredits(10);
+      await middleware(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(mockRes.status).toHaveBeenCalledWith(402);
+      expect(mockNext).not.toHaveBeenCalled();
+    });
   });
 });

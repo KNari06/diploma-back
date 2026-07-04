@@ -688,6 +688,9 @@ export class MobileTestRunJobHandler {
           // Forward the test's user-defined triggers verbatim (no-op when
           // undefined/empty — the client drops the field from the body).
           triggers,
+          // Scope the runner's resolver cache to the app build so a pooled
+          // runner process can't replay a cached pick from a different version.
+          appVersionCode,
           signal: runStepsAbort.signal,
           userId,
         });

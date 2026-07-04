@@ -579,6 +579,9 @@ export class MobileRunnerClient {
        *  reach the runner and free its session mutex. */
       signal?: AbortSignal;
       userId?: string;
+      /** App build versionCode — scopes the runner's resolver cache key so a
+       *  cached pick from a different build isn't replayed against this one. */
+      appVersionCode?: number;
     },
   ): Promise<MobileRunStepsResponse> {
     const body: MobileRunStepsRequest = {
@@ -589,6 +592,7 @@ export class MobileRunnerClient {
       // Only attach when present so a no-trigger run sends a byte-identical
       // body to pre-trigger behaviour (the runner schema treats it optional).
       ...(opts?.triggers && opts.triggers.length > 0 ? { triggers: opts.triggers } : {}),
+      ...(typeof opts?.appVersionCode === 'number' ? { appVersionCode: opts.appVersionCode } : {}),
     };
 
     return this.request<MobileRunStepsResponse>(

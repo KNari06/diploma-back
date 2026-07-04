@@ -419,6 +419,13 @@ export interface MobileRunStepsRequest {
    * Omitted when the test has none.
    */
   triggers?: Trigger[];
+  /**
+   * Android versionCode / iOS CFBundleVersion of the app under test. The runner
+   * stashes it on the session and folds it into the element-resolver cache key,
+   * so a cached pick from a different build (same runner process, within the
+   * cache TTL) is never replayed against a new build. Omitted when unknown.
+   */
+  appVersionCode?: number;
 }
 
 export interface MobileRunStepsResponse {

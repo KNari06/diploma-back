@@ -563,6 +563,15 @@ export class AIAnalysisJobHandler {
    * Convert database result to TestResult type
    */
   private static convertToTestResult(dbResult: any) {
+    // Mobile runs store their rich per-step evidence (device logcat, WebView
+    // CDP console/network errors, system alerts, per-step error classification)
+    // under metadata.steps[].evidence — NOT in the flat errors/logs/network_logs
+    // columns the analyzer reads. Without folding it in, mobile bug detection
+    // ran on a screenshot + a generic "element not found" string. Merge that
+    // evidence into the SAME channels the analyzer already consumes (errors /
+    // logs / networkLogs) so no analyzer or prompt change is needed.
+    const mobileEvidence = this.extractMobileEvidence(dbResult);
+
     return {
       id: dbResult.id,
       testId: dbResult.test_id,
@@ -570,9 +579,9 @@ export class AIAnalysisJobHandler {
       status: dbResult.status,
       screenshot: dbResult.screenshot,
       dom: dbResult.dom,
-      logs: dbResult.logs || [],
-      networkLogs: dbResult.network_logs || [],
-      errors: dbResult.errors || [],
+      logs: [...(dbResult.logs || []), ...mobileEvidence.logs],
+      networkLogs: [...(dbResult.network_logs || []), ...mobileEvidence.networkLogs],
+      errors: [...(dbResult.errors || []), ...mobileEvidence.errors],
       performance: dbResult.performance,
       qualityChecks: dbResult.quality_checks,
       aiSummary: dbResult.ai_summary,
@@ -581,6 +590,65 @@ export class AIAnalysisJobHandler {
       createdAt: new Date(dbResult.created_at),
       completedAt: dbResult.completed_at ? new Date(dbResult.completed_at) : undefined,
     };
+  }
+
+  /**
+   * Fold mobile per-step evidence (metadata.steps[].evidence / errorClassification)
+   * into the flat error/log/network channels the analyzer reads. No-op for web
+   * results (no metadata.platform === 'mobile'). Best-effort — any shape mismatch
+   * is swallowed so a malformed step never breaks analysis.
+   */
+  private static extractMobileEvidence(dbResult: any): {
+    errors: string[];
+    logs: string[];
+    networkLogs: any[];
+  } {
+    const out = { errors: [] as string[], logs: [] as string[], networkLogs: [] as any[] };
+    try {
+      const meta = dbResult?.metadata;
+      if (!meta || meta.platform !== 'mobile' || !Array.isArray(meta.steps)) return out;
+
+      meta.steps.forEach((step: any, idx: number) => {
+        const label = `Step ${idx + 1}${step?.stepId ? ` (${step.stepId})` : ''}`;
+        const ev = step?.evidence;
+
+        // Per-step classification is the analyzer's strongest signal: it already
+        // names the failure kind (app_crash / anr / network_error / …) with a
+        // one-line summary. Surface it as a high-signal error line.
+        const cls = step?.errorClassification;
+        if (cls?.type && cls.type !== 'unknown') {
+          out.errors.push(`${label}: [${cls.type}] ${cls.summary || 'classified failure'}`);
+        }
+
+        if (ev) {
+          // Device logcat / iOS syslog lines → logs channel.
+          if (Array.isArray(ev.logErrors)) {
+            for (const line of ev.logErrors) out.logs.push(`${label} device: ${line}`);
+          }
+          // WebView JS console errors/exceptions → errors channel.
+          if (Array.isArray(ev.consoleErrors)) {
+            for (const c of ev.consoleErrors) {
+              out.errors.push(`${label} console ${c.type}: ${c.message}${c.source ? ` (${c.source}${c.line ? `:${c.line}` : ''})` : ''}`);
+            }
+          }
+          // WebView network failures → networkLogs channel (analyzer truncates).
+          if (Array.isArray(ev.networkErrors)) {
+            for (const n of ev.networkErrors) {
+              out.networkLogs.push({ url: n.url, method: n.method, status: n.status, statusText: n.statusText, error: n.error });
+            }
+          }
+          // On-screen error alert/toast → errors channel.
+          if (ev.systemAlert?.isError && ev.systemAlert.text) {
+            out.errors.push(`${label} alert: ${ev.systemAlert.text}`);
+          }
+        }
+      });
+    } catch (err) {
+      logger.debug('[AI-ANALYSIS] extractMobileEvidence failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return out;
   }
 
   /**

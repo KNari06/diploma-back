@@ -489,7 +489,7 @@ export const getPricingPlans = async (req: Request, res: Response): Promise<void
  */
 export const getUserPlan = async (req: Request, res: Response): Promise<void> => {
   try {
-    const userId = req.headers['x-user-id'] as string;
+    const userId = req.user?.id;
 
     if (!userId || !isValidUUID(userId)) {
       res.status(400).json({
@@ -567,23 +567,13 @@ export const getUserPlan = async (req: Request, res: Response): Promise<void> =>
  */
 export const assignUserPlan = async (req: Request, res: Response): Promise<void> => {
   try {
-    const adminUserId = req.headers['x-user-id'] as string;
+    // Admin identity comes from the verified JWT (req.user), NOT a client-supplied
+    // header. The route is guarded by requireAdmin; this is a defense-in-depth
+    // recheck against the same trusted identity.
+    const adminUserId = req.user?.id;
     const { user_id, plan_slug } = req.body;
 
-    // Validate admin
-    if (!adminUserId || !isValidUUID(adminUserId)) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid admin user ID',
-        code: 'INVALID_ADMIN_ID',
-        message: 'Valid admin user ID is required',
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
-
-    const isAdminUser = await isAdmin(adminUserId);
-    if (!isAdminUser) {
+    if (!adminUserId || !(await isAdmin(adminUserId))) {
       res.status(403).json({
         success: false,
         error: 'Access denied',
@@ -668,7 +658,7 @@ export const assignUserPlan = async (req: Request, res: Response): Promise<void>
  */
 export const checkUserCredits = async (req: Request, res: Response): Promise<void> => {
   try {
-    const userId = req.headers['x-user-id'] as string;
+    const userId = req.user?.id;
     const { credits_amount = 1 } = req.body;
 
     if (!userId || !isValidUUID(userId)) {

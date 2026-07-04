@@ -509,3 +509,68 @@ describe('getProjectWorkspaceMemberIds', () => {
     expect(ids).toEqual(['owner-1']);
   });
 });
+
+describe('RegressionReportAssemblerService bug dedup', () => {
+  // dedupeBugs / fingerprintBug are pure private statics — access via `as any`
+  // (the same pattern this file uses elsewhere for internal shape assertions).
+  const svc = RegressionReportAssemblerService as any;
+
+  const mkBug = (over: Record<string, unknown> = {}) => ({
+    id: 'b',
+    title: 'Login button not found',
+    severity: 'high',
+    category: 'functional',
+    testCaseId: 'tc-1',
+    testCaseName: 'Login',
+    executionId: 'exec-1',
+    steps: [],
+    expected: '',
+    actual: '',
+    recommendation: '',
+    ...over,
+  });
+
+  it('collapses identical bugs across executions into one, counting occurrences', () => {
+    const bugs = [
+      mkBug({ executionId: 'exec-1' }),
+      mkBug({ executionId: 'exec-2' }),
+      mkBug({ executionId: 'exec-3' }),
+    ];
+    const out = svc.dedupeBugs(bugs);
+    expect(out).toHaveLength(1);
+    expect(out[0].occurrences).toBe(3);
+    expect(out[0].seenInExecutions.sort()).toEqual(['exec-1', 'exec-2', 'exec-3']);
+    expect(out[0].fingerprint).toMatch(/^[0-9a-f]{40}$/); // sha1 hex
+  });
+
+  it('treats attempt/run-number suffixes and long ids in the title as the same bug', () => {
+    const out = svc.dedupeBugs([
+      mkBug({ title: 'Login button not found (attempt 1)' }),
+      mkBug({ title: 'Login button not found (attempt 2)' }),
+      mkBug({ title: 'Login button not found 1699999999' }),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].occurrences).toBe(3);
+  });
+
+  it('keeps genuinely different bugs separate (severity / category / selector / title)', () => {
+    const out = svc.dedupeBugs([
+      mkBug({ title: 'Login button not found', severity: 'high' }),
+      mkBug({ title: 'Login button not found', severity: 'critical' }),   // diff severity
+      mkBug({ title: 'Checkout total wrong', severity: 'high' }),          // diff title
+      mkBug({ title: 'Login button not found', severity: 'high', category: 'visual' }), // diff category
+      mkBug({ title: 'Login button not found', severity: 'high', selector: '#a' }),     // diff selector
+    ]);
+    expect(out).toHaveLength(5);
+    expect(out.every((b: any) => b.occurrences === 1)).toBe(true);
+  });
+
+  it('preserves the first instance execution linkage for drill-down', () => {
+    const out = svc.dedupeBugs([
+      mkBug({ executionId: 'exec-first', id: 'keep-me' }),
+      mkBug({ executionId: 'exec-second', id: 'drop-me' }),
+    ]);
+    expect(out[0].id).toBe('keep-me');
+    expect(out[0].executionId).toBe('exec-first');
+  });
+});
