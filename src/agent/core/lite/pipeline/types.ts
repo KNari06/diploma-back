@@ -107,6 +107,26 @@ export interface TestBlackboardState {
   // ── Contextual hints (from GoalDetector, updated per round) ──
   contextualHints?: string[];         // navigation hints (e.g. "registration form not visible, click Sign Up")
 
+  // ── Page health (from CommandExecutor via page-health classifier) ──
+  // Technical-health verdict so Planner/Reviewer can tell "server broke" /
+  // "logged out" from "goal not yet reached". Best-effort; may be absent.
+  pageHealth?: import('../collectors/page-health').PageHealth;
+
+  // ── Round budget awareness (set by TestPipeline before each Planner call) ──
+  // Lets the Planner trade thoroughness for speed when rounds run low.
+  roundInfo?: { current: number; max: number };
+
+  // ── No-progress counter (set by TestPipeline same-state detection) ──
+  // Consecutive rounds where page state did not meaningfully change. Lets the
+  // Reviewer tell "the action had no effect, stop repeating it" from "progressing".
+  noProgressRounds?: number;
+
+  // ── Prior cross-flow learnings (set once at pipeline start from config) ──
+  // Compact summary of what OTHER flows already accomplished / got blocked on
+  // + the active strategy focus. Read-only context for the Planner so it reuses
+  // sibling flows' outcomes instead of re-discovering them. Absent for flow #1.
+  priorLearnings?: string;
+
   // ══════════════════════════════════════════════════════════════════════
   // HYBRID EXECUTOR FIELDS (only populated when enableHybridExecutor=true)
   // ══════════════════════════════════════════════════════════════════════
@@ -202,6 +222,29 @@ export interface ReviewResult {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PREFLIGHT RESULT (written by PreflightCheck agent, read by TestPipeline)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * PreflightCheck verdict — a PRE-action gate that inspects the Planner's plan
+ * BEFORE the Executor runs it. Reactive review (Reviewer) catches a bad action
+ * only AFTER it burned a round; this catches it before.
+ * - 'go'     → plan is sound, execute it.
+ * - 'revise' → plan is flawed but fixable; replan next round with `guidance`.
+ * - 'block'  → the goal is unreachable / plan is unsafe; stop the flow.
+ */
+export type PreflightVerdict = 'go' | 'revise' | 'block';
+
+export interface PreflightResult {
+  /** Gate decision. */
+  verdict: PreflightVerdict;
+  /** Human-readable reason (surfaced as an insight + trace). */
+  reason: string;
+  /** Guidance for the Planner on how to fix the plan (for 'revise'). */
+  guidance?: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // PIPELINE CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -253,6 +296,28 @@ export interface PipelineConfig {
    * Default: false. Decided by LiteEngine based on enableHybridExecutor flag.
    */
   enableHybridSafety?: boolean;
+  /**
+   * Whether THIS flow is an auth/login flow. Used by the page-health check so
+   * landing on a login URL is treated as the GOAL (not a "session lost"
+   * regression). Exploration sets it from the entry point's category.
+   */
+  flowIsAuth?: boolean;
+  /**
+   * Condensed Cartographer page understanding (forms, entities, interactive
+   * areas) for the flow's starting page. Threaded into the Planner's
+   * contextual hints so it doesn't re-derive page structure from raw DOM.
+   * Optional — absent for non-exploration callers.
+   */
+  pageInsightContext?: string;
+  /**
+   * Condensed cross-flow learnings from OTHER flows in the same exploration:
+   * what's already been accomplished (cookies accepted, logged in), which
+   * categories just got blocked and why, and the active strategy focus. Lets
+   * this flow's Planner skip solved obstacles and avoid a dead end a sibling
+   * flow already hit, instead of re-deriving everything per flow. Optional —
+   * absent for non-exploration callers and for the very first flow.
+   */
+  priorLearnings?: string;
 }
 
 /** Result returned by the pipeline */

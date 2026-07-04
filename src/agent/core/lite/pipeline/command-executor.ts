@@ -42,6 +42,8 @@ import type { CommandName, CommandResult, PipelineConfig } from './types';
 import { checkDomainBoundary } from '../exploration/domain-boundary';
 import { evaluateOverlayGate } from '../exploration/intra-flow-overlay-gate';
 import { OverlayDismisser } from '../exploration/overlay-dismisser';
+import { redactCredentialValues } from '@/utils/interpolation/redact-secrets';
+import { classifyPageHealth, formatPageHealth, pageHealthHasSignal } from '../collectors/page-health';
 
 /**
  * PR-Hybrid: Commands that carry a `ref` parameter and can be intercepted
@@ -73,6 +75,26 @@ export const REF_BASED_COMMANDS: ReadonlySet<CommandName> = new Set<CommandName>
  * events, insights) never sees plaintext credentials.
  */
 const SENSITIVE_VALUE_PLACEHOLDER = '[SENSITIVE]';
+
+/**
+ * How many recent console errors to surface in observe_page output. Enough to
+ * signal "the page is erroring" without flooding the prompt with a noisy log.
+ */
+const OBSERVE_CONSOLE_ERROR_LIMIT = 3;
+
+/**
+ * Vision escalation (observe_page). The per-flow agents read a TEXT render of
+ * the DOM — blind to canvas/SVG widgets, image-only controls, and "why is the
+ * page stuck". When a trigger fires we take ONE screenshot and enrich the
+ * snapshot with a VISION section. Vision calls are ~5-10x the cost/latency of a
+ * text round, so this is strictly rate-limited and never runs on ordinary pages.
+ */
+/** Min rounds between two vision escalations on the same flow (cooldown). */
+const VISION_ESCALATION_COOLDOWN_ROUNDS = 2;
+/** Hard cap on vision escalations per flow — a backstop against cost blow-up. */
+const VISION_ESCALATION_MAX_PER_FLOW = 3;
+/** No-progress rounds that, on their own, justify a vision look ("stuck, DOM can't explain why"). */
+const VISION_ESCALATION_NO_PROGRESS_ROUNDS = 2;
 
 /**
  * PR-Hybrid: Build a preliminary AICommand from tool-call args. Used by
@@ -176,6 +198,19 @@ export class CommandExecutor {
    */
   private safetyInterceptorDisabled = false;
 
+  /**
+   * Timestamp marking the start of the current health window. Network/console
+   * errors AFTER this point are attributed to the latest action when building
+   * the page-health verdict. Advanced on every health check so each verdict
+   * reflects only the most recent activity, not the whole run.
+   */
+  private lastHealthCheckTs = Date.now();
+
+  /** How many vision escalations this flow has spent (capped at VISION_ESCALATION_MAX_PER_FLOW). */
+  private visionEscalationCount = 0;
+  /** Round index of the last vision escalation, for the cooldown gate. -Infinity = never. */
+  private lastVisionEscalationRound = -Infinity;
+
   constructor(
     private page: Page,
     private actionExecutor: ActionExecutor,
@@ -183,6 +218,194 @@ export class CommandExecutor {
     private blackboard: TestBlackboard,
     private integrations: CommandExecutorIntegrations = {},
   ) {}
+
+  /**
+   * Build a page-health verdict from collector signals since the last check,
+   * store it on the blackboard (Reviewer + auditDone read it), and return a
+   * compact prompt-section body for inline enrichment. Best-effort: any
+   * failure returns '' and never throws (CLAUDE.md invariant #11).
+   */
+  private collectPageHealth(previousUrl: string | undefined, currentUrl: string): string {
+    try {
+      // The window spans everything since the previous health check (i.e. the
+      // previous observe_page). Errors that arrived during intervening
+      // click/navigate/wait commands are correctly attributed to THIS check —
+      // the next observe_page picks up exactly what happened since this one.
+      const since = this.lastHealthCheckTs;
+      this.lastHealthCheckTs = Date.now();
+
+      const networkErrorsSince = this.integrations.networkTracker?.getErrorsSince(since) ?? [];
+      const consoleErrorCount = this.integrations.consoleCollector
+        ? this.integrations.consoleCollector.getErrorsSince(since).length
+        : 0;
+
+      const health = classifyPageHealth({
+        networkErrorsSince,
+        consoleErrorCount,
+        previousUrl,
+        currentUrl,
+        flowIsAuth: this.config.flowIsAuth,
+      });
+
+      // ALWAYS overwrite the blackboard verdict so each window stands alone.
+      // Persisting only on signal would leave a stale server-error / session-
+      // lost verdict from an earlier round to keep tripping the Reviewer's
+      // deterministic health gate after the app has recovered — blocking a
+      // now-healthy flow forever. A clean window must clear the prior verdict.
+      this.blackboard.setPageHealth(pageHealthHasSignal(health) ? health : undefined);
+
+      // Trace the RAW signals behind the verdict (not just the later
+      // reviewer_fast_path decision), so a reader can see WHICH request 5xx'd /
+      // what console errors fired. Only on signal — clean rounds aren't traced.
+      if (pageHealthHasSignal(health)) {
+        this.integrations.traceWriter?.write({
+          stage: 'flow',
+          eventType: 'page_health',
+          spanId: this.integrations.traceWriter.generateSpanId(),
+          payload: {
+            entryPointId: this.config.entryPointId,
+            url: currentUrl,
+            serverErrorStatus: health.serverErrorStatus,
+            hasServerError: health.hasServerError,
+            sessionLost: health.sessionLost,
+            consoleErrorCount: health.consoleErrorCount,
+            networkErrors: networkErrorsSince.slice(0, 5).map((e) => ({ url: e.url, method: e.method, status: e.status })),
+          },
+        });
+      }
+
+      const body = formatPageHealth(health);
+      return body ? `\nPAGE HEALTH:\n${body}` : '';
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Decide whether THIS observe_page should spend a vision look, given the
+   * snapshot we just took. The per-flow agents read a text render of the DOM;
+   * a screenshot only earns its cost when the text is likely misleading:
+   *   - the snapshot itself recommends vision (canvas/SVG-heavy or thin DOM —
+   *     SnapshotCollector already computes this in metadata.recommendVision), OR
+   *   - the flow has made no progress for a couple of rounds (the DOM can't
+   *     explain why it's stuck; a picture might).
+   * Guarded by a per-flow cap + a cooldown so a stuck loop can't fire vision
+   * every round. Pure/read-only — never throws.
+   */
+  private shouldEscalateToVision(snapshot: LiteSnapshot): boolean {
+    if (this.visionEscalationCount >= VISION_ESCALATION_MAX_PER_FLOW) return false;
+    const currentRound = this.blackboard.getRounds().length;
+    if (currentRound - this.lastVisionEscalationRound < VISION_ESCALATION_COOLDOWN_ROUNDS) return false;
+
+    const domRecommends = snapshot.metadata?.recommendVision === true;
+    const stuck = this.blackboard.getNoProgressRounds() >= VISION_ESCALATION_NO_PROGRESS_ROUNDS;
+    return domRecommends || stuck;
+  }
+
+  /**
+   * Take ONE screenshot and analyze it with vision, returning a compact prompt
+   * section for the observe_page output. Reuses the same producer LiteEngine's
+   * L5 vision fallback uses (`analyzeScreenshotWithVision`) — no new model call
+   * shape, cost tracking already centralized there. Best-effort: any failure
+   * returns '' and never throws (CLAUDE.md invariant #11). The caller only
+   * invokes this after shouldEscalateToVision() has gated on cost.
+   */
+  private async collectVisionInsight(snapshot: LiteSnapshot): Promise<string> {
+    try {
+      this.visionEscalationCount += 1;
+      this.lastVisionEscalationRound = this.blackboard.getRounds().length;
+
+      const screenshot = await this.page.screenshot({ type: 'png' });
+      const base64 = screenshot.toString('base64');
+
+      const { analyzeScreenshotWithVision } = await import('@/services/ai/analysis/vision-analyzer.service');
+      const analysis = await analyzeScreenshotWithVision(base64, {
+        scope: this.blackboard.getGoal(),
+        url: snapshot.url,
+      });
+
+      const body = this.formatVisionInsight(analysis);
+      if (!body) return '';
+
+      this.integrations.traceWriter?.write({
+        stage: 'flow',
+        eventType: 'vision_escalation',
+        spanId: this.integrations.traceWriter.generateSpanId(),
+        payload: {
+          entryPointId: this.config.entryPointId,
+          url: snapshot.url,
+          round: this.lastVisionEscalationRound,
+          reason: snapshot.metadata?.recommendVision === true ? 'dom_weak_or_visual' : 'no_progress',
+          escalationCount: this.visionEscalationCount,
+          pageType: analysis.pageType,
+          elementsSeen: analysis.elements.length,
+          modalsSeen: analysis.modals?.length ?? 0,
+        },
+      });
+
+      return `\n${body}`;
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Render a vision analysis into a compact, credential-safe VISION section.
+   * Only surfaces what the text DOM tends to miss: CTAs / form fields the
+   * screenshot shows, active modals, and the layout. Returns '' when vision
+   * found nothing useful, so a failed/empty look adds no noise to the prompt.
+   */
+  private formatVisionInsight(
+    analysis: Awaited<ReturnType<typeof import('@/services/ai/analysis/vision-analyzer.service').analyzeScreenshotWithVision>>,
+  ): string {
+    const buttons = analysis.elements.filter((e) => e.isCTA).map((e) => `"${e.text}" (${e.location})`);
+    const fields = analysis.elements.filter((e) => e.type === 'input').map((e) => `${e.text || e.purpose} (${e.type})`);
+    const modal = analysis.modals?.[0];
+
+    const lines: string[] = [];
+    if (buttons.length) lines.push(`Visible buttons: ${buttons.join(', ')}`);
+    if (fields.length) lines.push(`Form fields: ${fields.join(', ')}`);
+    if (modal) lines.push(`Active modal: ${modal.description}${modal.hasCloseButton ? ' (has close button)' : ''}`);
+    if (analysis.layout && analysis.layout !== 'Unknown layout') lines.push(`Layout: ${analysis.layout}`);
+    if (!lines.length) return '';
+
+    // Vision text can echo whatever the page renders — redact any credential
+    // value before it reaches the LLM prompt / JSONL trace (invariant #10).
+    return this.redactCredentials(
+      `VISION (DOM was weak or the flow was stuck, so a screenshot was analyzed):\n${lines.join('\n')}`,
+    );
+  }
+
+  /**
+   * Cheap DOM signature for before/after change detection. NOT a full snapshot
+   * collect (that's heavy) — a fast evaluate of url + element count + body text
+   * length + title. Lets the trace PROVE whether an action changed the page
+   * ("click had no effect" is the single most common agent-fault pattern).
+   * Returns '' on failure — never throws, never blocks the action.
+   */
+  private async domSignature(): Promise<string> {
+    try {
+      // String-body evaluate (matches the alerts-evaluate pattern below) so the
+      // browser-context globals (document/location) aren't type-checked as Node.
+      const sig = await this.page.evaluate(`
+        (() => {
+          const d = document;
+          const interactive = d.querySelectorAll('button, a, input, select, textarea, [role="button"]').length;
+          const textLen = (d.body && d.body.innerText ? d.body.innerText.length : 0);
+          return location.href + '|' + d.title + '|' + interactive + '|' + textLen;
+        })()
+      `);
+      return typeof sig === 'string' ? sig : '';
+    } catch {
+      return '';
+    }
+  }
+
+  /** Commands that change page state — worth a before/after DOM-change check. */
+  private static readonly MUTATING_COMMANDS: ReadonlySet<string> = new Set([
+    'click_element', 'fill_field', 'select_option', 'press_key', 'toggle_element',
+    'set_range', 'select_date', 'clear_field', 'navigate_to',
+  ]);
 
   /**
    * Execute a single Playwright command.
@@ -225,6 +448,11 @@ export class CommandExecutor {
           return safetyBlockResult;
         }
       }
+
+      // Capture a cheap DOM signature before mutating commands so the trace can
+      // show whether the action actually changed the page (no-effect detection).
+      const isMutating = CommandExecutor.MUTATING_COMMANDS.has(name);
+      const sigBefore = isMutating ? await this.domSignature() : '';
 
       let result: CommandResult;
 
@@ -281,8 +509,14 @@ export class CommandExecutor {
           result = { success: false, output: '', error: `Unknown command: ${commandName}` };
       }
 
+      // After a mutating command, re-capture the signature to detect no-effect.
+      const sigAfter = isMutating ? await this.domSignature() : '';
+      const domChanged = isMutating && sigBefore !== '' && sigAfter !== ''
+        ? sigBefore !== sigAfter
+        : undefined;
+
       // Trace command execution
-      this.traceCommand(name, args, result, Date.now() - startMs);
+      this.traceCommand(name, args, result, Date.now() - startMs, domChanged);
 
       // Emit graph action node (for non-meta commands)
       this.emitGraphActionNode(name, args, result, Date.now() - startMs);
@@ -303,6 +537,9 @@ export class CommandExecutor {
 
   private async observePage(): Promise<CommandResult> {
     try {
+      // Capture the URL the blackboard knew BEFORE this observation so the
+      // page-health check can detect a mid-flow redirect (e.g. → /login).
+      const previousUrl = this.blackboard.getCurrentUrl();
       let snapshot = await SnapshotRouter.collect(this.page, { context: 'pipeline-observe', fullPage: true });
 
       // Intra-flow overlay gate: cheap check on the snapshot we just took.
@@ -400,15 +637,31 @@ export class CommandExecutor {
         try {
           const errorCount = this.integrations.consoleCollector.getErrorCount();
           if (errorCount > 0) {
-            const recentErrors = this.integrations.consoleCollector.getFormattedErrors(3);
+            const recentErrors = this.integrations.consoleCollector.getFormattedErrors(OBSERVE_CONSOLE_ERROR_LIMIT);
             if (recentErrors !== 'No console errors') {
-              consoleInfo = `\nCONSOLE ERRORS:\n${recentErrors}`;
+              // Redact any credential value a site may have echoed to the
+              // console before it reaches the LLM prompt / JSONL trace
+              // (CLAUDE.md hard invariant #10 — never surface plaintext creds).
+              consoleInfo = `\nCONSOLE ERRORS:\n${this.redactCredentials(recentErrors)}`;
             }
           }
         } catch {
           // Non-critical
         }
       }
+
+      // Page health: server error / session-lost / console errors since the
+      // last check. Stored on the blackboard (Reviewer + auditDone read it)
+      // and surfaced inline so the LLM can build the causal link
+      // (e.g. HTTP 500 + thin DOM ⇒ server broke, not goal achieved).
+      const healthInfo = this.collectPageHealth(previousUrl, snapshot.url);
+
+      // Vision escalation: only when the text DOM is likely misleading
+      // (canvas/SVG-heavy, thin DOM) or the flow is stuck. Gated on a per-flow
+      // cap + cooldown so it never runs on ordinary pages. Best-effort → ''.
+      const visionInfo = this.shouldEscalateToVision(snapshot)
+        ? await this.collectVisionInsight(snapshot)
+        : '';
 
       // Emit graph page node for page observation
       if (this.integrations.graphBuilder) {
@@ -436,7 +689,7 @@ export class CommandExecutor {
 
       return {
         success: true,
-        output: formatted + progressInfo + networkInfo + consoleInfo,
+        output: formatted + progressInfo + networkInfo + consoleInfo + healthInfo + visionInfo,
       };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
@@ -1227,6 +1480,16 @@ export class CommandExecutor {
   }
 
   /**
+   * Strip configured credential values out of an LLM-facing / trace-bound
+   * string before it leaves the executor. Thin delegate to the shared
+   * `redactCredentialValues` (single source — see redact-secrets.ts,
+   * CLAUDE.md invariant #10).
+   */
+  private redactCredentials(text: string): string {
+    return redactCredentialValues(text, this.config.credentials);
+  }
+
+  /**
    * Override fill value for credential fields.
    * SECURITY: Never sends real credentials to LLM — backend injects correct values.
    * Uses shared field classifier (3-level hierarchy).
@@ -1303,8 +1566,23 @@ export class CommandExecutor {
     args: Record<string, any>,
     result: CommandResult,
     durationMs: number,
+    domChanged?: boolean,
   ): void {
     try {
+      // Resolve WHAT element the ref pointed at (tag/role/name/visible/covered),
+      // so a reader sees the agent clicked e.g. a hidden div, not just "ref e310".
+      // Cheap in-memory lookup against the current snapshot.
+      let targetElement: Record<string, unknown> | undefined;
+      const ref = args.ref as string | undefined;
+      if (ref) {
+        const el = this.blackboard.getCurrentPageSnapshot()?.elements.find(e => e.ref === ref);
+        if (el) {
+          targetElement = {
+            ref: el.ref, tag: el.tag, role: el.role, name: el.name,
+            visible: el.visible, disabled: el.disabled, topmost: el.isTopMostAtCenter,
+          };
+        }
+      }
       this.integrations.traceWriter?.write({
         iteration: this.blackboard.getRounds().length,
         stage: 'command_execution',
@@ -1320,6 +1598,10 @@ export class CommandExecutor {
           done: result.done,
           blocked: result.blocked,
           durationMs,
+          // No-effect signal: did the action change the page? (mutating cmds only)
+          // undefined when not applicable / signature unavailable.
+          domChanged,
+          targetElement,
         },
       });
     } catch {

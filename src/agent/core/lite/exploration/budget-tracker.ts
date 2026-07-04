@@ -114,13 +114,6 @@ export class BudgetTracker {
     });
   }
 
-  async recordFlowCompletion(roundsUsed: number): Promise<void> {
-    await this.withMutex(() => {
-      this.flowsCompleted++;
-      this.pipelineRoundsUsed += roundsUsed;
-    });
-  }
-
   async recordPageSurvey(): Promise<void> {
     await this.withMutex(() => {
       this.pagesSurveyed++;

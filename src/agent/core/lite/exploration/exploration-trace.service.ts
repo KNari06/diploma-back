@@ -43,21 +43,52 @@ const EXPLORATION_MAX_PAYLOAD_CHARS = 30_000; // prompts can be long
 // SERVICE
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** Owner context needed to upload the trace to Supabase Storage on prod. */
+export interface ExplorationTraceUploadContext {
+  explorationId: string;
+  /** Server-derived run owner. Absent/non-UUID → anonymous upload, no DB record. */
+  userId?: string;
+}
+
 export class ExplorationTraceService {
   private writer: LiteTraceWriter;
+  private readonly uploadContext: ExplorationTraceUploadContext;
+  private uploaded = false;
 
-  constructor(explorationId: string) {
+  constructor(explorationId: string, uploadContext?: ExplorationTraceUploadContext) {
     this.writer = new LiteTraceWriter({
       testId: `exploration_${explorationId}`,
       logsDir: EXPLORATION_LOGS_DIR,
       maxFileSizeBytes: EXPLORATION_MAX_FILE_SIZE,
       maxPayloadChars: EXPLORATION_MAX_PAYLOAD_CHARS,
     });
+    this.uploadContext = uploadContext ?? { explorationId };
   }
 
+  /**
+   * Flush + close the trace file, then (on prod) upload it to Supabase Storage
+   * so the run leaves the same trace we get locally. The upload is
+   * fire-and-forget and idempotent (guarded by `uploaded`) — the engine has
+   * several close() call sites across its return paths, and this must run
+   * exactly once regardless of which one fires. Returns the local file path
+   * (unchanged contract) WITHOUT waiting on the storage round-trip.
+   */
   async close(): Promise<string> {
     const filePath = this.writer.getFilePath();
     await this.writer.close();
+    if (!this.uploaded) {
+      this.uploaded = true;
+      // Fire-and-forget: never let a storage hiccup delay or fail the run.
+      import('./exploration-trace-upload')
+        .then(({ uploadExplorationTrace }) =>
+          uploadExplorationTrace({
+            filePath,
+            userId: this.uploadContext.userId,
+            explorationId: this.uploadContext.explorationId,
+          }),
+        )
+        .catch(() => { /* best-effort — upload module logs its own failures */ });
+    }
     return filePath;
   }
 
@@ -123,6 +154,64 @@ export class ExplorationTraceService {
     this.writer.write({
       stage: 'lifecycle',
       eventType: 'checkpoint_saved',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // RESULT BUILD + PERSISTENCE EVENTS (END of the URL→test-cases path)
+  // Previously the trace went silent after the last flow_end; these surface
+  // what test cases were produced and whether they were saved — the part the
+  // user cares most about ("did I get ready-to-use tests?").
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writeTestCaseDiscovered(data: {
+    name: string;
+    category?: string;
+    stepsCount: number;
+    assertionsCount?: number;
+    hasCompiledLocators?: boolean;
+    sourceEntryPointId?: string;
+    isNegative?: boolean;
+  }): void {
+    this.writer.write({
+      stage: 'build',
+      eventType: 'test_case_discovered',
+      payload: data,
+    });
+  }
+
+  writeResultBuilt(data: {
+    testCasesCount: number;
+    negativeCount?: number;
+    totalSteps: number;
+    categories?: string[];
+  }): void {
+    this.writer.write({
+      stage: 'build',
+      eventType: 'result_built',
+      payload: data,
+    });
+  }
+
+  writeTestCasesSaved(data: {
+    requestedCount: number;
+    savedCount: number;
+    projectId: string;
+    savedIds?: string[];
+    error?: string;
+  }): void {
+    this.writer.write({
+      stage: 'persistence',
+      eventType: 'test_cases_saved',
+      payload: data,
+    });
+  }
+
+  writeRunCompleted(data: { explorationId: string; testCasesCount: number; durationMs: number }): void {
+    this.writer.write({
+      stage: 'persistence',
+      eventType: 'run_completed',
       payload: data,
     });
   }
@@ -651,8 +740,81 @@ export class ExplorationTraceService {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // PAGE HEALTH + ELEMENT RESOLUTION (per-action diagnostics)
+  // Surface the RAW signals behind a health verdict and the locator waterfall,
+  // so a reader can answer "why did the agent click that / why did it fail".
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writePageHealth(data: {
+    entryPointId?: string;
+    round?: number;
+    url: string;
+    serverErrorStatus?: number;
+    hasServerError: boolean;
+    sessionLost: boolean;
+    consoleErrorCount: number;
+    networkErrors?: Array<{ url: string; method: string; status?: number }>;
+    consoleErrors?: string[];
+  }): void {
+    this.writer.write({
+      stage: 'flow',
+      eventType: 'page_health',
+      payload: data,
+    });
+  }
+
+  writeElementResolution(data: {
+    entryPointId?: string;
+    round?: number;
+    ref: string;
+    command: string;
+    stage: 'compiled' | 'evidence' | 'llm' | 'smart_locator' | 'screenshot' | 'identity';
+    success: boolean;
+    reason?: string;
+    durationMs?: number;
+    resolved?: { tag?: string; role?: string; name?: string; text?: string; visible?: boolean; covered?: boolean; disabled?: boolean };
+  }): void {
+    this.writer.write({
+      stage: 'flow',
+      eventType: 'element_resolution',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // PRE-ENGINE LIFECYCLE (START of the path — controller/job/browser)
+  // Captures the previously-blind window between "URL dropped" and the first
+  // in-engine event, including crashes before the engine ever runs.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writeJobStart(data: { explorationId: string; entryUrl: string; isResume: boolean; resumeCount?: number }): void {
+    this.writer.write({
+      stage: 'lifecycle',
+      eventType: 'job_start',
+      payload: data,
+    });
+  }
+
+  writeBrowserLaunched(data: { headless: boolean; durationMs: number }): void {
+    this.writer.write({
+      stage: 'lifecycle',
+      eventType: 'browser_launched',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // ERROR & WARNING
   // ─────────────────────────────────────────────────────────────────────────
+
+  /** Capture a crash with stack so a failed run is diagnosable from the trace alone. */
+  writeFatal(data: { phase: string; error: string; stack?: string }): void {
+    this.writer.write({
+      stage: 'error',
+      eventType: 'fatal',
+      payload: data,
+    });
+  }
 
   writeError(error: string, context?: Record<string, any>): void {
     this.writer.write({

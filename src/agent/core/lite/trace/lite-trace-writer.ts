@@ -115,6 +115,10 @@ const SAFE_FIELD_NAMES = new Set([
   'authResource',
   // Common no-secret auth-adjacent counts/flags
   'authCheckpointCount',
+  // Page-health flags — booleans/counts, not secrets. `sessionLost` matches
+  // the broad /session/i pattern but is just "did the flow get logged out".
+  'sessionLost',
+  'hasServerError',
 ]);
 
 const SENSITIVE_PATTERNS = [

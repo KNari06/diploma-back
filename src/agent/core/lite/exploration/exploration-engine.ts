@@ -157,11 +157,24 @@ export class ExplorationEngine {
    *   Phase 2:   Flow Execution (TestPipeline + Scout per flow)
    *   Phase 2.5: Coverage Evaluation (Sentinel assesses gaps)
    */
-  async run(): Promise<ExplorationResult> {
+  /**
+   * @param onResultReady Optional async hook invoked with the built result
+   *   AFTER the test cases are produced but BEFORE the trace is finalized and
+   *   closed. The job uses it to persist test cases so the save is part of the
+   *   single traced lifecycle (fixes the old bug where trace.close() ran before
+   *   persistence, so a failed save still showed "completed"). It returns the
+   *   persistence outcome which is folded into the exploration_end status.
+   */
+  async run(
+    onResultReady?: (result: ExplorationResult) => Promise<{ savedCount: number; error?: string } | void>,
+  ): Promise<ExplorationResult> {
     const startTime = Date.now();
     const budget = new BudgetTracker(this.config.budget);
     const rateLimiter = new RateLimiter(this.config.rateLimiting, budget);
-    const trace = new ExplorationTraceService(this.config.explorationId);
+    const trace = new ExplorationTraceService(this.config.explorationId, {
+      explorationId: this.config.explorationId,
+      userId: this.config.userId,
+    });
     const emitProgress = this.onProgress || (() => {});
 
     // Create shared blackboard for all agents
@@ -176,6 +189,14 @@ export class ExplorationEngine {
       maxConcurrency: this.config.maxConcurrency,
       totalTimeoutMs: this.config.budget.totalTimeoutMs,
     });
+
+    // Guarantee the trace is flushed + uploaded on EVERY exit — including a
+    // mid-run throw (survey/strategist crash), which is exactly the trace we
+    // most want on prod. close() is idempotent (uploaded-once guard), so the
+    // explicit close() calls on the normal return paths below are harmless
+    // and this finally simply backstops the throw paths. Mirrors LiteEngine's
+    // `finally { traceWriter.close() }` pattern.
+    try {
 
     // ════════════════════════════════════════════════════════════════════
     // PHASE 1: SURVEY
@@ -329,8 +350,21 @@ export class ExplorationEngine {
           await targetedSurveyContext.close();
         }
       } catch (err) {
-        logger.warn('[EXPLORATION] Targeted survey failed, continuing with existing queue', {
-          error: err instanceof Error ? err.message : String(err),
+        // Targeted survey failed → some Strategist-requested pages are NOT in
+        // the queue, so coverage will be incomplete. Continuing is right (one
+        // failed sub-survey shouldn't kill the whole run), but it must be
+        // VISIBLE — otherwise the user sees "exploration complete" believing
+        // full coverage when pages were unreachable.
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn('[EXPLORATION] Targeted survey failed, continuing with existing queue', { error: msg });
+        trace.writeWarning('targeted_survey_failed', {
+          phase: 'strategizing',
+          targets: bb.currentStrategy.surveyTargets,
+          error: msg,
+        });
+        this.emitProgress('strategizing', 'agent_warning', {
+          message: 'Some requested pages could not be surveyed — coverage may be incomplete.',
+          targets: bb.currentStrategy.surveyTargets,
         });
       }
     }
@@ -489,8 +523,19 @@ export class ExplorationEngine {
             await targetedSurveyContext.close();
           }
         } catch (err) {
-          logger.warn('[EXPLORATION] Phase 2.5: Targeted survey failed, continuing with existing queue', {
-            error: err instanceof Error ? err.message : String(err),
+          // Same rationale as the Phase 1.5 targeted-survey catch: continue, but
+          // make the incomplete coverage visible rather than reporting a clean
+          // "complete".
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn('[EXPLORATION] Phase 2.5: Targeted survey failed, continuing with existing queue', { error: msg });
+          trace.writeWarning('targeted_survey_failed', {
+            phase: 'evaluating',
+            targets: focused.surveyTargets,
+            error: msg,
+          });
+          this.emitProgress('evaluating', 'agent_warning', {
+            message: 'Some follow-up pages could not be surveyed — coverage may be incomplete.',
+            targets: focused.surveyTargets,
           });
         }
       }
@@ -501,12 +546,15 @@ export class ExplorationEngine {
 
       if (bb.queue && !bb.queue.isEmpty()) {
         const extraFlowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter, trace, bb);
-        // Pass accumulated flow names from Phase 2 so Scout knows what's already been tested
+        // Pass accumulated flow names from Phase 2 so Scout knows what's already been tested,
+        // AND the cached auth state so auth-gated extra flows reuse the session instead of
+        // running logged-out (loginCompleted=true without cookies = silent unauthenticated runs).
         extraFlowRunner.restoreFromCheckpoint({
           loginCompleted: flowRunner.isLoginCompleted(),
           knownFlowNames: flowRunner.getKnownFlowNames(),
           flowsCompleted: flowTasks.length,
           completedTasks: flowTasks,
+          authState: flowRunner.getAuthState(),
         });
         try {
           const extraTasks = await extraFlowRunner.runAll(bb.queue);
@@ -529,6 +577,27 @@ export class ExplorationEngine {
 
     const builder = new TestCaseBuilder();
     const result = builder.build(bb.tree, flowTasks, budget, this.config, startTime, skippedEntryPoints);
+
+    // Trace each discovered test case + the result summary so the END of the
+    // path (what tests were produced) is visible, not just silence after the
+    // last flow_end. Best-effort — tracing must never affect the result.
+    try {
+      for (const tc of result.testCases) {
+        trace.writeTestCaseDiscovered({
+          name: tc.name,
+          category: tc.category,
+          stepsCount: tc.steps?.length ?? 0,
+          assertionsCount: (tc as any).assertions?.length,
+          hasCompiledLocators: tc.steps?.some((s: any) => !!s.compiled) ?? false,
+          isNegative: (tc as any).isNegative ?? false,
+        });
+      }
+      trace.writeResultBuilt({
+        testCasesCount: result.testCases.length,
+        totalSteps: result.summary.totalStepsDiscovered,
+        categories: result.summary.categories,
+      });
+    } catch { /* tracing is best-effort */ }
 
     // Attach Sentinel assessment to result
     if (bb.coverageAssessment) {
@@ -555,13 +624,47 @@ export class ExplorationEngine {
       continueExploring: false,
     }, 100);
 
+    // Persist BEFORE finalizing the trace so the save (and any failure) is part
+    // of the single traced lifecycle — fixes the old ordering where the trace
+    // closed first and a failed save still showed "completed".
+    let persistError: string | undefined;
+    if (onResultReady) {
+      try {
+        const outcome = await onResultReady(result);
+        if (outcome) {
+          trace.writeTestCasesSaved({
+            requestedCount: result.testCases.length,
+            savedCount: outcome.savedCount,
+            projectId: this.config.projectId,
+            error: outcome.error,
+          });
+          persistError = outcome.error;
+        }
+      } catch (err) {
+        persistError = err instanceof Error ? err.message : String(err);
+        trace.writeTestCasesSaved({
+          requestedCount: result.testCases.length,
+          savedCount: 0,
+          projectId: this.config.projectId,
+          error: persistError,
+        });
+      }
+    }
+
     trace.writeExplorationEnd({
-      status: 'completed',
+      status: persistError ? 'failed' : 'completed',
       durationMs: result.durationMs,
       testCasesCount: result.testCases.length,
       summary: result.summary,
+      error: persistError,
     });
     await trace.close();
+
+    // A failed persist is a failed run: surface it so the job marks the run
+    // failed and does NOT charge / report success for tests that weren't saved.
+    if (persistError) {
+      throw new Error(`Exploration persistence failed: ${persistError}`);
+    }
 
     logger.info('[EXPLORATION] Exploration complete', {
       explorationId: this.config.explorationId,
@@ -577,6 +680,11 @@ export class ExplorationEngine {
     });
 
     return result;
+    } finally {
+      // Backstop: close (→ upload) the trace even if a phase threw above.
+      // Idempotent, so a normal-path close() already having run is fine.
+      await trace.close();
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -593,7 +701,10 @@ export class ExplorationEngine {
     checkpoint: ExplorationCheckpoint,
   ): Promise<ExplorationResult> {
     const engine = new ExplorationEngine(browser, config);
-    const trace = new ExplorationTraceService(config.explorationId);
+    const trace = new ExplorationTraceService(config.explorationId, {
+      explorationId: config.explorationId,
+      userId: config.userId,
+    });
 
     logger.info('[EXPLORATION] Resuming from checkpoint', {
       explorationId: config.explorationId,
@@ -603,6 +714,10 @@ export class ExplorationEngine {
 
     trace.writeExplorationStart(config);
 
+    // Same guarantee as run(): close (→ upload) the trace on EVERY exit,
+    // including a mid-resume throw. Idempotent, so the explicit close() calls
+    // on the return paths below stay harmless.
+    try {
     // Restore tree and budget from checkpoint
     const tree = ExplorationTree.fromCheckpoint(checkpoint.tree);
     const budget = BudgetTracker.fromCheckpoint(config.budget, checkpoint.budget);
@@ -615,6 +730,14 @@ export class ExplorationEngine {
     bb.tree = tree;
     if (checkpoint.pageInsights) {
       bb.pageInsights = new Map(checkpoint.pageInsights);
+    }
+    // Rehydrate completedFlows from the checkpoint so the blackboard matches the
+    // non-resume path (which fills it at Phase 2 end). Today the resume path goes
+    // straight to builder.build and skips Sentinel/Phase 2.5, so nothing reads
+    // this yet — but leaving it empty is a latent trap: any future coverage/
+    // re-strategy step added to resume would see 0 prior flows. Cheap to keep sound.
+    for (const task of checkpoint.flowRunner?.completedTasks ?? []) {
+      bb.completedFlows.push(taskToFlowResult(task));
     }
 
     // Check if budget is already exhausted (stale checkpoint)
@@ -769,6 +892,10 @@ export class ExplorationEngine {
     });
     await trace.close();
     return result;
+    } finally {
+      // Backstop: close (→ upload) the trace even if resume threw above.
+      await trace.close();
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════

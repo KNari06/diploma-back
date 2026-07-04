@@ -128,6 +128,18 @@ export class StateManager {
   }
 
   /**
+   * Export the cached auth storageState so it can be handed to ANOTHER
+   * FlowRunner's StateManager (e.g. the Phase 2.5 extra runner) via
+   * preloadAuthState — without this, a second runner starts with a null
+   * auth state, and if it also carries loginCompleted=true it would run
+   * auth-gated flows LOGGED OUT (login skipped, no cookies injected).
+   * Returns null when no login has happened yet.
+   */
+  getAuthState(): object | null {
+    return this.authStateJson;
+  }
+
+  /**
    * Clear cached auth state (e.g., if session expired).
    */
   clearAuthState(): void {

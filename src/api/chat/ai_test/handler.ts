@@ -1,4 +1,5 @@
 import { redisConnection } from '@/config/infrastructure/queues';
+import { PENDING_EXPLORATION_PREFIX, PENDING_EXPLORATION_TTL_SEC } from '@/api/chat/shared/exploration-confirmation';
 import { supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
@@ -756,7 +757,7 @@ export async function handlePlatformTest(
       // ─────────────────────────────────────────────────────────────────
       // AI-DETECTED EXPLORATION — requires user confirmation (existing flow)
       // ─────────────────────────────────────────────────────────────────
-      const pendingKey = `pending_exploration:${chatSessionId || userId}`;
+      const pendingKey = `${PENDING_EXPLORATION_PREFIX}${chatSessionId || userId}`;
       const pendingData = JSON.stringify({
         entryUrl: extractedUrl.trim(),
         projectId: project_id,
@@ -766,7 +767,7 @@ export async function handlePlatformTest(
         scopeHint: parsedIntent?.target || parsedIntent?.scope || undefined,
         credentials: finalCredentials || undefined,
       });
-      await redisConnection.set(pendingKey, pendingData, 'EX', 600); // 10 min TTL
+      await redisConnection.set(pendingKey, pendingData, 'EX', PENDING_EXPLORATION_TTL_SEC);
 
       const confirmationMessage =
         `**Site Exploration** — **${extractedUrl}**\n\n` +
@@ -775,7 +776,7 @@ export async function handlePlatformTest(
         `- Uses **significantly more credits** than a single test (5-20x depending on site size)\n` +
         `- Takes **10-15 minutes** to complete\n` +
         `- Explores up to 10 pages and 20 flows\n\n` +
-        `Do you want to proceed? Reply **yes** to start or **no** to cancel.`;
+        `Want me to go ahead?`;
 
       if (chatSessionId) {
         ChatService.saveChatMessages(chatSessionId, [

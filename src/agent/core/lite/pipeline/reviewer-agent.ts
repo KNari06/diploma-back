@@ -56,6 +56,18 @@ const REVIEWER_CONFIG = {
   progressThresholdDone: 85,
   /** Auditor cooldown: skip gpt-5.4-mini calls for N rounds after rejection */
   auditCooldownRounds: 2,
+  /**
+   * Consecutive server-error (5xx) rounds before the health gate escalates
+   * from "replan" (transient, retry) to "blocked" (app persistently down).
+   * Stops a hard-down server from burning the whole round budget on retries.
+   */
+  serverErrorBlockAfter: 2,
+  /**
+   * Consecutive rate-limited (HTTP 429) rounds before the gate escalates from
+   * "replan + back off" to "blocked". More lenient than 5xx: throttling often
+   * clears if we simply wait, so we give it more rounds before giving up.
+   */
+  rateLimitBlockAfter: 3,
 } as const;
 
 export class ReviewerAgent {
@@ -66,6 +78,16 @@ export class ReviewerAgent {
    */
   private static auditCooldowns = new WeakMap<TestBlackboard, number>();
 
+  /**
+   * Per-blackboard count of CONSECUTIVE server-error (5xx) rounds. Same WeakMap
+   * lifetime semantics as auditCooldowns. Reset to 0 on the first clean round
+   * so a recovered app starts the streak over.
+   */
+  private static serverErrorStreaks = new WeakMap<TestBlackboard, number>();
+
+  /** Per-blackboard count of CONSECUTIVE rate-limited (429) rounds. */
+  private static rateLimitStreaks = new WeakMap<TestBlackboard, number>();
+
   /** Get cooldown remaining for a specific test (via its blackboard) */
   private static getCooldown(bb: TestBlackboard): number {
     return ReviewerAgent.auditCooldowns.get(bb) || 0;
@@ -74,6 +96,24 @@ export class ReviewerAgent {
   /** Set cooldown remaining for a specific test */
   private static setCooldown(bb: TestBlackboard, value: number): void {
     ReviewerAgent.auditCooldowns.set(bb, value);
+  }
+
+  /** Consecutive 5xx streak for a specific test (via its blackboard). */
+  private static getServerErrorStreak(bb: TestBlackboard): number {
+    return ReviewerAgent.serverErrorStreaks.get(bb) || 0;
+  }
+
+  private static setServerErrorStreak(bb: TestBlackboard, value: number): void {
+    ReviewerAgent.serverErrorStreaks.set(bb, value);
+  }
+
+  /** Consecutive 429 streak for a specific test (via its blackboard). */
+  private static getRateLimitStreak(bb: TestBlackboard): number {
+    return ReviewerAgent.rateLimitStreaks.get(bb) || 0;
+  }
+
+  private static setRateLimitStreak(bb: TestBlackboard, value: number): void {
+    ReviewerAgent.rateLimitStreaks.set(bb, value);
   }
 
   /**
@@ -91,6 +131,85 @@ export class ReviewerAgent {
     traceWriter?: LiteTraceWriter,
   ): Promise<ReviewResult> {
     const round = blackboard.getRounds().length;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Phase -1: PAGE HEALTH gate (deterministic, runs BEFORE the done-claim
+    // check so it catches the no-auditor / cooldown paths that would
+    // otherwise trust a "done" on a broken page). Only the unambiguous
+    // failures override here: a hard server error (5xx) or a mid-flow logout.
+    // A transient 4xx alone is left to the AI reviewer / done-auditor.
+    // ═══════════════════════════════════════════════════════════════════
+    const health = blackboard.getPageHealth();
+    if (health?.serverErrorStatus) {
+      // Track consecutive 5xx rounds: transient → replan (retry), but a
+      // persistently-down server escalates to blocked so we stop burning the
+      // round budget on doomed retries (the round limit alone would just
+      // time out ungracefully).
+      const streak = ReviewerAgent.getServerErrorStreak(blackboard) + 1;
+      ReviewerAgent.setServerErrorStreak(blackboard, streak);
+      const escalate = streak >= REVIEWER_CONFIG.serverErrorBlockAfter;
+      logger.debug('[REVIEWER] Health gate: server error', {
+        status: health.serverErrorStatus, streak, verdict: escalate ? 'blocked' : 'replan',
+      });
+      const result: ReviewResult = escalate
+        ? {
+            verdict: 'blocked',
+            reason: `Server error HTTP ${health.serverErrorStatus} persisted for ${streak} rounds — the app appears down, goal not achievable`,
+            goalAlignment: 0,
+          }
+        : {
+            verdict: 'replan',
+            reason: `Server error HTTP ${health.serverErrorStatus} — the page failed, goal not achieved`,
+            goalAlignment: 0,
+            guidance: 'The app returned a server error. Retry the action or a different path; do not treat this page as success.',
+          };
+      ReviewerAgent.trace(traceWriter, 'reviewer_fast_path', {
+        round, path: 'health_server_error', verdict: result.verdict, status: health.serverErrorStatus, streak,
+      });
+      return result;
+    }
+    // Clean round (no 5xx): reset the streak so a later transient error starts
+    // a fresh count and a recovered app isn't escalated on stale history.
+    ReviewerAgent.setServerErrorStreak(blackboard, 0);
+
+    // Rate limited (429): the app is ALIVE but throttling us — not a failure.
+    // Back off and retry; escalate to blocked only if it persists (the site is
+    // refusing us for now). More lenient than 5xx (rateLimitBlockAfter > 5xx).
+    if (health?.rateLimited) {
+      const streak = ReviewerAgent.getRateLimitStreak(blackboard) + 1;
+      ReviewerAgent.setRateLimitStreak(blackboard, streak);
+      const escalate = streak >= REVIEWER_CONFIG.rateLimitBlockAfter;
+      const result: ReviewResult = escalate
+        ? {
+            verdict: 'blocked',
+            reason: `Rate limited (HTTP 429) for ${streak} rounds — the site keeps throttling; goal not achievable right now`,
+            goalAlignment: 0,
+          }
+        : {
+            verdict: 'replan',
+            reason: `Rate limited (HTTP 429) — the site is throttling requests, not failing`,
+            goalAlignment: blackboard.getProgressScore() / 100,
+            guidance: 'The site returned HTTP 429 (too many requests). Wait before retrying and slow the pace — do NOT treat this as goal failure or keep hammering the same action.',
+          };
+      ReviewerAgent.trace(traceWriter, 'reviewer_fast_path', {
+        round, path: 'health_rate_limited', verdict: result.verdict, streak,
+      });
+      return result;
+    }
+    ReviewerAgent.setRateLimitStreak(blackboard, 0);
+
+    if (health?.sessionLost) {
+      logger.debug('[REVIEWER] Health gate: session lost → blocked');
+      const result: ReviewResult = {
+        verdict: 'blocked',
+        reason: 'Redirected to a login page mid-flow — the session was lost, goal not achieved',
+        goalAlignment: 0,
+      };
+      ReviewerAgent.trace(traceWriter, 'reviewer_fast_path', {
+        round, path: 'health_session_lost', verdict: result.verdict,
+      });
+      return result;
+    }
 
     // ═══════════════════════════════════════════════════════════════════
     // Phase 0: auditDone() — validate "done" claims with gpt-4o

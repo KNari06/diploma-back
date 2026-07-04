@@ -36,6 +36,7 @@ You also detect authentication:
 RULES:
 - Be comprehensive — find ALL real user journeys, not just obvious ones
 - Prioritize interactive flows (forms, CTAs, buttons) over passive content
+- POPULATE pageInsight.forms for EVERY form on the page: for each form list its input fields (ref, label, type, required) and the submit button. This includes forms without a <form> tag — any group of inputs + a submit control. This drives form-flow planning; an empty forms array means the planner cannot fill the form.
 - Authentication flows are always critical priority
 - Do NOT list truly destructive flows only (delete account, wipe all data, permanently ban user) — other delete/cancel actions like "cancel order", "remove from cart", "delete review" ARE valid test flows
 - Do NOT list pure UI noise: cookie banners, generic chat widget openers, "close modal" buttons
@@ -136,7 +137,18 @@ These overlays were auto-dismissed before this snapshot. Ignore them.`);
     "loginUrl": null
   },
   "pageInsight": {
-    "forms": [],
+    "forms": [
+      {
+        "formRef": "e5",
+        "fields": [
+          {"ref": "e6", "label": "Email", "type": "email", "required": true},
+          {"ref": "e7", "label": "Phone", "type": "tel", "required": true},
+          {"ref": "e8", "label": "I agree to processing", "type": "checkbox", "required": true}
+        ],
+        "submitButtonRef": "e9",
+        "submitButtonText": "Submit"
+      }
+    ],
     "interactiveAreas": ["navigation bar", "search section", "product grid"],
     "dataEntities": ["products", "categories"],
     "stateIndicators": ["cart has 0 items"],

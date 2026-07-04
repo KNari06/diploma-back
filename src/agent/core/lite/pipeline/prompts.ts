@@ -15,6 +15,7 @@
  */
 
 import { TestBlackboard } from './blackboard';
+import { formatPageHealth } from '../collectors/page-health';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PLANNER PROMPT
@@ -35,6 +36,43 @@ export function buildPlannerPrompt(bb: TestBlackboard): string {
   // Goal
   sections.push(`GOAL: ${bb.getGoal()}`);
   sections.push(`URL: ${bb.getCurrentUrl() || bb.getUrl()}`);
+
+  // Progress + remaining budget — lets the Planner trade thoroughness for
+  // speed and recognise a stuck flow (low progress + few rounds left).
+  const roundInfo = bb.getRoundInfo();
+  if (roundInfo) {
+    const remaining = Math.max(0, roundInfo.max - roundInfo.current);
+    sections.push(
+      `PROGRESS: ${bb.getProgressScore()}% toward goal (round ${roundInfo.current}/${roundInfo.max}, ${remaining} left)`,
+    );
+  }
+
+  // No-effect signal — graduated to match the Reviewer's threshold: a single
+  // no-effect round is a soft caution (the action may just need a beat), but
+  // 2+ consecutive rounds is the same hard "dead element, pivot" line the
+  // Reviewer acts on (2+ → replan, 3+ → blocked). Keeping the thresholds in
+  // sync stops the Planner from confidently re-queuing a click the Reviewer
+  // is about to reject.
+  const noProgress = bb.getNoProgressRounds();
+  if (noProgress >= 2) {
+    sections.push(
+      `NO STATE CHANGE: page unchanged for ${noProgress} consecutive rounds — the last action(s) had NO effect. Do NOT repeat them; choose a DIFFERENT element or path, or report_blocked if none exists.`,
+    );
+  } else if (noProgress === 1) {
+    sections.push(
+      `CAUTION: the page did not change after the last action. If your plan repeats that action, prefer a DIFFERENT element/path unless you have a concrete reason it will work this time.`,
+    );
+  }
+
+  // Page health — technical-health verdict (server error / session lost /
+  // console errors), same signal the Reviewer reads. Without it the Planner
+  // would plan a fresh round against a 500 page / logged-out state and only the
+  // Reviewer would catch it after the fact; here the Planner can go straight to
+  // report_blocked instead of burning a round.
+  const plannerHealth = formatPageHealth(bb.getPageHealth());
+  if (plannerHealth) {
+    sections.push(`PAGE HEALTH:\n${plannerHealth}`);
+  }
 
   // Credential hint
   if (bb.getHasCredentials()) {
@@ -73,6 +111,15 @@ export function buildPlannerPrompt(bb: TestBlackboard): string {
     sections.push(`CONTEXTUAL HINTS:\n${contextualHints.join('\n')}`);
   }
 
+  // Cross-flow learnings from OTHER flows in this exploration (accomplishments
+  // already done, categories that got blocked + why, active strategy focus).
+  // Read-only context — lets the Planner skip solved obstacles and steer clear
+  // of a dead end a sibling flow already hit, instead of re-deriving per flow.
+  const priorLearnings = bb.getPriorLearnings();
+  if (priorLearnings) {
+    sections.push(`LEARNINGS FROM OTHER FLOWS (context — do NOT redo what's done, avoid known blockers):\n${priorLearnings}`);
+  }
+
   // Shared team insights
   if (insights.length > 0) {
     sections.push(`TEAM INSIGHTS:\n${insights.map((i, idx) => `  ${idx + 1}. ${i}`).join('\n')}`);
@@ -86,8 +133,15 @@ INSTRUCTIONS:
 - Analyze the page structure: forms, buttons, links, modals, errors
 - Create concrete steps in DOM order (top-to-bottom for form fields)
 - For forms: list each field to fill, then the submit action
+- If the goal targets a form BUT CURRENT PAGE STATE does not yet list the form's
+  fields (only a container or a trigger button is visible), make the FIRST step
+  observe_page (or a click/scroll that reveals the form) so the next plan can
+  target the real field refs — do NOT invent field steps against refs you cannot see
 - If replanning after failure: adjust the approach based on reviewer feedback
 - Keep steps concise and actionable
+- If PROGRESS is low AND few rounds remain: do NOT repeat a failed approach — try a
+  different element/path, or if the goal is clearly unreachable (server error, hard
+  block) instruct a report_blocked rather than burning the last rounds.
 
 Respond with JSON:
 {
@@ -177,11 +231,16 @@ COMMANDS AVAILABLE:
 - report_blocked(reason) — signal blocked (CAPTCHA, 2FA, etc.)
 
 EXECUTION RULES:
-1. If CURRENT PAGE STATE is already provided above, DO NOT call observe_page — you already have the page state. Only call observe_page after navigation/submit or when refs are stale.
+1. If CURRENT PAGE STATE is already provided above, DO NOT call a redundant observe_page — you already have the page state. Legitimate observe_page cases: (a) the PLAN explicitly includes an observe_page step (execute it as planned — it's there to reveal refs), (b) after navigation/submit, (c) after an action revealed NEW content (modal/accordion/form opened) whose refs you don't have, (d) refs went stale.
 2. Follow the plan steps in order
 3. Plan steps may include element refs like [e1]. Use these refs directly when available. If a ref is stale (element not found), infer from the description and call observe_page to get fresh refs.
-4. You CAN call MULTIPLE commands in one response (batch fill + click together)
-5. After submit/navigation: call wait_for_page then observe_page
+4. BATCH aggressively — issue MULTIPLE commands in ONE response instead of one-at-a-time. This is the fast path; a single command per response wastes a full plan/execute/review cycle.
+   - Forms: fill EVERY field then click submit, all in one response — do NOT observe_page between fills.
+     Example: fill_field(email) + fill_field(password) + toggle_element(consent) + click_element(submit).
+   - Chains: scroll_to_element(ref) + click_element(ref) together; hover_element + click together.
+   - Only the LAST command in a batch may navigate/submit; put non-navigating actions before it.
+   - NEVER batch observe_page with commands that use refs it would reveal. If the plan's first step is observe_page (e.g. to expose a form's fields), run observe_page ALONE this response, then batch the fills next response using the fresh refs. Batching observe_page with fills = the fills fire against stale/absent refs.
+5. After a submit/navigation happens: the NEXT response calls wait_for_page then observe_page (one verification per navigation, not per field).
 6. If a command fails, try a different approach
 7. For credential fields: set is_sensitive=true, use any placeholder value
 8. Call mark_done ONLY after verifying goal with observe_page
@@ -189,7 +248,10 @@ EXECUTION RULES:
 10. Use hover_element to reveal tooltips or dropdown menus before interacting
 11. Use scroll_to_element(ref) to bring off-screen elements into view
 12. report_blocked should include blocker_type and can_user_help when possible
-13. If [POST-ACTION] shows PAGE ALERTS with errors — call observe_page to get full page state before deciding next action
+13. Use [POST-ACTION] signals to decide WHETHER to observe — do NOT reflexively observe_page after every command:
+    - [POST-ACTION] empty (no alert, no URL change) → keep batching more commands, no observe needed.
+    - [POST-ACTION] shows a URL change → a navigation happened; next response does wait_for_page + observe_page.
+    - [POST-ACTION] shows validation errors that block progress → THEN call observe_page for the full state.
 14. CRITICAL: If observe_page shows PAGE ALERTS with authentication errors like "Invalid email or password", "Wrong credentials", "Incorrect password", or "Account locked" after a login attempt: call report_blocked with reason="credentials_invalid", blocker_type="auth_failure", can_user_help=true. Do NOT retry — the user-provided credentials are wrong.
 15. CAPTCHA DETECTION: If observe_page shows a checkbox inside an [IFRAME] with empty name (CAPTCHA widget), or if PAGE ALERTS mention "reCAPTCHA", "CAPTCHA", "hCaptcha", "Turnstile", or "bot verification" — immediately call report_blocked with blocker_type="captcha". Do NOT retry form submission.`;
 }
@@ -239,6 +301,23 @@ export function buildReviewerPrompt(bb: TestBlackboard): string {
   // Progress score
   sections.push(`PROGRESS: ${bb.getProgressScore()}%`);
 
+  // Page health — technical-health verdict (server error / session lost /
+  // console errors). Lets the Reviewer build the causal link instead of
+  // mistaking a 500 error page for goal achievement.
+  const healthBody = formatPageHealth(bb.getPageHealth());
+  if (healthBody) {
+    sections.push(`PAGE HEALTH:\n${healthBody}`);
+  }
+
+  // No-effect signal — consecutive rounds where the page didn't meaningfully
+  // change. Stops the "click → no effect → click again" loop seen in practice.
+  const noProgress = bb.getNoProgressRounds();
+  if (noProgress >= 1) {
+    sections.push(
+      `NO STATE CHANGE: the page has not meaningfully changed for ${noProgress} consecutive round(s) — the last action(s) had NO visible effect.`,
+    );
+  }
+
   return `You are a TEST REVIEWER. Evaluate whether the execution achieved the goal.
 
 ${sections.join('\n\n')}
@@ -249,6 +328,9 @@ Analyze:
 3. Are there errors or unexpected states on the page (check PAGE ALERTS section)?
 4. If PAGE ALERTS mention CAPTCHA/reCAPTCHA/hCaptcha/Turnstile/bot verification, the verdict should be "blocked" — CAPTCHAs cannot be automated.
 5. If credentials were used and page shows authentication errors (invalid, wrong, incorrect), the verdict should be "blocked" — user-provided credentials appear wrong.
+6. If PAGE HEALTH reports a SERVER ERROR (HTTP 5xx), the page is broken — this is NOT goal achievement even if the DOM looks thin/empty. Verdict "replan" (retry) or "blocked" (app down), never "done".
+7. If PAGE HEALTH reports SESSION LOST (redirected to login mid-flow), the user was logged out — the goal was NOT achieved. Verdict "blocked".
+8. If NO STATE CHANGE is reported (the action had no visible effect for 2+ rounds): do NOT verdict "continue" to repeat the same action. The element is likely dead, covered, or opens content elsewhere. Verdict "replan" with guidance to try a DIFFERENT element/path; if 3+ rounds with no effect and no alternative, verdict "blocked".
 
 Respond with JSON:
 {

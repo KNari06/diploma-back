@@ -156,6 +156,10 @@ const envSchema = z.object({
   // wait. Validate before enabling broadly. See agent/execution/replay-readiness.ts.
   REPLAY_READINESS_RECOLLECT_ENABLED: z.string().transform(v => v === 'true').default('false'),
   EXPLORATION_TIMEOUT_MS: z.string().transform(Number).default('300000'),
+  // PreflightCheck: a pre-action gate that inspects the Planner's plan before
+  // the Executor runs it (catches loops / hallucinated refs / unreachable goals
+  // BEFORE burning a round). Exploration-only. ON by default; flip to disable.
+  EXPLORATION_PREFLIGHT_ENABLED: z.string().transform(v => v === 'true').default('true'),
 
   // Logging
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),

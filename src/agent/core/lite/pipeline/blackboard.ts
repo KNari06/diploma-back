@@ -275,6 +275,60 @@ export class TestBlackboard {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // PRIOR CROSS-FLOW LEARNINGS (set once at pipeline start from config;
+  // read-only summary of sibling flows' accomplishments / blockers + strategy).
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setPriorLearnings(text: string): void {
+    this.state.priorLearnings = text;
+  }
+
+  getPriorLearnings(): string | undefined {
+    return this.state.priorLearnings;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // PAGE HEALTH (written by CommandExecutor per action/round, read by
+  // Reviewer prompt + auditDone gate). Best-effort technical-health verdict.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setPageHealth(health: import('../collectors/page-health').PageHealth | undefined): void {
+    this.state.pageHealth = health;
+  }
+
+  getPageHealth(): import('../collectors/page-health').PageHealth | undefined {
+    return this.state.pageHealth;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // ROUND INFO (set by TestPipeline before each Planner call so the Planner
+  // knows how much budget remains and can change strategy / give up).
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setRoundInfo(current: number, max: number): void {
+    this.state.roundInfo = { current, max };
+  }
+
+  getRoundInfo(): { current: number; max: number } | undefined {
+    return this.state.roundInfo;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // NO-PROGRESS COUNTER (set by TestPipeline from same-state detection).
+  // Number of consecutive rounds where the page state did NOT meaningfully
+  // change. Read by the Reviewer to escalate from "retry same action" to
+  // "the action has no effect — pivot or report_blocked" instead of looping.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setNoProgressRounds(n: number): void {
+    this.state.noProgressRounds = n;
+  }
+
+  getNoProgressRounds(): number {
+    return this.state.noProgressRounds ?? 0;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // PR-HYBRID: SUPERVISOR BLACKBOARD (written by TestPipeline per round,
   // read by CommandExecutor for forbidden-action enforcement)
   // ═══════════════════════════════════════════════════════════════════════

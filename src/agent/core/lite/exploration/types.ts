@@ -782,4 +782,12 @@ export interface FlowRunnerCheckpoint {
   knownFlowNames: string[];
   flowsCompleted: number;
   completedTasks: FlowExplorationTask[];
+  /**
+   * Cached auth storageState (cookies + localStorage) captured after the first
+   * successful login. Restored into a Phase-2.5 / resumed FlowRunner's
+   * StateManager so its auth-gated flows reuse the session instead of running
+   * logged-out with a stale `loginCompleted=true`. Optional / null before any
+   * login happened.
+   */
+  authState?: object | null;
 }

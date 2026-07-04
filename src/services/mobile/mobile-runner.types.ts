@@ -231,7 +231,7 @@ export interface MobileIntentStep {
    * not declared on the type, so ts-eyes couldn't see that the
    * regression dispatch path was correctly forwarding it. Persist via
    * `IntentTestCaseService.batchUpdateStepsFromRun()` after every run
-   * (see mobile-test-run.job.ts:persistCompiledPlansFromRun) and via
+   * (see mobile-test-run.job.ts:CompiledPlanPersistenceService.persistFromRun) and via
    * `updateStepFromPreviewApply()` after every editor apply (web's
    * preview.handler.ts pattern; mobile editor session.controller.ts
    * needs the same treatment).
@@ -284,7 +284,7 @@ export interface MobileStepResult {
    *     the plan that pointed at it is locking in a wrong element.
    *   - 'foreground_mismatch': plan was built against the wrong app's tree.
    * Backend persist sites (mobile-step-apply.service.ts,
-   * mobile-test-run.job.ts persistCompiledPlansFromRun, session.controller.ts
+   * mobile-test-run.job.ts CompiledPlanPersistenceService.persistFromRun, session.controller.ts
    * runTestCaseOnSession auto-persist) check this and skip writes.
    */
   planStaleReason?: 'vte_mismatch' | 'foreground_mismatch';

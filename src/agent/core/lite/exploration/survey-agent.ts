@@ -24,6 +24,7 @@ import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
 import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.service';
 import { VisualStability } from '../collectors/visual-stability';
+import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 
 import type { LiteSnapshot, LiteElement } from '../lite-types';
 import type { ExplorationConfig, EntryPoint, NavigationAction, TestFlowCategory, FlowPriority } from './types';
@@ -45,6 +46,7 @@ import {
   isClickable,
   bestLabel,
 } from '../analysis/interactive-element-signals';
+import { isLoginUrl } from './auth-url-patterns';
 
 /** Max hidden navigation links to follow per page (Cartographer-discovered links have no limit) */
 const MAX_NAV_LINKS_PER_PAGE = 15;
@@ -58,11 +60,23 @@ const MAX_FALLBACK_ENTRY_POINTS = 20;
 /** Max SPA route clicks per page during BFS (raised from 5 for tab-heavy SPAs) */
 const MAX_SPA_CLICKS_PER_PAGE = 10;
 
-/** Common login URL patterns */
-const LOGIN_URL_PATTERNS = [
-  /\/login/i, /\/signin/i, /\/sign-in/i, /\/auth/i,
-  /\/log-in/i, /\/sso/i,
-];
+/**
+ * `SnapshotCollector.format` silently priority-sorts + caps the element list at
+ * `snapshotMaxElements` (shared with the editor, so we don't change its output).
+ * On a dense page (long form, big table) the Cartographer then sees only the
+ * top-N and — because the header says "N total" using the CAPPED count — has no
+ * idea it's incomplete, so it can't flag `recommendDeeper`. Append an explicit
+ * truncation notice (exploration-only) so the vision model knows to treat the
+ * list as partial. Returns the string unchanged when nothing was truncated.
+ */
+function annotateSnapshotTruncation(formatted: string, snapshot: LiteSnapshot): string {
+  const cap = LITE_ENGINE_FLAGS.snapshotMaxElements;
+  const total = snapshot.elements.length;
+  if (cap > 0 && total > cap) {
+    return `${formatted}\n\nNOTE: this page has ${total} interactive elements but only the ${cap} highest-priority are listed above — the list is INCOMPLETE. Below-the-fold or lower-priority controls (extra table rows, secondary actions, pagination) may be missing. Set recommendDeeper: true so they get surveyed.`;
+  }
+  return formatted;
+}
 
 export class SurveyAgent {
   private tree: ExplorationTree;
@@ -485,8 +499,8 @@ export class SurveyAgent {
         continue;
       }
 
-      // Format snapshot for AI
-      const formattedSnapshot = SnapshotCollector.format(snapshot);
+      // Format snapshot for AI (with a truncation notice if the element list was capped)
+      const formattedSnapshot = annotateSnapshotTruncation(SnapshotCollector.format(snapshot), snapshot);
 
       this.trace?.writePageSnapshot({
         url: item.url,
@@ -1055,10 +1069,11 @@ export class SurveyAgent {
   }
 
   /**
-   * Check if a URL looks like a login page.
+   * Check if a URL looks like a login page. Thin delegate to the shared
+   * auth-url-patterns util (single source — see auth-url-patterns.ts).
    */
   private isLoginUrl(url: string): boolean {
-    return LOGIN_URL_PATTERNS.some((pattern) => pattern.test(url));
+    return isLoginUrl(url);
   }
 
   /**
@@ -1066,7 +1081,7 @@ export class SurveyAgent {
    */
   private inferPageTypeFromUrl(url: string): string {
     const path = new URL(url).pathname.toLowerCase();
-    if (LOGIN_URL_PATTERNS.some((p) => p.test(path))) return 'login';
+    if (isLoginUrl(path)) return 'login';
     if (/register|signup|sign-up/i.test(path)) return 'registration';
     if (/dashboard/i.test(path)) return 'dashboard';
     if (/product|item|catalog/i.test(path)) return 'product_list';
@@ -1173,7 +1188,7 @@ export class SurveyAgent {
           });
 
           // Classify and add as virtual page
-          const formattedSnapshot = SnapshotCollector.format(newSnapshot);
+          const formattedSnapshot = annotateSnapshotTruncation(SnapshotCollector.format(newSnapshot), newSnapshot);
           let screenshotBase64: string | undefined;
           try {
             const buf = await this.page.screenshot({ type: 'png', fullPage: false });
