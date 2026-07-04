@@ -1191,6 +1191,11 @@ export class CommandExecutor {
     const blockerType = args.blocker_type || 'other';
     const canUserHelp = args.can_user_help ?? true;
 
+    // Persist the STRUCTURED blocker so the caller (FlowRunner) routes to the
+    // right clarification (captcha / 2fa / needs_data) instead of keyword-
+    // guessing the blocked reason string.
+    this.blackboard.setBlockedInfo({ blockerType, canUserHelp, reason });
+
     // Add insight with blocker details for reporting
     this.blackboard.addInsight(
       `BLOCKED [${blockerType}]: ${reason}` +
@@ -1549,9 +1554,16 @@ export class CommandExecutor {
       }
     }
 
-    // Generic sensitive: fallback to email
-    if (command.isSensitive && !classification.kind && credentials.email) {
-      return { ...command, value: credentials.email };
+    // NO generic email fallback. Previously an is_sensitive field the classifier
+    // could NOT identify (kind===undefined) got the user's real email injected —
+    // so a promo-code / referral / account-number field the LLM flagged sensitive
+    // would receive the account email, corrupting the flow AND leaking the email
+    // into an unrelated field. When we can't identify the credential kind, keep
+    // the LLM's placeholder value instead of guessing a real secret.
+    if (command.isSensitive && !classification.kind) {
+      logger.debug('[CMD_EXECUTOR] Sensitive field with no identified credential kind — keeping placeholder, not injecting', {
+        ref: command.ref,
+      });
     }
 
     return command;

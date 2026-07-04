@@ -287,6 +287,15 @@ export class TestBlackboard {
     return this.state.priorLearnings;
   }
 
+  /** Structured blocker info from report_blocked (blockerType + canUserHelp + reason). */
+  setBlockedInfo(info: { blockerType: string; canUserHelp: boolean; reason: string }): void {
+    this.state.blockedInfo = info;
+  }
+
+  getBlockedInfo(): { blockerType: string; canUserHelp: boolean; reason: string } | undefined {
+    return this.state.blockedInfo;
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // PAGE HEALTH (written by CommandExecutor per action/round, read by
   // Reviewer prompt + auditDone gate). Best-effort technical-health verdict.
