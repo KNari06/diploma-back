@@ -777,7 +777,10 @@ export class FlowRunner {
           entryPointId: entryPoint.id,
           blockerType,
           canUserHelp,
-          reason: pipelineResult.blockedReason,
+          // The blocked reason is an LLM summary, but it can quote a page string
+          // that echoed a credential — redact before it lands in the (now
+          // prod-uploaded) trace. Belt-and-suspenders for invariant #10.
+          reason: redactCredentialValues(pipelineResult.blockedReason || '', this.config.credentials),
         });
 
         // 10a. Request user help for a user-resolvable blocker. captcha/2fa ask
