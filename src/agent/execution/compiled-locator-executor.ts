@@ -27,6 +27,7 @@ import { CELL_SEP, normalizeText } from '@/services/testing/ui/preview/text-norm
 import {
   buildStrategyLocator,
   type PageLike,
+  type LocatorScope,
 } from '@/services/testing/ui/preview/locator-resolution.util';
 import { Frame, Locator, Page } from 'playwright';
 
@@ -1199,7 +1200,14 @@ async function tryLocatorEntry(
   page: PageLike,
   entry: LocatorEntry,
   timeout: number,
-  fingerprint?: TargetFingerprint
+  fingerprint?: TargetFingerprint,
+  /**
+   * Locator context. Defaults to `page`. When the step targets an element
+   * inside a same-origin iframe, the caller passes `page.frameLocator(sel)`
+   * so every strategy resolves INSIDE that frame. Landmark prefiltering is
+   * skipped under a frame scope (landmarks-in-iframe is out of scope for v1).
+   */
+  scope: LocatorScope = page,
 ): Promise<{
   success: boolean;
   locator?: Locator;
@@ -1207,6 +1215,7 @@ async function tryLocatorEntry(
   failureKind?: 'ambiguous' | 'not_found' | 'error';
   matchCount?: number;
 }> {
+  const isFrameScoped = scope !== page;
   try {
     // ── Landmark scoping (soft prefilter) ───────────────────────────────
     // When the recorded element had a nearestLandmark (e.g. 'navigation'),
@@ -1227,7 +1236,7 @@ async function tryLocatorEntry(
     // scoped candidate that fails fingerprint validation all route back to
     // the global locator below. The prefilter can never cause a step to
     // fail; it can only make it succeed earlier.
-    if (fingerprint?.nearestLandmark) {
+    if (fingerprint?.nearestLandmark && !isFrameScoped) {
       try {
         const landmarkRole = fingerprint.nearestLandmark.toLowerCase();
         const landmark = page.getByRole(landmarkRole as any);
@@ -1283,7 +1292,7 @@ async function tryLocatorEntry(
       }
     }
 
-    const locator = buildStrategyLocator(page, entry);
+    const locator = buildStrategyLocator(page, entry, scope);
     if (!locator) {
       return { success: false, error: `Unknown strategy: ${entry.strategy}` };
     }
@@ -1517,6 +1526,22 @@ export async function executeCompiledLocatorPlan(
     }
   }
 
+  // Frame scope: when the step targets an element inside a same-origin iframe
+  // (selector captured at discovery into action.options.iframe), resolve every
+  // locator INSIDE that frame. `page.locator()` does not cross frame
+  // boundaries, so without this an iframe step would never match on the fast
+  // path. Failure to build the frame locator (rare) degrades to page root.
+  const iframeSelector = compiled.action?.options?.iframe?.selector;
+  let scope: LocatorScope = page;
+  if (iframeSelector) {
+    try {
+      scope = page.frameLocator(iframeSelector);
+      logger.debug('[COMPILED_EXECUTOR] Scoping compiled plan to iframe', { iframeSelector });
+    } catch {
+      scope = page;
+    }
+  }
+
   // 4. Try each locator in order
   let sawAmbiguous = false;
   const ambiguityDetails: Array<{ strategy: string; matchCount: number }> = [];
@@ -1533,7 +1558,7 @@ export async function executeCompiledLocatorPlan(
     });
 
     const attemptStart = Date.now();
-    const result = await tryLocatorEntry(page, entry, timeout, compiled.targetFingerprint);
+    const result = await tryLocatorEntry(page, entry, timeout, compiled.targetFingerprint, scope);
     const attemptDur = Date.now() - attemptStart;
 
     if (result.success && result.locator) {

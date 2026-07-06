@@ -27,6 +27,7 @@ import { logger } from '@/utils/core/logger';
 import type { Locator, Page } from 'playwright';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import type { IntentActionType, IntentStep, TargetFingerprint } from './preview.types';
+import { isIframeRef } from '@/agent/core/lite/execution/iframe-ref.util';
 
 const V2 = STEP_READINESS_CONFIG.v2;
 
@@ -187,10 +188,11 @@ function buildLocators(page: Page, step: IntentStep): Locator[] {
     if (locators.length) return locators;
   }
 
-  // Evidence fallback — same guards as V1.
+  // Evidence fallback — same guards as V1 (incl. iframe refs, which a main-page
+  // page.locator() can't reach — see step-readiness.service.ts Guard 1).
   if (step.evidence?.lastSuccessRef) {
     const ref = step.evidence.lastSuccessRef;
-    if (/^(e\d+|s\d+|bg-\d+)$/.test(ref)) return locators;
+    if (/^(e\d+|s\d+|bg-\d+)$/.test(ref) || isIframeRef(ref)) return locators;
     if (step.evidence.capturedAt) {
       const age = Date.now() - new Date(step.evidence.capturedAt).getTime();
       if (Number.isFinite(age) && age > 60 * 60 * 1000) return locators;

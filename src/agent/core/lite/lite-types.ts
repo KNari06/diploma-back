@@ -78,6 +78,13 @@ export interface LiteElement {
   shadowDepth?: number;
   /** Source iframe name/url (only for elements collected from iframes) */
   iframeSource?: string;
+  /**
+   * Durable CSS selector for the owning <iframe> in the parent document
+   * (id → name → src → nth-of-type). Persisted into a compiled step's
+   * `action.options.iframe.selector` so replay can `page.frameLocator(...)`
+   * back into this frame on a fresh page. Only for iframe-collected elements.
+   */
+  iframeSelector?: string;
   // Semantic attributes for field classification (Level 1 signals)
   autocomplete?: string;  // e.g., "current-password", "email", "tel", "username"
   inputmode?: string;     // e.g., "tel", "email", "numeric"
@@ -937,6 +944,13 @@ export interface ElementInfo {
   tag: string;
   type?: string;
   role?: string;
+  /**
+   * Frame name/url when this element lives inside a same-origin iframe.
+   * Set by the snapshot collector's iframe pass; the action executor uses it
+   * (alongside the `ifr{N}_` ref prefix) to scope the Playwright locator to
+   * the correct frame instead of the main page.
+   */
+  iframeSource?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

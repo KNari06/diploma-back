@@ -28,6 +28,7 @@ import { GoalDetector } from '../analysis/goal-detector';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
 import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.service';
 import { OverlayDismisser } from './overlay-dismisser';
+import { buildSelfContainedSteps, type RecordedDismissal } from './overlay-step.util';
 import { VisualStability } from '../collectors/visual-stability';
 
 import {
@@ -590,6 +591,11 @@ export class FlowRunner {
         }
       }
 
+      // Overlay dismissals recorded across this flow (pre-pipeline here +
+      // intra-round from the pipeline) → prepended as replayable steps so a
+      // re-run clears the same overlays instead of stalling on them.
+      const recordedDismissals: RecordedDismissal[] = [];
+
       // 2.5. Dismiss overlays before pipeline starts (cookie consent, promo modals)
       try {
         const overlayResult = await OverlayDismisser.dismissOverlays(page, {
@@ -597,6 +603,9 @@ export class FlowRunner {
           maxTimeMs: 5000,
           mode: 'flow',
         });
+        for (const attempt of overlayResult.attempts) {
+          if (attempt.dismissed) recordedDismissals.push({ attempt, pageUrl: page.url() });
+        }
         if (overlayResult.overlaysDetected > 0) {
           this.trace?.writeOverlayDetected({
             url: page.url(),
@@ -680,6 +689,17 @@ export class FlowRunner {
         flowStartTime: pipelineStartTime,
         successfulCalls,
       });
+
+      // Merge intra-round dismissals (from the pipeline) with the pre-pipeline
+      // ones. `recordedDismissals` now holds every overlay the agent cleared
+      // during this flow, in roughly the order they were encountered.
+      recordedDismissals.push(...pipelineResult.dismissals);
+
+      // NOTE: the SELF-CONTAINED step list is built LATER, just before the
+      // return — NOT here. A 2FA/CAPTCHA retry branch below can still append to
+      // `discoveredSteps` + `recordedDismissals`; building the list here would
+      // snapshot it pre-retry and silently drop the retry's actions/dismissals
+      // from the saved test case. See buildSelfContainedSteps at the return.
 
       this.trace?.writeFlowPipelineEnd({
         entryPointId: entryPoint.id,
@@ -910,6 +930,10 @@ export class FlowRunner {
                     successfulCalls: retryCalls,
                   });
                   discoveredSteps.push(...retryAttributed);
+                  // Carry the retry's intra-round dismissals too, so the
+                  // self-contained step list reflects overlays cleared during
+                  // the retry (same gap as the main path, on the retry branch).
+                  recordedDismissals.push(...retryResult.dismissals);
                 }
               } finally {
                 // Must stop the retry tracker — the outer cleanup only stops
@@ -936,10 +960,25 @@ export class FlowRunner {
       await page.close();
       await this.stateManager.closeContext(context);
 
+      // Build the SELF-CONTAINED step list NOW (after the optional 2FA/CAPTCHA
+      // retry has appended to discoveredSteps/recordedDismissals), so the saved
+      // test case includes retry-path actions + overlay dismissals:
+      //   [navigate to entry URL] + [dismiss overlays] + [flow steps]
+      // Kept SEPARATE from `discoveredSteps` (which Scout consumed above) —
+      // Scout must see only the real flow actions, not the prepended setup.
+      const finalSteps = buildSelfContainedSteps(
+        entryPoint.sourcePageUrl,
+        recordedDismissals,
+        discoveredSteps,
+      );
+
       return {
         entryPoint,
         status,
-        discoveredSteps,
+        // Self-contained list (navigate + dismissals + flow steps). NOT the
+        // raw `discoveredSteps` — that was already handed to Scout above
+        // without the prepended setup.
+        discoveredSteps: finalSteps,
         branchPoints,
         errors,
         errorClassification,

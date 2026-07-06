@@ -1149,6 +1149,7 @@ export class TestPipeline {
       durationMs: Date.now() - this.startTime,
       rounds: [...this.blackboard.getRounds()],
       insights: [...this.blackboard.getInsights()],
+      dismissals: [...this.blackboard.getDismissals()],
       finalSnapshot: this.blackboard.getCurrentPageSnapshot(),
       blockedReason: phase === 'blocked'
         ? this.blackboard.getReview()?.reason || 'Unknown blocker'

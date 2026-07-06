@@ -15,9 +15,10 @@ import {
   IRON_CLAD_MODAL_SELECTORS,
   CLOSE_BUTTON_SELECTOR,
 } from '@/agent/utils/selectors/modal-detection';
-import type { Page } from 'playwright';
+import type { Frame, Page } from 'playwright';
 import type { LiteElement, LiteSnapshot, ObstacleFact } from '../lite-types';
 import { VisualStability } from './visual-stability';
+import { deriveIframeSelector } from './iframe-selector.util';
 import { LANDMARK_EVALUATE_BUNDLE } from '@/services/testing/ui/preview/landmark.util';
 
 // April 2026: Module-level throttle map for [SNAPSHOT_REJECTS] logging.
@@ -3303,7 +3304,8 @@ export class SnapshotCollector {
       // IFRAME ELEMENT COLLECTION (same-origin only)
       // ═══════════════════════════════════════════════════════════════════════
       try {
-        const frames = page.frames().filter(f => f !== page.mainFrame() && !f.isDetached());
+        const allFrames = page.frames();
+        const frames = allFrames.filter(f => f !== page.mainFrame() && !f.isDetached());
         for (const frame of frames) {
           try {
             let frameName: string;
@@ -3313,7 +3315,28 @@ export class SnapshotCollector {
               frameName = frame.name() || 'iframe';
             }
 
-            const iframeResult = await frame.evaluate((fName: string) => {
+            // Index of this frame in the UNFILTERED page.frames() list. The
+            // executor reconstructs the same list to resolve a ref back to its
+            // Frame, so the ref must encode this stable position (not the
+            // filtered-array index). Stamping data-agent-ref INSIDE the frame
+            // (below) is what makes an iframe element actionable at all — the
+            // main-frame collector stamps refs too; the iframe path used to
+            // skip it, so iframe elements were surveyed but never clickable.
+            const frameIndex = allFrames.indexOf(frame);
+            const refPrefix = `ifr${frameIndex}_`;
+
+            // Durable CSS selector for the <iframe> element in the PARENT
+            // document, so replay can `page.frameLocator(selector)` to re-enter
+            // this frame on a fresh page (the runtime `ifr{N}_` index round-trip
+            // only holds within one observe→act cycle — a saved test case needs
+            // a selector that survives a reload). Priority: id → name → src →
+            // nth-of-type. Best-effort: derivation failure leaves it undefined
+            // (step still works at discovery via the index path; just no
+            // compiled frame scope on replay).
+            const iframeSelector = await deriveIframeSelector(frame);
+
+            const iframeResult = await frame.evaluate((args: { fName: string; refPrefix: string }) => {
+              const { fName, refPrefix } = args;
               const selectors = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], [role="option"], [role="combobox"], [role="switch"], [role="menuitem"], [role="slider"], [role="searchbox"], [role="textbox"], [role="gridcell"], [role="rowheader"], [role="columnheader"], [onclick], [tabindex]:not([tabindex="-1"]), [contenteditable="true"]';
               const els: any[] = [];
               let idx = 0;
@@ -3345,8 +3368,14 @@ export class SnapshotCollector {
                 const role = (htmlEl.getAttribute('role') || (tag === 'a' ? 'link' : tag === 'input' || tag === 'select' || tag === 'textarea' ? 'input' : 'button')).replace(/["']/g, '').trim();
                 const name = htmlEl.getAttribute('aria-label') || htmlEl.title || htmlEl.textContent?.trim().slice(0, 80) || htmlEl.getAttribute('placeholder') || '';
 
+                // Globally-unique, frame-scoped ref. Stamp it as an attribute
+                // INSIDE the frame so frame.locator('[data-agent-ref=...]')
+                // resolves at action time.
+                const ref = `${refPrefix}${idx}`;
+                htmlEl.setAttribute('data-agent-ref', ref);
+
                 els.push({
-                  ref: `f${idx}`,
+                  ref,
                   role,
                   name,
                   tag,
@@ -3361,10 +3390,16 @@ export class SnapshotCollector {
                 idx++;
               });
               return { els, rejects, frameName: fName };
-            }, frameName);
+            }, { fName: frameName, refPrefix });
 
             const iframeElements = iframeResult.els;
             if (iframeElements.length > 0) {
+              // Tag every element with the parent-doc iframe selector (when we
+              // could derive one) so the compiled-plan builder can persist a
+              // frame-scoped replay locator.
+              if (iframeSelector) {
+                for (const el of iframeElements) el.iframeSelector = iframeSelector;
+              }
               (snapshot as any).elements.push(...iframeElements);
             }
             // Attach iframe rejection stats so the debug logger can see them.
@@ -3624,3 +3659,6 @@ export class SnapshotCollector {
     return lines.join('\n');
   }
 }
+
+// deriveIframeSelector moved to ./iframe-selector.util (imported at top) to keep
+// this file from growing past its already-large size — see repo file-size rule.

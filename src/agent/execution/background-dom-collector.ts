@@ -823,6 +823,9 @@ export function adaptLiteElementsToInteractiveNodes(elements: LiteElement[]): In
         // iframe" hint they rely on.
         ? [`iframe: ${el.iframeSource}`, ...(el.containerTitles ?? [])]
         : el.containerTitles,
+      // Durable iframe selector → compiled plan persists frame-scoped replay.
+      iframeSource: el.iframeSource,
+      iframeSelector: el.iframeSelector,
       // Phase 4 interactivity.
       frameworkClickable: el.frameworkClickable,
       isContentEditable: el.isContentEditable,

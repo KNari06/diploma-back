@@ -551,11 +551,16 @@ export class CommandExecutor {
       const gate = evaluateOverlayGate(snapshot);
       if (gate.shouldDismiss) {
         try {
-          await OverlayDismisser.dismissOverlays(this.page, {
+          const dismissResult = await OverlayDismisser.dismissOverlays(this.page, {
             maxPasses: 1,
             maxTimeMs: 1500,
             mode: 'flow',
           });
+          // Record successful dismissals so the flow runner can replay them as
+          // leading steps — otherwise replay hits the same overlay with no step
+          // to clear it. Captured BEFORE the re-collect so a re-collect failure
+          // can't drop the record.
+          this.blackboard.addDismissals(dismissResult.attempts, this.page.url());
           // Re-collect once to pick up the cleaned DOM. Best-effort — if
           // re-collection fails we fall back to the original snapshot so
           // the round still progresses.
