@@ -761,30 +761,60 @@ export class FlowRunner {
         status = 'completed';
       } else if (pipelineResult.blockedReason) {
         status = 'blocked';
-        const blockerInfo = this.extractBlockerInfo(pipelineResult.insights, pipelineResult.blockedReason);
-        blockerType = blockerInfo.type;
-        canUserHelp = blockerInfo.canUserHelp;
+        // Prefer the STRUCTURED blocker the Executor reported (report_blocked →
+        // pipelineResult.blockerType) over keyword-guessing the reason string;
+        // fall back to keyword extraction when the Executor didn't set one.
+        if (pipelineResult.blockerType) {
+          blockerType = pipelineResult.blockerType as BlockerType;
+          canUserHelp = pipelineResult.canUserHelp ?? true;
+        } else {
+          const blockerInfo = this.extractBlockerInfo(pipelineResult.insights, pipelineResult.blockedReason);
+          blockerType = blockerInfo.type;
+          canUserHelp = blockerInfo.canUserHelp;
+        }
 
         this.trace?.writeFlowBlockerDetected({
           entryPointId: entryPoint.id,
           blockerType,
           canUserHelp,
-          reason: pipelineResult.blockedReason,
+          // The blocked reason is an LLM summary, but it can quote a page string
+          // that echoed a credential — redact before it lands in the (now
+          // prod-uploaded) trace. Belt-and-suspenders for invariant #10.
+          reason: redactCredentialValues(pipelineResult.blockedReason || '', this.config.credentials),
         });
 
-        // 10a. Request user help for captcha/2FA if possible
+        // 10a. Request user help for a user-resolvable blocker. captcha/2fa ask
+        // the user to solve/enter a code; needs_data asks for a real value the
+        // agent could not invent (promo/referral code, account number, a
+        // one-time code that isn't strictly 2FA) — the user types it, we fill it
+        // into the blocking field, and the flow retries. (login_wall is NOT here:
+        // supplying credentials mid-run needs a dedicated SECURE form, not this
+        // free-text channel — see the credentials note; it stays blocked today.)
         if (
           canUserHelp &&
-          (blockerType === 'captcha' || blockerType === '2fa') &&
+          (blockerType === 'captcha' || blockerType === '2fa' || blockerType === 'needs_data') &&
           this.config.chatSessionId
         ) {
-          const clarificationQuestion = blockerType === 'captcha'
-            ? 'A CAPTCHA was encountered during exploration. Please solve it in the browser and click "Done".'
-            : 'A 2FA verification code is required. Please enter the code.';
+          const clarificationType: 'captcha_solve' | '2fa_code' | 'test_data' =
+            blockerType === 'captcha' ? 'captcha_solve'
+            : blockerType === '2fa' ? '2fa_code'
+            : 'test_data';
+
+          const clarificationQuestion =
+            blockerType === 'captcha'
+              ? 'A CAPTCHA was encountered during exploration. Please solve it in the browser and click "Done".'
+              : blockerType === '2fa'
+                ? 'A 2FA verification code is required. Please enter the code.'
+                // needs_data: surface the executor's reason so the user knows WHAT
+                // value is being asked for (redacted — it's a page-derived string).
+                : `The exploration needs a value to continue: ${redactCredentialValues(
+                    pipelineResult.blockedReason || 'a required field value',
+                    this.config.credentials,
+                  )}. Please provide it.`;
 
           this.trace?.writeFlowUserHelpRequested({
             entryPointId: entryPoint.id,
-            type: blockerType === 'captcha' ? 'captcha_solve' : '2fa_code',
+            type: clarificationType,
             timeoutMs: 120_000,
           });
 
@@ -792,13 +822,13 @@ export class FlowRunner {
             explorationId: this.config.explorationId,
             chatSessionId: this.config.chatSessionId,
             question: clarificationQuestion,
-            type: blockerType === 'captcha' ? 'captcha_solve' : '2fa_code',
+            type: clarificationType,
             timeout: 120_000,
           });
 
           this.trace?.writeFlowUserHelpReceived({
             entryPointId: entryPoint.id,
-            type: blockerType === 'captcha' ? 'captcha_solve' : '2fa_code',
+            type: clarificationType,
             received: !!answer,
           });
 
@@ -810,9 +840,13 @@ export class FlowRunner {
             });
 
             try {
-              // If 2FA: type the code the user provided
-              if (blockerType === '2fa' && answer !== 'done') {
-                const codeInputs = await page.$$('input[type="text"], input[type="tel"], input[type="number"]');
+              // 2FA or needs_data: type the user-provided value into the first
+              // editable field, then submit. (captcha is solved in-browser by the
+              // user, so there's nothing to type — answer is just the 'done'
+              // sentinel.) Best-effort: if no input is found the retry still runs
+              // and the Planner re-observes.
+              if ((blockerType === '2fa' || blockerType === 'needs_data') && answer !== 'done') {
+                const codeInputs = await page.$$('input[type="text"], input[type="tel"], input[type="number"], input[type="email"]');
                 if (codeInputs.length > 0) {
                   await codeInputs[0].fill(answer);
                   await page.keyboard.press('Enter');
@@ -838,6 +872,14 @@ export class FlowRunner {
                 credentials: this.config.credentials,
                 hasCredentials: !!this.config.credentials,
                 testId: entryPoint.id,
+                // Exploration testIds are non-UUID (ep-N); without this the retry
+                // pipeline keeps hitting the DB cancellation lookup for a row that
+                // doesn't exist (wasted 5s DB race + warning spam) — the primary
+                // config sets it too.
+                skipDbCancellationCheck: true,
+                // entryPointId ties retry round/command traces back to this flow;
+                // omitting it (as before) left retried rounds uncorrelated.
+                entryPointId: entryPoint.id,
                 maxRounds: Math.max(1, Math.min(5, allocatedRounds)),
                 timeoutMs: Math.max(5_000, flowTimeoutMs - (Date.now() - startTime)),
                 // Keep page-health context consistent with the primary config so

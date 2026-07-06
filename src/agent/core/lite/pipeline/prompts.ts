@@ -253,7 +253,8 @@ EXECUTION RULES:
     - [POST-ACTION] shows a URL change → a navigation happened; next response does wait_for_page + observe_page.
     - [POST-ACTION] shows validation errors that block progress → THEN call observe_page for the full state.
 14. CRITICAL: If observe_page shows PAGE ALERTS with authentication errors like "Invalid email or password", "Wrong credentials", "Incorrect password", or "Account locked" after a login attempt: call report_blocked with reason="credentials_invalid", blocker_type="auth_failure", can_user_help=true. Do NOT retry — the user-provided credentials are wrong.
-15. CAPTCHA DETECTION: If observe_page shows a checkbox inside an [IFRAME] with empty name (CAPTCHA widget), or if PAGE ALERTS mention "reCAPTCHA", "CAPTCHA", "hCaptcha", "Turnstile", or "bot verification" — immediately call report_blocked with blocker_type="captcha". Do NOT retry form submission.`;
+15. CAPTCHA DETECTION: If observe_page shows a checkbox inside an [IFRAME] with empty name (CAPTCHA widget), or if PAGE ALERTS mention "reCAPTCHA", "CAPTCHA", "hCaptcha", "Turnstile", or "bot verification" — immediately call report_blocked with blocker_type="captcha". Do NOT retry form submission.
+16. NEEDS REAL DATA: If a REQUIRED field blocks the goal and needs a specific real value you cannot invent — a promo/referral/coupon code, an existing account or order number, an SMS/email one-time code that is NOT app-2FA, an invitation token — and a made-up placeholder was (or would be) rejected, call report_blocked with blocker_type="needs_data", can_user_help=true, and reason=WHAT value is needed (name the field/purpose, e.g. "a valid promo code for the checkout form"). Do NOT use this for fields you can reasonably fill yourself (names, emails, generic search terms, free-text) or for OPTIONAL fields — only when a real, unguessable value is the sole thing blocking progress. Ask at most once per flow.`;
 }
 
 /**

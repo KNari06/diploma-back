@@ -140,21 +140,39 @@ export const MAX_STEP_DESC_CHARS = 120;
  */
 const MAX_EXPECTED_SOURCE_CHARS = 300;
 
-const STEP_CONVERSION_SYSTEM_PROMPT = `You convert Allure test report steps into UI test actions for a web testing platform.
+/**
+ * Build the step-conversion system prompt.
+ *
+ * Conservation-biased by design: imported steps are curated test documentation
+ * (TestOps exports, authored Allure steps), NOT noisy automation logs — the
+ * model's job is to normalize types, never to filter. The old prompt's SKIP
+ * rules ("skip non-UI", "skip redundant", "return [] if nothing meaningful")
+ * silently reduced multi-step test cases to 1-2 steps in production.
+ *
+ * Platform-aware: mobile imports were previously told they target a "web
+ * testing platform", giving the model license to drop mobile-shaped steps.
+ */
+function buildStepConversionSystemPrompt(platform: ImportPlatform): string {
+  const platformLabel = platform === 'web'
+    ? 'web application'
+    : 'mobile application (Android/iOS)';
+
+  return `You convert imported test-case steps into UI test actions for a ${platformLabel} testing platform.
 
 ## Input
-You receive a test name and its steps. Each step has:
-- name: the step description from Allure
+You receive a test name and its steps, imported from an Allure report or TestOps export. Each step has:
+- name: the step text as the QA engineer wrote it
 - value: parameter value (if any)
 - parent: parent grouping step name (context)
 - status: passed/failed/broken/skipped
+- optional "expected results" listed under the step
 
 ## Output
-Convert each MEANINGFUL step into a UI test action.
+Convert EVERY step into a UI test action. These steps are curated test documentation written by a QA engineer — your job is to normalize them, NOT to filter them.
 
 ## Action types (pick the most specific one)
-- navigate: Go to a URL, open a page, redirect
-- click: Click a button, link, element, submit
+- navigate: Go to a URL, open a page/screen, redirect
+- click: Click/tap a button, link, element, submit
 - type: Type/fill text into an input field, textarea, search box
 - select: Choose an option from a dropdown/select/combobox
 - hover: Mouse over an element
@@ -169,18 +187,16 @@ Convert each MEANINGFUL step into a UI test action.
 - drag_and_drop: Drag element to another position
 
 ## Rules
-1. SKIP non-UI steps: API calls, database queries, internal assertions about response codes, screenshot captures, log statements, "Given/When/Then" wrappers that contain no action
-2. SKIP redundant steps: if "Click Login" and "Login button clicked" both exist, keep only one
-3. SPLIT composite ACTIONS only: "Enter email and click Submit" → two actions (type + click). Do NOT split a single assertion sentence into multiple asserts.
+1. PRESERVE EVERY STEP: each input step becomes EXACTLY ONE action, in the same order. Never drop, merge, or summarize steps. N input steps must produce at least N output actions.
+2. SPLIT composite ACTIONS only: "Enter email and click Submit" → two actions (type + click). Splitting adds actions; dropping is never allowed. Do NOT split a single assertion sentence into multiple asserts.
+3. If a step is ambiguous or technical (API call, precondition, log statement), still convert it: use "assert" if it describes a verification or expected state, otherwise "click", keeping the original text as the description.
 4. For "type" actions: put the typed value in "value" field. If step says 'Type "hello"' → value: "hello"
 5. For "navigate" actions: put the URL in "value" field if present
 6. For "press" actions: put the key name in "value" field (e.g. "Enter", "Tab", "Escape")
 7. For "assert" actions: write what should be verified as the description (e.g. "Verify error message is displayed")
 8. EXPECTED RESULTS: when a step lists "expected results", emit exactly ONE assert per expected-result item, and place those asserts IMMEDIATELY AFTER that step's action (before the next step). Never merge several expected results into one assert, never drop one, and never move them away from their step. The action step keeps its own type (click/type/...).
-9. Description should be clear, concise, human-readable (not code). Max ${MAX_STEP_DESC_CHARS} chars.
-10. If a step is ambiguous but seems like a UI action, include it as "click" with a descriptive description
-11. Return empty array [] if there are NO meaningful UI steps
-12. Preserve the logical order of steps
+9. Description should be clear, concise, human-readable (not code), in the SAME LANGUAGE as the source step. Max ${MAX_STEP_DESC_CHARS} chars.
+10. Preserve the logical order of steps.
 
 ## Response format
 Return a JSON object with a "steps" array:
@@ -191,184 +207,151 @@ Return a JSON object with a "steps" array:
     { "type": "click", "description": "Click Sign In button" },
     { "type": "assert", "description": "Verify dashboard is displayed" }
   ]
+}`;
 }
-If no meaningful UI steps exist, return: { "steps": [] }`;
 
 /**
  * Maximum raw steps to send in a single AI call.
- * Keeps the prompt under ~4K tokens (each step ~30 tokens).
- * 50 steps × ~50 output tokens each ≈ 2500 tokens — safely within max_tokens.
+ *
+ * Halved from 50: the conversion model is a reasoning-tier model whose hidden
+ * reasoning tokens count against `max_tokens`, so large batches risk truncated
+ * JSON (which used to silently delete the whole batch). 25 steps × ~50 output
+ * tokens ≈ 1250 tokens of payload, leaving generous reasoning headroom.
  */
-const AI_STEP_BATCH_SIZE = 50;
+const AI_STEP_BATCH_SIZE = 25;
 
 /**
- * Convert flattened Allure steps into IntentSteps using AI.
- * For tests with many steps, processes in batches.
+ * Minimum acceptable output/input step ratio for LARGE batches. Below this we
+ * assume steps were dropped and retry once, then fall back to the deterministic
+ * 1:1 mapping. Not 1.0 for large batches because a long list may legitimately
+ * contain a few noise lines the model won't fabricate actions for; splitting
+ * can only ADD steps, so the ratio only guards against loss.
  */
-async function convertStepsWithAI(
-  testName: string,
-  rawSteps: FlattenedRawStep[],
-): Promise<AIStepConversionResult> {
-  if (rawSteps.length === 0) return { steps: [], degraded: false };
+const MIN_CONVERSION_RATIO = 0.8;
 
+/**
+ * Minimum output steps required for a batch of `inputCount` steps.
+ *
+ * Small batches demand ZERO loss: the reported bug was multi-step tests
+ * collapsing to 1-2 steps, which are exactly small inputs — a 3-step test that
+ * returns 2 steps must trigger the guard. Only once a batch is large enough
+ * that a ratio is meaningful do we tolerate a handful of unconverted lines.
+ */
+function minStepsFor(inputCount: number): number {
+  if (inputCount <= 5) return inputCount;
+  return Math.max(5, Math.ceil(inputCount * MIN_CONVERSION_RATIO));
+}
+
+/**
+ * A source step normalized for AI conversion — the common denominator of the
+ * ZIP path (FlattenedRawStep) and the CSV path (ParsedTestCaseFromLLM steps).
+ */
+interface NormalizedStep {
+  text: string;
+  value?: string;
+  parentName?: string;
+  status?: string;
+  expected?: string[];
+}
+
+/**
+ * Parse an AI response into step entries.
+ * Returns null on JSON parse failure (typically max_tokens truncation) so the
+ * caller can retry/fall back — an unparseable batch must NEVER be treated as
+ * "the model found no steps" (that silently deleted up to a full batch of
+ * steps in production, with `degraded` never set).
+ */
+function parseAIStepsContent(rawContent: string): AIStepResult[] | null {
+  try {
+    const json = JSON.parse(rawContent);
+    if (Array.isArray(json)) return json;
+    if (Array.isArray(json.steps)) return json.steps;
+    return [];
+  } catch {
+    return null;
+  }
+}
+
+/** Validate AI step entries and convert to IntentSteps (malformed entries dropped). */
+function toIntentSteps(parsed: AIStepResult[]): IntentStep[] {
+  const result: IntentStep[] = [];
+  for (const step of parsed) {
+    if (!step || typeof step !== 'object') continue;
+
+    const desc = typeof step.description === 'string' ? step.description.trim() : '';
+    if (!desc) continue;
+
+    result.push({
+      id: randomUUID(),
+      type: VALID_ACTION_TYPES.includes(step.type as IntentActionType)
+        ? (step.type as IntentActionType)
+        : 'click',
+      description: desc.slice(0, MAX_STEP_DESC_CHARS),
+      ...(step.value !== undefined && step.value !== null && step.value !== '' && {
+        value: String(step.value),
+      }),
+    });
+  }
+  return result;
+}
+
+/**
+ * Deterministic 1:1 fallback: every step becomes a 'click' with the original
+ * text, every expected result becomes an assert right after its step. Step
+ * TYPES are unreliable (caller must set `degraded`), but no step is lost.
+ */
+function fallbackIntentSteps(batch: NormalizedStep[]): IntentStep[] {
+  const result: IntentStep[] = [];
+  for (const raw of batch) {
+    result.push({
+      id: randomUUID(),
+      type: 'click',
+      description: raw.text.slice(0, MAX_STEP_DESC_CHARS),
+      ...(raw.value !== undefined && raw.value !== '' && { value: raw.value }),
+    });
+    for (const exp of raw.expected ?? []) {
+      result.push({
+        id: randomUUID(),
+        type: 'assert',
+        description: exp.slice(0, MAX_STEP_DESC_CHARS),
+      });
+    }
+  }
+  return result;
+}
+
+/**
+ * Convert normalized source steps into IntentSteps using AI, in batches.
+ *
+ * Conservation contract per batch:
+ *  1. AI call → parse → must yield ≥ minStepsFor(batch) steps.
+ *  2. Short/unparseable output → ONE corrective retry (previous output echoed
+ *     back with an explicit "you dropped steps" instruction).
+ *  3. Still short → deterministic 1:1 fallback + degraded flag. A batch can
+ *     shrink below the ratio ONLY by explicit fallback, never silently.
+ */
+async function convertNormalizedStepsWithAI(
+  testName: string,
+  items: NormalizedStep[],
+  platform: ImportPlatform,
+): Promise<AIStepConversionResult> {
+  if (items.length === 0) return { steps: [], degraded: false };
+
+  const systemPrompt = buildStepConversionSystemPrompt(platform);
   const allResults: IntentStep[] = [];
   let degraded = false;
 
-  // Process in batches to keep prompt size reasonable
-  for (let i = 0; i < rawSteps.length; i += AI_STEP_BATCH_SIZE) {
-    const batch = rawSteps.slice(i, i + AI_STEP_BATCH_SIZE);
+  for (let i = 0; i < items.length; i += AI_STEP_BATCH_SIZE) {
+    const batch = items.slice(i, i + AI_STEP_BATCH_SIZE);
     const batchNum = Math.floor(i / AI_STEP_BATCH_SIZE) + 1;
-    const totalBatches = Math.ceil(rawSteps.length / AI_STEP_BATCH_SIZE);
+    const totalBatches = Math.ceil(items.length / AI_STEP_BATCH_SIZE);
 
     const stepsText = batch
       .map((s, idx) => {
-        const parts = [`${idx + 1}. "${s.name}"`];
+        const parts = [`${i + idx + 1}. "${s.text}"`];
         if (s.value) parts.push(`value="${s.value}"`);
         if (s.parentName) parts.push(`(in: "${s.parentName}")`);
         if (s.status && s.status !== 'passed') parts.push(`[${s.status}]`);
-        // Parity with the CSV path: expected results under their step so the
-        // model emits one assert per item, right after the action.
-        if (s.expected?.length) {
-          parts.push(
-            '\n   expected results (emit one assert each, right after this step):\n' +
-            s.expected.map((e) => `     - ${e}`).join('\n'),
-          );
-        }
-        return parts.join(' ');
-      })
-      .join('\n');
-
-    const batchContext = totalBatches > 1
-      ? ` (batch ${batchNum}/${totalBatches}, steps ${i + 1}-${Math.min(i + AI_STEP_BATCH_SIZE, rawSteps.length)})`
-      : '';
-
-    const userPrompt = `Test: "${testName}"${batchContext}\n\nSteps:\n${stepsText}`;
-
-    try {
-      const response = await getChatCompletionWithMessages(
-        [
-          { role: 'system', content: STEP_CONVERSION_SYSTEM_PROMPT },
-          { role: 'user', content: userPrompt },
-        ],
-        {
-          model: AI_TASK_MODELS.allureStepConvert,
-          temperature: 0,
-          max_tokens: 8192,
-          response_format: { type: 'json_object' },
-        },
-      );
-
-      const rawContent = response.content?.trim() ?? '{"steps":[]}';
-      // AI returns {steps: [...]} (json_object mode always returns objects)
-      let parsed: AIStepResult[];
-      try {
-        const json = JSON.parse(rawContent);
-        if (Array.isArray(json)) {
-          parsed = json;
-        } else if (Array.isArray(json.steps)) {
-          parsed = json.steps;
-        } else {
-          parsed = [];
-        }
-      } catch (parseErr) {
-        // JSON may be truncated if max_tokens was hit
-        logger.warn('[AllureMapper] AI response JSON parse failed (truncated?)', {
-          testName,
-          batch: batchNum,
-          contentLength: rawContent.length,
-        });
-        parsed = [];
-      }
-
-      for (const step of parsed) {
-        // Skip malformed entries (AI sometimes returns nulls or strings)
-        if (!step || typeof step !== 'object') continue;
-
-        const desc = typeof step.description === 'string' ? step.description.trim() : '';
-        if (!desc) continue; // skip steps with no description
-
-        // Validate action type
-        const actionType: IntentActionType = VALID_ACTION_TYPES.includes(step.type as IntentActionType)
-          ? (step.type as IntentActionType)
-          : 'click';
-
-        allResults.push({
-          id: randomUUID(),
-          type: actionType,
-          description: desc.slice(0, MAX_STEP_DESC_CHARS),
-          ...(step.value !== undefined && step.value !== null && step.value !== '' && {
-            value: String(step.value),
-          }),
-        });
-      }
-    } catch (err) {
-      logger.warn('[AllureMapper] AI step conversion failed, using fallback', {
-        testName,
-        batch: batchNum,
-        stepsCount: batch.length,
-        error: err instanceof Error ? err.message : String(err),
-      });
-
-      // Fallback: create basic steps from raw data without AI. Mark degraded —
-      // step types are now unreliable ('click' for everything).
-      degraded = true;
-      for (const raw of batch) {
-        allResults.push({
-          id: randomUUID(),
-          type: 'click', // safe default
-          description: raw.name.slice(0, MAX_STEP_DESC_CHARS),
-          ...(raw.value !== undefined && { value: raw.value }),
-        });
-        // Preserve expected results as asserts right after their step, even on
-        // the degraded path (parity with the CSV converter).
-        for (const exp of raw.expected ?? []) {
-          allResults.push({
-            id: randomUUID(),
-            type: 'assert',
-            description: exp.slice(0, MAX_STEP_DESC_CHARS),
-          });
-        }
-      }
-    }
-  }
-
-  return { steps: allResults, degraded };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CSV/PDF step conversion (exported for use by processCsvPdfImport)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Convert simple step descriptions (from CSV/PDF parser) into proper IntentSteps
- * using AI. The AI determines the correct action type, cleans up descriptions,
- * splits composite steps, and extracts values.
- *
- * If AI fails, falls back to deterministic mapping (all steps → type 'click').
- *
- * @param testName - Test case name (context for AI)
- * @param rawSteps - Steps from the deterministic CSV/PDF parser
- * @returns IntentStep[] with correct types, clean descriptions, and UUIDs
- */
-export async function convertImportedStepsWithAI(
-  testName: string,
-  rawSteps: Array<{ type: string; description: string; value?: string; expected?: string[] }>,
-): Promise<AIStepConversionResult> {
-  if (rawSteps.length === 0) return { steps: [], degraded: false };
-
-  const allResults: IntentStep[] = [];
-  let degraded = false;
-
-  // Process in batches (same limit as ZIP path) to avoid context overflow
-  for (let i = 0; i < rawSteps.length; i += AI_STEP_BATCH_SIZE) {
-    const batch = rawSteps.slice(i, i + AI_STEP_BATCH_SIZE);
-    const batchNum = Math.floor(i / AI_STEP_BATCH_SIZE) + 1;
-    const totalBatches = Math.ceil(rawSteps.length / AI_STEP_BATCH_SIZE);
-
-    const stepsText = batch
-      .map((s, idx) => {
-        const parts = [`${i + idx + 1}. "${s.description}"`];
-        if (s.value) parts.push(`value="${s.value}"`);
         // Expected results are listed under their step so the model emits one
         // assert per item, right after the action — preserving the link.
         if (s.expected?.length) {
@@ -382,84 +365,175 @@ export async function convertImportedStepsWithAI(
       .join('\n');
 
     const batchContext = totalBatches > 1
-      ? ` (batch ${batchNum}/${totalBatches})`
+      ? ` (batch ${batchNum}/${totalBatches}, steps ${i + 1}-${Math.min(i + AI_STEP_BATCH_SIZE, items.length)})`
       : '';
 
-    const userPrompt = `Test: "${testName}"${batchContext}\n\nSteps:\n${stepsText}`;
+    const baseMessages = [
+      { role: 'system' as const, content: systemPrompt },
+      { role: 'user' as const, content: `Test: "${testName}"${batchContext}\n\nSteps:\n${stepsText}` },
+    ];
+
+    const callModel = async (
+      messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+    ): Promise<string> => {
+      const response = await getChatCompletionWithMessages(messages, {
+        model: AI_TASK_MODELS.allureStepConvert,
+        temperature: 0,
+        max_tokens: 8192,
+        response_format: { type: 'json_object' },
+        // Mechanical normalization task — low effort keeps reasoning tokens
+        // from eating the output budget (truncated JSON = dropped steps).
+        reasoning_effort: 'low',
+      });
+      return response.content?.trim() ?? '';
+    };
 
     try {
-      const response = await getChatCompletionWithMessages(
-        [
-          { role: 'system', content: STEP_CONVERSION_SYSTEM_PROMPT },
-          { role: 'user', content: userPrompt },
-        ],
-        {
-          model: AI_TASK_MODELS.allureStepConvert,
-          temperature: 0,
-          max_tokens: 8192,
-          response_format: { type: 'json_object' },
-        },
-      );
+      let rawContent = await callModel(baseMessages);
+      let parsed = parseAIStepsContent(rawContent);
+      let steps = parsed === null ? null : toIntentSteps(parsed);
 
-      const rawContent = response.content?.trim() ?? '{"steps":[]}';
+      // Conservation guard: unparseable OR fewer steps than the floor →
+      // one corrective retry before falling back.
+      if (steps === null || steps.length < minStepsFor(batch.length)) {
+        logger.warn('[AllureMapper] AI batch under-converted, retrying once', {
+          testName,
+          batch: batchNum,
+          inputSteps: batch.length,
+          outputSteps: steps?.length ?? 'unparseable',
+        });
 
-      let parsed: AIStepResult[];
-      try {
-        const json = JSON.parse(rawContent);
-        parsed = Array.isArray(json) ? json : Array.isArray(json.steps) ? json.steps : [];
-      } catch {
-        logger.warn('[AllureMapper] AI step conversion JSON parse failed', { testName, batch: batchNum });
-        parsed = [];
+        rawContent = await callModel([
+          ...baseMessages,
+          { role: 'assistant', content: rawContent.slice(0, 2000) },
+          {
+            role: 'user',
+            content:
+              `Your response had ${steps === null ? 'invalid JSON' : `only ${steps.length} steps`} ` +
+              `for ${batch.length} input steps. Every input step must become at least one action — ` +
+              `do not drop, merge, or summarize any step. Return the full corrected JSON.`,
+          },
+        ]);
+        parsed = parseAIStepsContent(rawContent);
+        steps = parsed === null ? null : toIntentSteps(parsed);
       }
 
-      // Trust AI result — even if empty (AI determined no meaningful UI steps)
-      for (const s of parsed) {
-        if (!s || typeof s !== 'object') continue;
-        const desc = typeof s.description === 'string' ? s.description.trim() : '';
-        if (!desc) continue;
-
-        allResults.push({
-          id: randomUUID(),
-          type: VALID_ACTION_TYPES.includes(s.type as IntentActionType)
-            ? (s.type as IntentActionType)
-            : 'click',
-          description: desc.slice(0, MAX_STEP_DESC_CHARS),
-          ...(s.value != null && s.value !== '' && { value: String(s.value) }),
+      if (steps === null || steps.length < minStepsFor(batch.length)) {
+        logger.warn('[AllureMapper] AI batch still under-converted after retry, using 1:1 fallback', {
+          testName,
+          batch: batchNum,
+          inputSteps: batch.length,
+          outputSteps: steps?.length ?? 'unparseable',
         });
+        degraded = true;
+        allResults.push(...fallbackIntentSteps(batch));
+      } else {
+        allResults.push(...steps);
       }
     } catch (err) {
-      logger.warn('[AllureMapper] AI step conversion failed, using fallback for batch', {
+      logger.warn('[AllureMapper] AI step conversion failed, using 1:1 fallback', {
         testName,
         batch: batchNum,
         stepsCount: batch.length,
         error: err instanceof Error ? err.message : String(err),
       });
-
-      // Fallback for this batch only — keep original descriptions, default type.
-      // Mark degraded: step types are now unreliable ('click' for everything).
-      // Expected results still become asserts placed right after their step so
-      // they're not lost even on the degraded path (action TYPE is unreliable;
-      // the assertions themselves are preserved and linked).
       degraded = true;
-      for (const s of batch) {
-        allResults.push({
-          id: randomUUID(),
-          type: 'click',
-          description: (s.description ?? '').slice(0, MAX_STEP_DESC_CHARS),
-          ...(s.value ? { value: s.value } : {}),
-        });
-        for (const exp of s.expected ?? []) {
-          allResults.push({
-            id: randomUUID(),
-            type: 'assert',
-            description: exp.slice(0, MAX_STEP_DESC_CHARS),
-          });
-        }
-      }
+      allResults.push(...fallbackIntentSteps(batch));
     }
   }
 
   return { steps: allResults, degraded };
+}
+
+/**
+ * Convert flattened Allure steps (ZIP path) into IntentSteps using AI.
+ */
+async function convertStepsWithAI(
+  testName: string,
+  rawSteps: FlattenedRawStep[],
+  platform: ImportPlatform,
+): Promise<AIStepConversionResult> {
+  return convertNormalizedStepsWithAI(
+    testName,
+    rawSteps.map((s) => ({
+      text: s.name,
+      value: s.value,
+      parentName: s.parentName,
+      status: s.status,
+      expected: s.expected,
+    })),
+    platform,
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CSV/PDF step conversion (exported for use by processCsvPdfImport)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Convert simple step descriptions (from the CSV parser) into proper
+ * IntentSteps using AI. The AI determines the correct action type, cleans up
+ * descriptions, splits composite steps, and extracts values.
+ *
+ * Same conservation contract as the ZIP path (see convertNormalizedStepsWithAI):
+ * an under-converted or unparseable batch retries once, then falls back to the
+ * deterministic 1:1 mapping with `degraded` set.
+ *
+ * @param testName - Test case name (context for AI)
+ * @param rawSteps - Steps from the deterministic CSV parser
+ * @param platform - Import target platform (framing for the AI prompt)
+ */
+export async function convertImportedStepsWithAI(
+  testName: string,
+  rawSteps: Array<{ type: string; description: string; value?: string; expected?: string[] }>,
+  platform: ImportPlatform = 'web',
+): Promise<AIStepConversionResult> {
+  return convertNormalizedStepsWithAI(
+    testName,
+    rawSteps.map((s) => ({
+      text: s.description,
+      value: s.value,
+      expected: s.expected,
+    })),
+    platform,
+  );
+}
+
+/**
+ * Finalize steps that ALREADY carry real action types — the PDF path.
+ *
+ * The PDF parser's LLM infers types and per-step expected results in the same
+ * pass that extracts the test cases, so running its output through the step
+ * converter was a SECOND lossy LLM pass over the same data (production imports
+ * lost steps to it). This is the deterministic replacement: validate the type,
+ * cap the description, emit one assert per expected item right after its step.
+ * No LLM, nothing can be dropped, not degraded.
+ */
+export function finalizeTypedSteps(
+  rawSteps: Array<{ type: string; description: string; value?: string; expected?: string[] }>,
+): IntentStep[] {
+  const result: IntentStep[] = [];
+  for (const s of rawSteps) {
+    const desc = (s.description ?? '').trim();
+    if (!desc) continue;
+
+    result.push({
+      id: randomUUID(),
+      type: VALID_ACTION_TYPES.includes(s.type as IntentActionType)
+        ? (s.type as IntentActionType)
+        : 'click',
+      description: desc.slice(0, MAX_STEP_DESC_CHARS),
+      ...(s.value != null && s.value !== '' && { value: String(s.value) }),
+    });
+    for (const exp of s.expected ?? []) {
+      result.push({
+        id: randomUUID(),
+        type: 'assert',
+        description: exp.slice(0, MAX_STEP_DESC_CHARS),
+      });
+    }
+  }
+  return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1041,7 +1115,7 @@ export async function mapAllureResult(
 
   // ── 1. Flatten + AI-convert steps ──────────────────────────────────────────
   const rawSteps = flattenRawSteps(result.steps);
-  const { steps, degraded: stepsDegraded } = await convertStepsWithAI(result.name, rawSteps);
+  const { steps, degraded: stepsDegraded } = await convertStepsWithAI(result.name, rawSteps, opts.platform);
 
   // ── 2. Extract labels ──────────────────────────────────────────────────────
   const { moduleName, flowName, priority, tags, descriptionSuffix } =

@@ -266,7 +266,11 @@ export class ClarificationService {
     explorationId: string;
     chatSessionId: string;
     question: string;
-    type: 'captcha_solve' | '2fa_code';
+    // 'test_data' = the flow needs a real value it can't invent (promo/referral
+    // code, account number, a one-time code that isn't strictly 2FA). Reuses the
+    // same text-input clarification UI as '2fa_code'. NOT for credentials —
+    // passwords need a dedicated secure form (see FlowRunner note).
+    type: 'captcha_solve' | '2fa_code' | 'test_data';
     timeout?: number;
   }): Promise<string | null> {
     const questionId = uuidv4();

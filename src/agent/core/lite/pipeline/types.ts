@@ -127,6 +127,12 @@ export interface TestBlackboardState {
   // sibling flows' outcomes instead of re-discovering them. Absent for flow #1.
   priorLearnings?: string;
 
+  // ── Structured blocker info (set by report_blocked via CommandExecutor) ──
+  // Carries the Executor's explicit blocker_type + can_user_help so the caller
+  // (FlowRunner) can route to the right clarification instead of keyword-guessing
+  // the blocked reason. Absent unless the Executor reported a blocker.
+  blockedInfo?: { blockerType: string; canUserHelp: boolean; reason: string };
+
   // ══════════════════════════════════════════════════════════════════════
   // HYBRID EXECUTOR FIELDS (only populated when enableHybridExecutor=true)
   // ══════════════════════════════════════════════════════════════════════
@@ -344,6 +350,15 @@ export interface TestPipelineResult {
   finalSnapshot?: LiteSnapshot;
   /** Blocked info if test was blocked */
   blockedReason?: string;
+  /**
+   * Structured blocker type from the Executor's report_blocked (e.g.
+   * 'captcha' | '2fa' | 'needs_data' | 'login_wall'). Set only when the
+   * Executor explicitly reported a blocker. FlowRunner prefers this over
+   * keyword-guessing the blockedReason string.
+   */
+  blockerType?: string;
+  /** Whether the reported blocker is user-resolvable (from report_blocked). */
+  canUserHelp?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

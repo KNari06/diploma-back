@@ -1153,6 +1153,10 @@ export class TestPipeline {
       blockedReason: phase === 'blocked'
         ? this.blackboard.getReview()?.reason || 'Unknown blocker'
         : undefined,
+      // Structured blocker (from report_blocked) — lets FlowRunner route to the
+      // right clarification instead of keyword-guessing the reason.
+      blockerType: this.blackboard.getBlockedInfo()?.blockerType,
+      canUserHelp: this.blackboard.getBlockedInfo()?.canUserHelp,
     };
   }
 
