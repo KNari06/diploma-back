@@ -1,3 +1,6 @@
+// IMPORTANT: `../instrument` must load before any other import so Sentry can
+// instrument http before it is required. Keep it first.
+import '../instrument';
 import { VideoStreamRegistry } from '@/agent/playwright/artifacts/video-stream-registry';
 import { createRunKey, TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
 import { env } from '@/config/environment/env';
