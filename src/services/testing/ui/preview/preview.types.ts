@@ -404,7 +404,10 @@ export type IntentActionType =
   | 'swipe'
   | 'click_at'
   // V17: Meta / Scratchpad — store a key-value pair for cross-step memory
-  | 'store';
+  | 'store'
+  // V-cross-app: run another saved test case at this point in the sequence,
+  // possibly on a different platform. See StepOptions.linkTestCase.
+  | 'link_test_case';
 
 /**
  * Binding hints for element resolution
@@ -1297,6 +1300,26 @@ export interface StepOptions {
   };
   /** CSS selector of scrollable container (for container scroll vs page scroll) */
   scrollContainer?: string;
+  /**
+   * V-cross-app: configuration for a `link_test_case` step — runs another
+   * saved test case at this point in the sequence, possibly on a different
+   * platform, splicing it into (same-platform) or nesting it beneath
+   * (cross-platform) this test's own execution.
+   */
+  linkTestCase?: {
+    /** ID of the test case to run at this point */
+    linkedTestCaseId: string;
+    /** Platform the linked test case runs on — may differ from this step's own test case's platform */
+    linkedPlatform: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
+    /** Values passed INTO the linked test case's own runtime parameters before it runs */
+    inputBindings?: Array<{ targetParam: string; valueExpr: string }>;
+    /**
+     * Named values pulled OUT of the linked test case's own variable scope
+     * after it completes (e.g. `extracted.orderId`), exposed to later steps
+     * in THIS test case as `{{link.<alias>}}`.
+     */
+    outputBindings?: Array<{ alias: string; sourceVariable: string }>;
+  };
 }
 
 /**

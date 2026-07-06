@@ -13,6 +13,8 @@ import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 import { emitTestCaseMutated } from '@/websocket/helpers/project-mutation-emit';
 import { validateTriggers, sanitizeTriggers } from '@/services/mobile/trigger-validation.util';
 import { normaliseVariantOverride } from '@/services/mobile/project-mobile-app.helper';
+import { extractLinkedTestCaseIds, wouldCreateCycle, LinkGraphNode } from '@/utils/graph/link-graph';
+import { ValidationError } from '@/types';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Per-testCase in-memory mutex (prevents concurrent read-modify-write races)
@@ -657,6 +659,45 @@ export class IntentTestCaseService {
               id,
               error: mergeError instanceof Error ? mergeError.message : String(mergeError),
             });
+          }
+        }
+
+        // A `link_test_case` step is a second edge source (alongside
+        // dependsOn) with the same "X requires Y to run first/as part of it"
+        // semantics — a save introducing one must be checked against the
+        // COMBINED project graph, the same way updateDependencies already
+        // checks dependsOn additions (saved-test-cases.controller.ts). This
+        // is genuinely new here: nothing previously referenced another test
+        // case from inside steps_json. See utils/graph/link-graph.ts.
+        const linkedIds = extractLinkedTestCaseIds(mergedSteps);
+        if (linkedIds.length > 0) {
+          if (linkedIds.includes(id)) {
+            throw new ValidationError('A test case cannot link to itself');
+          }
+
+          const { data: flowProject } = await intentTestCaseDb.getTestCaseFlowProjectForUser(id, userId);
+          if (flowProject?.project_id) {
+            const { data: graphRows, error: graphError } = await intentTestCaseDb.getProjectGraphRows(
+              flowProject.project_id,
+              userId,
+            );
+            if (graphError) {
+              throw new Error(`Failed to validate linked test cases: ${graphError.message}`);
+            }
+
+            const nodes: LinkGraphNode[] = (graphRows || []).map((row: any) => ({
+              id: row.id,
+              dependsOn: Array.isArray(row.depends_on) ? row.depends_on : [],
+              // This row's own not-yet-saved steps are what we're validating —
+              // use the new linkedIds rather than the stale DB copy.
+              linkedTestCaseIds: row.id === id ? linkedIds : extractLinkedTestCaseIds(row.steps_json),
+            }));
+
+            if (wouldCreateCycle(nodes, id, linkedIds)) {
+              throw new ValidationError(
+                'This step links to a test case that (directly or transitively) links back to this one — that would create a circular run',
+              );
+            }
           }
         }
 

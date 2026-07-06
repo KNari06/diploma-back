@@ -147,6 +147,13 @@ export class MobileTestRunJobHandler {
       // Retry counter — undefined on first attempt, incremented by the
       // worker before re-throwing on retry-able errors. See W5 below.
       retryCount = 0,
+      // V-cross-app continuation (see MobileTestJobData for the full
+      // rationale) — resume an existing session instead of acquiring +
+      // prepping a new one, and/or leave this job's session alive for a
+      // later segment to resume.
+      resumeSessionId,
+      resumeSessionSource,
+      keepSessionAlive,
     } = job.data;
 
     // ── Job-level retry budget ───────────────────────────────────────
@@ -417,20 +424,31 @@ export class MobileTestRunJobHandler {
       await this.updateTestStatus(testId, 'running', browser);
 
       // ── Phase 3: Acquire session — Pool → Warmup → Cold Start ─
-      const sessionAcq = await MobileSessionAcquisitionService.acquireSession({
-        client,
-        testId,
-        platform: acquirePlatform,
-        browser,
-        userId,
-        workspaceId,
-        projectId,
-        chatSessionId,
-      });
-      sessionId = sessionAcq.sessionId;
-      sessionSource = sessionAcq.sessionSource;
-      tlm.sessionClaimMs = sessionAcq.sessionClaimMs;
-      tlm.coldStartUsed = sessionAcq.coldStartUsed;
+      // (skipped entirely when resuming a continuation segment — see below)
+      if (resumeSessionId) {
+        sessionId = resumeSessionId;
+        sessionSource = resumeSessionSource ?? 'cold';
+        logger.info('[MOBILE-TEST] Resuming existing session for link_test_case continuation — skipping acquisition + app setup', {
+          testId,
+          sessionId,
+          sessionSource,
+        });
+      } else {
+        const sessionAcq = await MobileSessionAcquisitionService.acquireSession({
+          client,
+          testId,
+          platform: acquirePlatform,
+          browser,
+          userId,
+          workspaceId,
+          projectId,
+          chatSessionId,
+        });
+        sessionId = sessionAcq.sessionId;
+        sessionSource = sessionAcq.sessionSource;
+        tlm.sessionClaimMs = sessionAcq.sessionClaimMs;
+        tlm.coldStartUsed = sessionAcq.coldStartUsed;
+      }
 
       // The session may have been BORN on a companion or dedicated runner (e.g.
       // an editor warmup claimed at Try-2, or the tier-0 dedicated intercept).
@@ -459,6 +477,14 @@ export class MobileTestRunJobHandler {
       }
 
 
+      // ── Phases 3a-3d: permission policy, app prep, fast-auth, Flutter
+      // attach — ALL skipped when resuming a continuation segment. The
+      // resumed session already has the right app installed, wiped,
+      // launched, and (for Flutter) attached from whichever earlier segment
+      // in this chain actually acquired it — redoing any of this would
+      // force-stop/relaunch the app and lose exactly the in-progress UI
+      // state this continuation exists to preserve.
+      if (!resumeSessionId) {
       // ── Phase 3a: Apply project-level runtime-permission policy ────
       // Editor warmup applies this during the warmup HTTP handler, but
       // regression/CI runs reach the runner through this worker WITHOUT
@@ -623,6 +649,15 @@ export class MobileTestRunJobHandler {
         }
         await activeClient.attachFlutter(sessionId, { packageName: appPackage }, { userId });
         logger.info('[MOBILE-TEST] Flutter session attached', { testId, sessionId, appPackage });
+      }
+      } // end if (!resumeSessionId) — Phases 3a-3d
+
+      // Persist the session id this test actually ended up using (fresh or
+      // resumed) so a LATER continuation segment in the same link_test_case
+      // chain can resume it in turn. Best-effort — a failed write just means
+      // the next segment falls back to a fresh session instead of resuming.
+      if (sessionId) {
+        await this.persistRunnerSessionId(testId, sessionId, sessionSource);
       }
 
 
@@ -1010,6 +1045,14 @@ export class MobileTestRunJobHandler {
               ...(typeof stepResult.screenshot === 'string' && stepResult.screenshot.startsWith('http')
                 ? { stepScreenshotUrl: stepResult.screenshot }
                 : {}),
+              // link_test_case output capture: the runner's full scratchpad at
+              // this step (only present when the step modified it — see
+              // MobileStepResult.scratchpadSnapshot). Persisted per-step so a
+              // later read of the LAST defined one gives the run's final
+              // accumulated variable state, which linked-test-case-runner.service.ts
+              // reads to resolve outputBindings. Not new data from the runner —
+              // it was already sent, just not previously read on this side.
+              ...(stepResult.scratchpadSnapshot ? { scratchpadSnapshot: stepResult.scratchpadSnapshot } : {}),
             },
           };
           await TestExecutedStepsRedisService.appendStepCompleted(testId, mobileStepEvent);
@@ -1392,7 +1435,13 @@ export class MobileTestRunJobHandler {
       // destroySession tears down the remote container (emulatorManager.stop →
       // adb emu kill). Pool sessions reset-and-return; everything else (cold /
       // warmup adhoc) is destroyed as before.
-      if (sessionId) {
+      //
+      // `keepSessionAlive` (V-cross-app continuation): a LATER segment in
+      // this link_test_case chain will resume this exact session via
+      // `resumeSessionId` — cleaning it up here would pull the app out from
+      // under that continuation. Skip entirely; the final segment in the
+      // chain always runs without this flag, so cleanup still happens once.
+      if (sessionId && !keepSessionAlive) {
         try {
           if (sessionSource === 'pool') {
             await activeClient.releaseSession(sessionId, { userId });
@@ -1807,6 +1856,33 @@ export class MobileTestRunJobHandler {
    * stay null — that's the honest "we don't know" signal for downstream
    * aggregation.
    */
+  /**
+   * V-cross-app continuation: record the runner sessionId (+ its original
+   * acquisition source) this job ended up using, merged into `tests.options`
+   * alongside anything already there. `RegressionRunService`'s segmented
+   * dispatch reads this back (via `getTestBrowsersAndOptions` in
+   * `regression.db.ts`) after polling a segment to completion, so it can
+   * pass `resumeSessionId` to the NEXT segment instead of letting it acquire
+   * a fresh session. Best-effort — a failed write just means the next
+   * segment falls back to its normal fresh-acquisition path.
+   */
+  private static async persistRunnerSessionId(
+    testId: string,
+    sessionId: string,
+    sessionSource: 'pool' | 'warmup' | 'cold' | 'dedicated',
+  ): Promise<void> {
+    try {
+      const existing = await dbAdminService.getTest(testId);
+      const options = { ...(existing?.options ?? {}), runnerSessionId: sessionId, runnerSessionSource: sessionSource };
+      await dbAdminService.updateTest(testId, { options });
+    } catch (err) {
+      logger.warn('[MOBILE-TEST] Failed to persist runner sessionId (continuation fallback will re-acquire)', {
+        testId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   private static async persistTelemetrySnapshot(
     testId: string,
     tlm: {

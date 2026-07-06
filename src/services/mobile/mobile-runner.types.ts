@@ -127,7 +127,12 @@ export type MobileIntentActionType =
   // Biometric & auth
   | 'biometric' | 'otp' | 'permission' | 'clipboard'
   // Network simulation
-  | 'network';
+  | 'network'
+  // V-cross-app: run another saved test case at this point in the sequence,
+  // possibly on a different platform. Informational only — the backend
+  // orchestrator resolves this step before dispatch; the runner never
+  // receives it (see MobileIntentStepOptions.linkTestCase).
+  | 'link_test_case';
 
 // ── IntentStep (mirror of runner's IntentStep) ──────────────────
 
@@ -215,6 +220,17 @@ export interface MobileIntentStepOptions {
    *  stores the resolved element's text under, namespaced as
    *  `extracted.<name>` and referenceable via `{{extracted.<name>}}`. */
   extractVariable?: string;
+  /**
+   * `link_test_case` steps only — mirrors `StepOptions.linkTestCase` in
+   * preview.types.ts. Informational: the runner never executes this step
+   * type, so this field never crosses the HTTP boundary to qait-mobile-runner.
+   */
+  linkTestCase?: {
+    linkedTestCaseId: string;
+    linkedPlatform: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
+    inputBindings?: Array<{ targetParam: string; valueExpr: string }>;
+    outputBindings?: Array<{ alias: string; sourceVariable: string }>;
+  };
 }
 
 export interface MobileIntentStep {
@@ -352,6 +368,16 @@ export interface MobileStepResult {
     /** Optional app identifier the warning refers to. */
     packageName?: string;
   }>;
+  /**
+   * The runner's ENTIRE scratchpad at the point this step completed (e.g.
+   * `extracted.orderId`), only present when this step's action modified it
+   * (runner gates on `scratchpad.dirty`). The runner has always sent this
+   * field (`run.routes.ts`) — it was simply never typed or read on the
+   * backend before `link_test_case` needed a way to read a completed run's
+   * final captured values back. Take the LAST step (in order) that defines
+   * this field to get the run's final accumulated state.
+   */
+  scratchpadSnapshot?: Record<string, string>;
 }
 
 // ── Test Metadata ────────────────────────────────────────────────
@@ -741,6 +767,37 @@ export interface MobileTestJobData {
    * runner doesn't infinitely retry.
    */
   retryCount?: number;
+  /**
+   * V-cross-app continuation: when set, this job RESUMES an existing live
+   * mobile session instead of acquiring/prepping a new one. Used for the
+   * "steps" segment that runs after a cross-platform `link_test_case` —
+   * without this, that segment goes through the normal session-acquire +
+   * MobileAppPrepService.prepApp + attachFlutter pipeline, which force-stops
+   * and relaunches the app, discarding any typed-but-not-yet-submitted UI
+   * state from before the link (confirmed incident 2026-07-06 — a phone
+   * number typed before the link was gone by the time the continuation
+   * segment ran). Skips session acquisition, permission-policy apply,
+   * prepApp, fast-auth restore, and attachFlutter entirely — goes straight
+   * to Phase 4 (run steps) against this exact sessionId.
+   */
+  resumeSessionId?: string;
+  /**
+   * The ORIGINAL sessionSource ('pool'|'warmup'|'cold'|'dedicated') the
+   * resumed session was acquired under. Required alongside
+   * `resumeSessionId` so the LAST segment's cleanup (release vs end vs
+   * destroy) still does the right thing — a resuming job never went
+   * through Phase 3 acquisition itself, so it has no other way to learn
+   * this. Ignored when `resumeSessionId` is absent.
+   */
+  resumeSessionSource?: 'pool' | 'warmup' | 'cold' | 'dedicated';
+  /**
+   * V-cross-app continuation: when true, this job's `finally` block must
+   * NOT release/end/destroy its session — a later segment (dispatched with
+   * `resumeSessionId` set to this session) will continue using it. Set on
+   * every segment except the last one in a chain, so the session is still
+   * cleaned up eventually.
+   */
+  keepSessionAlive?: boolean;
 }
 
 // ── Exploration (autonomous app crawl) ─────────────────────────────

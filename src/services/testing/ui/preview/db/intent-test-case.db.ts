@@ -69,6 +69,21 @@ export function getDependencyClosureRows(ids: string[]) {
     .in('id', ids);
 }
 
+/**
+ * Every case in a project's (id, depends_on, steps_json) — the full graph
+ * needed for combined dependsOn + link_test_case cycle detection (see
+ * utils/graph/link-graph.ts). Unlike `getDependencyClosureRows`, this is not
+ * scoped to a known id list — cycle checks need the whole project's edges,
+ * not just one node's closure.
+ */
+export function getProjectGraphRows(projectId: string, userId: string) {
+  return supabaseAdmin
+    .from('intent_test_cases')
+    .select('id, depends_on, steps_json')
+    .eq('project_id', projectId)
+    .eq('user_id', userId);
+}
+
 /** Owner-scoped exact count for a project (+ optional flow filter). */
 export function countTestCaseRowsForProject(projectId: string, userId: string, flowId?: string) {
   let q = supabaseAdmin

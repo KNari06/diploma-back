@@ -2419,6 +2419,18 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
       return;
     }
 
+    // V-cross-app: link_test_case steps are resolved by RegressionRunService
+    // before dispatch (see link-resolution.service.ts) — this session-scoped
+    // run path has no equivalent resolution wired up. Reject explicitly
+    // rather than forwarding an unresolved step straight to the runner.
+    if (steps.some((s: any) => s?.type === 'link_test_case')) {
+      res.status(400).json({
+        success: false,
+        error: 'This test case links to another test case — trigger a regression run to test it (linked steps are not supported when running on an existing session).',
+      });
+      return;
+    }
+
     logger.info('[MOBILE_SESSION] Running test case on emulator', {
       sessionId,
       intentTestCaseId,
