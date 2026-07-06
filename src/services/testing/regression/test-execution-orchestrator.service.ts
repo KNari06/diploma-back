@@ -20,6 +20,9 @@ import { priorityRank } from './resolve-test-case-priority.util';
 import { MobileTestDispatcherService } from './mobile-test-dispatcher.service';
 import { WebTestRequestBuilderService } from './web-test-request-builder.service';
 import { RegressionTestQueryService } from './db/regression-test-query.db';
+import { LinkResolutionService } from './link-resolution.service';
+import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
+import { ValidationError } from '@/types';
 import {
   getRunRoutingInfo,
   getExecutionRefsForRun,
@@ -553,6 +556,38 @@ export class TestExecutionOrchestratorService {
                   totalSteps: savedCase.steps_json.length,
                 });
               }
+            }
+
+            // V-cross-app: resolve link_test_case steps the same way the
+            // single ad-hoc run does (RegressionRunService.runSavedTestCase).
+            // Same-platform links inline cleanly (no-op for every test case
+            // that doesn't use one). A remaining cross-platform marker means
+            // this test case needs the segmented dispatch-and-poll chain
+            // (dispatchFirstSegmentAndDetachRest) — this orchestrator's
+            // per-execution tracking is built around ONE testId per execId
+            // (concurrency gating, executionCompletionEmitter waiters, BullMQ
+            // job waits all key off it), so silently sending only the first
+            // segment would under-report the test and swapping testId
+            // mid-flight would break those waiters. Fail this one execution
+            // clearly instead of letting the raw unresolved step reach the
+            // runner, which rejects it with an opaque schema error (the
+            // runner has no `link_test_case` command — it's resolved here,
+            // before dispatch, by design). Tracked as a known gap; see
+            // DECISIONS.md.
+            savedCase.steps_json = await LinkResolutionService.resolveSameProlatformLinks(
+              (savedCase.steps_json as IntentStep[]) || [],
+              savedCase.platform || 'web',
+              userId,
+            );
+            // Checking segment KIND, not count: a test case whose entire
+            // steps_json is a single cross-platform link (no steps before
+            // or after it) segments to exactly one — but it's a "link"
+            // segment, not "steps". `.length > 1` alone would miss that
+            // and let the unresolved marker through to dispatch.
+            if (LinkResolutionService.segmentByLinks(savedCase.steps_json as IntentStep[]).some((s) => s.kind === 'link')) {
+              throw new ValidationError(
+                `Test case "${testCase.testCaseId}" has a cross-platform Link Test Case step, which is only supported when this test case is run individually — not as part of a plan/module/flow run. Run it on its own, or remove the cross-platform link before including it here.`,
+              );
             }
 
             // Route: mobile tests → mobile runner queue, web tests → Playwright queue

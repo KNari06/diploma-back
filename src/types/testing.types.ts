@@ -1236,6 +1236,12 @@ export interface RunReport {
   healthSummary?: HealthSummary;
   negativeSummary?: NegativeSummary;
   negativeExecutions?: RunReportExecution[];
+  /**
+   * Chain view: one entry per segment of a `link_test_case` chain (mobile →
+   * web → mobile, etc.) — see `tests.regression_run_id`. Absent/empty for
+   * the overwhelming majority of runs (unsegmented, single dispatch).
+   */
+  chainExecutions?: RunReportExecution[];
 }
 
 /**

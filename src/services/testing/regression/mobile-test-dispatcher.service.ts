@@ -62,6 +62,31 @@ export class MobileTestDispatcherService {
      * Undefined for plan / scheduled / CI runs.
      */
     chatSessionId?: string,
+    /**
+     * V-cross-app continuation (see `MobileTestJobData` for the full
+     * rationale): lets a segmented `link_test_case` regression run resume
+     * an existing live session for the "steps" segment after a cross-
+     * platform link, instead of acquiring + prepping a new one (which
+     * force-stops/relaunches the app and loses any typed-but-unsubmitted
+     * UI state from before the link). Only set by
+     * `RegressionRunService.dispatchFirstSegmentAndDetachRest` — every
+     * other caller omits it and gets the pre-existing fresh-dispatch
+     * behaviour unchanged.
+     */
+    continuation?: {
+      resumeSessionId?: string;
+      resumeSessionSource?: MobileTestJobData['resumeSessionSource'];
+      keepSessionAlive?: boolean;
+    },
+    /**
+     * Chain-view: the outer `regression_runs.id` this segment belongs to, so
+     * its `tests` row can be queried back alongside its sibling segments.
+     * Only set by the single-test-case dispatch path (`RegressionRunService.
+     * dispatchStepsSegment` and `LinkedTestCaseRunnerService.run`) — bulk
+     * plan/module/flow/priority dispatches omit it and get `NULL`, matching
+     * today's behaviour (those runs already group via `test_ids`).
+     */
+    runId?: string,
   ): Promise<{ testId: string; jobId: string; appBuildId: string | null }> {
     // 0. Plan gate — mobile testing is a Pro feature. This is the single choke
     // point for every mobile dispatch path (single-case run, plan/module
@@ -252,11 +277,17 @@ export class MobileTestDispatcherService {
       project_id: intentCase.project_id,
       user_id: userId,
       status: 'pending',
+      regression_run_id: runId ?? null,
       browsers: [browser as any],
       options: {
         mode: 'lite',
         platform,
         trigger,
+        // Chain view: mirrors the web dispatch path's `options.metadata`
+        // shape (see WebTestRequestBuilderService.buildTestRequest / test-
+        // creator.ts) so the report assembler can read a test case's name
+        // the same way regardless of which platform ran it.
+        metadata: { intentTestCaseId: intentCase.id, intentTestCaseName: intentCase.name },
         appPackage: resolvedBuild?.packageName,
         // Preserve which APK actually ran for this test — helps when
         // debugging "test failed on prod build vs. on PR branch", and
@@ -346,6 +377,12 @@ export class MobileTestDispatcherService {
       // attached when non-empty so no-trigger jobs are byte-identical to
       // pre-trigger dispatch.
       ...(triggers.length > 0 ? { triggers } : {}),
+      // V-cross-app continuation — see the param doc above. Omitted entirely
+      // for every non-continuation caller, so this is byte-identical to
+      // pre-continuation dispatch unless explicitly requested.
+      ...(continuation?.resumeSessionId ? { resumeSessionId: continuation.resumeSessionId } : {}),
+      ...(continuation?.resumeSessionSource ? { resumeSessionSource: continuation.resumeSessionSource } : {}),
+      ...(continuation?.keepSessionAlive ? { keepSessionAlive: true } : {}),
     };
 
     await QueueManager.addMobileTestRunJob(jobData);

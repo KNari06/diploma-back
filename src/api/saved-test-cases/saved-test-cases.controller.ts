@@ -8,6 +8,7 @@
  */
 
 import { supabaseAdmin } from '@/db/supabase';
+import { extractLinkedTestCaseIds, wouldCreateCycle, LinkGraphNode } from '@/utils/graph/link-graph';
 import { DependencySuggestion, SavedCaseDependencySuggester } from '@/services/testing/flows/saved-case-dependency-suggester.service';
 import {
   AUDIT_EVENTS,
@@ -700,7 +701,14 @@ async function validateDependencies(
 }
 
 /**
- * Detect if adding dependencies would create a cycle (DFS-based)
+ * Detect if adding dependencies would create a cycle (DFS-based).
+ *
+ * Checks against the COMBINED dependsOn + link_test_case graph, not just
+ * dependsOn — a `link_test_case` step (runs another test case at its own
+ * position, see intentTestCase step type) is a second edge source with the
+ * same "X requires Y" semantics, so a dependsOn addition that would cycle
+ * back through an existing link step must be rejected too. See
+ * utils/graph/link-graph.ts for why these are checked together.
  */
 async function detectCycle(
   targetId: string,
@@ -714,7 +722,7 @@ async function detectCycle(
   // Fetch all cases in the project for full graph traversal (cross-flow deps allowed)
   const { data: allCases, error } = await supabaseAdmin
     .from('intent_test_cases')
-    .select('id, depends_on')
+    .select('id, depends_on, steps_json')
     .eq('user_id', userId)
     .eq('project_id', projectId);
   if (error) {
@@ -727,31 +735,13 @@ async function detectCycle(
     return true;
   }
 
-  const adjacency = new Map<string, string[]>();
-  for (const c of allCases || []) {
-    const deps = Array.isArray((c as any).depends_on) ? (c as any).depends_on : [];
-    adjacency.set((c as any).id, deps);
-  }
+  const nodes: LinkGraphNode[] = (allCases || []).map((c: any) => ({
+    id: c.id,
+    dependsOn: Array.isArray(c.depends_on) ? c.depends_on : [],
+    linkedTestCaseIds: extractLinkedTestCaseIds(c.steps_json),
+  }));
 
-  const canReachTarget = (startId: string): boolean => {
-    const stack = [startId];
-    const visited = new Set<string>();
-
-    while (stack.length > 0) {
-      const node = stack.pop()!;
-      if (node === targetId) return true;
-      if (visited.has(node)) continue;
-      visited.add(node);
-
-      const next = adjacency.get(node) || [];
-      for (const n of next) {
-        if (!visited.has(n)) stack.push(n);
-      }
-    }
-    return false;
-  };
-
-  return newDependsOn.some(depId => canReachTarget(depId));
+  return wouldCreateCycle(nodes, targetId, newDependsOn);
 }
 
 // ============================================================================

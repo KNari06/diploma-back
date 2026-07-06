@@ -1098,7 +1098,12 @@ export class MobileRunnerClient {
           let runnerReason: string | undefined;
           if (errorBody) {
             try {
-              const parsed = JSON.parse(errorBody) as { code?: string; error?: string; reason?: string };
+              const parsed = JSON.parse(errorBody) as {
+                code?: string;
+                error?: string;
+                reason?: string;
+                details?: Array<{ path?: string; message?: string }>;
+              };
               if (typeof parsed.code === 'string' && parsed.code) {
                 runnerCode = parsed.code;
               }
@@ -1109,6 +1114,21 @@ export class MobileRunnerClient {
               // the editor expiry trace to record WHY the session vanished.
               if (typeof parsed.reason === 'string' && parsed.reason) {
                 runnerReason = parsed.reason;
+              }
+              // The runner's zod validation middleware (`validate.middleware.ts`)
+              // returns `{error:'Validation failed', details:[{path,message}]}`
+              // with no `code` — without surfacing `details` here, every such
+              // failure reads as an opaque "Validation failed (runner code:
+              // none)" with no way to tell which field/step was actually
+              // rejected short of adding a temporary log and reproducing.
+              if (Array.isArray(parsed.details) && parsed.details.length > 0) {
+                const detail = parsed.details
+                  .map((d) => [d.path, d.message].filter(Boolean).join(': '))
+                  .filter(Boolean)
+                  .join('; ');
+                if (detail) {
+                  runnerMessage = runnerMessage ? `${runnerMessage} — ${detail}` : detail;
+                }
               }
             } catch {
               // Body wasn't JSON — fall back to raw text below.

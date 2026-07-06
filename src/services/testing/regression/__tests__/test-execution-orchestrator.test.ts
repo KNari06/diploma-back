@@ -253,6 +253,43 @@ describe('TestExecutionOrchestratorService.executeTestCasesAsync', () => {
     expect(mockBuildWebReq).not.toHaveBeenCalled();
   });
 
+  it('fails a UI test case with a clear message instead of dispatching when it has an unresolved cross-platform Link Test Case step', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [{ id: 'e1', test_case_id: 'ui-1', test_type: 'ui' }],
+      error: null,
+    });
+    mockGetSavedCase.mockResolvedValue({
+      platform: 'mobile_android',
+      steps_json: [
+        {
+          id: 's1',
+          type: 'link_test_case',
+          options: {
+            linkTestCase: {
+              linkedTestCaseId: 'other-tc',
+              linkedPlatform: 'web',
+              inputBindings: [],
+              outputBindings: [],
+            },
+          },
+        },
+      ],
+    });
+
+    await run([uiTC()]);
+
+    // Never reaches the runner/Playwright with the unresolved marker still
+    // in steps_json — this orchestrator's per-execution tracking (one
+    // testId per execId) doesn't support the segmented dispatch chain a
+    // cross-platform link requires (see RegressionRunService.dispatchFirstSegmentAndDetachRest).
+    expect(mockDispatchMobile).not.toHaveBeenCalled();
+    expect(mockBuildWebReq).not.toHaveBeenCalled();
+
+    const call = mockUpdateStatus.mock.calls.find((c: any[]) => c[0].id === 'e1');
+    expect(call![0].status).toBe('failed');
+    expect(call![0].errorMessage).toContain('cross-platform Link Test Case step');
+  });
+
   it('surfaces out-of-run dependencies in the run summary instead of swallowing them', async () => {
     mockGetExecRefs.mockResolvedValue({
       rows: [{ id: 'e1', test_case_id: 'api-1', test_type: 'api' }],
