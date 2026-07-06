@@ -107,3 +107,26 @@ export function escapeHasText(value: string): string {
     .replace(/\\/g, '\\\\')
     .replace(/"/g, '\\"');
 }
+
+/**
+ * Escape value for CSS attribute selector.
+ * Keeps selector valid even if value contains quotes/backslashes/brackets/
+ * newlines. V22 Audit-fix H2: previous version only handled `\` and `"`,
+ * which broke when bsTarget contained CSS metacharacters like `]`
+ * (closing the attribute selector) or `[` (re-opening). Newlines also
+ * break selector parsing in Playwright.
+ *
+ * Order matters: `\` MUST be escaped first, otherwise we double-escape
+ * the backslashes we just added.
+ *
+ * Moved here from locator-plan-builder (July 2026) so the ancestor-scoped
+ * locator util can share it without a circular import.
+ */
+export function escapeCssAttrValue(value: string): string {
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\]/g, '\\]')
+    .replace(/\[/g, '\\[')
+    .replace(/[\n\r]/g, ' ');
+}
