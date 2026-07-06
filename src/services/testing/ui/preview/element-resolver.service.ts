@@ -54,6 +54,7 @@ import {
   type HonestySemanticDeps,
   type HonestyJudgeDeps,
 } from './semantic-match.util';
+import { splitBatchesWithLexicalAnchor } from './candidate-batch.util';
 import { buildSemanticDeps, buildJudgeDeps, isJudgeEnabled } from './honesty-guard-deps';
 import {
   recordedFingerprintHasStrongIdentity,
@@ -4764,8 +4765,27 @@ export async function resolveElement(params: {
   // The pruner does the smart shortlist (60 → 15) on top.
   // Fail-open: if pruner skips/errors, the resolver still operates on this
   // 60-candidate DOM-order set, which is the natural deterministic fallback.
-  const primaryBatch = allAllowed.slice(0, MAX_CANDIDATES_FOR_LLM);
-  const overflowBatch = allAllowed.slice(MAX_CANDIDATES_FOR_LLM);
+  //
+  // Lexical anchor (July 2026, bi.group «Войти»): candidates whose labels
+  // overlap the intent are guaranteed a seat in the primary batch. Without it,
+  // a penalty-demoted target on a >60-candidate page fell out of the batch and
+  // the LLM either answered not_found (slow extended-search rescue) or picked
+  // an unrelated element. The prompt cannot choose what it does not see.
+  const batchSplit = splitBatchesWithLexicalAnchor({
+    nodes: allAllowed,
+    intentText,
+    maxPrimary: MAX_CANDIDATES_FOR_LLM,
+  });
+  const primaryBatch = batchSplit.primary;
+  const overflowBatch = batchSplit.overflow;
+  if (batchSplit.rescuedRefs.length > 0) {
+    logger.info('[ELEMENT_RESOLVER] lexical anchor pinned tail candidates into LLM batch', {
+      previewSessionId,
+      intentText: intentText.slice(0, 60),
+      rescuedRefs: batchSplit.rescuedRefs,
+      allAllowedCount: allAllowed.length,
+    });
+  }
 
   const candidatesToProcess: Array<{ node: InteractiveNode; candidateText: string }> = [];
   for (const node of primaryBatch) {
