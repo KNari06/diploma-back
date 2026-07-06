@@ -78,6 +78,7 @@ Element resolution and auto-healing serve all three.
 | [implicit-role.util.ts](implicit-role.util.ts) | Maps `<button>`, `<a href>` etc. to ARIA roles. |
 | [selector-robustness.util.ts](selector-robustness.util.ts) | #4 — pure authoring-time robustness scorer (`computeSelectorRobustness`): strong/medium/weak + risk flags (cross_origin / image / icon-only / text-only) from the fingerprint. Surfaced on `preview:pick:result.robustness`. Advisory only — never affects resolution. |
 | [dynamic-id.util.ts](dynamic-id.util.ts) | Detects framework-generated IDs (`el-id-`, `radix-`, `:rN:`, `mui-`, UUID, …) — skipped in fingerprints. |
+| [candidate-batch.util.ts](candidate-batch.util.ts) | Pure primary/overflow batch split for the LLM resolver with the lexical anchor: intent-matching candidates are guaranteed a seat in the top-K batch (cap 12 anchors, DOM order preserved). Fixes the ">60 candidates + penalty-demoted target" class where the LLM never saw the real element. |
 | [intent-resolve-audit.ts](intent-resolve-audit.ts) | Audit log for resolver decisions: `logIntentResolveApply`, `logIntentResolveLint`, `buildChosenSnapshot`. Fire-and-forget JSONL to `logs/intent_resolve.log`. |
 | [failure-collector.service.ts](failure-collector.service.ts) | Builds `StepFailureEvidence` bundle when apply exhausts all strategies. Called only from `_buildFailureResult()` in preview-step-apply. |
 | [recorded-description-llm.service.ts](recorded-description-llm.service.ts) | Generates natural-language element descriptions at record time via LLM (`generateRecordedDescription`). Cached; fail-open (returns undefined). Used as a soft hint by the resolver. |
@@ -345,6 +346,13 @@ buildAllowedSets(snapshot, intent, viewport?, recordedFingerprint?)
 
 (3) LLM resolver (Gemini Flash)
     input: intent text, action type, candidates (top-K), scene summary.
+    LEXICAL ANCHOR (candidate-batch.util.ts, July 2026 bi.group «Войти»): the
+    top-K primary batch is not a plain DOM-order slice — candidates whose
+    label channels lexically overlap the intent are guaranteed a seat (cap 12),
+    displaced fillers go to the extended-search overflow. Without it a
+    penalty-demoted target (e.g. `stability.dynamic_id` on a Radix id) on a
+    >60-candidate page fell out of the batch: the LLM answered not_found
+    (slow extended-search rescue) or confidently picked an unrelated element.
     rules 1–18 in apply prompt: no loudest-CTA fallback, slug intents,
     adjacency≠function, etc. Rule 1 also carries CAPOT-OVER-LABEL: match by
     English technical identity (type/role/name/testid) when intent language
