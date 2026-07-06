@@ -1,5 +1,7 @@
 /**
- * THROWAWAY verification harness (not part of the build / not committed).
+ * Manual verification harness (dev-only — run directly via `npx tsx`, not part
+ * of the production build or CI). Committed so the iframe-replay work is
+ * reproducible, but it is NOT wired into any runtime path.
  *
  * Runs ExplorationEngine directly against a real browser — NO API / queue /
  * Supabase writes — and dumps each discovered test case's steps, flagging:

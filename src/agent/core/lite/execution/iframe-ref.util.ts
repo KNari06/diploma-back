@@ -35,6 +35,21 @@ const IFRAME_REF_RE = /^ifr(\d+)_/;
  */
 export const VALID_REF_RE = /^(?:[es]\d+|ifr\d+_\d+)$/;
 
+/**
+ * Raw regex source for the iframe element-ref shape `ifr{N}_{M}` — WITHOUT
+ * anchors — so other ref-classifying regexes can splice it into an alternation
+ * (e.g. stale-ref guards, state-hash extractors) instead of re-typing `ifr\d+_\d+`
+ * and forgetting to keep it in sync. Several such regexes silently excluded
+ * iframe refs before this was centralised. Use inside a `RegExp(...)` build, e.g.
+ * `new RegExp(`^(e\\d+|s\\d+|${IFRAME_REF_SRC})$`)`.
+ */
+export const IFRAME_REF_SRC = 'ifr\\d+_\\d+';
+
+/** True for a same-origin iframe element ref (`ifr{N}_{M}`). */
+export function isIframeRef(ref: string | undefined): boolean {
+  return !!ref && IFRAME_REF_RE.test(ref);
+}
+
 /** Frame index encoded in an iframe ref, or null for a main-page ref. */
 export function parseIframeRefIndex(ref: string | undefined): number | null {
   if (!ref) return null;

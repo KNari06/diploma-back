@@ -464,8 +464,15 @@ export class ActionExecutor {
     // for the whole command so every downstream `currentContext.locator(...)`
     // sub-case (scroll targetRef, select option, drag targetRef) resolves in
     // the same frame. Main-page refs leave currentContext untouched.
-    if (cmd.ref) {
-      this.currentContext = this.resolveContextForRef(cmd.ref);
+    //
+    // Consider BOTH ref and targetRef: ref-only commands (click/fill) carry the
+    // element in `ref`, but the targetRef-only commands named above (scroll into
+    // an iframe element, drag target) carry it in `targetRef`. Reading only
+    // `ref` left those scoped to the main page, so a scroll to an iframe element
+    // silently ran against the wrong frame.
+    const contextRef = cmd.ref ?? cmd.targetRef;
+    if (contextRef) {
+      this.currentContext = this.resolveContextForRef(contextRef);
     }
     const locator = cmd.ref
       ? this.currentContext.locator(`[data-agent-ref="${cmd.ref}"]`)

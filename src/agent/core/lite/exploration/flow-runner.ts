@@ -646,17 +646,11 @@ export class FlowRunner {
       // during this flow, in roughly the order they were encountered.
       recordedDismissals.push(...pipelineResult.dismissals);
 
-      // Build the SELF-CONTAINED step list for the saved test case:
-      //   [navigate to entry URL] + [dismiss overlays] + [flow steps]
-      // so a replay reproduces the setup the discovery relied on. This is kept
-      // SEPARATE from `discoveredSteps` (which Scout consumes below) — Scout
-      // must see only the real flow actions, not the prepended setup, or its
-      // branch dedup could misfire. See buildSelfContainedSteps.
-      const finalSteps = buildSelfContainedSteps(
-        entryPoint.sourcePageUrl,
-        recordedDismissals,
-        discoveredSteps,
-      );
+      // NOTE: the SELF-CONTAINED step list is built LATER, just before the
+      // return — NOT here. A 2FA/CAPTCHA retry branch below can still append to
+      // `discoveredSteps` + `recordedDismissals`; building the list here would
+      // snapshot it pre-retry and silently drop the retry's actions/dismissals
+      // from the saved test case. See buildSelfContainedSteps at the return.
 
       this.trace?.writeFlowPipelineEnd({
         entryPointId: entryPoint.id,
@@ -868,6 +862,18 @@ export class FlowRunner {
       networkTracker.stopTracking();
       await page.close();
       await this.stateManager.closeContext(context);
+
+      // Build the SELF-CONTAINED step list NOW (after the optional 2FA/CAPTCHA
+      // retry has appended to discoveredSteps/recordedDismissals), so the saved
+      // test case includes retry-path actions + overlay dismissals:
+      //   [navigate to entry URL] + [dismiss overlays] + [flow steps]
+      // Kept SEPARATE from `discoveredSteps` (which Scout consumed above) —
+      // Scout must see only the real flow actions, not the prepended setup.
+      const finalSteps = buildSelfContainedSteps(
+        entryPoint.sourcePageUrl,
+        recordedDismissals,
+        discoveredSteps,
+      );
 
       return {
         entryPoint,

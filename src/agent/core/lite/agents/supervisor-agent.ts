@@ -15,6 +15,14 @@ import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { LitePromptBuilder } from '../prompt/lite-prompt-builder';
 import { logger } from '@/utils/core/logger';
+import { IFRAME_REF_SRC } from '../execution/iframe-ref.util';
+
+// State-hash ref extractor. Matches `e0: "name" …`, `s0: …`, and iframe refs
+// `ifr0_3: …`. The iframe alternative is spliced from the shared IFRAME_REF_SRC
+// so it can't silently fall out of sync — before this, iframe elements were
+// dropped from the loop-detection signature set, so changes inside an iframe
+// never registered as progress. Group order preserved: [1]=ref, [2]=name.
+const STATE_HASH_REF_RE = new RegExp(`^([es]\\d+|${IFRAME_REF_SRC}):\\s*"([^"]*)"(.*)$`);
 
 // Reuse the same dynamic patterns from LiteState for noise filtering
 const DYNAMIC_NAME_PATTERNS = [
@@ -231,8 +239,8 @@ export class SupervisorAgent {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('[') || trimmed.startsWith('─')) continue;
 
-      // Extract ref pattern: e0: "name" or s0: "name"
-      const match = trimmed.match(/^([es]\d+):\s*"([^"]*)"(.*)$/);
+      // Extract ref pattern: e0: "name", s0: "name", or ifr0_3: "name"
+      const match = trimmed.match(STATE_HASH_REF_RE);
       if (!match) continue;
 
       const name = match[2] || '';

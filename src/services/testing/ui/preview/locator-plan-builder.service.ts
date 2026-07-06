@@ -1312,6 +1312,15 @@ async function validateOnPage(
   plan: LocatorEntry[],
   page: Page,
   config: LocatorConfig,
+  // When the recorded element lives inside a same-origin iframe, its locators
+  // only resolve INSIDE that Frame — `page.locator()` never crosses a frame
+  // boundary, so a build-time count on the main page is always 0 and would drop
+  // every iframe locator, leaving the compiled plan empty. We skip the live
+  // count for iframe-scoped plans (matchCount stays undefined, sortAndCap keeps
+  // them — drop only fires on an explicit 0) and rely on replay-time frame
+  // resolution (action-executor resolveIframeFrame / compiled-locator-executor
+  // frameLocator scope). Mirrors the role-without-roleName skip below.
+  iframeScoped = false,
 ): Promise<LocatorEntry[]> {
   const startedAt = Date.now();
   const PER_LOCATOR_MS = 200;
@@ -1331,6 +1340,13 @@ async function validateOnPage(
       // entirely; sortAndCap keeps it (matchCount undefined, drop only
       // fires on explicit 0).
       if (entry.strategy === 'role' && !entry.roleName) {
+        return { ...entry, validated: false };
+      }
+      // Iframe-scoped plan — can't count against the main page (see the
+      // `iframeScoped` param doc). Skip the count so the entry survives to
+      // replay, where the frame is resolved. validated=false, matchCount
+      // undefined → sortAndCap keeps it.
+      if (iframeScoped) {
         return { ...entry, validated: false };
       }
       const locator = buildStrategyLocator(page, entry);
@@ -1572,7 +1588,11 @@ export class LocatorPlanBuilder {
 
     if (page && rawPlan.length > 0) {
       const validationStart = Date.now();
-      const validated = await validateOnPage(rawPlan, page, config);
+      // Iframe-scoped elements can't be counted on the main page — skip the
+      // live count for them so their locators aren't dropped as "dead".
+      const iframeScoped = !!step.options?.iframe?.selector
+        || (typeof resolvedNode.ref === 'string' && resolvedNode.ref.startsWith('ifr'));
+      const validated = await validateOnPage(rawPlan, page, config, iframeScoped);
       // Compute aggregate stats from the same `validated` array the
       // logger.info inside validateOnPage already reads. Re-derived
       // here (cheap) so we don't have to plumb a return type through
