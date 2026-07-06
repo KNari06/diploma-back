@@ -16,7 +16,8 @@ import type {
   TargetFingerprint,
 } from './preview.types';
 import { TIER_ORDER } from './preview.types';
-import { CELL_SEP, escapeHasText, normalizeText } from './text-normalizer.util';
+import { CELL_SEP, escapeCssAttrValue, escapeHasText, normalizeText } from './text-normalizer.util';
+import { buildAncestorScopedLocators } from './ancestor-scoped-locator.util';
 import { extractStableTokensViaLLM } from './stable-tokens-llm.service';
 import { buildStrategyLocator, safeCountWithTimeout } from './locator-resolution.util';
 import {
@@ -25,25 +26,8 @@ import {
   type LocatorConfig,
 } from '@/config/testing/locator-config';
 
-/**
- * Escape value for CSS attribute selector.
- * Keeps selector valid even if value contains quotes/backslashes/brackets/
- * newlines. V22 Audit-fix H2: previous version only handled `\` and `"`,
- * which broke when bsTarget contained CSS metacharacters like `]`
- * (closing the attribute selector) or `[` (re-opening). Newlines also
- * break selector parsing in Playwright.
- *
- * Order matters: `\` MUST be escaped first, otherwise we double-escape
- * the backslashes we just added.
- */
-function escapeCssAttrValue(value: string): string {
-  return value
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\]/g, '\\]')
-    .replace(/\[/g, '\\[')
-    .replace(/[\n\r]/g, ' ');
-}
+// escapeCssAttrValue moved to text-normalizer.util.ts (shared with the
+// ancestor-scoped locator util) — imported above.
 
 /**
  * ARIA roles that are too generic to be useful as locators.
@@ -1557,6 +1541,34 @@ export class LocatorPlanBuilder {
     // labels without structural anchors. On testId-rich elements the
     // function returns synchronously fast (no LLM call).
     const rawPlan = await buildLocatorChain(resolvedNode, config);
+
+    // Ancestor-scoped strategies (July 2026): the recorded fingerprint's
+    // ancestorSummary carries the ancestors' STABLE testId/#id anchors —
+    // until now only a soft LLM hint. For targets without strong own
+    // identity, chain the innermost anchored ancestor with the most
+    // specific child shape (`#layout-header svg`,
+    // `[data-testid=nav] button:has-text("Войти")`). Uniqueness is
+    // enforced by the SAME validateOnPage count below — ambiguous chains
+    // demote/drop like any other entry.
+    try {
+      const scoped = buildAncestorScopedLocators({
+        fingerprint: step.recordedFingerprint,
+        node: resolvedNode,
+      });
+      if (scoped.length > 0) {
+        rawPlan.push(...scoped);
+        logger.debug('[LOCATOR_PLAN_BUILDER] Added ancestor-scoped strategies', {
+          stepId: step.id,
+          selectors: scoped.map((s) => s.value),
+        });
+      }
+    } catch (err) {
+      // Pure helper — a parse edge case must never break plan building.
+      logger.warn('[LOCATOR_PLAN_BUILDER] ancestor-scoped strategies failed', {
+        stepId: step.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     if (rawPlan.length === 0) {
       logger.warn('[LOCATOR_PLAN_BUILDER] Empty locator plan — element has no durable selectors', {
