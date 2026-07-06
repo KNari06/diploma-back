@@ -252,17 +252,19 @@ const envSchema = z.object({
   FEATURE_ORG_CREDITS_ENABLED: z.string().transform(v => v === 'true').default('true'),
 
   // ──────────────────────────────────────────────────────────────────
-  // Self-serve PLG signup. Default false keeps the B2B flow intact
-  // (manual admin approval + business-email gate). When true:
+  // Self-serve PLG signup. Default TRUE — the product is now self-serve B2C:
   //   - new users are provisioned approved on first auth (status set to
   //     'approved', overriding the users.status column default), with a
   //     default workspace + project so they skip the onboarding wizard
   //   - the business-email gate accepts personal domains (Gmail etc.);
   //     the disposable-domain block stays on as anti-abuse
-  // The requireApproved middleware is left in place — flipping this off
-  // restores gated behaviour with no code change.
+  // Set AUTO_APPROVE_SIGNUP=false to restore the gated B2B flow (manual admin
+  // approval + business-email gate). The requireApproved middleware stays in
+  // place, so flipping this off re-gates with no code change.
+  // NOTE: default true means ANY env without an explicit value (staging, local,
+  // a fork) also auto-approves — set it false there if you want manual review.
   // ──────────────────────────────────────────────────────────────────
-  AUTO_APPROVE_SIGNUP: z.string().transform(v => v === 'true').default('false'),
+  AUTO_APPROVE_SIGNUP: z.string().transform(v => v === 'true').default('true'),
 
   // ──────────────────────────────────────────────────────────────────
   // Per-test-case chat (Phase 1-8 backend, frontend integration TBD).

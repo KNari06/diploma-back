@@ -10,6 +10,7 @@ import {
 } from '@/utils/validation/businessEmail';
 import * as crypto from 'crypto';
 import { notifyAdminsOfNewUser } from './new-user-notification.service';
+import { resolveEffectiveStatus } from './effective-status';
 
 // Thrown when signup is rejected because the email domain is a free/consumer
 // or disposable provider. The controller catches this and returns a 400
@@ -896,7 +897,7 @@ export async function verifyToken(accessToken: string): Promise<AuthUser | null>
       email: data.user.email || '',
       name: userData?.name || data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'User',
       role: userData?.role || 'user',
-      status: userData?.status || 'pending_approval',
+      status: resolveEffectiveStatus(userData?.status),
       avatar: userData?.avatar_url || data.user.user_metadata?.avatar_url,
     };
 
