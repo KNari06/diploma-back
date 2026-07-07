@@ -380,13 +380,14 @@ function mapSavedTestCaseToResponse(row: any): any {
 /**
  * List runs for project
  *
- * @route GET /api/v1/regression/runs?projectId=<uuid>
+ * @route GET /api/v1/regression/runs?projectId=<uuid>&planId=<uuid>
  * @query {string} projectId - Project ID to list runs for
+ * @query {string} [planId] - Optional: scope to one plan's run history (includes ad-hoc runs of the plan's member test cases)
  * @returns {array} List of regression runs with status and summary
  */
 export async function listRuns(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId } = req.query;
+    const { projectId, planId } = req.query;
 
     if (!projectId || typeof projectId !== 'string') {
       res.status(400).json({
@@ -398,7 +399,12 @@ export async function listRuns(req: AuthenticatedRequest, res: Response): Promis
 
     const userId = getUserId(req);
 
-    const runs = await RegressionRunService.listRuns(projectId, userId);
+    const runs = await RegressionRunService.listRuns(
+      projectId,
+      userId,
+      undefined,
+      typeof planId === 'string' ? planId : undefined,
+    );
 
     res.json({
       success: true,

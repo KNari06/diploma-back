@@ -114,6 +114,27 @@ export async function getMobileTestResultsByTestIds(testIds: string[]): Promise<
 /**
  * Batch fetch executed_steps from the tests table. Empty input → empty array.
  */
+/**
+ * Chain view: every `tests` row dispatched under one outer `regression_runs`
+ * id (a segmented link_test_case run tags each segment's `tests` row with
+ * the SAME outer run id — see `tests.regression_run_id` migration).
+ * Ordered by dispatch order so segments render in chain order.
+ */
+export async function getTestsByRegressionRunId(
+  runId: string,
+): Promise<Array<{ id: string; status: string; browsers: string[] | null; options: any; created_at: string; completed_at: string | null; started_at: string | null }>> {
+  const { data, error } = await supabaseAdmin
+    .from('tests')
+    .select('id, status, browsers, options, created_at, completed_at, started_at')
+    .eq('regression_run_id', runId)
+    .order('created_at', { ascending: true });
+
+  if (error) {
+    logger.warn('[REGRESSION_RUN] Failed to fetch chain segment tests', { error, runId });
+  }
+  return data || [];
+}
+
 export async function getExecutedStepsByTestIds(
   testIds: string[],
 ): Promise<Array<{ id: string; executed_steps: any[] | null }>> {

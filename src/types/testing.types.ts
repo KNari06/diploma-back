@@ -1140,6 +1140,17 @@ export interface EnrichedBug {
   actual: string;
   selector?: string;
   recommendation: string;
+  /**
+   * Deterministic identity of the bug (severity + category + normalized title +
+   * selector). Duplicates of the same underlying issue across a run's executions
+   * share a fingerprint and are collapsed into ONE entry. Follows the
+   * `regression_doctor_findings.pattern_hash` convention (SHA-1 hex).
+   */
+  fingerprint?: string;
+  /** How many raw bug instances collapsed into this one (≥1). 1 = unique. */
+  occurrences?: number;
+  /** Distinct executions this bug was seen in (for the "seen in N runs" UI). */
+  seenInExecutions?: string[];
 }
 
 /**
@@ -1225,6 +1236,12 @@ export interface RunReport {
   healthSummary?: HealthSummary;
   negativeSummary?: NegativeSummary;
   negativeExecutions?: RunReportExecution[];
+  /**
+   * Chain view: one entry per segment of a `link_test_case` chain (mobile →
+   * web → mobile, etc.) — see `tests.regression_run_id`. Absent/empty for
+   * the overwhelming majority of runs (unsegmented, single dispatch).
+   */
+  chainExecutions?: RunReportExecution[];
 }
 
 /**

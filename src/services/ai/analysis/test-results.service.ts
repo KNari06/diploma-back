@@ -57,18 +57,30 @@ export class AIService {
       // Generate AI analysis
       const analysis = await this.generateAnalysis(context);
 
+      // Anti-hallucination code-gate. Prompt rule #3 tells the LLM not to
+      // manufacture bugs on a clean run, but a soft instruction isn't a
+      // guarantee — a model seeing only accessibility warnings / perf metrics
+      // can still invent a "bug" (and it costs 5 credits + pollutes Jira). Here
+      // we ENFORCE it: if the run is a clean pass with zero real error signal
+      // (status completed, no errors, no 4xx/5xx network), scrub any bugs the
+      // LLM returned. A failed/timeout run — or any genuine error/5xx — is a
+      // legitimate bug source and is left untouched (assertion failures and
+      // element-not-found drift produce no console error but ARE real).
+      const scrubbed = this.scrubHallucinatedBugs(testResult, analysis);
+
       const duration = Date.now() - startTime;
       logger.info('[AI_SERVICE] Analysis completed', {
         testId: testResult.testId,
         duration,
-        bugsFound: analysis.bugs.length,
-        severity: analysis.severity,
+        bugsFound: scrubbed.bugs.length,
+        bugsScrubbed: analysis.bugs.length - scrubbed.bugs.length,
+        severity: scrubbed.severity,
       });
 
       // Log the analysis
-      logAIAnalysis(testResult.testId, analysis);
+      logAIAnalysis(testResult.testId, scrubbed);
 
-      return analysis;
+      return scrubbed;
     } catch (error) {
       logger.error('[AI_SERVICE] Analysis failed', {
         testId: testResult.testId,
@@ -76,6 +88,44 @@ export class AIService {
       });
       throw handleAIError(error);
     }
+  }
+
+  /**
+   * Enforce prompt rule #3 in code: on a genuinely clean run, an LLM must not
+   * invent bugs. "Clean" = the test PASSED (status 'completed') AND there is no
+   * real error signal — no `errors[]` entries and no 4xx/5xx network responses.
+   * In that case any `bugs` the model returned are hallucinations (fabricated
+   * from accessibility warnings / perf metrics / speculation), so we drop them
+   * and force a low-severity clean summary.
+   *
+   * We deliberately do NOT scrub when the run FAILED/timed out or has any real
+   * error signal — those are legitimate bug sources even with an empty console
+   * (assertion failures, element-not-found / test-drift produce no console
+   * error but ARE real). Pure + side-effect-free so it's unit-testable.
+   */
+  private scrubHallucinatedBugs(testResult: TestResult, analysis: AISummary): AISummary {
+    if (!analysis.bugs || analysis.bugs.length === 0) return analysis;
+
+    const passed = testResult.status === 'completed';
+    const hasErrors = (testResult.errors?.length ?? 0) > 0;
+    const hasHttpFailure = (testResult.networkLogs ?? []).some(
+      (n) => typeof n?.status === 'number' && n.status >= 400,
+    );
+    const hasRealSignal = !passed || hasErrors || hasHttpFailure;
+    if (hasRealSignal) return analysis; // legitimate bug source — leave untouched
+
+    logger.warn('[AI_SERVICE] Scrubbing hallucinated bugs on a clean run', {
+      testId: testResult.testId,
+      droppedBugs: analysis.bugs.length,
+      droppedTitles: analysis.bugs.map((b) => b.title).slice(0, 5),
+    });
+    return {
+      ...analysis,
+      bugs: [],
+      severity: 'low',
+      // Keep the model's recommendations (advisory a11y/perf notes are fine as
+      // recommendations — rule #4 in the prompt — just not as bugs).
+    };
   }
 
   /**
@@ -381,6 +431,18 @@ Output:
   "recommendations": ["Add null check before .map() in reports component", "Fix /api/reports 500 error on backend", "Add error boundary around Reports tab"],
   "severity": "high",
   "confidence": 92
+}
+
+CLEAN-RUN EXAMPLE (do NOT manufacture bugs — rule #3):
+
+Input: status=completed, errors=[], networkLogs=[{url:"/api/user",status:200,method:"GET"}], accessibilityWarnings=["Image missing alt text","Low contrast on footer link"]
+Output:
+{
+  "summary": "Test completed successfully. No functional errors or failed requests. Two minor accessibility warnings noted.",
+  "bugs": [],
+  "recommendations": ["Add alt text to the flagged image", "Increase footer link contrast to meet WCAG AA"],
+  "severity": "low",
+  "confidence": 90
 }`;
   }
 

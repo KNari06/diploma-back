@@ -104,3 +104,32 @@ export function redactWithValues(value: string, secretValues: readonly string[])
   }
   return out;
 }
+
+/** Structural shape of the runtime credentials carried by agent configs. */
+export interface RedactableCredentials {
+  email?: string;
+  username?: string;
+  password?: string;
+  phone?: string;
+}
+
+/**
+ * Strip any configured credential value (email / username / password / phone)
+ * out of an LLM-facing or trace-bound string. A page that echoes a credential
+ * into its console / DOM / form labels would otherwise leak it into a prompt or
+ * the JSONL trace. Single source so every agent sink redacts identically
+ * (CLAUDE.md invariant #10). Identity on the no-creds path.
+ */
+export function redactCredentialValues(
+  value: string,
+  credentials: RedactableCredentials | null | undefined,
+): string {
+  if (!credentials) return value;
+  const values = [credentials.password, credentials.email, credentials.username, credentials.phone]
+    .filter((v): v is string => typeof v === 'string' && v.length > 0)
+    // Longest-first so a value that is a substring of another (e.g. username
+    // inside email) can't mask first and leave the longer one's tail exposed.
+    // Mirrors collectSecretValues' ordering above.
+    .sort((a, b) => b.length - a.length);
+  return redactWithValues(value, values);
+}

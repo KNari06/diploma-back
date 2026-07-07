@@ -3407,6 +3407,28 @@ export class CommandExecutor {
       if (!cloned) cloned = { ...meta };
       (cloned as Record<string, unknown>)[f] = r;
     }
+    // link_test_case output capture (extractedDataSnapshot) — the FULL
+    // per-run scratchpad, which can legitimately hold a resolved
+    // {{secrets.*}} value written via a `store`/`extract` step (that's
+    // exactly what makes it useful as a link_test_case output binding).
+    // Redact every VALUE in the map (not just the fixed FIELDS above,
+    // since keys are dynamic variable names) before it's persisted or
+    // broadcast — Hard invariant #10.
+    const snapshot = (meta as Record<string, unknown>).extractedDataSnapshot;
+    if (snapshot && typeof snapshot === 'object') {
+      let redactedSnapshot: Record<string, string> | undefined;
+      for (const [key, value] of Object.entries(snapshot as Record<string, string>)) {
+        if (typeof value !== 'string') continue;
+        const r = redactWithValues(value, this.redactValues);
+        if (r === value) continue;
+        if (!redactedSnapshot) redactedSnapshot = { ...(snapshot as Record<string, string>) };
+        redactedSnapshot[key] = r;
+      }
+      if (redactedSnapshot) {
+        if (!cloned) cloned = { ...meta };
+        (cloned as Record<string, unknown>).extractedDataSnapshot = redactedSnapshot;
+      }
+    }
     return cloned ?? meta;
   }
 

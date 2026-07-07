@@ -548,7 +548,7 @@ export class UserCreditsService {
    * For a recurring subscription cycle the balance must be SET to the plan's
    * monthly credits (no rollover), NOT added to — otherwise each renewal stacks
    * the allotment on top of the unused balance and the user accrues credits
-   * forever. Mirrors WorkspaceCreditsService.renewPlan for the B2C path.
+   * forever. This is the renewal (SET) counterpart to addCredits (ADD).
    *
    * @param userId
    * @param periodCredits  exact balance the user should have for the new period
@@ -606,6 +606,102 @@ export class UserCreditsService {
       return { success: true, newBalance };
     } catch (error) {
       logger.error('[USER_CREDITS] Exception in resetToPlanCredits', { error, userId });
+      return { success: false, newBalance: 0 };
+    }
+  }
+
+  /**
+   * Grant a B2B plan's allotment to a USER account.
+   *
+   * Credits belong to the user, not the workspace — B2B (pilot / small_business
+   * / middle_business / enterprise) invoices and the ops assign script land the
+   * plan's credits + grace limit here, same as the B2C path. There is no
+   * workspace credits pool.
+   *
+   * Modes:
+   *   - mode 'upgrade' (first charge / plan change): ADD the plan's credits.
+   *   - mode 'renew'   (subscription_cycle): SET the balance to the allotment
+   *     (no rollover), matching resetToPlanCredits.
+   * In both modes the per-tier grace_limit and B2B subscription_plan/status are
+   * written, and any prior grace debt is cleared when the new balance is >= 0.
+   *
+   * @param userId
+   * @param planSlug     B2B plan slug from WORKSPACE_PLANS
+   * @param credits      the plan's period credit allotment
+   * @param graceLimit   the plan's grace limit
+   * @param mode         'upgrade' (add) or 'renew' (set)
+   * @param description  transaction description
+   * @param metadata     extra transaction metadata (e.g. invoice id)
+   */
+  static async grantBusinessPlan(
+    userId: string,
+    planSlug: 'pilot' | 'small_business' | 'middle_business' | 'enterprise',
+    credits: number,
+    graceLimit: number,
+    mode: 'upgrade' | 'renew',
+    description: string,
+    metadata: Record<string, any> = {}
+  ): Promise<{ success: boolean; newBalance: number }> {
+    try {
+      if (!userId || typeof userId !== 'string') {
+        logger.error('[USER_CREDITS] Invalid userId in grantBusinessPlan', { userId });
+        return { success: false, newBalance: 0 };
+      }
+      if (!Number.isFinite(credits) || credits < 0) {
+        logger.error('[USER_CREDITS] Invalid credits in grantBusinessPlan', { userId, credits });
+        return { success: false, newBalance: 0 };
+      }
+
+      const existing = await this.getOrCreateUserCredits(userId);
+      const currentBalance = toNum(existing.credits_balance);
+      const roundedCredits = Math.round(credits * 100) / 100;
+      // upgrade ADDS to the current balance; renew SETS to the allotment.
+      const newBalance =
+        mode === 'renew' ? roundedCredits : Math.round((currentBalance + roundedCredits) * 100) / 100;
+
+      const { error: updateError } = await supabaseAdmin
+        .from('user_credits')
+        .update({
+          credits_balance: newBalance,
+          total_purchased: toNum(existing.total_purchased) + roundedCredits,
+          subscription_plan: planSlug,
+          subscription_status: 'active',
+          grace_limit: graceLimit,
+          // A funded period clears any accumulated grace debt.
+          overage_balance: newBalance >= 0 ? 0 : toNum(existing.overage_balance),
+          grace_started_at: newBalance >= 0 ? null : existing.grace_started_at,
+          credits_purchased_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('user_id', userId);
+
+      if (updateError) {
+        logger.error('[USER_CREDITS] Error granting business plan', {
+          error: updateError.message,
+          userId,
+          planSlug,
+        });
+        return { success: false, newBalance: currentBalance };
+      }
+
+      await this.recordTransaction(userId, roundedCredits, newBalance, 'purchase', description, {
+        ...metadata,
+        b2b_plan: planSlug,
+        renewal_reset: mode === 'renew',
+      });
+
+      logger.info('[USER_CREDITS] Business plan granted to user', {
+        userId,
+        planSlug,
+        credits: roundedCredits,
+        graceLimit,
+        mode,
+        newBalance,
+      });
+
+      return { success: true, newBalance };
+    } catch (error) {
+      logger.error('[USER_CREDITS] Exception in grantBusinessPlan', { error, userId, planSlug });
       return { success: false, newBalance: 0 };
     }
   }

@@ -17,6 +17,7 @@ jest.mock('@/services/testing/regression/db/regression-report.db', () => ({
   getExecutedStepsByTestIds: jest.fn(),
   getNegativeMetaByIds: jest.fn(),
   getTestCasePhaseInfoByIds: jest.fn(),
+  getTestsByRegressionRunId: jest.fn(),
 }));
 
 jest.mock('@/services/testing/regression/db/regression.db', () => ({
@@ -46,6 +47,7 @@ import {
   getExecutedStepsByTestIds,
   getNegativeMetaByIds,
   getTestCasePhaseInfoByIds,
+  getTestsByRegressionRunId,
 } from '@/services/testing/regression/db/regression-report.db';
 import {
   getProjectWorkspaceId,
@@ -66,6 +68,7 @@ const mockGetMobileTestResults = getMobileTestResultsByTestIds as jest.MockedFun
 const mockGetExecutedSteps = getExecutedStepsByTestIds as jest.MockedFunction<typeof getExecutedStepsByTestIds>;
 const mockGetNegativeMeta = getNegativeMetaByIds as jest.MockedFunction<typeof getNegativeMetaByIds>;
 const mockGetPhaseInfo = getTestCasePhaseInfoByIds as jest.MockedFunction<typeof getTestCasePhaseInfoByIds>;
+const mockGetTestsByRegressionRunId = getTestsByRegressionRunId as jest.MockedFunction<typeof getTestsByRegressionRunId>;
 const mockGetWorkspaceId = getProjectWorkspaceId as jest.MockedFunction<typeof getProjectWorkspaceId>;
 const mockGetMembers = getActiveWorkspaceMemberIds as jest.MockedFunction<typeof getActiveWorkspaceMemberIds>;
 const mockGetStats = ExecutionService.getStats as jest.MockedFunction<typeof ExecutionService.getStats>;
@@ -133,6 +136,8 @@ describe('RegressionReportAssemblerService.assembleReport', () => {
     mockBuildHealthSummary.mockReturnValue(undefined as any);
     mockGetStats.mockResolvedValue(makeStats());
     mockGetByRunId.mockResolvedValue([]);
+    // No chain segments by default — most runs aren't a link_test_case chain.
+    mockGetTestsByRegressionRunId.mockResolvedValue([]);
   });
 
   afterEach(() => jest.clearAllMocks());
@@ -507,5 +512,152 @@ describe('getProjectWorkspaceMemberIds', () => {
     const ids = await getProjectWorkspaceMemberIds('proj-1', 'owner-1');
 
     expect(ids).toEqual(['owner-1']);
+  });
+});
+
+describe('RegressionReportAssemblerService.buildChainExecutions', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('returns an empty array for an unsegmented run (0 or 1 tagged tests rows)', async () => {
+    mockGetTestsByRegressionRunId.mockResolvedValue([
+      { id: 'test-1', status: 'completed', browsers: ['chrome'], options: {}, created_at: '2026-01-01T00:00:00Z', completed_at: null, started_at: null },
+    ]);
+
+    const executions = await RegressionReportAssemblerService.buildChainExecutions('run-1');
+
+    expect(executions).toEqual([]);
+  });
+
+  it('builds one entry per segment, ordered by dispatch time, with names/platform normalized', async () => {
+    mockGetTestsByRegressionRunId.mockResolvedValue([
+      {
+        id: 'test-mobile-1',
+        status: 'completed',
+        browsers: ['mobile-flutter'],
+        options: { platform: 'flutter', metadata: { intentTestCaseId: 'tc-1', intentTestCaseName: 'Password login' } },
+        created_at: '2026-01-01T00:00:00Z',
+        started_at: '2026-01-01T00:00:00Z',
+        completed_at: '2026-01-01T00:00:05Z',
+      },
+      {
+        id: 'test-web-1',
+        status: 'failed',
+        browsers: ['chrome'],
+        options: { metadata: { intentTestCaseId: 'tc-2', intentTestCaseName: 'View order details' } },
+        created_at: '2026-01-01T00:01:00Z',
+        started_at: '2026-01-01T00:01:00Z',
+        completed_at: '2026-01-01T00:01:10Z',
+      },
+    ]);
+    mockGetExecutedSteps.mockResolvedValue([
+      { id: 'test-mobile-1', executed_steps: [] },
+      { id: 'test-web-1', executed_steps: [] },
+    ]);
+
+    const executions = await RegressionReportAssemblerService.buildChainExecutions('run-1');
+
+    expect(executions).toHaveLength(2);
+    expect(executions[0]).toMatchObject({
+      id: 'test-mobile-1',
+      testCaseName: 'Password login',
+      status: 'passed', // 'completed' → 'passed'
+      platform: 'mobile_flutter',
+      durationMs: 5000,
+    });
+    expect(executions[1]).toMatchObject({
+      id: 'test-web-1',
+      testCaseName: 'View order details',
+      status: 'failed',
+      platform: 'web',
+      durationMs: 10000,
+    });
+  });
+
+  it('extracts per-step screenshots into the artifacts gallery', async () => {
+    mockGetTestsByRegressionRunId.mockResolvedValue([
+      { id: 'test-1', status: 'completed', browsers: ['chrome'], options: { metadata: { intentTestCaseName: 'A' } }, created_at: '2026-01-01T00:00:00Z', started_at: null, completed_at: null },
+      { id: 'test-2', status: 'completed', browsers: ['chrome'], options: { metadata: { intentTestCaseName: 'B' } }, created_at: '2026-01-01T00:01:00Z', started_at: null, completed_at: null },
+    ]);
+    mockGetExecutedSteps.mockResolvedValue([
+      {
+        id: 'test-1',
+        executed_steps: [
+          { type: 'step_completed', data: { step: 0, stepDescription: 'Tap login', success: true, runtimeMeta: { stepScreenshotUrl: 'https://cdn/shot1.png' } } },
+        ],
+      },
+      { id: 'test-2', executed_steps: [] },
+    ]);
+
+    const executions = await RegressionReportAssemblerService.buildChainExecutions('run-1');
+
+    expect(executions[0].steps).toHaveLength(1);
+    expect(executions[0].steps[0]).toMatchObject({ description: 'Tap login', status: 'passed', screenshot: 'https://cdn/shot1.png' });
+    expect(executions[0].artifacts.screenshots).toHaveLength(1);
+    expect(executions[0].artifacts.screenshots[0].url).toBe('https://cdn/shot1.png');
+  });
+});
+
+describe('RegressionReportAssemblerService bug dedup', () => {
+  // dedupeBugs / fingerprintBug are pure private statics — access via `as any`
+  // (the same pattern this file uses elsewhere for internal shape assertions).
+  const svc = RegressionReportAssemblerService as any;
+
+  const mkBug = (over: Record<string, unknown> = {}) => ({
+    id: 'b',
+    title: 'Login button not found',
+    severity: 'high',
+    category: 'functional',
+    testCaseId: 'tc-1',
+    testCaseName: 'Login',
+    executionId: 'exec-1',
+    steps: [],
+    expected: '',
+    actual: '',
+    recommendation: '',
+    ...over,
+  });
+
+  it('collapses identical bugs across executions into one, counting occurrences', () => {
+    const bugs = [
+      mkBug({ executionId: 'exec-1' }),
+      mkBug({ executionId: 'exec-2' }),
+      mkBug({ executionId: 'exec-3' }),
+    ];
+    const out = svc.dedupeBugs(bugs);
+    expect(out).toHaveLength(1);
+    expect(out[0].occurrences).toBe(3);
+    expect(out[0].seenInExecutions.sort()).toEqual(['exec-1', 'exec-2', 'exec-3']);
+    expect(out[0].fingerprint).toMatch(/^[0-9a-f]{40}$/); // sha1 hex
+  });
+
+  it('treats attempt/run-number suffixes and long ids in the title as the same bug', () => {
+    const out = svc.dedupeBugs([
+      mkBug({ title: 'Login button not found (attempt 1)' }),
+      mkBug({ title: 'Login button not found (attempt 2)' }),
+      mkBug({ title: 'Login button not found 1699999999' }),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].occurrences).toBe(3);
+  });
+
+  it('keeps genuinely different bugs separate (severity / category / selector / title)', () => {
+    const out = svc.dedupeBugs([
+      mkBug({ title: 'Login button not found', severity: 'high' }),
+      mkBug({ title: 'Login button not found', severity: 'critical' }),   // diff severity
+      mkBug({ title: 'Checkout total wrong', severity: 'high' }),          // diff title
+      mkBug({ title: 'Login button not found', severity: 'high', category: 'visual' }), // diff category
+      mkBug({ title: 'Login button not found', severity: 'high', selector: '#a' }),     // diff selector
+    ]);
+    expect(out).toHaveLength(5);
+    expect(out.every((b: any) => b.occurrences === 1)).toBe(true);
+  });
+
+  it('preserves the first instance execution linkage for drill-down', () => {
+    const out = svc.dedupeBugs([
+      mkBug({ executionId: 'exec-first', id: 'keep-me' }),
+      mkBug({ executionId: 'exec-second', id: 'drop-me' }),
+    ]);
+    expect(out[0].id).toBe('keep-me');
+    expect(out[0].executionId).toBe('exec-first');
   });
 });

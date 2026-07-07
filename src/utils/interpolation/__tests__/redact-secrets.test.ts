@@ -1,5 +1,6 @@
 import {
   collectSecretValues,
+  redactCredentialValues,
   redactSecrets,
   redactWithValues,
 } from '../redact-secrets';
@@ -118,5 +119,33 @@ describe('redactWithValues', () => {
 
   it('returns input unchanged when list is empty', () => {
     expect(redactWithValues('hello', [])).toBe('hello');
+  });
+});
+
+describe('redactCredentialValues', () => {
+  it('returns input unchanged on the no-creds path', () => {
+    expect(redactCredentialValues('plain text', null)).toBe('plain text');
+    expect(redactCredentialValues('plain text', undefined)).toBe('plain text');
+    expect(redactCredentialValues('plain text', {})).toBe('plain text');
+  });
+
+  it('masks each configured credential value echoed into a string', () => {
+    const out = redactCredentialValues('user user@acme.io failed with hunter2pw', {
+      email: 'user@acme.io',
+      password: 'hunter2pw',
+    });
+    expect(out).not.toContain('user@acme.io');
+    expect(out).not.toContain('hunter2pw');
+  });
+
+  it('masks the longer value fully when a shorter value is its substring', () => {
+    // username "johndoe" is a prefix of email "johndoe@acme.io" — longest-first
+    // ordering must mask the email whole, leaving no "@acme.io" tail exposed.
+    const out = redactCredentialValues('contact johndoe@acme.io now', {
+      username: 'johndoe',
+      email: 'johndoe@acme.io',
+    });
+    expect(out).not.toContain('@acme.io');
+    expect(out).toBe('contact *** now');
   });
 });

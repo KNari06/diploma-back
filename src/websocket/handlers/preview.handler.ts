@@ -5558,6 +5558,23 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           return;
         }
 
+        // V-cross-app: link_test_case steps are resolved by
+        // RegressionRunService before dispatch (see link-resolution.service.ts)
+        // — this live-editor path forwards stepsJson essentially raw (no
+        // precondition inlining happens here either, see plan doc §2.3) and
+        // has no equivalent resolution wired up yet. Reject explicitly with a
+        // clear message rather than forwarding an unresolved step straight to
+        // the runner's generic Zod validation 400.
+        if (steps.some((s) => s?.type === 'link_test_case')) {
+          socket.emit('error', {
+            code: 'LINK_TEST_CASE_NOT_SUPPORTED_HERE',
+            message: 'This test case links to another test case — trigger a regression run to test it (linked steps do not run from the live editor yet).',
+            timestamp: new Date().toISOString(),
+          });
+          emitRunTerminator('Linked test case steps are not supported in the live editor');
+          return;
+        }
+
         // If inline steps provided, save them to DB first (Apply All flow)
         if (Array.isArray(inlineSteps) && inlineSteps.length > 0) {
           // Diagnostic — answers "did the frontend ship `recordedFingerprint`
@@ -5777,6 +5794,24 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           timestamp: new Date().toISOString(),
         });
         emitRunTerminator('Run already in progress');
+        return;
+      }
+
+      // V-cross-app: same guard as the mobile branch above — link_test_case
+      // steps are resolved by RegressionRunService before dispatch (see
+      // link-resolution.service.ts), and PreviewRunService.runSavedSteps has
+      // no case for this step type. Reject explicitly rather than letting it
+      // fall into the normal element-resolution waterfall (compiled plan →
+      // LLM resolver → vision), which would waste the full resolver chain on
+      // a step with no element to resolve, or worse, coincidentally resolve
+      // to an unrelated element and perform an unintended action.
+      if ((testCase?.stepsJson || []).some((s: any) => s?.type === 'link_test_case')) {
+        socket.emit('error', {
+          code: 'LINK_TEST_CASE_NOT_SUPPORTED_HERE',
+          message: 'This test case links to another test case — trigger a regression run to test it (linked steps do not run from the live editor yet).',
+          timestamp: new Date().toISOString(),
+        });
+        emitRunTerminator('Linked test case steps are not supported in the live editor');
         return;
       }
 

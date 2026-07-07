@@ -24,6 +24,7 @@ import type { Locator, Page } from 'playwright';
 import type { IntentActionType, IntentStep } from './preview.types';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { countInteractiveElementsLight } from './page-interactive.utils';
+import { isIframeRef } from '@/agent/core/lite/execution/iframe-ref.util';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -1440,8 +1441,10 @@ function buildFastLocators(page: Page, step: IntentStep): Locator[] {
   // only need a cheap existence check for the retry loop.
   if (step.evidence?.lastSuccessRef) {
     const ref = step.evidence.lastSuccessRef;
-    // Guard 1: preview/background ref patterns (fragile DOM counters)
-    if (/^(e\d+|s\d+|bg-\d+)$/.test(ref)) {
+    // Guard 1: preview/background/iframe ref patterns (fragile DOM counters,
+    // or an iframe ref that a main-page `page.locator()` can't reach — pushing
+    // it as a fallback locator would just fail across the frame boundary).
+    if (/^(e\d+|s\d+|bg-\d+)$/.test(ref) || isIframeRef(ref)) {
       return locators;
     }
     // Guard 2: TTL — evidence older than 60 min cannot be trusted

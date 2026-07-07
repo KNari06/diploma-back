@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import {
   getRunWithOwnership,
   getRunByShareToken,
@@ -7,6 +8,7 @@ import {
   getExecutedStepsByTestIds,
   getNegativeMetaByIds,
   getTestCasePhaseInfoByIds,
+  getTestsByRegressionRunId,
 } from './db/regression-report.db';
 import { getProjectWorkspaceId, getActiveWorkspaceMemberIds } from './db/regression.db';
 import { describeDeviceError } from './device-error-catalog';
@@ -119,6 +121,109 @@ export class RegressionReportAssemblerService {
   }
 
   /**
+   * Chain view: assemble one `RunReportExecution`-shaped entry per segment
+   * of a `link_test_case` chain, so `TestCasesTable`/`TestCaseDetail` (the
+   * SAME components already used for a bulk run's `executions[]`) can
+   * render the whole chain — no new UI. See `tests.regression_run_id`
+   * migration for how segments get tagged to this run.
+   *
+   * Deliberately simpler than the full bulk-run assembly in
+   * `assembleReport` below (no bug/health-check/phase enrichment) — a chain
+   * segment's card is a compact summary with click-through, per the
+   * "compact summary + click-through" design decision, not full parity
+   * with bulk-run analytics depth.
+   *
+   * Returns `[]` when the run has 0 or 1 segments (a normal, unsegmented
+   * run) — the single-run view renders exactly as it does today.
+   */
+  static async buildChainExecutions(runId: string): Promise<RunReportExecution[]> {
+    const rows = await getTestsByRegressionRunId(runId);
+    if (rows.length < 2) return [];
+
+    const executedStepsMap = await RegressionReportAssemblerService.batchGetExecutedSteps(
+      rows.map((r) => r.id),
+    );
+
+    // `options.metadata.intentTestCaseName` is a denormalized copy written at
+    // dispatch time — usually present, but not guaranteed (e.g. an older row,
+    // or a dispatch path that didn't set it). Batch-fetch the canonical name
+    // as a backstop instead of falling straight to 'Unknown'.
+    const fallbackIds = rows
+      .map((r) => (r.options as any)?.metadata?.intentTestCaseId)
+      .filter((id): id is string => typeof id === 'string');
+    const fallbackNamesMap = await RegressionReportAssemblerService.batchGetTestCaseNames(fallbackIds);
+
+    return rows.map((row): RunReportExecution => {
+      const options = (row.options || {}) as any;
+      const rawSteps = executedStepsMap.get(row.id) || [];
+      const completedSteps = rawSteps.filter((s: any) => s.type === 'step_completed');
+
+      const screenshots: RunReportScreenshot[] = [];
+      const steps: RunReportStep[] = completedSteps.map((s: any, i: number) => {
+        const meta = s.data?.runtimeMeta;
+        const success = s.data?.success !== false;
+        // Soft failures (e.g. an auto-injected waitFor timeout) are warnings,
+        // not errors — same rule the main execution loop below applies
+        // (`isSoftFailure`). Without this a chain segment's soft-failed step
+        // shows as a hard 'failed' where the identical step, viewed through
+        // the normal single-run report, correctly shows 'warning'.
+        const isSoftFailure = !success && !!s.data?.softFailure;
+        const description = s.data?.stepDescription || s.data?.step || `Step ${i + 1}`;
+        const status: RunReportStep['status'] = success ? 'passed' : (isSoftFailure ? 'warning' : 'failed');
+        const screenshotUrl =
+          typeof meta?.stepScreenshotUrl === 'string' && meta.stepScreenshotUrl && !meta.stepScreenshotUrl.startsWith('data:')
+            ? meta.stepScreenshotUrl
+            : undefined;
+        if (screenshotUrl) {
+          screenshots.push({
+            url: screenshotUrl,
+            stepName: `${options.metadata?.intentTestCaseName || 'Segment'}: ${description}`,
+            timestamp: formatClock(s.timestamp || s.data?.timestamp),
+            status,
+          });
+        }
+        return {
+          index: i,
+          description,
+          status,
+          durationMs: typeof s.data?.durationMs === 'number' ? s.data.durationMs : undefined,
+          screenshot: screenshotUrl,
+        };
+      });
+
+      const durationMs = row.started_at && row.completed_at
+        ? Math.max(new Date(row.completed_at).getTime() - new Date(row.started_at).getTime(), 0)
+        : 0;
+
+      // Mobile stores the unprefixed device platform ('android'|'ios'|
+      // 'flutter') in options.platform; web has no such field. Normalize to
+      // the same 'mobile_<platform>' | 'web' shape RunReportExecution.platform
+      // uses elsewhere (PlatformBadge / bucketing logic already expect this).
+      const platform = options.platform ? `mobile_${options.platform}` : 'web';
+
+      return {
+        id: row.id,
+        testCaseId: options.metadata?.intentTestCaseId,
+        testCaseName: options.metadata?.intentTestCaseName
+          || fallbackNamesMap.get(options.metadata?.intentTestCaseId)
+          || 'Unknown',
+        status: row.status === 'completed' ? 'passed' : row.status,
+        durationMs,
+        browser: Array.isArray(row.browsers) ? row.browsers[0] : undefined,
+        platform,
+        bugsCount: 0,
+        steps,
+        artifacts: {
+          screenshots,
+          bugScreenshots: [],
+          consoleLogs: [],
+          networkLogs: [],
+        },
+      } as unknown as RunReportExecution;
+    });
+  }
+
+  /**
    * Build a full aggregated run report (authenticated — checks ownership)
    */
   static async buildFullReport(
@@ -137,6 +242,53 @@ export class RegressionReportAssemblerService {
     const run = await this.getRunByShareToken(shareToken);
     if (!run) return null;
     return RegressionReportAssemblerService.assembleReport(run);
+  }
+
+  /**
+   * Deterministic identity of a bug for cross-execution dedup. Same shape of
+   * defect → same fingerprint. Keyed on severity + category + a normalized
+   * title (lowercased, whitespace-collapsed, trailing digits/ids stripped so
+   * "Login button not found (attempt 2)" ≡ "Login button not found") + selector.
+   * SHA-1 hex — mirrors `regression_doctor_findings.pattern_hash`. Title is the
+   * stable identity here (not steps/actual, which vary run-to-run).
+   */
+  private static fingerprintBug(bug: EnrichedBug): string {
+    const normTitle = (bug.title || '')
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .replace(/[#(]?\s*(attempt|try|run|step)\s*\d+\)?/g, '') // drop "(attempt 2)" style suffixes
+      .replace(/\b\d{2,}\b/g, '')                              // drop long numbers (ids/timestamps)
+      .trim();
+    const key = [bug.severity, bug.category, normTitle, bug.selector || ''].join('␟');
+    return createHash('sha1').update(key).digest('hex');
+  }
+
+  /**
+   * Collapse duplicate bugs across a run's executions. Keeps the FIRST instance
+   * of each fingerprint (preserving its execution/test-case linkage for
+   * drill-down) and annotates it with `occurrences` + the distinct
+   * `seenInExecutions`. Order-preserving so the report's bug order is stable.
+   */
+  private static dedupeBugs(bugs: EnrichedBug[]): EnrichedBug[] {
+    const byFp = new Map<string, EnrichedBug>();
+    for (const bug of bugs) {
+      const fp = RegressionReportAssemblerService.fingerprintBug(bug);
+      const existing = byFp.get(fp);
+      if (!existing) {
+        byFp.set(fp, {
+          ...bug,
+          fingerprint: fp,
+          occurrences: 1,
+          seenInExecutions: bug.executionId ? [bug.executionId] : [],
+        });
+        continue;
+      }
+      existing.occurrences = (existing.occurrences || 1) + 1;
+      if (bug.executionId && !existing.seenInExecutions!.includes(bug.executionId)) {
+        existing.seenInExecutions!.push(bug.executionId);
+      }
+    }
+    return [...byFp.values()];
   }
 
   /**
@@ -178,10 +330,16 @@ export class RegressionReportAssemblerService {
    * Fetches executions, test results, steps, bugs, artifacts and assembles RunReport.
    */
   static async assembleReport(run: any): Promise<RunReport> {
-    // Phase 1: Parallel fetch stats + executions
-    const [stats, executions] = await Promise.all([
+    // Phase 1: Parallel fetch stats + executions + chain segments.
+    // `buildChainExecutions` only depends on `run.id` (same as the other
+    // two), so it belongs in this same batch rather than being awaited in
+    // isolation near the end of the function — that would serialize its
+    // round-trip after everything else is already assembled, adding pure
+    // wall-clock latency to every report fetch for no reason.
+    const [stats, executions, chainExecutions] = await Promise.all([
       ExecutionService.getStats(run.id),
       ExecutionService.getByRunId(run.id),
+      RegressionReportAssemblerService.buildChainExecutions(run.id),
     ]);
 
     const planName = (run.regression_plans as any)?.name || null;
@@ -617,10 +775,22 @@ export class RegressionReportAssemblerService {
       });
     }
 
-    // Build merged summary (stats + bugs breakdown)
+    // Dedup bugs across the run's executions. The AI analysis job runs once per
+    // execution and has no cross-run memory, so the SAME underlying issue (e.g.
+    // "Login button not found") surfaces as a separate bug in every execution
+    // that hit it — 10 executions → 10 identical entries the user has to wade
+    // through. Collapse by a deterministic fingerprint (see fingerprintBug),
+    // keeping the first instance and recording how many collapsed + which
+    // executions they came from, so the UI can show "seen in N runs" instead of
+    // N duplicate cards. Done at assembly (not storage) so each execution's
+    // ai_summary stays intact for drill-down.
+    const dedupedBugs = RegressionReportAssemblerService.dedupeBugs(allBugs);
+
+    // Build merged summary (stats + bugs breakdown) — over the DEDUPED set so
+    // the severity/category counts match what the user actually sees.
     const bySeverity: Record<string, number> = {};
     const byCategory: Record<string, number> = {};
-    for (const bug of allBugs) {
+    for (const bug of dedupedBugs) {
       bySeverity[bug.severity] = (bySeverity[bug.severity] || 0) + 1;
       byCategory[bug.category] = (byCategory[bug.category] || 0) + 1;
     }
@@ -668,7 +838,7 @@ export class RegressionReportAssemblerService {
       failed: stats.failed,
       skipped: stats.skipped,
       flaky: byClassification['flaky'] || 0,
-      totalBugs: allBugs.length,
+      totalBugs: dedupedBugs.length,
       bySeverity,
       byCategory,
       byClassification,
@@ -706,6 +876,8 @@ export class RegressionReportAssemblerService {
       };
     }
 
+    // Chain view — `chainExecutions` was already fetched in Phase 1's
+    // Promise.all above; empty for the overwhelming majority of (unsegmented) runs.
     return {
       id: run.id,
       planId: run.plan_id || null,
@@ -718,12 +890,13 @@ export class RegressionReportAssemblerService {
       aiConfidence: confidenceCount > 0 ? Math.round(totalConfidence / confidenceCount) : null,
       summary,
       executions: positiveExecutions,
-      bugs: allBugs,
+      bugs: dedupedBugs,
       recommendations: [...allRecommendations],
       artifactsSummary: aggArtifacts,
       healthSummary,
       ...(negativeSummary && { negativeSummary }),
       ...(negativeExecs.length > 0 && { negativeExecutions: negativeExecs }),
+      ...(chainExecutions.length > 0 && { chainExecutions }),
     };
   }
 }

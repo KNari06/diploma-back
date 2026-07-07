@@ -2,7 +2,6 @@ import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
 import { EmailService } from '@/services/core/email.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
-import { WorkspaceCreditsService } from '@/services/core/workspace-credits.service';
 import { PlanService } from '@/services/core/plan.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -800,12 +799,12 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     });
   }
 
-  // V16: Provision workspace credits for B2B plans.
-  // Maps plan codes from Stripe `plans` table to WORKSPACE_PLANS slugs.
+  // Provision B2B plan credits on the USER account (credits belong to the user,
+  // NOT the workspace). Maps plan codes from the Stripe `plans` table to
+  // WORKSPACE_PLANS slugs for the credit + grace allotment.
   // Supports both legacy 'business' and new B2B plan codes.
-  // Pilot is admin-only (assignPilot), not purchasable via Stripe
-  type StripePurchasablePlan = 'small_business' | 'middle_business' | 'enterprise';
-  const B2B_PLAN_MAP: Record<string, StripePurchasablePlan> = {
+  // Pilot is admin-only (assignPilot), not purchasable via Stripe.
+  const B2B_PLAN_MAP: Record<string, 'small_business' | 'middle_business' | 'enterprise'> = {
     business: 'small_business',         // Legacy business → Small Business (29K)
     Business: 'small_business',
     small_business: 'small_business',   // $1,000/mo → 29K credits
@@ -813,53 +812,44 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     enterprise: 'enterprise',           // $2,990/mo → 200K credits
   };
 
-  const workspacePlanSlug = B2B_PLAN_MAP[planCode];
-  const isBusinessPlan = !!workspacePlanSlug;
+  const b2bPlanSlug = B2B_PLAN_MAP[planCode];
+  const isBusinessPlan = !!b2bPlanSlug;
 
   if (isBusinessPlan) {
-    // Resolve the owner workspace. A paid B2B invoice MUST land workspace
-    // credits — if we can't, THROW so Stripe retries (workspace may provision
-    // moments later) rather than finalizing a paid invoice with zero credits.
-    const { data: ownerMembership } = await supabaseAdmin
-      .from('workspace_members')
-      .select('workspace_id')
-      .eq('user_id', user.id)
-      .eq('role', 'owner')
-      .eq('status', 'active')
-      .maybeSingle();
+    const { WORKSPACE_PLANS } = await import('@/services/core/token-calculator.service');
+    const planConfig = WORKSPACE_PLANS[b2bPlanSlug];
 
-    if (!ownerMembership) {
-      logger.error('[STRIPE_WEBHOOK] No owned workspace for paid B2B invoice — throwing for retry', {
-        userId: user.id,
-        plan: workspacePlanSlug,
-        invoiceId: invoice.id,
-      });
-      throw new Error(`No owned workspace for B2B invoice ${invoice.id}`);
-    }
-
-    const workspaceId = ownerMembership.workspace_id;
     // First charge / upgrade ADDS; a recurring/period event RESETS to allotment.
-    const result = isPeriodReset
-      ? await WorkspaceCreditsService.renewPlan(workspaceId, workspacePlanSlug)
-      : await WorkspaceCreditsService.upgradeToPlan(workspaceId, workspacePlanSlug);
+    const result = await UserCreditsService.grantBusinessPlan(
+      user.id,
+      b2bPlanSlug,
+      planConfig.credits,
+      planConfig.graceLimit,
+      isPeriodReset ? 'renew' : 'upgrade',
+      isPeriodReset
+        ? `Subscription renewal - ${b2bPlanSlug} plan`
+        : `Subscription payment - ${b2bPlanSlug} plan`,
+      { invoice_id: invoice.id, event_type: event.type }
+    );
 
-    if (!result) {
-      logger.error('[STRIPE_WEBHOOK] B2B workspace grant failed — throwing for Stripe retry', {
-        workspaceId,
+    // On failure THROW so handleWebhook returns 500 and Stripe retries; the
+    // credits_granted flag stays false so the retry re-attempts (not swallowed).
+    if (!result.success) {
+      logger.error('[STRIPE_WEBHOOK] B2B credit grant failed — throwing for Stripe retry', {
         userId: user.id,
-        plan: workspacePlanSlug,
+        plan: b2bPlanSlug,
         invoiceId: invoice.id,
       });
-      throw new Error(`B2B workspace grant failed for invoice ${invoice.id}`);
+      throw new Error(`B2B credit grant failed for invoice ${invoice.id}`);
     }
 
-    logger.info('[STRIPE_WEBHOOK] B2B workspace plan provisioned', {
-      workspaceId,
+    logger.info('[STRIPE_WEBHOOK] B2B plan credits granted to user', {
       userId: user.id,
-      plan: workspacePlanSlug,
+      plan: b2bPlanSlug,
       mode: isPeriodReset ? 'renew' : 'upgrade',
-      credits: result.credits_balance,
-      graceLimit: result.grace_limit,
+      credits: planConfig.credits,
+      graceLimit: planConfig.graceLimit,
+      newBalance: result.newBalance,
       invoiceId: invoice.id,
     });
   }
@@ -887,13 +877,14 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     userUpdateData.stripe_price_id = priceId;
   }
 
-  // B2B plans are gated at the workspace level (workspace_credits, provisioned
-  // above) — pricing_plans only knows free/pro/ultra, so a B2B slug can't be
-  // resolved by the facade. Keep the legacy users.{plan,plan_status} text
-  // mirror inline for B2B; route the personal 'pro' plan through the single
-  // funnel so plan_id + user_credits.subscription_plan stay in sync.
+  // B2B credits/tier now live on the USER account (granted above via
+  // grantBusinessPlan, which also set user_credits.subscription_plan). But
+  // pricing_plans only knows free/pro/ultra, so a B2B slug can't be resolved by
+  // the PlanService facade — keep the legacy users.{plan,plan_status} text mirror
+  // inline for B2B; route the personal 'pro' plan through the single funnel so
+  // plan_id + user_credits.subscription_plan stay in sync.
   if (plan && isBusinessPlan) {
-    userUpdateData.plan = workspacePlanSlug || 'business';
+    userUpdateData.plan = b2bPlanSlug || 'business';
     userUpdateData.plan_status = 'paid';
   }
 

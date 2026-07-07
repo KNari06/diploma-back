@@ -110,7 +110,7 @@ export interface MobileSessionConfig {
 export type MobileIntentActionType =
   // Web-compatible actions (mapped to mobile commands by runner)
   | 'click' | 'type' | 'scroll' | 'press' | 'hover'
-  | 'assert' | 'ai_check' | 'navigate' | 'wait' | 'screenshot'
+  | 'assert' | 'ai_check' | 'extract_text' | 'navigate' | 'wait' | 'screenshot'
   | 'select' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'wait_for'
   // Mobile-specific actions
   | 'open_app'           // launch app by package/bundle ID
@@ -127,7 +127,12 @@ export type MobileIntentActionType =
   // Biometric & auth
   | 'biometric' | 'otp' | 'permission' | 'clipboard'
   // Network simulation
-  | 'network';
+  | 'network'
+  // V-cross-app: run another saved test case at this point in the sequence,
+  // possibly on a different platform. Informational only — the backend
+  // orchestrator resolves this step before dispatch; the runner never
+  // receives it (see MobileIntentStepOptions.linkTestCase).
+  | 'link_test_case';
 
 // ── IntentStep (mirror of runner's IntentStep) ──────────────────
 
@@ -144,6 +149,15 @@ export interface MobileIntentStepOptions {
   timeout?: number;
   replaceContent?: boolean;
   pressEnter?: boolean;
+  /**
+   * Opt-in per-step AI VISUAL check (mirror of the runner's
+   * IntentStepOptions.visualCheck). When `enabled`, the runner runs a vision
+   * pass over the post-step screenshot for defects the a11y-tree / rule path
+   * can't see (text truncation, overlap, contrast, blank/stuck screen,
+   * keyboard-over-input, …) and returns them in `MobileStepResult.visualIssues`.
+   * Non-fatal by default; `failOnIssue` fails the step on a detected issue.
+   */
+  visualCheck?: { enabled: boolean; failOnIssue?: boolean };
   /**
    * Typing realism for a type step (editor "type like a human" toggle).
    * 'human' = per-character, 'instant' = atomic, 'auto'/undefined = the runner's
@@ -202,6 +216,21 @@ export interface MobileIntentStepOptions {
   /** Free-text hint for `dismiss` steps ("Reading settings sheet"). Advisory
    *  only — the runner always closes the top-most active layer it sees. */
   dismissTarget?: string;
+  /** `extract_text` steps only — variable name the runner's scratchpad
+   *  stores the resolved element's text under, namespaced as
+   *  `extracted.<name>` and referenceable via `{{extracted.<name>}}`. */
+  extractVariable?: string;
+  /**
+   * `link_test_case` steps only — mirrors `StepOptions.linkTestCase` in
+   * preview.types.ts. Informational: the runner never executes this step
+   * type, so this field never crosses the HTTP boundary to qait-mobile-runner.
+   */
+  linkTestCase?: {
+    linkedTestCaseId: string;
+    linkedPlatform: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
+    inputBindings?: Array<{ targetParam: string; valueExpr: string }>;
+    outputBindings?: Array<{ alias: string; sourceVariable: string }>;
+  };
 }
 
 export interface MobileIntentStep {
@@ -231,7 +260,7 @@ export interface MobileIntentStep {
    * not declared on the type, so ts-eyes couldn't see that the
    * regression dispatch path was correctly forwarding it. Persist via
    * `IntentTestCaseService.batchUpdateStepsFromRun()` after every run
-   * (see mobile-test-run.job.ts:persistCompiledPlansFromRun) and via
+   * (see mobile-test-run.job.ts:CompiledPlanPersistenceService.persistFromRun) and via
    * `updateStepFromPreviewApply()` after every editor apply (web's
    * preview.handler.ts pattern; mobile editor session.controller.ts
    * needs the same treatment).
@@ -284,7 +313,7 @@ export interface MobileStepResult {
    *     the plan that pointed at it is locking in a wrong element.
    *   - 'foreground_mismatch': plan was built against the wrong app's tree.
    * Backend persist sites (mobile-step-apply.service.ts,
-   * mobile-test-run.job.ts persistCompiledPlansFromRun, session.controller.ts
+   * mobile-test-run.job.ts CompiledPlanPersistenceService.persistFromRun, session.controller.ts
    * runTestCaseOnSession auto-persist) check this and skip writes.
    */
   planStaleReason?: 'vte_mismatch' | 'foreground_mismatch';
@@ -313,6 +342,19 @@ export interface MobileStepResult {
     detectedAt: number;
   };
   /**
+   * Visual defects the opt-in per-step AI visual check found in the post-step
+   * screenshot (mirror of the runner's CommandResult.visualIssues). Present
+   * only when the step opted in (`options.visualCheck`) and ≥1 issue was found.
+   * Persisted into `metadata.steps[]` and folded into the AI-analysis input.
+   */
+  visualIssues?: Array<{
+    type: string;
+    severity: 'warning' | 'critical';
+    description: string;
+    location?: string;
+    confidence: number;
+  }>;
+  /**
    * Non-blocking, advisory messages raised by the runner for this step (e.g.
    * `install_app` warns when the APK is a release build without WebView
    * debugging). The editor renders these as amber badges / toasts next to
@@ -326,6 +368,16 @@ export interface MobileStepResult {
     /** Optional app identifier the warning refers to. */
     packageName?: string;
   }>;
+  /**
+   * The runner's ENTIRE scratchpad at the point this step completed (e.g.
+   * `extracted.orderId`), only present when this step's action modified it
+   * (runner gates on `scratchpad.dirty`). The runner has always sent this
+   * field (`run.routes.ts`) — it was simply never typed or read on the
+   * backend before `link_test_case` needed a way to read a completed run's
+   * final captured values back. Take the LAST step (in order) that defines
+   * this field to get the run's final accumulated state.
+   */
+  scratchpadSnapshot?: Record<string, string>;
 }
 
 // ── Test Metadata ────────────────────────────────────────────────
@@ -415,6 +467,13 @@ export interface MobileRunStepsRequest {
    * Omitted when the test has none.
    */
   triggers?: Trigger[];
+  /**
+   * Android versionCode / iOS CFBundleVersion of the app under test. The runner
+   * stashes it on the session and folds it into the element-resolver cache key,
+   * so a cached pick from a different build (same runner process, within the
+   * cache TTL) is never replayed against a new build. Omitted when unknown.
+   */
+  appVersionCode?: number;
 }
 
 export interface MobileRunStepsResponse {
@@ -708,6 +767,37 @@ export interface MobileTestJobData {
    * runner doesn't infinitely retry.
    */
   retryCount?: number;
+  /**
+   * V-cross-app continuation: when set, this job RESUMES an existing live
+   * mobile session instead of acquiring/prepping a new one. Used for the
+   * "steps" segment that runs after a cross-platform `link_test_case` —
+   * without this, that segment goes through the normal session-acquire +
+   * MobileAppPrepService.prepApp + attachFlutter pipeline, which force-stops
+   * and relaunches the app, discarding any typed-but-not-yet-submitted UI
+   * state from before the link (confirmed incident 2026-07-06 — a phone
+   * number typed before the link was gone by the time the continuation
+   * segment ran). Skips session acquisition, permission-policy apply,
+   * prepApp, fast-auth restore, and attachFlutter entirely — goes straight
+   * to Phase 4 (run steps) against this exact sessionId.
+   */
+  resumeSessionId?: string;
+  /**
+   * The ORIGINAL sessionSource ('pool'|'warmup'|'cold'|'dedicated') the
+   * resumed session was acquired under. Required alongside
+   * `resumeSessionId` so the LAST segment's cleanup (release vs end vs
+   * destroy) still does the right thing — a resuming job never went
+   * through Phase 3 acquisition itself, so it has no other way to learn
+   * this. Ignored when `resumeSessionId` is absent.
+   */
+  resumeSessionSource?: 'pool' | 'warmup' | 'cold' | 'dedicated';
+  /**
+   * V-cross-app continuation: when true, this job's `finally` block must
+   * NOT release/end/destroy its session — a later segment (dispatched with
+   * `resumeSessionId` set to this session) will continue using it. Set on
+   * every segment except the last one in a chain, so the session is still
+   * cleaned up eventually.
+   */
+  keepSessionAlive?: boolean;
 }
 
 // ── Exploration (autonomous app crawl) ─────────────────────────────

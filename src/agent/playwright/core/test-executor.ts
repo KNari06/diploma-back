@@ -1376,9 +1376,27 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               // V16: Surface soft failure so frontend can show warning instead of error
               ...(isSoftFailure ? { softFailure: true, softFailureError: stepResult.error } : {}),
               timestamp: new Date().toISOString(),
-              runtimeMeta: stepScreenshotUrl
-                ? { ...(stepResult.runtimeMeta || {}), stepScreenshotUrl }
-                : stepResult.runtimeMeta,
+              // redactRuntimeMeta strips any {{secrets.*}}-derived value out
+              // of extractedDataSnapshot (Hard invariant #10) — this call
+              // site previously never wrapped its runtimeMeta in it (the old
+              // fields here, stepScreenshotUrl, carried no secret risk); now
+              // that extractedDataSnapshot can hold a resolved secret (e.g.
+              // a `store` step capturing {{secrets.apiKey}} for a
+              // link_test_case output binding), it must go through the same
+              // redaction every other emit site in this file already uses.
+              runtimeMeta: executor.redactRuntimeMeta({
+                ...(stepResult.runtimeMeta || {}),
+                ...(stepScreenshotUrl ? { stepScreenshotUrl } : {}),
+                // link_test_case output capture: the SAME per-run scratchpad
+                // used for {{extractedData.*}} interpolation above (line
+                // ~888), snapshotted per step so a later read of the LAST
+                // defined one gives the run's final accumulated variable
+                // state — linked-test-case-runner.service.ts reads this to
+                // resolve outputBindings when the linked test case is web.
+                ...(scratchpadData.size > 0
+                  ? { extractedDataSnapshot: Object.fromEntries(scratchpadData) }
+                  : {}),
+              }),
             };
             await TestExecutedStepsRedisService.appendStepCompleted(testData.testId, completedStepEvent);
             // Emit test:step:completed (non-fatal)

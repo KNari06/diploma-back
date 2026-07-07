@@ -59,9 +59,18 @@ export async function classifyConfirmation(
   if (!trimmed) return 'other';
 
   const promptText =
-    'You classify user messages in a yes/no confirmation dialog. ' +
-    `The user was asked whether they want to ${subject}. ` +
-    'Classify the response as exactly one of: "confirm", "decline", or "other". ' +
+    'You classify a user reply in a yes/no confirmation dialog.\n' +
+    `The user was asked whether they want to ${subject}.\n\n` +
+    'Classify as exactly one of: "confirm", "decline", or "other".\n' +
+    '- "confirm" = ANY clear go-ahead, including casual/indirect phrasing. ' +
+    'Examples: "yes", "ok", "sure", "go", "go ahead", "start", "let\'s start", ' +
+    '"let\'s go", "let\'s do it", "proceed", "begin", "run it", "да", "давай", ' +
+    '"поехали", "запускай", "иә", "жарайды".\n' +
+    '- "decline" = a clear no / stop. Examples: "no", "cancel", "stop", "nevermind", ' +
+    '"нет", "отмена", "жоқ".\n' +
+    '- "other" = ONLY when it is genuinely neither (a question, a new unrelated ' +
+    'request, or truly ambiguous). When in doubt between confirm and other, prefer "confirm" ' +
+    'if the user clearly wants to go ahead.\n' +
     'Support any language (English, Russian, Kazakh, etc.).\n\n' +
     `User message: "${trimmed}"\n\n` +
     'Return ONLY valid JSON: { "intent": "confirm" | "decline" | "other" }';

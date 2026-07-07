@@ -42,52 +42,29 @@ export async function getUserPlanSlug(userId: string): Promise<string | null> {
 }
 
 /**
- * Whether the user belongs to ANY workspace on a paid plan — either as the
- * owner or an active member. Reads `workspace_credits.subscription_plan` for
- * the user's owned + member workspaces; paid = any non-'free' active plan.
+ * Whether the user holds a paid B2B plan on their own credit row.
  *
- * Needed because B2B plans live on `workspace_credits`, not `users.plan_id`,
- * so a B2B user can have a paid workspace while their own `plan_id` is still
- * free/null. Returns false on any error (caller fails closed). DB-only.
- *
- * Note the id-type split: `workspaces.user_id` is text, `workspace_members.user_id` is uuid.
+ * Credits + plan tier belong to the USER account (see PlanService / Stripe
+ * webhook → UserCreditsService.grantBusinessPlan): a B2B invoice sets
+ * `user_credits.subscription_plan` to the B2B slug (small_business /
+ * middle_business / enterprise) with `subscription_status = 'active'`. B2B slugs
+ * have no `pricing_plans` row, so `getUserPlanSlug` (users.plan_id join) can't
+ * see them — this reads `user_credits` directly so a paying B2B user isn't
+ * wrongly blocked from paid features (mobile). Returns false on any error
+ * (caller fails closed). DB-only.
  */
-export async function userHasPaidWorkspace(userId: string): Promise<boolean> {
-  const [owned, member] = await Promise.all([
-    supabaseAdmin.from('workspaces').select('id').eq('user_id', userId),
-    supabaseAdmin
-      .from('workspace_members')
-      .select('workspace_id')
-      .eq('user_id', userId)
-      .eq('status', 'active'),
-  ]);
-
-  if (owned.error) {
-    logger.warn('[PLAN_ACCESS] Failed to read owned workspaces', { userId, error: owned.error.message });
-    return false;
-  }
-  if (member.error) {
-    logger.warn('[PLAN_ACCESS] Failed to read workspace memberships', { userId, error: member.error.message });
-    return false;
-  }
-
-  const workspaceIds = [
-    ...(owned.data?.map((w) => w.id) ?? []),
-    ...(member.data?.map((m) => m.workspace_id) ?? []),
-  ].filter(Boolean);
-  if (workspaceIds.length === 0) return false;
-
+export async function userHasPaidBusinessPlan(userId: string): Promise<boolean> {
   const { data, error } = await supabaseAdmin
-    .from('workspace_credits')
-    .select('workspace_id')
-    .in('workspace_id', workspaceIds)
+    .from('user_credits')
+    .select('subscription_plan')
+    .eq('user_id', userId)
     .eq('subscription_status', 'active')
     .neq('subscription_plan', 'free')
-    .limit(1);
+    .maybeSingle();
 
   if (error) {
-    logger.warn('[PLAN_ACCESS] Failed to read workspace credits', { userId, error: error.message });
+    logger.warn('[PLAN_ACCESS] Failed to read user_credits plan', { userId, error: error.message });
     return false;
   }
-  return (data?.length ?? 0) > 0;
+  return !!data && !isFreeSlug(data.subscription_plan);
 }

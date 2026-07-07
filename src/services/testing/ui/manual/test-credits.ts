@@ -111,7 +111,14 @@ export async function checkUserCredits(
 }
 
 /**
- * Deduct user credits
+ * Deduct user credits.
+ *
+ * Routes through the SINGLE canonical deduction path
+ * (UserCreditsService.deductCredits → atomic deduct_user_credits RPC +
+ * grace-limit handling + credit_transactions record). Credits belong to the
+ * USER account only. (Previously this called a non-existent `deduct_test_credits`
+ * RPC, which threw AFTER the retry job was queued — the test ran but the user
+ * was never charged.)
  */
 export async function deductCredits(
   userId: string,
@@ -129,17 +136,15 @@ export async function deductCredits(
     intelligentMode,
   });
 
-  // Deduct credits using Supabase function
-  const { data, error } = await dbService.supabaseAdmin
-    .rpc('deduct_test_credits', {
-      user_uuid: userId,
-      test_uuid: testId, // Real test ID (not 'temp')
-      credit_amount: requiredCredits,
-    });
+  const { UserCreditsService } = await import('@/services/core/user-credits.service');
+  const result = await UserCreditsService.deductCredits(
+    userId,
+    requiredCredits,
+    `Manual test run (${browsers.join(', ')})`,
+    { test_id: testId, test_type: intelligentMode ? 'intelligent' : 'standard' }
+  );
 
-  if (error) throw error;
-
-  if (!data) {
+  if (!result.success) {
     throw new ValidationError('Failed to deduct credits');
   }
 }

@@ -1,4 +1,4 @@
-import { requireAuth } from '@/middleware/auth.middleware';
+import { requireAuth, requireAdmin } from '@/middleware/auth.middleware';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { Router } from 'express';
 import {
@@ -342,7 +342,7 @@ router.get('/plan', requireAuth, asyncHandler(getUserPlan));
  *       500:
  *         description: Server error
  */
-router.post('/plan/assign', requireAuth, asyncHandler(assignUserPlan));
+router.post('/plan/assign', requireAuth, requireAdmin, asyncHandler(assignUserPlan));
 
 /**
  * @swagger

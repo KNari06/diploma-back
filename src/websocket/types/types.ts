@@ -1453,7 +1453,10 @@ export interface ExplorationClarificationPayload {
   explorationId: string;
   questionId: string;
   question: string;
-  type: 'captcha_solve' | '2fa_code';
+  // 'test_data' = the flow needs a real value it couldn't invent (promo code,
+  // account number, non-2FA one-time code). Frontend renders it with the same
+  // text-input modal as '2fa_code'. NOT credentials (those need a secure form).
+  type: 'captcha_solve' | '2fa_code' | 'test_data';
   timeout: number;
   chatSessionId: string;
   userId?: string;

@@ -32,10 +32,6 @@ import {
   deleteWorkspaceLogo,
 } from './workspace-logo.controller';
 import {
-  getCredits,
-  getCreditTransactions,
-} from './workspace-credits.controller';
-import {
   getWorkspaceAIUsage,
   getWorkspaceAIUsageHistory,
   getWorkspaceAIUsageDaily,
@@ -979,64 +975,6 @@ router.post(
   '/:id/invites/:inviteId/revoke',
   requireAuth,
   asyncHandler(revokeInvite)
-);
-
-// ============================================================================
-// CREDITS (workspace balance + transaction history)
-// ============================================================================
-
-/**
- * @swagger
- * /api/v1/workspaces/{id}/credits:
- *   get:
- *     summary: Get workspace credits
- *     description: Returns balance, plan, and monthly usage for an active member.
- *     tags: [Workspaces]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema: { type: string, format: uuid }
- *     responses:
- *       200:
- *         description: Workspace credits info
- *       403:
- *         description: Not a member of this workspace
- */
-router.get('/:id/credits', requireAuth, asyncHandler(getCredits));
-
-/**
- * @swagger
- * /api/v1/workspaces/{id}/credits/transactions:
- *   get:
- *     summary: Get workspace credit transactions
- *     description: Paginated credit transaction history for an active member.
- *     tags: [Workspaces]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema: { type: string, format: uuid }
- *       - in: query
- *         name: page
- *         schema: { type: integer, minimum: 1, default: 1 }
- *       - in: query
- *         name: limit
- *         schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
- *     responses:
- *       200:
- *         description: Paginated transactions
- *       403:
- *         description: Not a member of this workspace
- */
-router.get(
-  '/:id/credits/transactions',
-  requireAuth,
-  asyncHandler(getCreditTransactions)
 );
 
 // ============================================================================
