@@ -42,6 +42,7 @@ import {
   getAccessibleProject,
   listMobileProjectOptions,
 } from '@/services/chat/mobile-project-context.service';
+import { TestCaseResolverService } from '@/services/testing/resolver/test-case-resolver.service';
 import { logger } from '@/utils/core/logger';
 import type { MobileBlackboard } from './blackboard';
 import { generateFlowPlan, type ConcreteFlowPlan } from './planner';
@@ -677,6 +678,33 @@ const LIST_PROJECT_OPTIONS_TOOL: ChatCompletionTool = {
   },
 };
 
+const SEARCH_SIMILAR_TEST_CASES_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'search_similar_test_cases',
+    description:
+      'Semantic search over the user’s EXISTING saved mobile test cases (by ' +
+      'meaning, not just name). Call this ONCE before authoring a brand-new ' +
+      'test (before mobile_run_draft_steps) to avoid creating a duplicate. If a ' +
+      'close match comes back, tell the user it already exists and offer to run ' +
+      'or extend it instead of re-authoring. Read-only. Skip it when the user is ' +
+      'clearly editing an already-open test case.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description:
+            'What the new test would do, in a few words (e.g. "log in with ' +
+            'email and password", "add item to cart"). Defaults to the user’s ' +
+            'goal when omitted.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Phase B5 — cheap observation tools (foreground / step-history / logs /
 // take_screenshot).
@@ -806,6 +834,7 @@ export const MOBILE_AGENT_TOOLS: ChatCompletionTool[] = [
   MOBILE_RUN_DRAFT_STEPS_TOOL,
   MOBILE_CREATE_TEST_CASE_TOOL,
   LIST_PROJECT_OPTIONS_TOOL,
+  SEARCH_SIMILAR_TEST_CASES_TOOL,
   // WebView (Phase 8) — only relevant for hybrid apps; native flows
   // never call them. Listing them at the bottom keeps the prompt cache
   // stable for native-only sessions while still giving the LLM access
@@ -896,6 +925,8 @@ export async function executeTool(
         return await runMobileCreateTestCase(args, bb, opts);
       case 'list_project_options':
         return await runListProjectOptions(args, bb);
+      case 'search_similar_test_cases':
+        return await runSearchSimilarTestCases(args, bb);
       case 'list_webview_contexts':
         return await runListWebviewContexts(args, bb, opts);
       case 'switch_to_webview':
@@ -2615,6 +2646,68 @@ async function runListProjectOptions(
       'Show these to the user and ask which project to save into, then call ' +
       'mobile_create_test_case again with that projectId. Prefer projects with a mobile app uploaded.',
     data: { options },
+  };
+}
+
+/**
+ * Duplicate-avoidance search before authoring. Reuses the shared hybrid
+ * (embedding + name + URL) resolver, scoped to the caller's own MOBILE test
+ * cases. Surfaces the top matches so the LLM can offer to run/extend an
+ * existing test instead of re-authoring one. Best-effort — a resolver failure
+ * degrades to "no matches" so authoring is never blocked.
+ */
+async function runSearchSimilarTestCases(
+  args: Record<string, unknown>,
+  bb: MobileBlackboard,
+): Promise<ToolResult> {
+  const startedAt = Date.now();
+  const query =
+    typeof args.query === 'string' && args.query.trim() ? args.query.trim() : bb.goal;
+
+  if (!bb.workspaceId) {
+    return {
+      ok: true,
+      content:
+        'No workspace scope on this turn — cannot search existing test cases. Proceed with authoring.',
+    };
+  }
+
+  const hits = await TestCaseResolverService.findSimilar({
+    query,
+    userId: bb.userId,
+    workspaceId: bb.workspaceId,
+    platformPrefix: 'mobile_',
+    limit: 3,
+  });
+
+  bb.recordToolCall({
+    tool: 'search_similar_test_cases',
+    args: { query, hitCount: hits.length },
+    ok: true,
+    durationMs: Date.now() - startedAt,
+    at: startedAt,
+  });
+
+  if (hits.length === 0) {
+    return {
+      ok: true,
+      content:
+        'No similar existing mobile test cases found. Safe to author a new one.',
+    };
+  }
+
+  const lines = hits.map(
+    (h) => `- "${h.name}" (id: ${h.id}, similarity ${h.score.toFixed(2)})`,
+  );
+  return {
+    ok: true,
+    content:
+      `Found ${hits.length} existing mobile test case(s) that may overlap:\n` +
+      `${lines.join('\n')}\n` +
+      'If one of these IS what the user wants, tell them it already exists and ' +
+      'offer to run it ("run saved <name>") or extend it — do NOT silently author a duplicate. ' +
+      'If none truly match, proceed with the new test.',
+    data: { hits },
   };
 }
 

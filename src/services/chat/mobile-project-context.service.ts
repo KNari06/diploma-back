@@ -25,6 +25,7 @@
 
 import { logger } from '@/utils/core/logger';
 import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
+import { decodeMobileGoal } from '@/services/testing/mobile/mobile-goal-codec';
 import {
   getChatSessionProjectId,
   getProjectRow,
@@ -113,7 +114,7 @@ export async function resolveMobileProjectContext(
           id: row.id,
           name: row.name,
           platform: row.platform ?? undefined,
-          appPackage: parseGoalAppPackage(row.goal),
+          appPackage: decodeMobileGoal(row.goal).appPackage,
           stepCount: row.stepsJson.length,
           stepsSummary: summariseSteps(row.stepsJson),
         };
@@ -293,20 +294,6 @@ function buildContext(
     source,
     testCase,
   };
-}
-
-/** Mobile rows carry `{ appPackage, startActivity }` JSON in `goal`. */
-function parseGoalAppPackage(goal: string | null): string | undefined {
-  if (!goal) return undefined;
-  try {
-    const parsed = JSON.parse(goal) as { appPackage?: unknown };
-    return typeof parsed.appPackage === 'string' && parsed.appPackage
-      ? parsed.appPackage
-      : undefined;
-  } catch {
-    // `goal` is free text on web rows — not an error.
-    return undefined;
-  }
 }
 
 /** Compact numbered rendering of saved steps_json for the prompt. */

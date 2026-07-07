@@ -58,6 +58,9 @@ jest.mock('@/services/testing/regression/regression-save.service', () => ({
 jest.mock('@/services/testing/mobile/mobile-draft-steps-cache', () => ({
   MobileDraftStepsCache: { set: jest.fn(), get: jest.fn(), consume: jest.fn() },
 }));
+jest.mock('@/services/testing/resolver/test-case-resolver.service', () => ({
+  TestCaseResolverService: { findSimilar: jest.fn().mockResolvedValue([]) },
+}));
 
 import { executeTool } from '../tools';
 import { MobileBlackboard } from '../blackboard';

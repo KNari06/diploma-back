@@ -65,6 +65,10 @@ jest.mock('@/services/chat/mobile-project-context.service', () => ({
   listMobileProjectOptions: jest.fn(),
 }));
 
+jest.mock('@/services/testing/resolver/test-case-resolver.service', () => ({
+  TestCaseResolverService: { findSimilar: jest.fn() },
+}));
+
 jest.mock('@/utils/core/logger', () => ({
   logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
 }));
@@ -78,6 +82,7 @@ import {
   getAccessibleProject,
   listMobileProjectOptions,
 } from '@/services/chat/mobile-project-context.service';
+import { TestCaseResolverService } from '@/services/testing/resolver/test-case-resolver.service';
 import { supabaseAdmin } from '@/db/supabase';
 
 const mockedConsume = MobileDraftStepsCache.consume as jest.Mock;
@@ -86,6 +91,7 @@ const mockedSave = RegressionSaveService.saveTestCase as jest.Mock;
 const mockedFramework = MobileAppStorageService.getDetectedFramework as jest.Mock;
 const mockedAccessibleProject = getAccessibleProject as jest.Mock;
 const mockedListOptions = listMobileProjectOptions as jest.Mock;
+const mockedFindSimilar = TestCaseResolverService.findSimilar as jest.Mock;
 const mockedSupabaseFrom = supabaseAdmin.from as jest.Mock;
 
 function makeBlackboard(overrides: Partial<ConstructorParameters<typeof MobileBlackboard>[0]> = {}): MobileBlackboard {
@@ -259,5 +265,64 @@ describe('list_project_options tool', () => {
     const result = await executeTool('list_project_options', {}, makeBlackboard());
     expect(result.ok).toBe(false);
     expect(result.content).toContain('No projects found');
+  });
+});
+
+describe('search_similar_test_cases tool', () => {
+  it('is registered in MOBILE_AGENT_TOOLS', () => {
+    const names = MOBILE_AGENT_TOOLS.map((t) => t.function.name);
+    expect(names).toContain('search_similar_test_cases');
+  });
+
+  it('queries the resolver scoped to the caller and mobile platform, and surfaces hits', async () => {
+    mockedFindSimilar.mockResolvedValue([
+      { id: 'tc1', name: 'Login with email', score: 0.91 },
+      { id: 'tc2', name: 'Login with phone', score: 0.77 },
+    ]);
+    const bb = makeBlackboard();
+
+    const result = await executeTool(
+      'search_similar_test_cases',
+      { query: 'log in with email' },
+      bb,
+    );
+
+    expect(mockedFindSimilar).toHaveBeenCalledWith(
+      expect.objectContaining({
+        query: 'log in with email',
+        userId: 'user-1',
+        workspaceId: 'ws-1',
+        platformPrefix: 'mobile_',
+      }),
+    );
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('"Login with email" (id: tc1, similarity 0.91)');
+    expect(result.content).toContain('do NOT silently author a duplicate');
+  });
+
+  it('falls back to the blackboard goal when no query arg is given', async () => {
+    mockedFindSimilar.mockResolvedValue([]);
+    const bb = makeBlackboard({ goal: 'create a checkout test' });
+
+    await executeTool('search_similar_test_cases', {}, bb);
+
+    expect(mockedFindSimilar).toHaveBeenCalledWith(
+      expect.objectContaining({ query: 'create a checkout test' }),
+    );
+  });
+
+  it('tells the agent it is safe to author when nothing similar exists', async () => {
+    mockedFindSimilar.mockResolvedValue([]);
+    const result = await executeTool('search_similar_test_cases', { query: 'x' }, makeBlackboard());
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('Safe to author');
+  });
+
+  it('degrades gracefully without a workspace scope (never blocks authoring)', async () => {
+    const bb = makeBlackboard({ workspaceId: undefined });
+    const result = await executeTool('search_similar_test_cases', { query: 'x' }, bb);
+    expect(result.ok).toBe(true);
+    expect(mockedFindSimilar).not.toHaveBeenCalled();
+    expect(result.content).toContain('Proceed with authoring');
   });
 });

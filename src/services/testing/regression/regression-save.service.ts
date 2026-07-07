@@ -1,5 +1,6 @@
 import * as regressionDb from './db/regression.db';
 import { sanitizeMobileSteps } from '@/services/testing/mobile/mobile-step-sanitizer';
+import { encodeMobileGoal } from '@/services/testing/mobile/mobile-goal-codec';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 
@@ -328,13 +329,12 @@ export class RegressionSaveService {
       start_url: effectiveUrl,
       tags: tags || null,
       // Mobile app metadata carried inline until we add a dedicated column.
-      ...(isMobile && (appPackage || startActivity)
-        ? {
-            goal: JSON.stringify({
-              appPackage: appPackage || null,
-              startActivity: startActivity || null,
-            }),
-          }
+      // Shape owned by mobile-goal-codec (single writer/reader convention).
+      ...(isMobile
+        ? (() => {
+            const goal = encodeMobileGoal({ appPackage, startActivity });
+            return goal ? { goal } : {};
+          })()
         : {}),
     });
 
