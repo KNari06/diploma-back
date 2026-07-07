@@ -35,6 +35,7 @@ import {
   formatMobileSnapshotForChat,
   type MobileSnapshot,
 } from '@/services/chat/mobile-context.service';
+import { formatMobileProjectContextForChat } from '@/services/chat/mobile-project-context.service';
 
 // Upper bound on "LLM → tool dispatch" rounds in a single turn.
 //
@@ -105,14 +106,18 @@ export async function runMobileAgentPipeline(
 ): Promise<MobileAgentResult> {
   const startedAt = Date.now();
 
-  // Eager-inject the runner snapshot as a SECOND system message when
-  // the handler pre-fetched it. We put it AFTER the base system prompt
-  // so the agent's identity / tool guidance always lands first, then
-  // the situational "here's what's on the screen right now" context.
-  // The order matters for prompt-cache hits — the static base prompt
-  // stays at index 0, only index 1 changes per turn.
+  // Eager-inject situational context as extra system messages AFTER the
+  // static base prompt (prompt-cache: index 0 never changes per turn):
+  //   1. Project context (project + app under test + open-test-case steps,
+  //      resolved by the handler). Stable across a session's turns, so it
+  //      sits before the per-turn snapshot for better cache locality.
+  //   2. Device snapshot ("here's what's on the screen right now").
+  const projectContext = blackboard.getProjectContext();
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: buildMobileAgentSystemPrompt() },
+    ...(projectContext
+      ? [{ role: 'system' as const, content: formatMobileProjectContextForChat(projectContext) }]
+      : []),
     ...(opts?.snapshot
       ? [{ role: 'system' as const, content: formatMobileSnapshotForChat(opts.snapshot) }]
       : []),

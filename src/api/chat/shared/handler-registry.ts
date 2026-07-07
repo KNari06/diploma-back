@@ -218,6 +218,9 @@ const handleMobileAgent: IntentHandler = async (req, res, params) => {
     // Forward the persistence backend so test-case-scoped mobile chats
     // land in the test-case store instead of leaking to the global tables.
     chatStore: params.chatStore,
+    // Forward the test-case binding so the handler can eagerly resolve
+    // the project + existing steps of the open test case.
+    testCaseId: params.testCaseId,
   });
 };
 

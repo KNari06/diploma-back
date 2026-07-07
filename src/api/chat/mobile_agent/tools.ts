@@ -38,11 +38,14 @@ import {
   type MobilePlatform,
 } from '@/services/mobile/mobile-runner.types';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
+import {
+  getAccessibleProject,
+  listMobileProjectOptions,
+} from '@/services/chat/mobile-project-context.service';
 import { logger } from '@/utils/core/logger';
 import type { MobileBlackboard } from './blackboard';
-import { generateFlowPlan } from './planner';
+import { generateFlowPlan, type ConcreteFlowPlan } from './planner';
 import { MobileDraftStepsCache } from '@/services/testing/mobile/mobile-draft-steps-cache';
-import { sanitizeMobileSteps } from '@/services/testing/mobile/mobile-step-sanitizer';
 import { RegressionSaveService } from '@/services/testing/regression/regression-save.service';
 import {
   emitMobileAgentThinking,
@@ -399,7 +402,10 @@ const PLAN_FLOW_TOOL: ChatCompletionTool = {
       'Call this ONCE at the start of any flow that needs more than one action ' +
       '(login, checkout, registration, multi-field form fill, exploration of a ' +
       'specific feature). Do NOT call for single-action requests like "tap X". ' +
-      'After planning, walk the plan via start_plan_step / finish_plan_step.',
+      'After planning, walk the plan via start_plan_step / finish_plan_step. ' +
+      'If the goal is too vague to plan (no target flow / no success criteria), ' +
+      'this returns a clarifying question instead of a plan — relay it to the ' +
+      'user and STOP; do not author or run steps until they answer.',
     parameters: {
       type: 'object',
       properties: {
@@ -566,6 +572,15 @@ const MOBILE_RUN_DRAFT_STEPS_TOOL: ChatCompletionTool = {
                 description:
                   'Natural-language assertion for assert_visible / assert_text steps.',
               },
+              isSensitive: {
+                type: 'boolean',
+                description:
+                  'Set true when `value` is a credential (password, OTP, ' +
+                  'token, API key, PIN). On save the value is replaced by a ' +
+                  '{{param_*}} placeholder regardless of wording — this flag ' +
+                  'is the authoritative signal, mirroring type_text\'s ' +
+                  'isSensitive. Default false.',
+              },
             },
             required: ['id', 'type', 'description'],
             additionalProperties: true,
@@ -623,6 +638,14 @@ const MOBILE_CREATE_TEST_CASE_TOOL: ChatCompletionTool = {
             'is testing a Flutter app pass "mobile_flutter" explicitly. Omit ' +
             'for native Android / iOS — the cached draft platform is correct.',
         },
+        projectId: {
+          type: 'string',
+          description:
+            'Target project id. Omit normally — the chat is already scoped to ' +
+            'a project. Pass ONLY when a previous save failed with "could not ' +
+            'resolve a project" and the user has since picked one from ' +
+            'list_project_options.',
+        },
         confirm: {
           type: 'boolean',
           description:
@@ -631,6 +654,24 @@ const MOBILE_CREATE_TEST_CASE_TOOL: ChatCompletionTool = {
         },
       },
       required: ['confirm'],
+      additionalProperties: false,
+    },
+  },
+};
+
+const LIST_PROJECT_OPTIONS_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'list_project_options',
+    description:
+      'List the projects in the user’s workspace a mobile test case could be ' +
+      'saved into (id, name, whether a mobile app is uploaded). Call ONLY when ' +
+      'mobile_create_test_case failed because no project could be resolved — ' +
+      'show the options to the user, ask which one to use, then retry ' +
+      'mobile_create_test_case with the chosen projectId. Read-only.',
+    parameters: {
+      type: 'object',
+      properties: {},
       additionalProperties: false,
     },
   },
@@ -764,6 +805,7 @@ export const MOBILE_AGENT_TOOLS: ChatCompletionTool[] = [
   THINK_ALOUD_TOOL,
   MOBILE_RUN_DRAFT_STEPS_TOOL,
   MOBILE_CREATE_TEST_CASE_TOOL,
+  LIST_PROJECT_OPTIONS_TOOL,
   // WebView (Phase 8) — only relevant for hybrid apps; native flows
   // never call them. Listing them at the bottom keeps the prompt cache
   // stable for native-only sessions while still giving the LLM access
@@ -852,6 +894,8 @@ export async function executeTool(
         return await runMobileRunDraftSteps(args, bb, opts);
       case 'mobile_create_test_case':
         return await runMobileCreateTestCase(args, bb, opts);
+      case 'list_project_options':
+        return await runListProjectOptions(args, bb);
       case 'list_webview_contexts':
         return await runListWebviewContexts(args, bb, opts);
       case 'switch_to_webview':
@@ -1259,7 +1303,26 @@ async function runPlanFlow(
     };
   }
 
-  bb.setPlan(result.plan);
+  // Ambiguity gate: the goal was too vague to plan (no target flow / no
+  // acceptance criteria). Do NOT install a plan or author any steps — return
+  // the clarifying question so the executor relays it to the user and STOPS.
+  // This is the enforcement point the prompt guidance alone can't guarantee.
+  if (result.plan.needsClarification) {
+    return {
+      ok: true,
+      content:
+        'The goal is too vague to plan without guessing. Do NOT author or run ' +
+        'any steps. Ask the user this clarifying question and wait for their ' +
+        `reply:\n\n"${result.plan.clarifyingQuestion}"`,
+      data: result.plan,
+    };
+  }
+
+  // Past the clarification gate the schema refine guarantees a non-empty
+  // steps[]. Narrow to ConcreteFlowPlan so setPlan + the step count reads are
+  // type-safe without optional chaining.
+  const plan = result.plan as ConcreteFlowPlan;
+  bb.setPlan(plan);
 
   // Surface a planning-specific timeline row so the UI can render
   // "Plan ready: 5 steps" with the planning step-type instead of the
@@ -1275,22 +1338,22 @@ async function runPlanFlow(
   const planProgress = Math.max(65, mobileToolProgress(roundsSoFar, 30));
   emitMobilePlanningStep(
     bb.chatSessionId,
-    `Plan ready: ${result.plan.steps.length} steps`,
+    `Plan ready: ${plan.steps.length} steps`,
     planProgress,
     {
       sessionId: bb.mobileSessionId,
-      stepCount: result.plan.steps.length,
-      goal: result.plan.goal,
+      stepCount: plan.steps.length,
+      goal: plan.goal,
     },
   );
 
   return {
     ok: true,
     content:
-      `Plan installed (${result.plan.steps.length} steps). Walk it by calling ` +
+      `Plan installed (${plan.steps.length} steps). Walk it by calling ` +
       `start_plan_step → action tools → finish_plan_step, in order.\n\n` +
       `${bb.formatPlanStatusForLlm()}`,
-    data: result.plan,
+    data: plan,
   };
 }
 
@@ -1545,6 +1608,9 @@ async function runMobileRunDraftSteps(
       type: type as MobileIntentStep['type'],
       description,
       ...(typeof r.value === 'string' ? { value: r.value } : {}),
+      // Primary credential signal for save-time sanitisation — must survive
+      // the cache → saveFromRecording round-trip.
+      ...(r.isSensitive === true ? { isSensitive: true } : {}),
       ...(typeof r.assertionText === 'string' ? { assertionText: r.assertionText } : {}),
       ...(r.bindingHints && typeof r.bindingHints === 'object'
         ? { bindingHints: r.bindingHints as MobileIntentStep['bindingHints'] }
@@ -1652,8 +1718,9 @@ async function runMobileRunDraftSteps(
 
 /**
  * Persist the draft cached for this chat session as an intent_test_case.
- * Sanitises sensitive values (password / token / secret / ...) BEFORE
- * insert by replacing matched values with `{{param_*}}` placeholders.
+ * Credential sanitisation (values → `{{param_*}}` placeholders + schema)
+ * is enforced by `RegressionSaveService.saveFromRecording` at the
+ * persistence boundary — this tool just hands over the raw draft.
  */
 async function runMobileCreateTestCase(
   args: Record<string, unknown>,
@@ -1699,22 +1766,49 @@ async function runMobileCreateTestCase(
   const description =
     typeof args.description === 'string' ? args.description.trim() : undefined;
 
-  // Sanitise sensitive values BEFORE handing to the save service.
-  // saveFromRecording does NOT sanitise (parity with web step-editor authoring),
-  // so this is the only line of defence against persisting plaintext credentials.
-  const { steps: sanitised, parametersSchema } = sanitizeMobileSteps(draft.steps);
+  // Sanitisation happens at the persistence boundary —
+  // `RegressionSaveService.saveFromRecording` runs `sanitizeMobileSteps` on
+  // every mobile save (credential values → `{{param_*}}`, schema persisted
+  // to parameters_schema). No pre-sanitisation here: a single boundary pass
+  // is what derives the schema.
 
-  // We need a project id. The mobile-agent context is project-aware via
-  // the chat session; but we don't carry it on the blackboard yet. Fall
-  // back to looking it up on the chat session row.
-  const projectId = await resolveProjectId(bb);
+  // We need a project id. Priority:
+  //   1. Explicit `projectId` arg — the recovery path after a failed save,
+  //      where the user picked a project from list_project_options. The
+  //      value is LLM-relayed and therefore untrusted: validate ownership /
+  //      workspace membership before using it.
+  //   2. The eager project context the handler resolved onto the blackboard.
+  //   3. Legacy lazy lookup on the chat session row (kept as the safety net
+  //      for turns where the eager resolution failed transiently).
+  let projectId: string | null = null;
+  const projectIdArg =
+    typeof args.projectId === 'string' && args.projectId.trim()
+      ? args.projectId.trim()
+      : null;
+  if (projectIdArg) {
+    const project = await getAccessibleProject(bb.userId, projectIdArg);
+    if (!project) {
+      MobileDraftStepsCache.set(bb.chatSessionId, draft);
+      return {
+        ok: false,
+        content:
+          `Project ${projectIdArg} does not exist or the user has no access to it. ` +
+          'The draft is still cached. Call list_project_options and let the user pick a valid project.',
+      };
+    }
+    projectId = project.id;
+  } else {
+    projectId = bb.getProjectContext()?.projectId ?? (await resolveProjectId(bb));
+  }
   if (!projectId) {
     // Re-cache so the user can retry after providing project context.
     MobileDraftStepsCache.set(bb.chatSessionId, draft);
     return {
       ok: false,
       content:
-        'Could not resolve a project for this chat session. The draft has been kept in cache — ask the user to confirm the project and retry.',
+        'Could not resolve a project for this chat session. The draft has been kept in cache. ' +
+        'Recovery path: call list_project_options, show the user the available projects, ask which ' +
+        'one to save into, then call mobile_create_test_case again with that projectId.',
     };
   }
 
@@ -1737,13 +1831,20 @@ async function runMobileCreateTestCase(
       ? (overrideRaw as SavePlatform)
       : null;
 
-  // Derive from the detected framework when the LLM didn't override. Failure
-  // to read it is non-fatal — fall through to the cached/host value.
+  // Derive from the detected framework when the LLM didn't override. The
+  // eager project context already carries it when it resolved THIS project —
+  // only hit the DB when it didn't (context miss, or explicit projectId arg
+  // pointing elsewhere). Failure to read it is non-fatal — fall through to
+  // the cached/host value.
   let frameworkPlatform: SavePlatform | null = null;
   if (!override) {
-    const framework = await MobileAppStorageService.getDetectedFramework(projectId).catch(
-      () => undefined,
-    );
+    const eagerCtx = bb.getProjectContext();
+    const framework =
+      eagerCtx?.projectId === projectId && eagerCtx.detectedFramework
+        ? eagerCtx.detectedFramework
+        : await MobileAppStorageService.getDetectedFramework(projectId).catch(
+            () => undefined,
+          );
     if (framework === 'flutter' || framework === 'ios') {
       frameworkPlatform = frameworkToMobilePlatformKey(
         framework,
@@ -1776,26 +1877,26 @@ async function runMobileCreateTestCase(
       description,
       kind: 'standalone',
       platform: finalPlatform,
-      steps: sanitised,
+      steps: draft.steps,
       appPackage: draft.appPackage,
       startActivity: draft.startActivity,
     });
 
     bb.recordToolCall({
       tool: 'mobile_create_test_case',
-      args: { name, stepCount: sanitised.length, parametersCount: Object.keys(parametersSchema).length },
+      args: { name, stepCount: draft.steps.length, parametersCount: result.parametersCount },
       ok: true,
       durationMs: Date.now() - startedAt,
       at: startedAt,
     });
 
-    const paramsLine = Object.keys(parametersSchema).length > 0
-      ? `\nSensitive values were parameterised: ${Object.keys(parametersSchema).join(', ')}.`
+    const paramsLine = result.parametersCount > 0
+      ? `\n${result.parametersCount} sensitive value(s) were parameterised as {{param_*}} placeholders.`
       : '';
     return {
       ok: true,
       content:
-        `✅ Saved as "${name}" (id: ${result.savedTestCaseId}, ${sanitised.length} steps).` +
+        `✅ Saved as "${name}" (id: ${result.savedTestCaseId}, ${draft.steps.length} steps).` +
         paramsLine +
         `\nReplay it later with "run saved ${name}".`,
       data: result,
@@ -1806,7 +1907,7 @@ async function runMobileCreateTestCase(
     const message = err instanceof Error ? err.message : String(err);
     bb.recordToolCall({
       tool: 'mobile_create_test_case',
-      args: { name, stepCount: sanitised.length },
+      args: { name, stepCount: draft.steps.length },
       ok: false,
       error: message,
       durationMs: Date.now() - startedAt,
@@ -2445,10 +2546,12 @@ function mapPlatformToMobilePlatform(
 }
 
 /**
- * Best-effort project lookup via the chat session. The blackboard doesn't
- * carry projectId today; rather than wire it through every layer for one
- * tool, we ask the DB. If the chat session has no project, returns null
- * and the tool surfaces a "no project" message to the LLM.
+ * Legacy lazy project lookup via the chat session row. The handler now
+ * resolves project context eagerly onto the blackboard
+ * (`bb.getProjectContext()`); this remains as the fallback for turns where
+ * that resolution failed transiently. Returns null when the chat session
+ * has no project either — the save tool then points the LLM at
+ * list_project_options.
  */
 async function resolveProjectId(bb: MobileBlackboard): Promise<string | null> {
   if (!bb.chatSessionId) return null;
@@ -2468,6 +2571,51 @@ async function resolveProjectId(bb: MobileBlackboard): Promise<string | null> {
     });
     return null;
   }
+}
+
+/**
+ * Recovery tool for the save dead-end: when no project resolves, the LLM
+ * calls this to enumerate the workspace's projects, asks the user to pick,
+ * then retries mobile_create_test_case with the chosen projectId.
+ */
+async function runListProjectOptions(
+  _args: Record<string, unknown>,
+  bb: MobileBlackboard,
+): Promise<ToolResult> {
+  const startedAt = Date.now();
+  const options = await listMobileProjectOptions(bb.workspaceId);
+
+  bb.recordToolCall({
+    tool: 'list_project_options',
+    args: { count: options.length },
+    ok: true,
+    durationMs: Date.now() - startedAt,
+    at: startedAt,
+  });
+
+  if (options.length === 0) {
+    return {
+      ok: false,
+      content:
+        'No projects found in this workspace. The user must create a project ' +
+        '(and upload a mobile app build) in the dashboard before a test case can be saved.',
+    };
+  }
+
+  const lines = options.map((o) => {
+    const app = o.hasMobileApp
+      ? ` — mobile app: ${o.appPackage ?? 'uploaded'}`
+      : ' — no mobile app uploaded';
+    return `- "${o.name}" (id: ${o.id})${app}`;
+  });
+  return {
+    ok: true,
+    content:
+      `Projects available for saving (${options.length}):\n${lines.join('\n')}\n` +
+      'Show these to the user and ask which project to save into, then call ' +
+      'mobile_create_test_case again with that projectId. Prefer projects with a mobile app uploaded.',
+    data: { options },
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
