@@ -1466,14 +1466,15 @@ function runThinkAloud(
  *     `swipe`, `scroll`, `press`, etc.
  *   - runner aliases that toRunnerCommand also handles — `tap`, `type_text`,
  *     `input_text`, `press_key`, `launch_app`.
- * Must be kept in sync with `toRunnerCommand` below; an unknown type would
- * fall through to the catch-all branch and the runner would reject it,
- * leaving the LLM with a vague "unknown failure".
+ * Must be kept in sync with `toRunnerCommand` below: every type here has an
+ * explicit case in its switch, and its default branch rejects with a
+ * "whitelist and converter are out of sync" message (guarded by a unit
+ * test in __tests__/tools.to-runner-command.test.ts).
  */
-const ACCEPTED_STEP_TYPES = new Set<string>([
+export const ACCEPTED_STEP_TYPES = new Set<string>([
   // canonical (mirror of MobileIntentActionType — mobile-runner.types.ts:42-62)
   'click', 'type', 'scroll', 'press', 'hover',
-  'assert', 'ai_check', 'navigate', 'wait', 'wait_for', 'screenshot',
+  'assert', 'ai_check', 'extract_text', 'navigate', 'wait', 'wait_for', 'screenshot',
   'select', 'check', 'uncheck', 'toggle', 'open', 'close',
   'open_app', 'close_app', 'open_notifications',
   'swipe', 'long_press', 'double_tap', 'drag', 'pinch',
@@ -1558,6 +1559,22 @@ async function runMobileRunDraftSteps(
     steps.push(step);
   }
 
+  // Convert every step to a runner command BEFORE caching/executing.
+  // A step that can't be converted (missing required params, no valid
+  // target) bails the whole batch with an actionable message — same
+  // policy as the shape validation above.
+  const commands: Record<string, unknown>[] = [];
+  for (let i = 0; i < steps.length; i++) {
+    const converted = toRunnerCommand(steps[i]);
+    if (!converted.ok) {
+      return {
+        ok: false,
+        content: `Step #${i + 1} (${steps[i].id}) cannot run: ${converted.reason}`,
+      };
+    }
+    commands.push(converted.command);
+  }
+
   // Persist draft in the cache BEFORE running. If the run errors out
   // mid-flight the user can still ask to save what we have.
   const snapshot = bb.getSnapshot();
@@ -1589,7 +1606,7 @@ async function runMobileRunDraftSteps(
   try {
     const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
-      steps.map(toRunnerCommand),
+      commands,
       { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
     );
     runnerResults = results ?? [];
@@ -1804,14 +1821,40 @@ async function runMobileCreateTestCase(
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
+ * Thrown by the per-type converter when a step is structurally valid but
+ * cannot produce a runnable command (missing required coordinates, no
+ * navigation target, ...). Caught by `toRunnerCommand` and surfaced as an
+ * `{ ok: false, reason }` result so the LLM gets an actionable message
+ * instead of the runner's generic zod validation error.
+ */
+class StepConversionError extends Error {}
+
+export type RunnerCommandConversion =
+  | { ok: true; command: Record<string, unknown> }
+  | { ok: false; reason: string };
+
+/**
  * Convert an authoring-time MobileIntentStep into the runner's command
  * shape. The mapping accepts BOTH canonical storage types (`click`, `type`,
  * `press`, `open_app`) and runner-aliased types (`tap`, `type_text`,
  * `press_key`, `launch_app`) — the LLM may emit either; we normalise here.
- * Anything we don't recognise gets shipped verbatim — the runner's zod
- * schema rejects it cleanly with an error result the LLM can react to.
+ * Mirrors qait-mobile-runner's intent-step-converter.ts so an authored
+ * step converts to the same command a saved test case would replay as.
+ * A step that can't produce a runnable command returns `{ ok: false }`
+ * with a reason the LLM can fix.
  */
-function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
+export function toRunnerCommand(step: MobileIntentStep): RunnerCommandConversion {
+  try {
+    return { ok: true, command: toRunnerCommandInner(step) };
+  } catch (err) {
+    if (err instanceof StepConversionError) {
+      return { ok: false, reason: err.message };
+    }
+    throw err;
+  }
+}
+
+function toRunnerCommandInner(step: MobileIntentStep): Record<string, unknown> {
   const type = step.type as string;
   switch (type) {
     // Canonical "tap" family — both storage names ('click' from
@@ -1825,6 +1868,14 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
     case 'hover':
     case 'select':
       return { type: 'tap', params: { intent: step.description } };
+
+    // ── close: app vs UI element, decided by structure (runner parity).
+    //    A package-like value ("com.example.app") → close_app; otherwise
+    //    tap the close button/icon the description names.
+    case 'close':
+      return isPackageLike(step.value ?? '')
+        ? { type: 'close_app', params: { packageName: step.value } }
+        : { type: 'tap', params: { intent: step.description } };
 
     case 'long_press':
       return { type: 'long_press', params: { intent: step.description } };
@@ -1853,13 +1904,74 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
         },
       };
 
-    case 'swipe':
-      // Swipe needs explicit start/end coords; without options we ship
-      // whatever options the LLM provided (runner validates).
+    case 'swipe': {
+      // Runner zod (swipeParams) requires all four coordinates. Use the
+      // LLM-provided coords when complete; otherwise derive them from the
+      // direction hint — same geometry as the runner's own
+      // inferSwipeCoordinates (centre of a 1080×1920 reference screen,
+      // shorter horizontal span to stay clear of Android's edge back-
+      // gesture zones).
+      const opts = step.options as
+        | {
+            startX?: number;
+            startY?: number;
+            endX?: number;
+            endY?: number;
+            durationMs?: number;
+            direction?: 'up' | 'down' | 'left' | 'right';
+            scrollDirection?: 'up' | 'down' | 'left' | 'right';
+          }
+        | undefined;
+      const coords =
+        opts?.startX != null && opts?.startY != null && opts?.endX != null && opts?.endY != null
+          ? { startX: opts.startX, startY: opts.startY, endX: opts.endX, endY: opts.endY }
+          : inferSwipeCoordinates(opts?.direction ?? opts?.scrollDirection ?? 'down');
       return {
         type: 'swipe',
-        params: (step.options as Record<string, unknown> | undefined) ?? {},
+        params: { ...coords, durationMs: opts?.durationMs ?? 300 },
       };
+    }
+
+    // ── drag: unlike swipe there is no sane default — a drag targets a
+    //    specific element pair, so all four coordinates are required
+    //    (runner parity: its converter rejects a coordinate-less drag).
+    case 'drag': {
+      const opts = step.options as
+        | { startX?: number; startY?: number; endX?: number; endY?: number; durationMs?: number }
+        | undefined;
+      if (opts?.startX == null || opts?.startY == null || opts?.endX == null || opts?.endY == null) {
+        throw new StepConversionError(
+          'drag requires options.startX/startY/endX/endY coordinates.',
+        );
+      }
+      return {
+        type: 'drag',
+        params: {
+          startX: opts.startX,
+          startY: opts.startY,
+          endX: opts.endX,
+          endY: opts.endY,
+          holdDurationMs: 500,
+          durationMs: opts.durationMs ?? 800,
+        },
+      };
+    }
+
+    // ── pinch: zoom gesture. Runner command name is pinch_zoom.
+    case 'pinch': {
+      const opts = step.options as
+        | { pinchDirection?: 'in' | 'out'; pinchScale?: number; startX?: number; startY?: number }
+        | undefined;
+      return {
+        type: 'pinch_zoom',
+        params: {
+          direction: opts?.pinchDirection ?? 'out',
+          scale: opts?.pinchScale ?? 2.0,
+          ...(opts?.startX != null ? { x: opts.startX } : {}),
+          ...(opts?.startY != null ? { y: opts.startY } : {}),
+        },
+      };
+    }
 
     case 'press':
     case 'press_key':
@@ -1917,6 +2029,56 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
           ...(step.assertionText ? { expectedText: step.assertionText } : {}),
         },
       };
+
+    // ── extract_text: read an element's text into the runner scratchpad.
+    //    variableName is required by the runner's zod schema.
+    case 'extract_text': {
+      const opts = step.options as { extractVariable?: string } | undefined;
+      const variableName = opts?.extractVariable?.trim();
+      if (!variableName) {
+        throw new StepConversionError(
+          'extract_text requires options.extractVariable (the scratchpad variable name to store the text under).',
+        );
+      }
+      return {
+        type: 'extract_text',
+        params: { intent: step.description, variableName },
+      };
+    }
+
+    // ── navigate: URL / deep link → open_url; package/bundle ID → launch_app.
+    //    Mirrors the runner's own navigate handling for saved test cases.
+    case 'navigate': {
+      const target =
+        step.value ??
+        (isUrlLike(step.description) || isPackageLike(step.description) ? step.description : '');
+      if (!target) {
+        throw new StepConversionError(
+          'navigate requires a URL, deep link, or package/bundle ID in step.value.',
+        );
+      }
+      return isUrlLike(target)
+        ? { type: 'open_url', params: { url: target } }
+        : { type: 'launch_app', params: { packageName: target } };
+    }
+
+    // ── wait / wait_for: re-snapshot and wait for a stable screen. The
+    //    runner replays these as observe_page; a numeric value extends the
+    //    timeout (runner parity: max(waitMs + 2000, 5000)).
+    case 'wait':
+    case 'wait_for': {
+      const waitMs = step.value ? parseInt(step.value, 10) : NaN;
+      return {
+        type: 'observe_page',
+        params: {},
+        ...(!isNaN(waitMs) && waitMs > 0
+          ? { timeout: Math.max(waitMs + 2000, 5000) }
+          : {}),
+      };
+    }
+
+    case 'screenshot':
+      return { type: 'screenshot', params: {} };
 
     case 'open_notifications':
       return { type: 'open_notifications' };
@@ -2010,6 +2172,47 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
       };
     }
 
+    // ── clipboard: set when a value is provided, otherwise read.
+    case 'clipboard':
+      return step.value
+        ? { type: 'set_clipboard', params: { text: step.value } }
+        : { type: 'get_clipboard', params: {} };
+
+    // ── network: simulate network conditions. Clear vs set decided by
+    //    structure (runner parity): explicit networkAction 'clear', or no
+    //    preset AND no custom params → clear.
+    case 'network': {
+      const opts = step.options as
+        | {
+            networkAction?: string;
+            networkPreset?: string;
+            networkLatencyMs?: number;
+            networkBandwidthKbps?: number;
+            networkPacketLossPercent?: number;
+          }
+        | undefined;
+      const hasCustomParams =
+        opts?.networkLatencyMs != null ||
+        opts?.networkBandwidthKbps != null ||
+        opts?.networkPacketLossPercent != null;
+      if (opts?.networkAction === 'clear' || (!opts?.networkPreset && !hasCustomParams)) {
+        return { type: 'clear_network_condition', params: {} };
+      }
+      return {
+        type: 'set_network_condition',
+        params: {
+          ...(opts?.networkPreset ? { preset: opts.networkPreset } : {}),
+          ...(opts?.networkLatencyMs != null ? { latencyMs: opts.networkLatencyMs } : {}),
+          ...(opts?.networkBandwidthKbps != null
+            ? { bandwidthKbps: opts.networkBandwidthKbps }
+            : {}),
+          ...(opts?.networkPacketLossPercent != null
+            ? { packetLossPercent: opts.networkPacketLossPercent }
+            : {}),
+        },
+      };
+    }
+
     // ── WebView (Phase 8) ────────────────────────────────────────────
     // Saved test cases recorded in WebView context store these step
     // types in steps_json; replay maps them back to runner commands.
@@ -2092,8 +2295,44 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
       return { type: 'web_screenshot', params: {} };
 
     default:
-      // Unknown — let the runner reject it. Don't silently drop.
-      return { type, params: { intent: step.description } };
+      // Only reachable when ACCEPTED_STEP_TYPES and this switch drift
+      // apart — reject loudly so the gap is named, instead of shipping a
+      // half-shaped command the runner rejects with a generic zod error.
+      throw new StepConversionError(
+        `step type "${type}" passed the whitelist but has no runner command mapping — ` +
+          `ACCEPTED_STEP_TYPES and toRunnerCommand are out of sync.`,
+      );
+  }
+}
+
+/** Check if a string looks like a URL or deep link (has a scheme). */
+function isUrlLike(s: string): boolean {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s) || /^(tel|mailto|sms|geo):/.test(s);
+}
+
+/** Check if a string looks like a package/bundle ID (e.g. "com.example.app"). */
+function isPackageLike(s: string): boolean {
+  return /^[a-zA-Z][\w]*(\.[a-zA-Z][\w]*)+$/.test(s);
+}
+
+/**
+ * Direction-based default swipe coordinates on a 1080×1920 reference
+ * screen — same geometry as the runner's inferSwipeCoordinates. The
+ * horizontal span is shorter on purpose: Android 10+ reserves the outer
+ * ~24-32dp of each side as a system back-gesture zone, so a wider swipe
+ * would be intercepted as "go back" before the app sees it.
+ */
+function inferSwipeCoordinates(
+  direction: 'up' | 'down' | 'left' | 'right',
+): { startX: number; startY: number; endX: number; endY: number } {
+  const cx = 540, cy = 960;
+  const HORIZONTAL_DELTA = 320;
+  const VERTICAL_DELTA = 500;
+  switch (direction) {
+    case 'up':    return { startX: cx, startY: cy + VERTICAL_DELTA, endX: cx, endY: cy - VERTICAL_DELTA };
+    case 'down':  return { startX: cx, startY: cy - VERTICAL_DELTA, endX: cx, endY: cy + VERTICAL_DELTA };
+    case 'left':  return { startX: cx + HORIZONTAL_DELTA, startY: cy, endX: cx - HORIZONTAL_DELTA, endY: cy };
+    case 'right': return { startX: cx - HORIZONTAL_DELTA, startY: cy, endX: cx + HORIZONTAL_DELTA, endY: cy };
   }
 }
 
