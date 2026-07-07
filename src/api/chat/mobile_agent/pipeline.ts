@@ -35,6 +35,7 @@ import {
   formatMobileSnapshotForChat,
   type MobileSnapshot,
 } from '@/services/chat/mobile-context.service';
+import type { MobileIntentStep } from '@/services/mobile/mobile-runner.types';
 
 // Upper bound on "LLM → tool dispatch" rounds in a single turn.
 //
@@ -79,6 +80,26 @@ export interface MobileAgentResult {
   toolCallsMade: number;
   observed: boolean;
   durationMs: number;
+  /**
+   * Structured draft steps authored by `mobile_run_draft_steps` this turn,
+   * surfaced so the handler can lift them onto the HTTP reply metadata. The
+   * chat UI renders them as editable step widgets (draftMeta.executed tells
+   * it whether they already ran or await a UI-confirm run). Absent on turns
+   * that didn't author a draft. If the tool is called more than once, the
+   * LAST authored draft wins (matches the in-memory draft cache, which the
+   * last call also overwrote).
+   */
+  draftSteps?: MobileIntentStep[];
+  draftMeta?: MobileDraftStepsMeta;
+}
+
+/** Shape of `draftMeta` carried on both the tool result and the reply. */
+export interface MobileDraftStepsMeta {
+  chatSessionId: string;
+  mobileSessionId: string;
+  platform: string;
+  suggestedName?: string;
+  executed: boolean;
 }
 
 export interface RunMobileAgentPipelineOpts {
@@ -132,6 +153,10 @@ export async function runMobileAgentPipeline(
 
   let round = 0;
   let toolCallsMade = 0;
+  // Captured from mobile_run_draft_steps' result data whenever it authors a
+  // draft this turn. Lifted onto the reply so the chat renders editable steps.
+  let draftSteps: MobileIntentStep[] | undefined;
+  let draftMeta: MobileDraftStepsMeta | undefined;
 
   while (round < MAX_TOOL_ROUNDS) {
     round++;
@@ -175,6 +200,7 @@ export async function runMobileAgentPipeline(
         toolCallsMade,
         observed: blackboard.getSnapshot() !== null,
         durationMs: Date.now() - startedAt,
+        ...(draftSteps && draftMeta ? { draftSteps, draftMeta } : {}),
       };
     }
 
@@ -283,6 +309,17 @@ export async function runMobileAgentPipeline(
       // network error) leave `data` either undefined or without
       // `screenshotBase64`, so this branch never fires on the unhappy
       // path — the `tool` message above already explained what happened.
+      // Capture authored draft steps (mobile_run_draft_steps). Present on both
+      // the author-only (confirm=false) and executed (confirm=true) paths. Last
+      // authoring call wins — mirrors the in-memory draft cache it overwrote.
+      const draftData = safeResult.data as
+        | { draftSteps?: MobileIntentStep[]; draftMeta?: MobileDraftStepsMeta }
+        | undefined;
+      if (draftData?.draftSteps && draftData.draftMeta) {
+        draftSteps = draftData.draftSteps;
+        draftMeta = draftData.draftMeta;
+      }
+
       const screenshotData = safeResult.data as { screenshotBase64?: string; capturedAt?: string } | undefined;
       if (safeResult.ok && screenshotData?.screenshotBase64) {
         messages.push({
@@ -331,6 +368,7 @@ export async function runMobileAgentPipeline(
     toolCallsMade,
     observed: blackboard.getSnapshot() !== null,
     durationMs: Date.now() - startedAt,
+    ...(draftSteps && draftMeta ? { draftSteps, draftMeta } : {}),
   };
 }
 

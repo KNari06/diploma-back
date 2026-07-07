@@ -280,6 +280,15 @@ export async function handleMobileAgent(
       };
     }
 
+    // Draft steps authored this turn (mobile_run_draft_steps) → the chat
+    // renders them as editable step widgets. `draftMeta.executed` tells the
+    // UI whether they already ran (confirm=true) or await a UI-confirm run
+    // (confirm=false). Values are already sanitised to {{param_*}} by the tool.
+    if (result.draftSteps && result.draftMeta) {
+      visualMetadata.draftSteps = result.draftSteps;
+      visualMetadata.draftMeta = result.draftMeta;
+    }
+
     await saveMobileChatTurn(
       chatSessionId,
       message,

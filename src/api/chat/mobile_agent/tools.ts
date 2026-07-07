@@ -511,10 +511,14 @@ const MOBILE_RUN_DRAFT_STEPS_TOOL: ChatCompletionTool = {
   function: {
     name: 'mobile_run_draft_steps',
     description:
-      'Execute a list of mobile test steps as a draft on the live device, ' +
-      'and cache them for the chat session so the user can save them later. ' +
-      'Use this when the user asks you to "run" / "execute" / "try out" a ' +
-      'flow you just designed. Steps are NOT persisted yet — call ' +
+      'Author a list of mobile test steps as a draft. The steps are surfaced ' +
+      'in the chat as EDITABLE step widgets the user can adjust, then confirm ' +
+      'in the UI to run on the device. Two modes via `confirm`: ' +
+      'confirm=false (DEFAULT, preferred) authors the draft WITHOUT running — ' +
+      'use this when you designed a flow and want the user to review/edit/run ' +
+      'it via the UI. confirm=true runs immediately on the live device — use ' +
+      'ONLY when the user explicitly said "run" / "execute" / "try it now". ' +
+      'Either way the steps are cached for the session; call ' +
       'mobile_create_test_case afterward if the user asks to save.',
     parameters: {
       type: 'object',
@@ -580,9 +584,11 @@ const MOBILE_RUN_DRAFT_STEPS_TOOL: ChatCompletionTool = {
         confirm: {
           type: 'boolean',
           description:
-            'Must be true to actually run. Pass false to merely cache the draft ' +
-            'without execution (rare — use only when the user wants to review ' +
-            'before running).',
+            'false (DEFAULT) = author the draft and show it as editable steps ' +
+            'for the user to review/edit/run via the UI, WITHOUT running now. ' +
+            'true = run immediately on the live device — set true ONLY when the ' +
+            'user explicitly asked to run/execute/try it now. When unsure, use ' +
+            'false: let the user confirm in the UI.',
         },
       },
       required: ['steps', 'confirm'],
@@ -1506,12 +1512,11 @@ async function runMobileRunDraftSteps(
   if (!stepsRaw || stepsRaw.length === 0) {
     return { ok: false, content: 'mobile_run_draft_steps requires a non-empty steps array.' };
   }
-  if (args.confirm !== true) {
-    return {
-      ok: false,
-      content: 'mobile_run_draft_steps requires confirm=true. Pass true once the user has approved running the draft.',
-    };
-  }
+  // confirm=false is NOT an error: it means "author the draft, surface it in the
+  // chat as editable step widgets, but do NOT run it on the device yet". The UI
+  // drives the live run later (with the user's edits) via a confirm=true call.
+  // confirm=true runs immediately as before.
+  const shouldRun = args.confirm === true;
 
   // Validate + light-normalise each step. We keep the LLM-provided shape
   // verbatim except for trimming and type coercion — no heuristics that
@@ -1580,6 +1585,49 @@ async function runMobileRunDraftSteps(
     });
   }
 
+  // Structured payload the chat UI renders as editable step widgets. Rides on
+  // the tool result's `data` and is lifted onto the HTTP reply metadata by the
+  // handler (draftSteps channel). Present on BOTH the run and cache-only paths.
+  //
+  // Sanitise sensitive `value`s to `{{param_*}}` BEFORE they leave the server
+  // (invariant #10 — a new sink emitting step bodies must redact). The cache +
+  // the live batch run above keep the RAW steps (the runner needs real values
+  // for placeholders it will substitute at replay); only what the UI sees is
+  // redacted. Save-time sanitisation still runs inside RegressionSaveService.
+  const { steps: sanitizedDraftSteps } = sanitizeMobileSteps(steps);
+  const draftStepsPayload = {
+    draftSteps: sanitizedDraftSteps,
+    draftMeta: {
+      chatSessionId: bb.chatSessionId,
+      mobileSessionId: bb.mobileSessionId,
+      platform,
+      suggestedName,
+      // false = author-only (this call did not execute); the UI shows a
+      // "Run on device" confirm. true = already ran below.
+      executed: shouldRun,
+    },
+  };
+
+  // Author-only path: cache + surface the editable steps, do NOT touch the
+  // device. The UI confirms (with edits) via a later confirm=true call.
+  if (!shouldRun) {
+    bb.recordToolCall({
+      tool: 'mobile_run_draft_steps',
+      args: { stepCount: steps.length, suggestedName, executed: false },
+      ok: true,
+      durationMs: Date.now() - startedAt,
+      at: startedAt,
+    });
+    return {
+      ok: true,
+      content:
+        `Drafted ${steps.length} step(s)${suggestedName ? ` for "${suggestedName}"` : ''}. ` +
+        `They are shown in the chat as editable steps — the user can adjust them, ` +
+        `then confirm in the UI to run on the device.`,
+      data: draftStepsPayload,
+    };
+  }
+
   // Execute as a single batch. Runner serialises per-session anyway, so
   // batching beats N separate calls — we get one round-trip with built-in
   // smart-wait + per-step results.
@@ -1623,13 +1671,14 @@ async function runMobileRunDraftSteps(
         `Could not run the draft: ${batchError}.\n` +
         `${steps.length} steps were cached for save, but none executed. ` +
         `Tell the user; do not call mobile_create_test_case unless they explicitly ask anyway.`,
+      data: draftStepsPayload,
     };
   }
 
   return {
     ok: summary.failed === 0,
     content: summary.report,
-    data: { runnerResults, summary },
+    data: { runnerResults, summary, ...draftStepsPayload },
   };
 }
 
