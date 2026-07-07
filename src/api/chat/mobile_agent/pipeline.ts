@@ -95,6 +95,9 @@ export interface MobileAgentResult {
 
 /** Shape of `draftMeta` carried on both the tool result and the reply. */
 export interface MobileDraftStepsMeta {
+  /** Stable per-draft id; the chat card uses it to namespace step ids so two
+   *  drafts (or a remounted one) never collide in editorSteps/status/save. */
+  draftId: string;
   chatSessionId: string;
   mobileSessionId: string;
   platform: string;

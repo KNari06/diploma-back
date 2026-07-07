@@ -21,8 +21,13 @@
  *   - Each detected sensitive value becomes `{{param_<name>}}`.
  *   - A parametersSchema map is returned alongside, ready to be persisted on
  *     `intent_test_cases.parameters_schema`.
- *   - Step shape is otherwise preserved verbatim — we only mutate `value`
- *     when the heuristic fires.
+ *   - `assertionText` is redacted the same way `value` is (an agent can put a
+ *     secret in an assertion — "screen shows token sk_live_..."), and
+ *     always-secret option fields (`totpSecret`, `otpCode`) are masked
+ *     unconditionally. This matters because the sanitised copy is what the
+ *     UI renders and what gets persisted into chat history + steps_json —
+ *     leaving a secret in `assertionText`/`options` there is a real leak
+ *     (backend invariant #10). Step shape is otherwise preserved verbatim.
  */
 
 import type { MobileIntentStep } from '@/services/mobile/mobile-runner.types';
@@ -70,7 +75,14 @@ export function sanitizeMobileSteps(
 ): SanitizedMobileResult {
   const parametersSchema: SanitizedMobileResult['parametersSchema'] = {};
 
-  const sanitized = steps.map<MobileIntentStep>((step) => {
+  const sanitized = steps.map<MobileIntentStep>((rawStep) => {
+    // First mask always-secret option fields + a sensitive assertionText, then
+    // fall through to the value-parameterisation logic below. `step` carries
+    // those masks forward so a step with BOTH a sensitive value and a secret
+    // option is fully cleaned.
+    let step = maskSecretOptionFields(rawStep);
+    step = maskSensitiveAssertionText(step);
+
     const value = step.value;
     if (typeof value !== 'string' || value.length === 0) return step;
 
@@ -94,22 +106,7 @@ export function sanitizeMobileSteps(
     // type, autocomplete. We do NOT inspect `value` itself — the regex
     // would false-positive on actual password strings just because they
     // contain "key" by accident.
-    const hintBits: string[] = [step.description ?? ''];
-    const hints = step.bindingHints as Record<string, unknown> | undefined;
-    if (hints) {
-      for (const k of [
-        'role',
-        'label',
-        'placeholder',
-        'nearText',
-        'type',
-        'autocomplete',
-      ]) {
-        const v = hints[k];
-        if (typeof v === 'string') hintBits.push(v);
-      }
-    }
-    const context = hintBits.join(' ').trim();
+    const context = [step.description ?? '', ...bindingHintBits(step)].join(' ').trim();
     if (!context) return step;
 
     const sensitive = SENSITIVE_PATTERNS.some((pat) => pat.test(context));
@@ -127,6 +124,62 @@ export function sanitizeMobileSteps(
   });
 
   return { steps: sanitized, parametersSchema };
+}
+
+// Option fields that are ALWAYS a secret when present — a TOTP shared seed and
+// a one-time code. Masked unconditionally (no keyword gate): there is no
+// legitimate reason to persist or ship these to the browser in cleartext.
+export const SECRET_OPTION_FIELDS = ['totpSecret', 'otpCode'] as const;
+const MASKED_SECRET = '{{param_secret}}';
+
+/**
+ * Mask always-secret fields inside `options` (totpSecret, otpCode). Returns
+ * the step unchanged when none are present, so identity is preserved for the
+ * common case. Does NOT clone `options` unless it actually masks something.
+ */
+function maskSecretOptionFields(step: MobileIntentStep): MobileIntentStep {
+  const opts = step.options as Record<string, unknown> | undefined;
+  if (!opts) return step;
+  let changed = false;
+  const next: Record<string, unknown> = { ...opts };
+  for (const f of SECRET_OPTION_FIELDS) {
+    const v = next[f];
+    if (typeof v === 'string' && v.length > 0 && !/^\{\{.+\}\}$/.test(v.trim())) {
+      next[f] = MASKED_SECRET;
+      changed = true;
+    }
+  }
+  return changed ? ({ ...step, options: next } as MobileIntentStep) : step;
+}
+
+/**
+ * Mask a sensitive `assertionText`. We scan the assertion string ITSELF (not
+ * the step's description — that describes the value, not the assertion, and
+ * keying off it would wrongly mask a benign assertion on a
+ * password-typing step). A secret quoted in the assertion
+ * ("the screen shows token sk_live_…") must not persist or reach the browser.
+ * Masks to a placeholder (an assertion is not a replay input to parameterise).
+ */
+function maskSensitiveAssertionText(step: MobileIntentStep): MobileIntentStep {
+  const at = step.assertionText;
+  if (typeof at !== 'string' || at.length === 0) return step;
+  if (/^\{\{.+\}\}$/.test(at.trim())) return step;
+  const sensitive = SENSITIVE_PATTERNS.some((pat) => pat.test(at));
+  if (!sensitive) return step;
+  return { ...step, assertionText: MASKED_SECRET };
+}
+
+/** Text fields from bindingHints that hint at the semantic role of a value. */
+function bindingHintBits(step: MobileIntentStep): string[] {
+  const out: string[] = [];
+  const hints = step.bindingHints as Record<string, unknown> | undefined;
+  if (hints) {
+    for (const k of ['role', 'label', 'placeholder', 'nearText', 'type', 'autocomplete']) {
+      const v = hints[k];
+      if (typeof v === 'string') out.push(v);
+    }
+  }
+  return out;
 }
 
 /**
@@ -149,11 +202,16 @@ function makeParamName(
   return candidate;
 }
 
-function slugify(s: string | undefined): string {
+/**
+ * Lowercase → `_`-joined alnum slug, trimmed of edge underscores. Shared by
+ * the param-name generator here and the mobile-agent `extract_text` variable
+ * name builder (tools.ts) so the two don't drift. `maxLen` defaults to 32.
+ */
+export function slugify(s: string | undefined, maxLen = 32): string {
   if (!s) return '';
   return s
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '')
-    .slice(0, 32);
+    .slice(0, maxLen);
 }

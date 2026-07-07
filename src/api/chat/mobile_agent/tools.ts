@@ -42,7 +42,7 @@ import { logger } from '@/utils/core/logger';
 import type { MobileBlackboard } from './blackboard';
 import { generateFlowPlan } from './planner';
 import { MobileDraftStepsCache } from '@/services/testing/mobile/mobile-draft-steps-cache';
-import { sanitizeMobileSteps } from '@/services/testing/mobile/mobile-step-sanitizer';
+import { sanitizeMobileSteps, slugify, SECRET_OPTION_FIELDS } from '@/services/testing/mobile/mobile-step-sanitizer';
 import { RegressionSaveService } from '@/services/testing/regression/regression-save.service';
 import {
   emitMobileAgentThinking,
@@ -1476,10 +1476,34 @@ function runThinkAloud(
  * fall through to the catch-all branch and the runner would reject it,
  * leaving the LLM with a vague "unknown failure".
  */
-const ACCEPTED_STEP_TYPES = new Set<string>([
+/**
+ * Assertion step types whose `assertionText` we backfill from `description`
+ * when empty (an empty assertion verifies nothing). Module-scoped so it's not
+ * re-allocated per step in the validation loop.
+ */
+const ASSERTION_STEP_TYPES = new Set<string>(['assert', 'assert_visible', 'assert_text', 'ai_check']);
+
+/**
+ * Small deterministic hash of a draft's steps → a short base36 string. Used
+ * only to build a stable `draftId` for UI id-namespacing (NOT security). Same
+ * steps in → same hash; a changed step → different hash. Deterministic (no
+ * Date/random) so it survives a message remount.
+ */
+function hashSteps(steps: MobileIntentStep[]): string {
+  const json = JSON.stringify(
+    steps.map((s) => [s.id, s.type, s.description, s.value ?? '', s.assertionText ?? '']),
+  );
+  let h = 5381;
+  for (let i = 0; i < json.length; i++) {
+    h = ((h << 5) + h + json.charCodeAt(i)) | 0; // djb2, 32-bit
+  }
+  return (h >>> 0).toString(36);
+}
+
+export const ACCEPTED_STEP_TYPES = new Set<string>([
   // canonical (mirror of MobileIntentActionType — mobile-runner.types.ts:42-62)
   'click', 'type', 'scroll', 'press', 'hover',
-  'assert', 'ai_check', 'navigate', 'wait', 'wait_for', 'screenshot',
+  'assert', 'ai_check', 'extract_text', 'navigate', 'wait', 'wait_for', 'screenshot',
   'select', 'check', 'uncheck', 'toggle', 'open', 'close',
   'open_app', 'close_app', 'open_notifications',
   'swipe', 'long_press', 'double_tap', 'drag', 'pinch',
@@ -1560,6 +1584,28 @@ async function runMobileRunDraftSteps(
         ? { expectedOutcome: r.expectedOutcome }
         : {}),
     };
+
+    // Empty-assertion guard: an assertion step with no assertionText verifies
+    // NOTHING — an empty-STRING assertionText (schema-allowed) defeats the
+    // runner's `expectedText ?? value ?? description` chain (empty string is
+    // not nullish), so the check runs against '' and vacuously passes.
+    // Backfill from description so there's real content to check.
+    //
+    // EXCEPTION: assert_text matches LITERAL expected text and legitimately
+    // carries that in `value`. Backfilling assertionText=description there
+    // would shadow the value-match with a human sentence (e.g. expect "42" but
+    // now match the sentence "Verify the total is 42"). So for assert_text we
+    // only backfill when there's ALSO no value — preserving the value fallback.
+    const hasAssertionText = typeof step.assertionText === 'string' && step.assertionText.trim();
+    const hasValue = typeof step.value === 'string' && step.value.trim();
+    if (ASSERTION_STEP_TYPES.has(type) && !hasAssertionText) {
+      if (type === 'assert_text') {
+        if (!hasValue) step.assertionText = description;
+      } else {
+        step.assertionText = description;
+      }
+    }
+
     steps.push(step);
   }
 
@@ -1595,9 +1641,18 @@ async function runMobileRunDraftSteps(
   // for placeholders it will substitute at replay); only what the UI sees is
   // redacted. Save-time sanitisation still runs inside RegressionSaveService.
   const { steps: sanitizedDraftSteps } = sanitizeMobileSteps(steps);
+  // Stable id for this draft, used by the chat card to NAMESPACE its step ids
+  // (the agent reuses positional ids like step_1 across drafts). Must be
+  // deterministic + stable across a message remount (chat-history reload) so
+  // the card's namespaced ids keep matching the rows already inserted into the
+  // editor — a mount-local counter on the frontend is NOT stable and would
+  // duplicate rows on remount. Derived from chatSessionId + a content hash of
+  // the authored steps: same draft → same id; a different draft → different id.
+  const draftId = `${bb.chatSessionId ?? 'nosess'}_${hashSteps(sanitizedDraftSteps)}`;
   const draftStepsPayload = {
     draftSteps: sanitizedDraftSteps,
     draftMeta: {
+      draftId,
       chatSessionId: bb.chatSessionId,
       mobileSessionId: bb.mobileSessionId,
       platform,
@@ -1628,6 +1683,75 @@ async function runMobileRunDraftSteps(
     };
   }
 
+  // Unresolved-placeholder guard: the interactive live-run path does NOT
+  // resolve `{{param_*}}` (only the saved regression-replay path substitutes
+  // from parameters_schema). A step whose value is still a placeholder would
+  // type the LITERAL string "{{param_password}}" on the device — so reject the
+  // run with guidance to provide a real value or save + run as a test. Only
+  // gates the RUN; the draft stays cached + editable and can still be SAVED.
+  // Match the canonical placeholder grammar in resolve-placeholders.ts
+  // (`/\{\{([\w.\-]+)\}\}/`) EXACTLY — same char class incl. the hyphen, no
+  // internal whitespace. A looser regex would miss a hyphenated key like
+  // `{{param-token}}` (which the replay resolver DOES substitute), letting the
+  // live run type the literal placeholder — the very thing this guard prevents.
+  //
+  // Scan `value` AND the secret option fields (totpSecret/otpCode): the UI-
+  // facing draft masks those to `{{param_secret}}`, and if the LLM re-emits a
+  // masked step on the confirm=true call the runner would otherwise receive the
+  // literal placeholder as a TOTP seed / OTP code. Same interactive-run path
+  // does not resolve placeholders anywhere.
+  const hasPlaceholder = (v: unknown): boolean =>
+    typeof v === 'string' && /\{\{[\w.\-]+\}\}/.test(v);
+  const placeholderSteps = steps
+    .map((s, i) => ({ i, s }))
+    .filter(({ s }) => {
+      if (hasPlaceholder(s.value)) return true;
+      const o = s.options as Record<string, unknown> | undefined;
+      return !!o && SECRET_OPTION_FIELDS.some((f) => hasPlaceholder(o[f]));
+    });
+  if (placeholderSteps.length > 0) {
+    return {
+      ok: false,
+      content:
+        `${placeholderSteps.length} step(s) still contain a {{placeholder}} value ` +
+        `(e.g. a password/OTP parameter). A live run can't fill those — the device ` +
+        `would type the literal placeholder text. ` +
+        placeholderSteps.map(({ i, s }) => `Step #${i + 1}: "${s.value}"`).join('; ') +
+        `.\nEither put a real value in those steps to try them now, or save the ` +
+        `draft as a test and run it (saved runs substitute the real values).`,
+      data: draftStepsPayload,
+    };
+  }
+
+  // Convert every step to a runner command BEFORE dispatching. A step we
+  // can't map (unsupported type, or swipe/drag without coords) is rejected
+  // HERE with an actionable reason — shipping it would 400 the whole batch
+  // (the runner parses the batch as one discriminated union), failing every
+  // step including the valid ones. The draft stays cached + editable so the
+  // user can fix or drop the offending step and re-run.
+  const commands: Record<string, unknown>[] = [];
+  const conversionErrors: string[] = [];
+  for (let i = 0; i < steps.length; i++) {
+    const converted = toRunnerCommand(steps[i]);
+    if (!converted.ok) {
+      conversionErrors.push(`Step #${i + 1} (${steps[i].type}): ${converted.reason}`);
+    } else {
+      commands.push(converted.command);
+    }
+  }
+  if (conversionErrors.length > 0) {
+    return {
+      ok: false,
+      content:
+        `${conversionErrors.length} step(s) can't run on the device as written, ` +
+        `so the draft was NOT executed (the other steps didn't run either):\n` +
+        conversionErrors.join('\n') +
+        `\n\nThe draft is still shown in the chat for editing. Fix or remove ` +
+        `those steps, then run again.`,
+      data: draftStepsPayload,
+    };
+  }
+
   // Execute as a single batch. Runner serialises per-session anyway, so
   // batching beats N separate calls — we get one round-trip with built-in
   // smart-wait + per-step results.
@@ -1637,7 +1761,7 @@ async function runMobileRunDraftSteps(
   try {
     const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
-      steps.map(toRunnerCommand),
+      commands,
       { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
     );
     runnerResults = results ?? [];
@@ -1853,14 +1977,79 @@ async function runMobileCreateTestCase(
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
+ * Result of converting a MobileIntentStep to a runner command. A step we
+ * cannot map to a command the runner's batch schema accepts returns
+ * `{ ok: false, reason }` so the caller can reject THAT step with a clear
+ * message — instead of shipping an invalid command that fails the WHOLE
+ * batch (the runner validates the batch as one discriminated-union parse, so
+ * a single bad command 400s every step). See CLAUDE.md (runner) invariant #5.
+ */
+type RunnerCommandConversion =
+  | { ok: true; command: Record<string, unknown> }
+  | { ok: false; reason: string };
+
+/**
+ * Step types the runner's batch discriminated-union schema has NO literal for.
+ * Shipping one 400s the ENTIRE batch (all steps fail), so we reject the step
+ * at authoring time with a clear reason instead. Keep in sync with the runner
+ * `command.schema.ts` union — a type here must be absent there. (`pinch`→the
+ * runner's name is `pinch_zoom`; `network`→`set_network_condition`;
+ * `clipboard`→`set_clipboard`/`get_clipboard`; `wait`/`wait_for`/`navigate`
+ * have no mobile equivalent at all.)
+ */
+const RUNNER_UNSUPPORTED_TYPES: Record<string, string> = {
+  wait: 'A plain "wait" is not a runnable mobile step. Use an assertion (assert_visible) to wait for something to appear, or remove it.',
+  wait_for: 'A URL "wait_for" is a web-only step and cannot run on mobile. Use assert_visible to wait for an element instead.',
+  navigate: 'A "navigate" (URL) step is web-only. On mobile use open_app, open_url, or tap navigation.',
+  pinch: 'Pinch-zoom is not yet supported as a draft step on mobile. Remove it or use scroll/swipe.',
+  clipboard: 'Clipboard steps are not yet supported as draft steps on mobile.',
+  network: 'Network-condition steps are not yet supported as draft steps on mobile.',
+};
+
+/**
  * Convert an authoring-time MobileIntentStep into the runner's command
  * shape. The mapping accepts BOTH canonical storage types (`click`, `type`,
  * `press`, `open_app`) and runner-aliased types (`tap`, `type_text`,
  * `press_key`, `launch_app`) — the LLM may emit either; we normalise here.
- * Anything we don't recognise gets shipped verbatim — the runner's zod
- * schema rejects it cleanly with an error result the LLM can react to.
+ *
+ * Types that have no command the runner accepts (or that need parameters the
+ * authoring schema can't supply) return `{ ok: false, reason }` rather than a
+ * command the runner would 400 on (which would fail the whole batch).
  */
-function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
+export function toRunnerCommand(step: MobileIntentStep): RunnerCommandConversion {
+  const type = step.type as string;
+  const unsupported = RUNNER_UNSUPPORTED_TYPES[type];
+  if (unsupported) return { ok: false, reason: unsupported };
+
+  // swipe / drag need explicit start/end coords the runner schema requires
+  // (startX/startY/endX/endY). The authoring schema exposes no coordinate
+  // field, so an authored swipe/drag arrives with empty options → the runner
+  // would reject the whole batch. Reject the single step with guidance
+  // instead. (The interactive `swipe` TOOL computes coords from the snapshot;
+  // that path is unaffected — this guards only authored draft steps.)
+  if (type === 'swipe' || type === 'drag') {
+    const o = (step.options as Record<string, unknown> | undefined) ?? {};
+    const hasCoords = ['startX', 'startY', 'endX', 'endY'].every(
+      (k) => typeof o[k] === 'number',
+    );
+    if (!hasCoords) {
+      return {
+        ok: false,
+        reason:
+          `A "${type}" draft step needs start/end coordinates (startX, startY, ` +
+          `endX, endY) in its options, which weren't provided. Use a "scroll" ` +
+          `step (which takes a direction) to move the screen, or drop this step.`,
+      };
+    }
+  }
+
+  const cmd = toRunnerCommandRaw(step);
+  return { ok: true, command: cmd };
+}
+
+/** The raw type→command switch. Callers go through `toRunnerCommand`, which
+ *  applies the unsupported-type + missing-param guards around this. */
+function toRunnerCommandRaw(step: MobileIntentStep): Record<string, unknown> {
   const type = step.type as string;
   switch (type) {
     // Canonical "tap" family — both storage names ('click' from
@@ -1903,12 +2092,36 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
       };
 
     case 'swipe':
-      // Swipe needs explicit start/end coords; without options we ship
-      // whatever options the LLM provided (runner validates).
+      // Coord presence is validated in toRunnerCommand (rejects coordless
+      // swipes before reaching here); forward the provided coords.
       return {
         type: 'swipe',
         params: (step.options as Record<string, unknown> | undefined) ?? {},
       };
+
+    case 'drag':
+      // Same coord contract as swipe (validated in toRunnerCommand). The runner
+      // dragParams accepts startX/startY/endX/endY (+ optional hold/duration).
+      return {
+        type: 'drag',
+        params: (step.options as Record<string, unknown> | undefined) ?? {},
+      };
+
+    case 'extract_text': {
+      // Runner extractTextParams REQUIRES variableName (min 1). Prefer an
+      // explicit options.variableName / extractVariable; fall back to a slug
+      // of the description so a bare authored extract_text still validates.
+      const o = step.options as { variableName?: string; extractVariable?: string } | undefined;
+      const variableName =
+        o?.variableName ||
+        o?.extractVariable ||
+        slugify(step.description || 'extracted', 40) ||
+        'extracted';
+      return {
+        type: 'extract_text',
+        params: { intent: step.description, variableName },
+      };
+    }
 
     case 'press':
     case 'press_key':
