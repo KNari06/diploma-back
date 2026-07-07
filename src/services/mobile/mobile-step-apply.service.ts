@@ -211,6 +211,13 @@ export interface MobileApplyOutput {
       message: string;
       packageName?: string;
     }>;
+    /** ai_check steps only, pass or fail: the fully-interpolated assertion
+     *  text actually evaluated (placeholders already resolved). */
+    aiCheckResolvedAssertion?: string;
+    /** ai_check steps only, pass or fail: LLM self-reported 0-1 confidence. */
+    aiCheckConfidence?: number;
+    /** ai_check steps only, pass or fail: 1-2 sentence LLM explanation. */
+    aiCheckExplanation?: string;
   };
   appliedStep?: {
     id: string;
@@ -485,6 +492,18 @@ export class MobileStepApplyService {
         // frontend can do a truthy-check rather than a length-check.
         ...(stepResult?.warnings && stepResult.warnings.length > 0
           ? { warnings: stepResult.warnings }
+          : {}),
+        // ai_check detail — no redaction needed here: the mobile scratchpad
+        // has no secrets.* namespace, so a resolved assertion can't leak one
+        // (unlike the web ai_check path, which must redact).
+        ...(stepResult?.aiCheckResolvedAssertion !== undefined
+          ? { aiCheckResolvedAssertion: stepResult.aiCheckResolvedAssertion }
+          : {}),
+        ...(stepResult?.aiCheckConfidence !== undefined
+          ? { aiCheckConfidence: stepResult.aiCheckConfidence }
+          : {}),
+        ...(stepResult?.aiCheckExplanation !== undefined
+          ? { aiCheckExplanation: stepResult.aiCheckExplanation }
           : {}),
       },
       appliedStep,

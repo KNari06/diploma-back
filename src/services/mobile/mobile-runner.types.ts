@@ -287,6 +287,13 @@ export interface MobileStepResult {
    * logged as a system failure.
    */
   aiCheckSkippedReason?: string;
+  /** ai_check steps only, pass or fail: the fully-interpolated assertion text
+   *  actually evaluated (placeholders resolved via the runner's scratchpad). */
+  aiCheckResolvedAssertion?: string;
+  /** ai_check steps only, pass or fail: LLM self-reported 0-1 confidence. */
+  aiCheckConfidence?: number;
+  /** ai_check steps only, pass or fail: 1-2 sentence LLM explanation. */
+  aiCheckExplanation?: string;
   durationMs: number;
   /** Freshly-built compiled plan from this run. Persist onto the IntentStep. */
   compiledPlan?: MobileCompiledPlan;
