@@ -33,7 +33,7 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function createModule(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, platformId, platformKey, name, description, tags, priority } = req.body;
+    const { projectId, platformId, platformKey, name, description, tags, priority, parentModuleId } = req.body;
 
     if (!projectId || !name) {
       res.status(400).json({ success: false, error: 'projectId and name are required' });
@@ -63,6 +63,7 @@ export async function createModule(req: AuthenticatedRequest, res: Response): Pr
       projectId,
       userId,
       platformId: resolvedPlatformId,
+      parentModuleId: typeof parentModuleId === 'string' ? parentModuleId : null,
       name,
       description,
       tags,
@@ -83,6 +84,7 @@ export async function createModule(req: AuthenticatedRequest, res: Response): Pr
         name: module.name,
         platform_id: module.platformId,
         platform_key: module.platformKey,
+        parent_module_id: module.parentModuleId,
         priority: module.priority,
       },
       ...getAuditContext(req),
@@ -120,7 +122,7 @@ export async function getModule(req: AuthenticatedRequest, res: Response): Promi
  */
 export async function listModules(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, platformId, platformKey } = req.query;
+    const { projectId, platformId, platformKey, parentModuleId } = req.query;
 
     if (!projectId || typeof projectId !== 'string') {
       res.status(400).json({ success: false, error: 'projectId is required' });
@@ -131,11 +133,18 @@ export async function listModules(req: AuthenticatedRequest, res: Response): Pro
     const limit = parseInt(req.query.limit as string) || 50;
     const offset = parseInt(req.query.offset as string) || 0;
 
+    // parentModuleId filter: "null" (literal) = top-level only, a uuid = children
+    // of that folder, absent = no parent filter (all levels).
+    let parentFilter: string | null | undefined;
+    if (parentModuleId === 'null') parentFilter = null;
+    else if (typeof parentModuleId === 'string') parentFilter = parentModuleId;
+
     const result = await ModuleService.listByProject(projectId, userId, {
       limit,
       offset,
       platformId: typeof platformId === 'string' ? platformId : undefined,
       platformKey: typeof platformKey === 'string' ? (platformKey as PlatformKey) : undefined,
+      parentModuleId: parentFilter,
     });
 
     res.json({
@@ -159,6 +168,11 @@ export async function updateModule(req: AuthenticatedRequest, res: Response): Pr
     const { name, description, tags, priority } = req.body;
     const userId = getUserId(req);
 
+    // Distinguish "not provided" (leave parent unchanged) from an explicit
+    // null (move to top level) or a string (move under that folder).
+    const hasParentMove = Object.prototype.hasOwnProperty.call(req.body, 'parentModuleId');
+    const parentModuleId = hasParentMove ? (req.body.parentModuleId ?? null) : undefined;
+
     const module = await ModuleService.update({
       id,
       userId,
@@ -166,6 +180,7 @@ export async function updateModule(req: AuthenticatedRequest, res: Response): Pr
       description,
       tags,
       priority,
+      parentModuleId,
     });
 
     res.json({ success: true, data: module, timestamp: new Date() });
@@ -178,7 +193,7 @@ export async function updateModule(req: AuthenticatedRequest, res: Response): Pr
         name: module.name,
       });
 
-      const changedFields = Object.entries({ name, description, tags, priority })
+      const changedFields = Object.entries({ name, description, tags, priority, parentModuleId })
         .filter(([, v]) => v !== undefined)
         .map(([k]) => k);
       void WorkspaceAuditService.logForProject({

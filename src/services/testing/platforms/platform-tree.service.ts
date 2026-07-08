@@ -5,6 +5,7 @@
  */
 
 import { supabaseAdmin } from '@/db/supabase';
+import { getPlatformModulesForTree, type PlatformModuleTreeRow } from '@/services/testing/modules/db/module.db';
 import { logger } from '@/utils/core/logger';
 
 // ============================================================================
@@ -34,9 +35,12 @@ interface ModuleSummary {
   id: string;
   platformId: string;
   platformKey?: 'web_ui' | 'api' | 'mobile';
+  /** Parent folder id (self-reference). null = top-level folder. */
+  parentModuleId: string | null;
   name: string;
   description?: string;
   priority?: string;
+  orderIndex: number | null;
 }
 
 interface FlowSummary {
@@ -46,6 +50,7 @@ interface FlowSummary {
   flowType: 'ui' | 'api' | 'mixed' | 'mobile';
   platform?: string;
   priority?: string;
+  tags: string[];
   orderIndex: number | null;
   mobileVariantLabel?: string | null;
   createdAt: string;
@@ -128,22 +133,24 @@ export class PlatformTreeService {
       return { platforms: { items: [] } };
     }
 
-    // Fetch paginated modules + count per platform in parallel (single query per platform)
+    // Return ALL modules per platform as a FLAT list carrying parent_module_id.
+    // The frontend assembles the nested folder tree from this set (and keeps a
+    // flat lookup by id). A nested tree CANNOT be offset/limit-paginated — a
+    // slice would drop folders and orphan their children — so we return the full
+    // (depth-capped, breadth-modest) module set regardless of limit/offset.
     const platformResults = await Promise.all(
       sortedPlatforms.map(async (p: any) => {
-        const modulesResult = await supabaseAdmin
-          .from('test_modules')
-          .select('id, platform_id, name, description, priority, order_index, created_at', { count: 'exact' })
-          .eq('platform_id', p.id)
-          .eq('user_id', userId)
-          .order('order_index', { ascending: true, nullsFirst: false })
-          .order('created_at', { ascending: false })
-          .range(offset, offset + limit - 1);
-
-        if (modulesResult.error) {
-          logger.error('[PLATFORM_TREE] Failed to get modules', { error: modulesResult.error, platformId: p.id });
-          throw new Error(`Failed to get modules: ${modulesResult.error.message}`);
-        }
+        const rows = await getPlatformModulesForTree(p.id, userId);
+        const items: ModuleSummary[] = rows.map((r: PlatformModuleTreeRow) => ({
+          id: r.id,
+          platformId: r.platformId,
+          platformKey: p.platform_key,
+          parentModuleId: r.parentModuleId,
+          name: r.name,
+          description: r.description,
+          priority: r.priority,
+          orderIndex: r.orderIndex,
+        }));
 
         return {
           id: p.id,
@@ -152,19 +159,11 @@ export class PlatformTreeService {
           name: p.name,
           description: p.description || undefined,
           modules: {
-            items: (modulesResult.data || []).map((m: any) => ({
-              id: m.id,
-              platformId: m.platform_id,
-              platformKey: p.platform_key,
-              name: m.name,
-              description: m.description || undefined,
-              priority: m.priority || undefined,
-              orderIndex: typeof m.order_index === 'number' ? m.order_index : null,
-            })),
+            items,
             pageInfo: {
               limit,
               offset,
-              total: modulesResult.count || 0,
+              total: items.length,
             },
           },
         };
@@ -189,7 +188,7 @@ export class PlatformTreeService {
     // Get module with platform info
     const { data: moduleData, error: moduleError } = await supabaseAdmin
       .from('test_modules')
-      .select('id, platform_id, name, description, priority, test_platforms!inner(platform_key)')
+      .select('id, platform_id, parent_module_id, name, description, priority, order_index, test_platforms!inner(platform_key)')
       .eq('id', moduleId)
       .eq('user_id', userId)
       .single();
@@ -201,7 +200,7 @@ export class PlatformTreeService {
     // Get paginated flows + count in single query
     const flowsResult = await supabaseAdmin
       .from('test_flows')
-      .select('id, module_id, name, flow_type, platform, priority, order_index, created_at, updated_at, mobile_variant_label', { count: 'exact' })
+      .select('id, module_id, name, flow_type, platform, priority, tags, order_index, created_at, updated_at, mobile_variant_label', { count: 'exact' })
       .eq('module_id', moduleId)
       .eq('user_id', userId)
       .order('order_index', { ascending: true, nullsFirst: false })
@@ -218,9 +217,11 @@ export class PlatformTreeService {
         id: moduleData.id,
         platformId: moduleData.platform_id,
         platformKey: (moduleData.test_platforms as any)?.platform_key,
+        parentModuleId: moduleData.parent_module_id ?? null,
         name: moduleData.name,
         description: moduleData.description || undefined,
         priority: moduleData.priority || undefined,
+        orderIndex: typeof moduleData.order_index === 'number' ? moduleData.order_index : null,
       },
       flows: {
         items: (flowsResult.data || []).map((f: any) => ({
@@ -230,6 +231,7 @@ export class PlatformTreeService {
           flowType: f.flow_type,
           platform: f.platform || undefined,
           priority: f.priority || undefined,
+          tags: f.tags || [],
           orderIndex: f.order_index,
           mobileVariantLabel: f.mobile_variant_label ?? null,
           createdAt: f.created_at,
@@ -265,7 +267,7 @@ export class PlatformTreeService {
       // 1. Flow itself
       supabaseAdmin
         .from('test_flows')
-        .select('id, module_id, name, flow_type, platform, priority, order_index, created_at, updated_at, mobile_variant_label')
+        .select('id, module_id, name, flow_type, platform, priority, tags, order_index, created_at, updated_at, mobile_variant_label')
         .eq('id', flowId)
         .eq('user_id', userId)
         .single(),
@@ -333,6 +335,7 @@ export class PlatformTreeService {
         flowType: flowData.flow_type,
         platform: flowData.platform || undefined,
         priority: flowData.priority || undefined,
+        tags: flowData.tags || [],
         orderIndex: flowData.order_index,
         mobileVariantLabel: flowData.mobile_variant_label ?? null,
         createdAt: flowData.created_at,

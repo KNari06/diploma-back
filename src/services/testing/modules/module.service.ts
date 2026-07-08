@@ -1,69 +1,77 @@
 /**
  * Module Service
- * CRUD operations for test modules
+ * CRUD + nesting orchestration for test modules (folders).
+ * Queries live in ./db/module.db.ts — this layer holds validation, cache
+ * invalidation and mapping only (no direct Supabase access).
  */
 
-import { supabaseAdmin } from '@/db/supabase';
-import type {
-    CreateTestModuleParams,
-    PlatformKey,
-    TestModule,
-    UpdateTestModuleParams,
+import * as moduleDb from '@/services/testing/modules/db/module.db';
+import { ValidationError } from '@/types';
+import {
+  MAX_MODULE_DEPTH,
+  type CreateTestModuleParams,
+  type PlatformKey,
+  type TestModule,
+  type UpdateTestModuleParams,
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 
 /**
- * Service for managing test modules
- * Modules represent functional areas of the product (Auth, Payments, Profile)
- * Each module belongs to a platform (web_ui or api)
+ * Service for managing test modules.
+ * Modules are folders within a platform; a module may nest inside another
+ * module (parent_module_id) up to MAX_MODULE_DEPTH levels. Each module belongs
+ * to a platform (web_ui, api or mobile).
  */
 export class ModuleService {
   /**
-   * Create a new test module
+   * Create a new test module (optionally nested under a parent folder).
    * @param params - Module creation parameters (must include platformId)
    * @returns Created module
    */
   static async create(params: CreateTestModuleParams): Promise<TestModule> {
-    const { projectId, userId, platformId, name, description, tags, priority } = params;
+    const { projectId, userId, platformId, parentModuleId, name, description, tags, priority } = params;
 
     if (!platformId) {
       throw new Error('platformId is required to create a module');
     }
 
-    logger.info('[MODULE_SERVICE] Creating module', {
-      projectId,
-      userId,
-      platformId,
-      name,
-    });
+    const parentId = parentModuleId ?? null;
+    if (parentId) {
+      // Parent must exist, be owned by the user, and share platform + project.
+      const parent = await moduleDb.getModuleCore(parentId, userId);
+      if (!parent) {
+        throw new ValidationError('Parent module not found');
+      }
+      if (parent.platformId !== platformId || parent.projectId !== projectId) {
+        throw new ValidationError('Parent module belongs to a different platform or project');
+      }
+      // New module sits one level below its parent.
+      const parentDepth = await this.computeDepth(parentId, userId);
+      if (parentDepth + 1 > MAX_MODULE_DEPTH) {
+        throw new ValidationError(`Maximum folder nesting depth (${MAX_MODULE_DEPTH}) exceeded`);
+      }
+    }
+
+    logger.info('[MODULE_SERVICE] Creating module', { projectId, userId, platformId, parentId, name });
 
     // order_index stays NULL on create. NULL = "not manually ordered" → the
     // module sorts by created_at DESC (newest-first). It only gets a value when
     // the user drags to reorder (ModuleService.reorder).
-    const { data, error } = await supabaseAdmin
-      .from('test_modules')
-      .insert({
-        project_id: projectId,
-        user_id: userId,
-        platform_id: platformId,
-        name,
-        description: description || null,
-        tags: tags || [],
-        priority: priority || null,
-      })
-      .select('*, test_platforms!inner(platform_key)')
-      .single();
+    const module = await moduleDb.insertModule({
+      project_id: projectId,
+      user_id: userId,
+      platform_id: platformId,
+      parent_module_id: parentId,
+      name,
+      description: description || null,
+      tags: tags || [],
+      priority: priority || null,
+    });
 
-    if (error) {
-      logger.error('[MODULE_SERVICE] Failed to create module', { error });
-      throw new Error(`Failed to create module: ${error.message}`);
-    }
+    await this.invalidateTreeCache(projectId);
 
-    // Invalidate platform tree cache
-    await cache.delByPattern(`qait:cache:ptree:base:${projectId}:*`);
-
-    return this.mapToTestModule(data);
+    return module;
   }
 
   /**
@@ -73,137 +81,69 @@ export class ModuleService {
    * @returns Module or null if not found
    */
   static async getById(id: string, userId: string): Promise<TestModule | null> {
-    const { data, error } = await supabaseAdmin
-      .from('test_modules')
-      .select('*, test_platforms!inner(platform_key)')
-      .eq('id', id)
-      .eq('user_id', userId)
-      .single();
-
-    if (error) {
-      if (error.code === 'PGRST116') {
-        return null;
-      }
-      logger.error('[MODULE_SERVICE] Failed to get module', { error, id });
-      throw new Error(`Failed to get module: ${error.message}`);
-    }
-
-    return this.mapToTestModule(data);
+    return moduleDb.getModuleById(id, userId);
   }
 
   /**
    * List modules for a project
    * @param projectId - Project ID
    * @param userId - User ID for access control
-   * @param options - Pagination and filter options
+   * @param options - Pagination + platform/parent filter options
    * @returns List of modules with total count
    */
   static async listByProject(
     projectId: string,
     userId: string,
-    options: { limit?: number; offset?: number; platformId?: string; platformKey?: PlatformKey } = {}
+    options: {
+      limit?: number;
+      offset?: number;
+      platformId?: string;
+      platformKey?: PlatformKey;
+      parentModuleId?: string | null;
+    } = {},
   ): Promise<{ items: TestModule[]; total: number }> {
-    const { limit = 50, offset = 0, platformId, platformKey } = options;
-
-    // Build base query for count
-    let countQuery = supabaseAdmin
-      .from('test_modules')
-      .select('id', { count: 'exact', head: true })
-      .eq('project_id', projectId)
-      .eq('user_id', userId);
-
-    // Apply platform filter
-    if (platformId) {
-      countQuery = countQuery.eq('platform_id', platformId);
-    }
-
-    // Build query for items with platform join
-    let itemsQuery = supabaseAdmin
-      .from('test_modules')
-      .select('*, test_platforms!inner(platform_key)')
-      .eq('project_id', projectId)
-      .eq('user_id', userId);
-
-    // Apply platform filters
-    if (platformId) {
-      itemsQuery = itemsQuery.eq('platform_id', platformId);
-    }
-    if (platformKey) {
-      itemsQuery = itemsQuery.eq('test_platforms.platform_key', platformKey);
-    }
-
-    // Execute count + data queries in parallel (independent reads)
-    const [countResult, itemsResult] = await Promise.all([
-      countQuery,
-      itemsQuery.order('order_index', { ascending: true, nullsFirst: false }).order('created_at', { ascending: false }).range(offset, offset + limit - 1),
-    ]);
-
-    const { count, error: countError } = countResult;
-    const { data, error } = itemsResult;
-
-    if (countError) {
-      logger.error('[MODULE_SERVICE] Failed to count modules', { error: countError });
-      throw new Error(`Failed to list modules: ${countError.message}`);
-    }
-
-    if (error) {
-      logger.error('[MODULE_SERVICE] Failed to list modules', { error });
-      throw new Error(`Failed to list modules: ${error.message}`);
-    }
-
-    return {
-      items: (data || []).map(this.mapToTestModule),
-      total: count || 0,
-    };
+    return moduleDb.listModules(projectId, userId, options);
   }
 
   /**
-   * Update a module
+   * Update a module. Supports re-parenting (move) via `parentModuleId`, which is
+   * cycle- and depth-checked before applying.
    * @param params - Update parameters
    * @returns Updated module
    */
   static async update(params: UpdateTestModuleParams): Promise<TestModule> {
-    const { id, userId, name, description, tags, priority, orderIndex } = params;
+    const { id, userId, name, description, tags, priority, orderIndex, parentModuleId } = params;
 
-    const updates: Record<string, any> = {};
+    const updates: Record<string, unknown> = {};
     if (name !== undefined) updates.name = name;
     if (description !== undefined) updates.description = description;
     if (tags !== undefined) updates.tags = tags;
     if (priority !== undefined) updates.priority = priority;
     if (orderIndex !== undefined) updates.order_index = orderIndex;
 
+    if (parentModuleId !== undefined) {
+      await this.validateReparent(id, parentModuleId, userId);
+      updates.parent_module_id = parentModuleId;
+    }
+
     if (Object.keys(updates).length === 0) {
       throw new Error('No fields to update');
     }
 
-    logger.info('[MODULE_SERVICE] Updating module', {
-      id,
-      updatedFields: Object.keys(updates),
-    });
+    logger.info('[MODULE_SERVICE] Updating module', { id, updatedFields: Object.keys(updates) });
 
-    const { data, error } = await supabaseAdmin
-      .from('test_modules')
-      .update(updates)
-      .eq('id', id)
-      .eq('user_id', userId)
-      .select('*, test_platforms!inner(platform_key)')
-      .single();
+    const module = await moduleDb.updateModuleRow(id, userId, updates);
 
-    if (error) {
-      logger.error('[MODULE_SERVICE] Failed to update module', { error, id });
-      throw new Error(`Failed to update module: ${error.message}`);
+    if (module.projectId) {
+      await this.invalidateTreeCache(module.projectId);
     }
 
-    // Invalidate platform tree cache
-    if (data?.project_id) {
-      await cache.delByPattern(`qait:cache:ptree:base:${data.project_id}:*`);
-    }
-
-    return this.mapToTestModule(data);
+    return module;
   }
 
   /**
-   * Delete a module
+   * Delete a module. Its subtree (child folders) and their flows/test cases
+   * cascade via foreign keys.
    * @param id - Module ID
    * @param userId - User ID for access control
    * @returns True if deleted
@@ -211,59 +151,23 @@ export class ModuleService {
   static async delete(id: string, userId: string): Promise<boolean> {
     logger.info('[MODULE_SERVICE] Deleting module', { id });
 
-    // Fetch project_id before delete for cache invalidation
-    const { data: mod } = await supabaseAdmin
-      .from('test_modules')
-      .select('project_id')
-      .eq('id', id)
-      .eq('user_id', userId)
-      .maybeSingle();
+    // Fetch project_id before delete for cache invalidation.
+    const projectId = await moduleDb.getModuleProjectId(id, userId);
 
-    const { error } = await supabaseAdmin
-      .from('test_modules')
-      .delete()
-      .eq('id', id)
-      .eq('user_id', userId);
+    await moduleDb.deleteModuleRow(id, userId);
 
-    if (error) {
-      logger.error('[MODULE_SERVICE] Failed to delete module', { error, id });
-      throw new Error(`Failed to delete module: ${error.message}`);
-    }
-
-    // Invalidate platform tree cache
-    if (mod?.project_id) {
-      await cache.delByPattern(`qait:cache:ptree:base:${mod.project_id}:*`);
+    if (projectId) {
+      await this.invalidateTreeCache(projectId);
     }
 
     return true;
   }
 
   /**
-   * Map database row to TestModule type
-   * Includes platformKey from joined test_platforms if available
-   */
-  private static mapToTestModule(row: any): TestModule {
-    return {
-      id: row.id,
-      projectId: row.project_id,
-      userId: row.user_id,
-      platformId: row.platform_id,
-      platformKey: row.test_platforms?.platform_key || undefined,
-      name: row.name,
-      description: row.description || undefined,
-      tags: row.tags || [],
-      priority: row.priority || undefined,
-      orderIndex: typeof row.order_index === 'number' ? row.order_index : null,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    };
-  }
-
-  /**
-   * Reorder modules within a platform. Sets each module's order_index to its
-   * position in `moduleIds` (full ordered list for that platform). Mirrors
-   * FlowService.reorder. `projectId` is required to invalidate the platform
-   * tree cache so the new order is visible immediately.
+   * Reorder modules within one level (a platform's top level, or the children
+   * of a single parent). Sets each module's order_index to its position in
+   * `moduleIds`. `projectId` invalidates the platform tree cache so the new
+   * order is visible immediately.
    */
   static async reorder(
     projectId: string,
@@ -277,25 +181,114 @@ export class ModuleService {
       count: moduleIds.length,
     });
 
-    const updates = moduleIds.map((moduleId, index) =>
-      supabaseAdmin
-        .from('test_modules')
-        .update({ order_index: index })
-        .eq('id', moduleId)
-        .eq('platform_id', platformId)
-        .eq('user_id', userId),
-    );
+    await moduleDb.setModuleOrderIndexes(moduleIds, platformId, userId);
 
-    const results = await Promise.all(updates);
-    const errors = results.filter((r) => r.error);
-    if (errors.length > 0) {
-      logger.error('[MODULE_SERVICE] Failed to reorder some modules', {
-        errors: errors.map((e) => e.error),
-      });
-      throw new Error('Failed to reorder modules');
+    await this.invalidateTreeCache(projectId);
+  }
+
+  // ── nesting validation ──────────────────────────────────────────────────────
+
+  /**
+   * Validate a re-parent (move). Rejects self-parenting, cycles (moving a folder
+   * under one of its own descendants), cross-platform/project moves, and moves
+   * that would push the moved subtree past MAX_MODULE_DEPTH.
+   */
+  private static async validateReparent(
+    moduleId: string,
+    newParentId: string | null,
+    userId: string,
+  ): Promise<void> {
+    if (newParentId === null) return; // moving to top level is always valid
+
+    if (newParentId === moduleId) {
+      throw new ValidationError('A folder cannot be its own parent');
     }
 
-    // Module order lives in the base platform tree cache.
+    const moduleCore = await moduleDb.getModuleCore(moduleId, userId);
+    if (!moduleCore) {
+      throw new ValidationError('Module not found');
+    }
+
+    const parentCore = await moduleDb.getModuleCore(newParentId, userId);
+    if (!parentCore) {
+      throw new ValidationError('Parent module not found');
+    }
+    if (parentCore.platformId !== moduleCore.platformId || parentCore.projectId !== moduleCore.projectId) {
+      throw new ValidationError('Cannot move a folder to a different platform or project');
+    }
+
+    if (await this.wouldCreateCycle(moduleId, newParentId, userId)) {
+      throw new ValidationError('Cannot move a folder into one of its own sub-folders');
+    }
+
+    const parentDepth = await this.computeDepth(newParentId, userId);
+    const subtreeHeight = await this.computeSubtreeHeight(moduleId, userId);
+    if (parentDepth + subtreeHeight > MAX_MODULE_DEPTH) {
+      throw new ValidationError(`Maximum folder nesting depth (${MAX_MODULE_DEPTH}) exceeded`);
+    }
+  }
+
+  /** Depth of a module = ancestor count + 1 (top-level folder = 1). */
+  private static async computeDepth(moduleId: string, userId: string): Promise<number> {
+    let depth = 1;
+    const visited = new Set<string>([moduleId]);
+    let current = await moduleDb.getModuleCore(moduleId, userId);
+
+    while (current?.parentModuleId) {
+      if (visited.has(current.parentModuleId)) break; // defensive: broken chain
+      visited.add(current.parentModuleId);
+      depth += 1;
+      current = await moduleDb.getModuleCore(current.parentModuleId, userId);
+    }
+
+    return depth;
+  }
+
+  /** Number of levels in a module's subtree (the module alone = 1). */
+  private static async computeSubtreeHeight(moduleId: string, userId: string): Promise<number> {
+    let height = 1;
+    let frontier = [moduleId];
+    const visited = new Set<string>([moduleId]);
+
+    while (frontier.length > 0) {
+      const next: string[] = [];
+      for (const id of frontier) {
+        const children = await moduleDb.getChildModuleIds(id, userId);
+        for (const child of children) {
+          if (!visited.has(child)) {
+            visited.add(child);
+            next.push(child);
+          }
+        }
+      }
+      if (next.length === 0) break;
+      height += 1;
+      frontier = next;
+    }
+
+    return height;
+  }
+
+  /** True if `newParentId` is `moduleId` or one of its descendants. */
+  private static async wouldCreateCycle(
+    moduleId: string,
+    newParentId: string,
+    userId: string,
+  ): Promise<boolean> {
+    const visited = new Set<string>();
+    let current: string | null = newParentId;
+
+    while (current && !visited.has(current)) {
+      if (current === moduleId) return true;
+      visited.add(current);
+      const core = await moduleDb.getModuleCore(current, userId);
+      current = core?.parentModuleId ?? null;
+    }
+
+    return false;
+  }
+
+  private static async invalidateTreeCache(projectId: string): Promise<void> {
     await cache.delByPattern(`qait:cache:ptree:base:${projectId}:*`);
   }
 }
