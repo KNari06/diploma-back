@@ -10,9 +10,14 @@
 jest.mock('@/services/testing/regression/db/regression-run.db', () => ({
   insertRun: jest.fn(),
   updateRunById: jest.fn(),
-  failZombieRuns: jest.fn(),
+  findZombieRunCandidates: jest.fn(),
+  forceFailRunsByIds: jest.fn(),
   listRunsByProject: jest.fn(),
   getRunExecutionStatsRows: jest.fn(),
+}));
+
+jest.mock('@/services/testing/results/test-completion-handler.service', () => ({
+  isPendingSegmentsStale: jest.fn(),
 }));
 
 jest.mock('@/services/testing/regression/db/regression-test-query.db', () => ({
@@ -92,7 +97,8 @@ jest.mock('@/services/testing/regression/test-execution-orchestrator.service', (
 import {
   insertRun,
   updateRunById,
-  failZombieRuns,
+  findZombieRunCandidates,
+  forceFailRunsByIds,
 } from '@/services/testing/regression/db/regression-run.db';
 import { RegressionTestQueryService } from '@/services/testing/regression/db/regression-test-query.db';
 import { getProjectForAccess } from '@/services/testing/regression/db/regression.db';
@@ -103,11 +109,14 @@ import { MobileTestDispatcherService } from '@/services/testing/regression/mobil
 import { WebTestRequestBuilderService } from '@/services/testing/regression/web-test-request-builder.service';
 import { TestExecutionOrchestratorService } from '@/services/testing/regression/test-execution-orchestrator.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
+import { isPendingSegmentsStale } from '@/services/testing/results/test-completion-handler.service';
 import { ValidationError, NotFoundError, InsufficientCreditsError } from '@/types';
 
 const mockInsertRun = insertRun as jest.MockedFunction<typeof insertRun>;
 const mockUpdateRun = updateRunById as jest.MockedFunction<typeof updateRunById>;
-const mockFailZombies = failZombieRuns as jest.MockedFunction<typeof failZombieRuns>;
+const mockFindZombieCandidates = findZombieRunCandidates as jest.MockedFunction<typeof findZombieRunCandidates>;
+const mockForceFailRuns = forceFailRunsByIds as jest.MockedFunction<typeof forceFailRunsByIds>;
+const mockIsPendingSegmentsStale = isPendingSegmentsStale as jest.MockedFunction<typeof isPendingSegmentsStale>;
 const mockGetSavedCase = RegressionTestQueryService.getSavedTestCase as jest.MockedFunction<any>;
 const mockGetStepRows = RegressionTestQueryService.getUiStepCountRows as jest.MockedFunction<any>;
 const mockGetByPriority = RegressionTestQueryService.getUiTestCasesByPriority as jest.MockedFunction<any>;
@@ -123,14 +132,57 @@ const mockExecuteAsync = TestExecutionOrchestratorService.executeTestCasesAsync 
 const USER = 'user-1';
 
 describe('RegressionRunService.cleanupZombieRuns', () => {
-  beforeEach(() => mockFailZombies.mockResolvedValue({ ids: [], error: null }));
+  beforeEach(() => {
+    mockFindZombieCandidates.mockResolvedValue({ candidates: [], error: null });
+    mockForceFailRuns.mockResolvedValue({ ids: [], error: null });
+    mockIsPendingSegmentsStale.mockReturnValue(false);
+  });
   afterEach(() => jest.clearAllMocks());
 
-  it('force-fails stale runs via the db sweep', async () => {
-    mockFailZombies.mockResolvedValue({ ids: ['z1', 'z2'], error: null });
+  it('force-fails a non-segmented stale run without consulting the per-segment check', async () => {
+    mockFindZombieCandidates.mockResolvedValue({
+      candidates: [{ id: 'z1', started_at: '2020-01-01T00:00:00.000Z', pending_segments: null, last_segment_dispatched_at: null }],
+      error: null,
+    });
+    mockForceFailRuns.mockResolvedValue({ ids: ['z1'], error: null });
 
     await expect(RegressionRunService.cleanupZombieRuns()).resolves.toBeUndefined();
-    expect(mockFailZombies).toHaveBeenCalledTimes(1);
+
+    expect(mockIsPendingSegmentsStale).not.toHaveBeenCalled();
+    expect(mockForceFailRuns).toHaveBeenCalledWith(['z1']);
+  });
+
+  // Regression: this sweep used to force-fail ANY run whose chain-wide
+  // started_at was old, with zero awareness of a segmented link_test_case
+  // chain still legitimately executing (ADR-0011 update 6) — it bypassed
+  // recomputeRunStatus's own per-segment staleness check entirely.
+  it('does not force-fail a segmented chain the per-segment check says is not stale', async () => {
+    mockFindZombieCandidates.mockResolvedValue({
+      candidates: [{ id: 'segmented-1', started_at: '2020-01-01T00:00:00.000Z', pending_segments: 2, last_segment_dispatched_at: '2026-07-08T00:00:00.000Z' }],
+      error: null,
+    });
+    mockIsPendingSegmentsStale.mockReturnValue(false);
+
+    await RegressionRunService.cleanupZombieRuns();
+
+    expect(mockIsPendingSegmentsStale).toHaveBeenCalledWith(
+      { started_at: '2020-01-01T00:00:00.000Z', last_segment_dispatched_at: '2026-07-08T00:00:00.000Z' },
+      expect.any(Number),
+    );
+    expect(mockForceFailRuns).toHaveBeenCalledWith([]);
+  });
+
+  it('does force-fail a segmented chain the per-segment check confirms is genuinely stale', async () => {
+    mockFindZombieCandidates.mockResolvedValue({
+      candidates: [{ id: 'segmented-dead', started_at: '2020-01-01T00:00:00.000Z', pending_segments: 1, last_segment_dispatched_at: '2020-01-01T00:10:00.000Z' }],
+      error: null,
+    });
+    mockIsPendingSegmentsStale.mockReturnValue(true);
+    mockForceFailRuns.mockResolvedValue({ ids: ['segmented-dead'], error: null });
+
+    await RegressionRunService.cleanupZombieRuns();
+
+    expect(mockForceFailRuns).toHaveBeenCalledWith(['segmented-dead']);
   });
 });
 
@@ -270,5 +322,46 @@ describe('RegressionRunService.runByPriority', () => {
     ).rejects.toBeInstanceOf(InsufficientCreditsError);
 
     expect(mockExecuteAsync).not.toHaveBeenCalled();
+  });
+
+  // Regression guard: a link_test_case step is ONE entry in steps_json, but
+  // inlines the ENTIRE linked test case at dispatch time. Before this fix the
+  // pre-flight only ever saw "1 step" here and would have passed this exact
+  // scenario (1 + 1 goto + 5 bug-report = 7 required, well under 10
+  // available) — a user could get a green light and then run out of credits
+  // mid-run once the linked case's 50 steps actually executed.
+  it('expands a same-platform link_test_case step to the linked case\'s own step count before gating credits', async () => {
+    mockGetByPriority.mockResolvedValue([
+      { id: 'tc-1', flow_id: null, depends_on: [], platform: 'web' },
+    ]);
+    mockGetStepRows.mockImplementation(async (ids: string[]) => {
+      if (ids.includes('tc-1')) {
+        return [{
+          id: 'tc-1',
+          steps_json: [{
+            id: 'link1',
+            type: 'link_test_case',
+            options: { linkTestCase: { linkedTestCaseId: 'linked-tc', linkedPlatform: 'web' } },
+          }],
+          setup_steps: [],
+          teardown_steps: [],
+        }];
+      }
+      if (ids.includes('linked-tc')) {
+        return [{ id: 'linked-tc', steps_json: new Array(50).fill({}) }];
+      }
+      return [];
+    });
+    // Expanded: 50 linked steps + 1 goto = 51 UI step credits + 1 UI case ×
+    // 5 bug-report = 56 required. effectiveAvailable 10 must NOT be enough.
+    mockCheckCredits.mockResolvedValue({ available: 10, effectiveAvailable: 10 });
+
+    await expect(
+      RegressionRunService.runByPriority({ projectId: 'proj-1', priority: 'high', userId: USER, trigger: 'manual' }),
+    ).rejects.toBeInstanceOf(InsufficientCreditsError);
+
+    expect(mockExecuteAsync).not.toHaveBeenCalled();
+    // proves the linked case's own row was actually fetched, not assumed
+    expect(mockGetStepRows).toHaveBeenCalledWith(['linked-tc']);
   });
 });

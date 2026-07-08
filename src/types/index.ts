@@ -595,7 +595,7 @@ export class ValidationError extends QAIError {
 export class InsufficientCreditsError extends ValidationError {
   constructor(
     message: string,
-    details?: { required?: number; available?: number; breakdown?: Record<string, number> },
+    details?: { required?: number; available?: number; breakdown?: Record<string, number | boolean> },
   ) {
     super(message, details);
     this.name = 'InsufficientCreditsError';

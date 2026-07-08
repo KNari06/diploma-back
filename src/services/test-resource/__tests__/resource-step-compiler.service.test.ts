@@ -786,3 +786,106 @@ describe('step output shape', () => {
     expect(snapshotJson).not.toContain(SECRET);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// secretValues — the mobile job's redact-value list (bug #2 fix)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('secretValues', () => {
+  it('is empty when there are no bindings', async () => {
+    const r = await ResourceStepCompilerService.compileForMobile({
+      bindings: [],
+      userId: 'u1',
+      projectId: 'p1',
+      platform: 'android',
+    });
+    expect(r.secretValues).toEqual([]);
+  });
+
+  it('is empty when nothing compiled is sensitive', async () => {
+    mockedModule.loadDecrypted.mockResolvedValueOnce(
+      makeResource({ kind: 'environment', config: { BASE_URL: 'https://stg.app' } }),
+    );
+    const r = await ResourceStepCompilerService.compileForMobile({
+      bindings: [binding('environment', 'e1')],
+      userId: 'u1',
+      projectId: 'p1',
+      platform: 'android',
+    });
+    expect(r.secretValues).toEqual([]);
+  });
+
+  it('collects a secret-kind resource value', async () => {
+    mockedModule.loadDecrypted.mockResolvedValueOnce(
+      makeResource({ kind: 'secret', sensitive: { API_KEY: 'sk-super-secret-value' } }),
+    );
+    const r = await ResourceStepCompilerService.compileForMobile({
+      bindings: [binding('secret', 's1')],
+      userId: 'u1',
+      projectId: 'p1',
+      platform: 'android',
+    });
+    expect(r.secretValues).toEqual(['sk-super-secret-value']);
+  });
+
+  it('collects auth sensitive fields but not bare non-sensitive config', async () => {
+    mockedModule.loadDecrypted.mockResolvedValueOnce(
+      makeResource({
+        kind: 'auth',
+        config: { username: 'admin@example.com' },
+        sensitive: { password: 's3cr3t-password' },
+        recipe: [{ id: 'r1', type: 'tap', description: 'tap' }],
+      }),
+    );
+    const r = await ResourceStepCompilerService.compileForMobile({
+      bindings: [binding('auth', 'auth1')],
+      userId: 'u1',
+      projectId: 'p1',
+      platform: 'android',
+    });
+    expect(r.secretValues).toEqual(['s3cr3t-password']);
+    expect(r.secretValues).not.toContain('admin@example.com');
+  });
+
+  it('collects an oauth_token value', async () => {
+    mockedModule.loadDecrypted.mockResolvedValueOnce(
+      makeResource({ kind: 'oauth_token', sensitive: { access_token: 'ghp_xxxxxxxxsecret' } }),
+    );
+    const r = await ResourceStepCompilerService.compileForMobile({
+      bindings: [binding('oauth_token', 'o1')],
+      userId: 'u1',
+      projectId: 'p1',
+      platform: 'android',
+    });
+    expect(r.secretValues).toEqual(['ghp_xxxxxxxxsecret']);
+  });
+
+  it('does not collect data_fixture values (plaintext by design, not secret-prefixed)', async () => {
+    mockedModule.loadDecrypted.mockResolvedValueOnce(
+      makeResource({ kind: 'data_fixture', config: { data: { EMAIL: 'fixture@example.com' } } }),
+    );
+    const r = await ResourceStepCompilerService.compileForMobile({
+      bindings: [binding('data_fixture', 'df1')],
+      userId: 'u1',
+      projectId: 'p1',
+      platform: 'android',
+    });
+    expect(r.secretValues).toEqual([]);
+  });
+
+  it('sorts collected values longest-first (substring-safe masking order)', async () => {
+    mockedModule.loadDecrypted.mockResolvedValueOnce(
+      makeResource({
+        kind: 'secret',
+        sensitive: { SHORT: 'abcd', LONG: 'abcdEFGH' },
+      }),
+    );
+    const r = await ResourceStepCompilerService.compileForMobile({
+      bindings: [binding('secret', 's1')],
+      userId: 'u1',
+      projectId: 'p1',
+      platform: 'android',
+    });
+    expect(r.secretValues).toEqual(['abcdEFGH', 'abcd']);
+  });
+});
