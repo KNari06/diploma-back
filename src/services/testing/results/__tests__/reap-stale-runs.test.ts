@@ -46,6 +46,8 @@ const makeRun = (id: string): StaleRunRow => ({
   test_id: null,
   test_ids: ['t1'],
   summary: null,
+  pending_segments: null,
+  last_segment_dispatched_at: null,
 });
 
 describe('StaleReaperService.reapStaleRuns', () => {
@@ -85,6 +87,25 @@ describe('StaleReaperService.reapStaleRuns', () => {
     for (const call of recomputeSpy.mock.calls) {
       expect(call[1]).toEqual({ suppressSideEffects: true });
     }
+  });
+
+  // Regression: RUN_FIELDS used to omit pending_segments/last_segment_dispatched_at,
+  // so a segmented chain surfaced via this reaper path (rather than the
+  // event-driven test-completion path) reached recomputeRunStatus with those
+  // fields silently undefined — its own pending-segments staleness guard read
+  // `undefined` as "not segmented" and fell through to the legacy chain-wide
+  // check the fix was specifically correcting. Asserts the fields now survive
+  // the fetch all the way to the recomputeRunStatus call.
+  it('passes pending_segments and last_segment_dispatched_at through to recomputeRunStatus', async () => {
+    const segmentedRun = { ...makeRun('segmented-1'), pending_segments: 2, last_segment_dispatched_at: '2026-07-08T00:00:00.000Z' };
+    mockFindStaleRuns.mockResolvedValue([segmentedRun]);
+
+    await StaleReaperService.reapStaleRuns();
+
+    expect(recomputeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ pending_segments: 2, last_segment_dispatched_at: '2026-07-08T00:00:00.000Z' }),
+      { suppressSideEffects: true },
+    );
   });
 
   it('reaps child-level orphans whose parent run is already finalized', async () => {

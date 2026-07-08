@@ -65,4 +65,28 @@ describe('computeUiStepCredits', () => {
     const mobTotal = computeUiStepCredits([mobile('a')], [stepsRow('a', 10)]);
     expect(mobTotal).toBe(webTotal * M);
   });
+
+  describe('expandedLengthById (link_test_case expansion)', () => {
+    it('uses the expanded length instead of the row\'s raw steps_json.length when present', () => {
+      // row has 1 raw step (a single link_test_case marker) but the linked
+      // test case has 100 steps — the estimate must reflect 100, not 1.
+      const row = stepsRow('a', 1);
+      const withoutExpansion = computeUiStepCredits([web('a')], [row]);
+      const withExpansion = computeUiStepCredits([web('a')], [row], new Map([['a', 100]]));
+
+      expect(withoutExpansion).toBe(2); // 1 step + 1 goto
+      expect(withExpansion).toBe(101); // 100 expanded steps + 1 goto
+    });
+
+    it('falls back to the row\'s own steps_json.length for a row with no entry in the map (no links)', () => {
+      const row = stepsRow('a', 5);
+      expect(computeUiStepCredits([web('a')], [row], new Map([['other-id', 999]]))).toBe(6);
+    });
+
+    it('applies the case rate on top of the expanded length for a mobile case', () => {
+      const row = stepsRow('m', 1);
+      const total = computeUiStepCredits([mobile('m')], [row], new Map([['m', 10]]));
+      expect(total).toBe((10 + 1) * M);
+    });
+  });
 });

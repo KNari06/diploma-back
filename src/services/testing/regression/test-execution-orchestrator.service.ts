@@ -163,6 +163,14 @@ export class TestExecutionOrchestratorService {
     let apiPassed = 0;
     let apiFailed = 0;
     let skippedCount = 0;
+    // A UI test case rejected by validation (e.g. an unsupported cross-
+    // platform link_test_case step, see the ValidationError branch below)
+    // never joins `uiTestIds` (by design — it must not block dispatch of
+    // other test cases) and isn't an API test, so it wouldn't otherwise be
+    // reflected in either counter the "only API tests" finalize branch reads.
+    // Tracked separately so a run whose test cases are ALL rejected persists
+    // as failed instead of a false 'completed' with a 0/0/0 summary.
+    let validationRejectedCount = 0;
     let completedCount = 0;
     const totalTests = testCases.length;
     const totalLevels = levels.length;
@@ -574,17 +582,18 @@ export class TestExecutionOrchestratorService {
             // runner has no `link_test_case` command — it's resolved here,
             // before dispatch, by design). Tracked as a known gap; see
             // DECISIONS.md.
-            savedCase.steps_json = await LinkResolutionService.resolveSameProlatformLinks(
+            const { resolvedSteps, segments } = await LinkResolutionService.resolveAndCheckForCrossPlatform(
               (savedCase.steps_json as IntentStep[]) || [],
               savedCase.platform || 'web',
               userId,
             );
+            savedCase.steps_json = resolvedSteps;
             // Checking segment KIND, not count: a test case whose entire
             // steps_json is a single cross-platform link (no steps before
             // or after it) segments to exactly one — but it's a "link"
             // segment, not "steps". `.length > 1` alone would miss that
             // and let the unresolved marker through to dispatch.
-            if (LinkResolutionService.segmentByLinks(savedCase.steps_json as IntentStep[]).some((s) => s.kind === 'link')) {
+            if (segments.some((s) => s.kind === 'link')) {
               throw new ValidationError(
                 `Test case "${testCase.testCaseId}" has a cross-platform Link Test Case step, which is only supported when this test case is run individually — not as part of a plan/module/flow run. Run it on its own, or remove the cross-platform link before including it here.`,
               );
@@ -803,20 +812,44 @@ export class TestExecutionOrchestratorService {
         } catch (error) {
           const errMsg = error instanceof Error ? error.message : String(error);
           const isCreditError = errMsg.toLowerCase().includes('insufficient credits');
+          // A ValidationError here is a deliberate configuration rejection
+          // (currently: a cross-platform link_test_case step, which is only
+          // supported for individual runs — see the throw above), not an
+          // unexpected crash. Two consequences follow: (1) it's logged at
+          // `warn`, not `error`, so monitoring doesn't conflate a known,
+          // by-design rejection with a real dispatch failure; (2) it does
+          // NOT trip fail-fast even when `failOnFirstFailure` is set — we
+          // read "fail on first failure" as "stop the batch on the first
+          // *unexpected* failure", not "abort every unrelated test case in
+          // the batch because one of them hit a documented config
+          // restriction". A genuine exception (crash, network, DB) still
+          // trips fail-fast exactly as before. See DECISIONS.md.
+          const isValidationError = error instanceof ValidationError;
 
-          logger.error('[REGRESSION_RUN] Failed to execute test case', {
-            runId,
-            testCaseId: testCase.testCaseId,
-            testType: testCase.testType,
-            errorMessage: errMsg,
-            errorCode: (error as any)?.code,
-            isCreditError,
-            error,
-          });
+          if (isValidationError) {
+            validationRejectedCount++;
+            logger.warn('[REGRESSION_RUN] Test case rejected by validation, not dispatched', {
+              runId,
+              testCaseId: testCase.testCaseId,
+              testType: testCase.testType,
+              errorMessage: errMsg,
+            });
+          } else {
+            logger.error('[REGRESSION_RUN] Failed to execute test case', {
+              runId,
+              testCaseId: testCase.testCaseId,
+              testType: testCase.testType,
+              errorMessage: errMsg,
+              errorCode: (error as any)?.code,
+              isCreditError,
+              error,
+            });
+          }
 
           failedOrSkippedIds.add(testCase.testCaseId);
-          // Same fail-fast trip as the normal-failure branch above.
-          if (failOnFirstFailure && !failFastTriggered && !isCreditError) {
+          // Same fail-fast trip as the normal-failure branch above. A
+          // ValidationError is excluded — see comment above.
+          if (failOnFirstFailure && !failFastTriggered && !isCreditError && !isValidationError) {
             failFastTriggered = true;
             failFastTriggerTestCaseId = testCase.testCaseId;
           }
@@ -1192,14 +1225,20 @@ export class TestExecutionOrchestratorService {
 
     // If only API tests exist, finalize run immediately.
     // NOTE: regression_runs.status uses 'completed' (not 'passed') for success — match DB convention.
-    const hasFails = apiFailed > 0;
+    // `validationRejectedCount` folds in here too — a UI test case rejected by
+    // validation never reaches `uiTestIds` (so the branch above never runs
+    // for it) and isn't an API test (so `apiFailed` alone would miss it) —
+    // without this, a run whose test cases were ALL validation-rejected fell
+    // through to here with `apiFailed === 0` and persisted as a clean
+    // 'completed' despite nothing having actually run.
+    const hasFails = apiFailed > 0 || validationRejectedCount > 0;
     const persistedStatus = hasFails ? 'failed' : 'completed';
     await updateRunById(runId, {
       status: persistedStatus,
       summary: {
         total: testCases.length,
         passed: apiPassed,
-        failed: apiFailed,
+        failed: apiFailed + validationRejectedCount,
         api_passed: apiPassed,
         api_failed: apiFailed,
         skipped: skippedCount,
@@ -1211,7 +1250,7 @@ export class TestExecutionOrchestratorService {
 
     emitProgress(
       persistedStatus === 'completed' ? 'completed' : 'failed',
-      `Regression run ${persistedStatus}: ${apiPassed} passed, ${apiFailed} failed, ${skippedCount} skipped`
+      `Regression run ${persistedStatus}: ${apiPassed} passed, ${apiFailed + validationRejectedCount} failed, ${skippedCount} skipped`
     );
   }
 }

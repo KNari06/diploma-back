@@ -48,6 +48,7 @@ import { MobileSessionAcquisitionService } from '@/services/mobile/session-acqui
 import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import type { TestStepCompletedPayload } from '@/websocket/types/types';
 import { FastAuthOrchestratorService } from '@/services/mobile/fast-auth-orchestrator.service';
+import { redactWithValues, redactSnapshotValues } from '@/utils/interpolation/redact-secrets';
 
 // ============================================================================
 // JOB HANDLER
@@ -310,6 +311,14 @@ export class MobileTestRunJobHandler {
     // restore loop branch-light. The compiler already suppressed recipe
     // steps for these bindings — they only travel through this channel.
     let fastAuthRestores: FastAuthRestore[] = [];
+    // Redact-value list from compileForMobile's secretValues — plaintext of
+    // every secret/auth-sensitive/oauth_token value compiled into this run's
+    // setup steps. Unlike web, the backend never runs resolvePlaceholders
+    // for mobile (the runner owns interpolation), so this compiled-step list
+    // is the ONLY visibility the backend has into resolved secret values.
+    // Used to mask `scratchpadSnapshot` / `failureExplanation` before they're
+    // persisted or broadcast (CLAUDE.md Hard invariant #10).
+    let mobileSecretValues: string[] = [];
 
     try {
       // Phase 2 telemetry: capture user-step count up-front so a test
@@ -378,6 +387,7 @@ export class MobileTestRunJobHandler {
         // recompile — would double the worker latency for marginal value
         // (Q2 in the design doc).
         fastAuthRestores = compileResult.fastAuthRestores;
+        mobileSecretValues = compileResult.secretValues;
 
         // Pre-build audit snapshot (identical shape to web's AppliedBinding).
         executedResources = [
@@ -1001,6 +1011,16 @@ export class MobileTestRunJobHandler {
             });
           }
 
+          // Redact any {{secrets.*}}-derived plaintext BEFORE it's persisted
+          // or broadcast — mirrors web's `executor.redactRuntimeMeta` in
+          // command-executor.ts/test-executor.ts (CLAUDE.md Hard invariant
+          // #10). `mobileSecretValues` is empty on the common no-secrets
+          // path, so both calls below are a cheap no-op then.
+          const scratchpadRedaction = redactSnapshotValues(stepResult.scratchpadSnapshot, mobileSecretValues);
+          const redactedFailureExplanation = stepResult.error
+            ? redactWithValues(stepResult.error, mobileSecretValues)
+            : stepResult.error;
+
           // Persist to the Redis buffer in-process (the worker owns step
           // persistence), then broadcast. The job's finally drains this buffer
           // via finalizeToDb — no cross-process append round-trip.
@@ -1025,7 +1045,7 @@ export class MobileTestRunJobHandler {
               runtimeStatus,
               executionMs: stepResult.durationMs,
               failedReason: stepResult.error ? 'unknown' : undefined,
-              failureExplanation: stepResult.error,
+              failureExplanation: redactedFailureExplanation,
               resolvedVia: stepResult.resolvedVia,
               // Soft-fail signal for the frontend. Absent (not `false`) for
               // hard failures and successes — keeps the field truthy-only
@@ -1052,7 +1072,14 @@ export class MobileTestRunJobHandler {
               // accumulated variable state, which linked-test-case-runner.service.ts
               // reads to resolve outputBindings. Not new data from the runner —
               // it was already sent, just not previously read on this side.
-              ...(stepResult.scratchpadSnapshot ? { scratchpadSnapshot: stepResult.scratchpadSnapshot } : {}),
+              // Redacted (see scratchpadRedaction above) — redactedSnapshotKeys
+              // tells the link-runner which keys were masked so it can fail
+              // loudly on an outputBinding instead of returning '***' silently.
+              ...(scratchpadRedaction
+                ? { scratchpadSnapshot: scratchpadRedaction.snapshot, redactedSnapshotKeys: scratchpadRedaction.redactedKeys }
+                : stepResult.scratchpadSnapshot
+                  ? { scratchpadSnapshot: stepResult.scratchpadSnapshot }
+                  : {}),
             },
           };
           await TestExecutedStepsRedisService.appendStepCompleted(testId, mobileStepEvent);
