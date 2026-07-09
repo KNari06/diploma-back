@@ -10,6 +10,7 @@ import { AIUsageQueryService } from '@/services/ai/tracking/ai-usage-query.servi
 import { FixtureService } from '@/services/testing/fixtures/fixture.service';
 import { ApiConfigService } from '@/services/api/api-config.service';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
+import { sanitizeSteps } from '@/services/testing/shared/step-sanitizer';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
 import { ScheduleService } from '@/services/testing/schedules/schedule.service';
@@ -3583,6 +3584,13 @@ export async function handleCreateTestCase(
     }
   }
 
+  // Sanitize credential-like values to {{param_*}} BEFORE persisting so a
+  // password/token typed into a step doesn't land in steps_json in plaintext,
+  // and persist the resulting parameters_schema so a regression replay can
+  // resolve them (without it the runner types the literal placeholder). Same
+  // fix + shared sanitizer as the mobile agent save path.
+  const { steps: sanitizedSteps, parametersSchema } = sanitizeSteps(steps);
+
   try {
     const created = await IntentTestCaseService.create({
       projectId,
@@ -3590,7 +3598,8 @@ export async function handleCreateTestCase(
       name,
       description: args.description || undefined,
       startUrl: args.start_url || undefined,
-      steps,
+      steps: sanitizedSteps,
+      parametersSchema,
       status: args.status || 'draft',
       // Pass priority straight to create() — eliminates the previous
       // create→update round-trip and avoids the brief window where the
