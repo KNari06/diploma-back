@@ -570,6 +570,66 @@ const MOBILE_RUN_DRAFT_STEPS_TOOL: ChatCompletionTool = {
                 description:
                   'Natural-language assertion for assert_visible / assert_text steps.',
               },
+              options: {
+                type: 'object',
+                description:
+                  'Per-type parameters. Set the field(s) for this step\'s type; ' +
+                  'omit for tap/type/etc. Without these the runner falls back to ' +
+                  'defaults (e.g. permission defaults to ALLOW — set ' +
+                  'permissionAction:"deny" to deny).',
+                properties: {
+                  // permission
+                  permissionAction: {
+                    type: 'string',
+                    enum: ['allow', 'deny', 'allow_always', 'allow_foreground', 'allow_once'],
+                    description: 'For type "permission": how to answer the OS permission dialog.',
+                  },
+                  // biometric
+                  biometricAction: {
+                    type: 'string',
+                    enum: ['enroll', 'match', 'fail'],
+                    description: 'For type "biometric": succeed (match) or reject (fail) the prompt.',
+                  },
+                  biometricType: {
+                    type: 'string',
+                    enum: ['fingerprint', 'faceId', 'touchId'],
+                  },
+                  // otp
+                  otpAction: {
+                    type: 'string',
+                    enum: ['read_sms', 'read_clipboard', 'read_notification', 'generate_totp', 'type_otp'],
+                    description: 'For type "otp": how to obtain/enter the code.',
+                  },
+                  // swipe / scroll direction (authoring-friendly — the runner/
+                  // converter turns a direction into coordinates)
+                  direction: {
+                    type: 'string',
+                    enum: ['up', 'down', 'left', 'right'],
+                    description:
+                      'For type "swipe"/"scroll": the swipe/scroll direction. Prefer this ' +
+                      'over raw coordinates — you rarely know exact pixels.',
+                  },
+                  scrollAmount: {
+                    type: 'number',
+                    description:
+                      'For type "scroll": optional fraction/pixels to scroll (e.g. 0.5 for half a screen).',
+                  },
+                  // assertions
+                  aiCheckSource: {
+                    type: 'string',
+                    enum: ['tree', 'screenshot'],
+                    description:
+                      'For type "ai_check": run a semantic/visual AI check against the a11y ' +
+                      'tree or a screenshot. Omit for a plain text/visibility assertion.',
+                  },
+                  // long_press
+                  durationMs: {
+                    type: 'number',
+                    description: 'For type "long_press": hold duration in milliseconds.',
+                  },
+                },
+                additionalProperties: true,
+              },
             },
             required: ['id', 'type', 'description'],
             additionalProperties: true,
@@ -1186,9 +1246,11 @@ async function runPressKey(
     );
   }
 
+  // Normalise logical key → Android keycode (KEYCODE_ENTER, not 'enter') so
+  // the runner's `input keyevent` accepts it — same fix as toRunnerCommand.
   return dispatchSingleCommand(
     bb,
-    { type: 'press_key', params: { keycode: key } },
+    { type: 'press_key', params: { keycode: mapMobileKeyToKeycode(key) } },
     {
       toolName: 'press_key',
       args,
@@ -1484,6 +1546,29 @@ function runThinkAloud(
 const ASSERTION_STEP_TYPES = new Set<string>(['assert', 'assert_visible', 'assert_text', 'ai_check']);
 
 /**
+ * Map a logical key name to an Android keycode. MUST mirror the runner's
+ * mapKeyToKeycode (qait-mobile-runner intent-step-converter.ts:1097 /
+ * websocket/index.ts:1447) — the runner runs `input keyevent <keycode>` with
+ * no normalisation, so a bare 'enter' fails on Android and no-ops on iOS.
+ * Cross-repo, so we can't import it; keep in sync. Unknown keys pass through
+ * uppercased (the same fallback the runner uses).
+ */
+const KEY_TO_KEYCODE: Record<string, string> = {
+  enter: 'KEYCODE_ENTER',
+  return: 'KEYCODE_ENTER',
+  back: 'KEYCODE_BACK',
+  backspace: 'KEYCODE_DEL',
+  delete: 'KEYCODE_DEL',
+  home: 'KEYCODE_HOME',
+  escape: 'KEYCODE_ESCAPE',
+  tab: 'KEYCODE_TAB',
+};
+function mapMobileKeyToKeycode(key: string): string {
+  const lower = String(key || '').toLowerCase().trim();
+  return KEY_TO_KEYCODE[lower] ?? String(key || '').toUpperCase();
+}
+
+/**
  * Small deterministic hash of a draft's steps → a short base36 string. Used
  * only to build a stable `draftId` for UI id-namespacing (NOT security). Same
  * steps in → same hash; a changed step → different hash. Deterministic (no
@@ -1640,7 +1725,8 @@ async function runMobileRunDraftSteps(
   // the live batch run above keep the RAW steps (the runner needs real values
   // for placeholders it will substitute at replay); only what the UI sees is
   // redacted. Save-time sanitisation still runs inside RegressionSaveService.
-  const { steps: sanitizedDraftSteps } = sanitizeMobileSteps(steps);
+  const { steps: sanitizedDraftSteps, parametersSchema: draftParametersSchema } =
+    sanitizeMobileSteps(steps);
   // Stable id for this draft, used by the chat card to NAMESPACE its step ids
   // (the agent reuses positional ids like step_1 across drafts). Must be
   // deterministic + stable across a message remount (chat-history reload) so
@@ -1660,6 +1746,13 @@ async function runMobileRunDraftSteps(
       // false = author-only (this call did not execute); the UI shows a
       // "Run on device" confirm. true = already ran below.
       executed: shouldRun,
+      // Placeholder schema for the sanitized {{param_*}} values in draftSteps.
+      // The card forwards this on Save so the persisted test case can resolve
+      // the sensitive values on regression replay (without it the runner types
+      // the literal placeholder). Only present when a value was parameterised.
+      ...(Object.keys(draftParametersSchema).length > 0
+        ? { parametersSchema: draftParametersSchema }
+        : {}),
     },
   };
 
@@ -1935,6 +2028,9 @@ async function runMobileCreateTestCase(
       steps: sanitised,
       appPackage: draft.appPackage,
       startActivity: draft.startActivity,
+      // Persist the placeholder schema so sensitive {{param_*}} values resolve
+      // on regression replay (otherwise the runner types the literal).
+      parametersSchema,
     });
 
     bb.recordToolCall({
@@ -2021,30 +2117,49 @@ export function toRunnerCommand(step: MobileIntentStep): RunnerCommandConversion
   const unsupported = RUNNER_UNSUPPORTED_TYPES[type];
   if (unsupported) return { ok: false, reason: unsupported };
 
-  // swipe / drag need explicit start/end coords the runner schema requires
-  // (startX/startY/endX/endY). The authoring schema exposes no coordinate
-  // field, so an authored swipe/drag arrives with empty options → the runner
-  // would reject the whole batch. Reject the single step with guidance
-  // instead. (The interactive `swipe` TOOL computes coords from the snapshot;
-  // that path is unaffected — this guards only authored draft steps.)
+  // swipe / drag need start/end coords the runner schema requires. The agent
+  // rarely knows exact pixels, so accept a `direction` (up/down/left/right) and
+  // compute coords — mirroring the saved-replay converter so live and replay
+  // behave identically. Only reject when NEITHER coords NOR a direction is
+  // given (nothing to run). drag: coords only (no meaningful direction default).
   if (type === 'swipe' || type === 'drag') {
     const o = (step.options as Record<string, unknown> | undefined) ?? {};
     const hasCoords = ['startX', 'startY', 'endX', 'endY'].every(
       (k) => typeof o[k] === 'number',
     );
-    if (!hasCoords) {
+    const dir = o.direction ?? o.scrollDirection;
+    const hasDir = type === 'swipe' && (dir === 'up' || dir === 'down' || dir === 'left' || dir === 'right');
+    if (!hasCoords && !hasDir) {
       return {
         ok: false,
         reason:
-          `A "${type}" draft step needs start/end coordinates (startX, startY, ` +
-          `endX, endY) in its options, which weren't provided. Use a "scroll" ` +
-          `step (which takes a direction) to move the screen, or drop this step.`,
+          `A "${type}" draft step needs ${type === 'swipe' ? 'a direction (up/down/left/right) or ' : ''}` +
+          `start/end coordinates (startX, startY, endX, endY) in its options, which ` +
+          `weren't provided. ${type === 'swipe' ? 'Set options.direction, or use a "scroll" step.' : 'Drop this step.'}`,
       };
     }
   }
 
   const cmd = toRunnerCommandRaw(step);
   return { ok: true, command: cmd };
+}
+
+/**
+ * Compute swipe start/end coords from a direction, mirroring the runner's
+ * inferSwipeCoordinates (intent-step-converter.ts) so a directional draft
+ * swipe runs the SAME live and on replay. Reference 1080×1920; horizontal
+ * delta is smaller to avoid Android's edge back-gesture zone.
+ */
+function swipeCoordsFromDirection(direction: 'up' | 'down' | 'left' | 'right'): {
+  startX: number; startY: number; endX: number; endY: number;
+} {
+  const cx = 540, cy = 960, H = 320, V = 500;
+  switch (direction) {
+    case 'up': return { startX: cx, startY: cy + V, endX: cx, endY: cy - V };
+    case 'down': return { startX: cx, startY: cy - V, endX: cx, endY: cy + V };
+    case 'left': return { startX: cx + H, startY: cy, endX: cx - H, endY: cy };
+    case 'right': return { startX: cx - H, startY: cy, endX: cx + H, endY: cy };
+  }
 }
 
 /** The raw type→command switch. Callers go through `toRunnerCommand`, which
@@ -2083,21 +2198,37 @@ function toRunnerCommandRaw(step: MobileIntentStep): Record<string, unknown> {
         },
       };
 
-    case 'scroll':
+    case 'scroll': {
+      // Forward direction + optional amount (the runner's scrollParams accepts
+      // `amount`). Dropping amount made every authored scroll go the default
+      // distance regardless of "scroll half a screen".
+      const o = step.options as { direction?: string; scrollAmount?: number; amount?: number } | undefined;
+      const amount = typeof o?.amount === 'number' ? o.amount
+        : typeof o?.scrollAmount === 'number' ? o.scrollAmount
+        : undefined;
       return {
         type: 'scroll',
         params: {
-          direction: (step.options as { direction?: string } | undefined)?.direction ?? 'down',
+          direction: o?.direction ?? 'down',
+          ...(amount !== undefined ? { amount } : {}),
         },
       };
+    }
 
-    case 'swipe':
-      // Coord presence is validated in toRunnerCommand (rejects coordless
-      // swipes before reaching here); forward the provided coords.
+    case 'swipe': {
+      // Coords OR direction is validated in toRunnerCommand. If explicit coords
+      // were given, forward them; otherwise compute from the direction (same
+      // math as the saved-replay converter, so live == replay).
+      const o = (step.options as Record<string, unknown> | undefined) ?? {};
+      const hasCoords = ['startX', 'startY', 'endX', 'endY'].every((k) => typeof o[k] === 'number');
+      if (hasCoords) return { type: 'swipe', params: o };
+      const dir = (o.direction ?? o.scrollDirection) as 'up' | 'down' | 'left' | 'right' | undefined;
+      const coords = swipeCoordsFromDirection(dir ?? 'down');
       return {
         type: 'swipe',
-        params: (step.options as Record<string, unknown> | undefined) ?? {},
+        params: { ...coords, ...(typeof o.durationMs === 'number' ? { durationMs: o.durationMs } : {}) },
       };
+    }
 
     case 'drag':
       // Same coord contract as swipe (validated in toRunnerCommand). The runner
@@ -2124,17 +2255,20 @@ function toRunnerCommandRaw(step: MobileIntentStep): Record<string, unknown> {
     }
 
     case 'press':
-    case 'press_key':
-      return {
-        type: 'press_key',
-        params: {
-          keycode:
-            (step.options as { key?: string; keycode?: string } | undefined)?.keycode ??
-            (step.options as { key?: string } | undefined)?.key ??
-            step.value ??
-            'enter',
-        },
-      };
+    case 'press_key': {
+      // The runner passes params.keycode straight to `adb shell input keyevent
+      // <keycode>`, so it MUST be an Android keycode name (KEYCODE_ENTER), NOT
+      // a logical alias ('enter'). Android rejects 'enter' as an unknown
+      // keycode; iOS's keyMap is keyed by KEYCODE_* so a logical name silently
+      // no-ops (false pass). Normalise here to match the saved-replay converter
+      // (mapKeyToKeycode) so live and replay behave identically.
+      const rawKey =
+        (step.options as { keycode?: string } | undefined)?.keycode ??
+        (step.options as { key?: string } | undefined)?.key ??
+        step.value ??
+        'enter';
+      return { type: 'press_key', params: { keycode: mapMobileKeyToKeycode(rawKey) } };
+    }
 
     case 'go_back':
     case 'go_home':
@@ -2163,22 +2297,42 @@ function toRunnerCommandRaw(step: MobileIntentStep): Record<string, unknown> {
 
     case 'assert':
     case 'ai_check':
-    case 'assert_visible':
-      return {
-        type: 'assert_visible',
-        params: {
-          intent: step.description,
-          ...(step.assertionText ? { expectedText: step.assertionText } : {}),
-        },
-      };
-    case 'assert_text':
+    case 'assert_visible': {
+      // Mirror the saved-replay converter (intent-step-converter.ts:218-293) so
+      // a step behaves IDENTICALLY live and on replay. Three outcomes:
+      //   1. ai_check + an AI source -> ai_visual_check (semantic/visual check).
+      //   2. expected text present    -> assert_text (assert_visible has NO
+      //      expectedText field, so the value would be silently dropped and
+      //      never verified — a false-green). Use the text as the element
+      //      lookup intent, exactly like the replay path.
+      //   3. neither                  -> assert_visible (pure visibility).
+      const opts = step.options as { aiCheckSource?: 'tree' | 'screenshot'; useVisualAi?: boolean } | undefined;
+      const assertText = step.assertionText ?? step.value;
+      const aiSource = opts?.aiCheckSource ?? (opts?.useVisualAi ? 'screenshot' : undefined);
+      if (type === 'ai_check' && aiSource) {
+        return {
+          type: 'ai_visual_check',
+          params: { assertion: (assertText ?? step.description) ?? '', source: aiSource },
+        };
+      }
+      if (assertText && assertText.trim()) {
+        return {
+          type: 'assert_text',
+          params: { intent: assertText.trim(), expectedText: assertText },
+        };
+      }
+      return { type: 'assert_visible', params: { intent: step.description } };
+    }
+    case 'assert_text': {
+      // assertTextParams REQUIRES expectedText — emitting without it 400s the
+      // whole batch. Fall back assertionText -> value -> description so there's
+      // always a non-empty expected string (matches the runner's own chain).
+      const expected = step.assertionText ?? step.value ?? step.description ?? '';
       return {
         type: 'assert_text',
-        params: {
-          intent: step.description,
-          ...(step.assertionText ? { expectedText: step.assertionText } : {}),
-        },
+        params: { intent: step.description, expectedText: expected },
       };
+    }
 
     case 'open_notifications':
       return { type: 'open_notifications' };
@@ -2468,12 +2622,16 @@ function mapPlatformToMobilePlatform(
 }
 
 /**
- * Best-effort project lookup via the chat session. The blackboard doesn't
- * carry projectId today; rather than wire it through every layer for one
- * tool, we ask the DB. If the chat session has no project, returns null
- * and the tool surfaces a "no project" message to the LLM.
+ * Resolve the project for the save tool. PREFER the projectId the controller
+ * already resolved (test-case access check / warmup binding) and threaded onto
+ * the blackboard — it's authoritative and present in both scopes. Fall back to
+ * the chat_sessions.project_id lookup only when it wasn't threaded (older
+ * callers). The lookup alone dead-ends: NULL in workspace scope (row has no
+ * project_id) and no matching row in test-case scope (chatSessionId is a
+ * test_case_chat_sessions id).
  */
 async function resolveProjectId(bb: MobileBlackboard): Promise<string | null> {
+  if (bb.projectId) return bb.projectId;
   if (!bb.chatSessionId) return null;
   try {
     const { supabaseAdmin } = await import('@/db/supabase');

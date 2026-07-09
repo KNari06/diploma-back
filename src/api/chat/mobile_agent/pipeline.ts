@@ -103,6 +103,12 @@ export interface MobileDraftStepsMeta {
   platform: string;
   suggestedName?: string;
   executed: boolean;
+  /**
+   * Placeholder schema for the sanitized {{param_*}} values in the draft. The
+   * chat card forwards it on Save so the saved test case resolves those values
+   * on regression replay. Absent when no value was parameterised.
+   */
+  parametersSchema?: Record<string, unknown>;
 }
 
 export interface RunMobileAgentPipelineOpts {
@@ -121,6 +127,21 @@ export interface RunMobileAgentPipelineOpts {
    * fires.
    */
   snapshot?: MobileSnapshot | null;
+  /**
+   * When the mobile editor is scoped to a SAVED test case, a formatted summary
+   * of its existing steps. Injected as a system block so the agent EXTENDS the
+   * open flow ("add a logout after login") instead of re-authoring it from
+   * scratch (duplicate). Null/undefined = no open test case (workspace scope).
+   */
+  openTestCaseBlock?: string | null;
+  /**
+   * Prior conversation turns (oldest→newest), already role-mapped for OpenAI
+   * and secret-redacted by the handler. Threaded between the system blocks and
+   * the current user goal so the agent has memory across turns ("now do the
+   * same on signup", "no, the other button", "undo the last step"). Empty when
+   * there's no prior history or the load failed (best-effort).
+   */
+  history?: ChatCompletionMessageParam[];
 }
 
 export async function runMobileAgentPipeline(
@@ -137,9 +158,20 @@ export async function runMobileAgentPipeline(
   // stays at index 0, only index 1 changes per turn.
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: buildMobileAgentSystemPrompt() },
+    // Open-test-case steps (when the editor is scoped to a saved test) BEFORE
+    // the device snapshot: the agent should know the existing flow to extend it,
+    // not duplicate it. Stable across the turn (good for prompt cache).
+    ...(opts?.openTestCaseBlock
+      ? [{ role: 'system' as const, content: opts.openTestCaseBlock }]
+      : []),
     ...(opts?.snapshot
       ? [{ role: 'system' as const, content: formatMobileSnapshotForChat(opts.snapshot) }]
       : []),
+    // Prior turns (oldest→newest) BEFORE the current goal so the agent resolves
+    // references to earlier turns. The snapshot/open-test-case system blocks
+    // stay ABOVE history (situational context first), history is the running
+    // dialogue, and the current goal is last.
+    ...(opts?.history ?? []),
     { role: 'user', content: blackboard.goal },
   ];
 

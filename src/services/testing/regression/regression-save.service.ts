@@ -65,6 +65,13 @@ export class RegressionSaveService {
     appPackage?: string;
     startActivity?: string;
     tags?: string[];
+    /**
+     * Pre-computed parameters schema for {{param_*}} placeholders in `steps`
+     * (mobile agent sanitizes sensitive values to placeholders before save).
+     * Without it, a saved sensitive step can't resolve on regression replay —
+     * resolvePlaceholders leaves the literal and the runner types it verbatim.
+     */
+    parametersSchema?: Record<string, unknown> | null;
     // common
     userId: string;
     name: string;
@@ -92,6 +99,7 @@ export class RegressionSaveService {
         appPackage: params.appPackage,
         startActivity: params.startActivity,
         tags: params.tags,
+        parametersSchema: params.parametersSchema ?? null,
       });
     }
 
@@ -200,6 +208,7 @@ export class RegressionSaveService {
     appPackage?: string;
     startActivity?: string;
     tags?: string[];
+    parametersSchema?: Record<string, unknown> | null;
   }): Promise<{
     savedTestCaseId: string;
     projectId: string;
@@ -217,7 +226,17 @@ export class RegressionSaveService {
       appPackage,
       startActivity,
       tags,
+      parametersSchema,
     } = params;
+    // Persist the placeholder schema so {{param_*}} values resolve on replay.
+    // Guard the same limit the from-test path enforces.
+    const paramSchema =
+      parametersSchema && Object.keys(parametersSchema).length > 0 ? parametersSchema : null;
+    if (paramSchema && Object.keys(paramSchema).length > MAX_PARAMETERS_PER_TEST) {
+      throw new ValidationError(
+        `Too many parameters detected (${Object.keys(paramSchema).length}). Maximum allowed: ${MAX_PARAMETERS_PER_TEST}`,
+      );
+    }
 
     if (!projectId) {
       throw new ValidationError(
@@ -294,7 +313,7 @@ export class RegressionSaveService {
       commands: null,
       graph_ref: null,
       steps_json: normalizedSteps,
-      parameters_schema: null,
+      parameters_schema: paramSchema,
       url: effectiveUrl,
       start_url: effectiveUrl,
       tags: tags || null,

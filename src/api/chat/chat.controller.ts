@@ -752,6 +752,10 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
           // ChatPersistence; legacy handlers receive but ignore it.
           chatStore,
           testCaseId,
+          // Controller-resolved project (test-case access check). Lets the
+          // mobile agent's save tool resolve the project without the
+          // chat_sessions.project_id lookup that is NULL in mobile scopes.
+          projectId: testCaseAccess?.projectId,
         }),
         timeoutGuard,
       ]);

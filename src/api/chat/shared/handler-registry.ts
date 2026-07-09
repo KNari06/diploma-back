@@ -71,6 +71,11 @@ export type IntentHandler = (
     chatStore?: ChatStore;
     /** Test-case scope marker (UUID). Mirrors the controller-level binding. */
     testCaseId?: string;
+    /**
+     * Controller-resolved project (from the test-case access check). Handlers
+     * that need it (mobile agent save tool) use it instead of a second lookup.
+     */
+    projectId?: string;
   }
 ) => Promise<void>;
 
@@ -218,6 +223,10 @@ const handleMobileAgent: IntentHandler = async (req, res, params) => {
     // Forward the persistence backend so test-case-scoped mobile chats
     // land in the test-case store instead of leaking to the global tables.
     chatStore: params.chatStore,
+    // Forward the controller-resolved project + test case so the save tool
+    // resolves the project instead of dead-ending on the chat_sessions lookup.
+    projectId: params.projectId,
+    testCaseId: params.testCaseId,
   });
 };
 
