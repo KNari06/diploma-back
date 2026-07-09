@@ -121,6 +121,22 @@ export function reduceRuntimeMeta(meta: any): any {
           ui: typeof meta.stepErrors.ui === 'number' ? meta.stepErrors.ui : 0,
         }
       : undefined,
+    // link_test_case output capture (mobile `scratchpadSnapshot` / web
+    // `extractedDataSnapshot`, plus which keys redaction masked) — dropped by
+    // this function's allowlist until now, so `readFinalVariables`
+    // (linked-test-case-runner.service.ts) never saw a persisted run's
+    // captured variables and the redacted-key ValidationError check could
+    // never fire. Already redacted by the producer before it reaches here
+    // (Hard invariant #10) — no new redaction needed, just stop discarding it.
+    scratchpadSnapshot: meta.scratchpadSnapshot && typeof meta.scratchpadSnapshot === 'object'
+      ? safeCloneForStorage(meta.scratchpadSnapshot, { maxDepth: 2, maxStringLen: 2000, maxArrayLen: 50, maxObjectKeys: 200 })
+      : undefined,
+    extractedDataSnapshot: meta.extractedDataSnapshot && typeof meta.extractedDataSnapshot === 'object'
+      ? safeCloneForStorage(meta.extractedDataSnapshot, { maxDepth: 2, maxStringLen: 2000, maxArrayLen: 50, maxObjectKeys: 200 })
+      : undefined,
+    redactedSnapshotKeys: Array.isArray(meta.redactedSnapshotKeys)
+      ? safeCloneForStorage(meta.redactedSnapshotKeys, { maxDepth: 1, maxStringLen: 200, maxArrayLen: 200, maxObjectKeys: 200 })
+      : undefined,
   };
 }
 

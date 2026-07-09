@@ -222,7 +222,7 @@ export class RegressionTestQueryService {
 
     const { data } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, commands, graph_ref, steps_json, setup_steps, teardown_steps, replay_strategy')
+      .select('id, platform, commands, graph_ref, steps_json, setup_steps, teardown_steps, replay_strategy')
       .in('id', uiIds);
 
     return data || [];

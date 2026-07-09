@@ -1,5 +1,5 @@
 /* eslint-disable no-case-declarations */
-import { collectSecretValues, redactWithValues } from '@/utils/interpolation/redact-secrets';
+import { collectSecretValues, redactWithValues, redactSnapshotValues } from '@/utils/interpolation/redact-secrets';
 import { AIExtractService } from '@/services/ai-extract';
 import { SelfHealingService } from '@/services/ai-selector/self-healing.service';
 import { AICostManager } from '@/services/ai/cost/ai-cost-manager.service';
@@ -3416,17 +3416,15 @@ export class CommandExecutor {
     // broadcast — Hard invariant #10.
     const snapshot = (meta as Record<string, unknown>).extractedDataSnapshot;
     if (snapshot && typeof snapshot === 'object') {
-      let redactedSnapshot: Record<string, string> | undefined;
-      for (const [key, value] of Object.entries(snapshot as Record<string, string>)) {
-        if (typeof value !== 'string') continue;
-        const r = redactWithValues(value, this.redactValues);
-        if (r === value) continue;
-        if (!redactedSnapshot) redactedSnapshot = { ...(snapshot as Record<string, string>) };
-        redactedSnapshot[key] = r;
-      }
-      if (redactedSnapshot) {
+      const result = redactSnapshotValues(snapshot as Record<string, string>, this.redactValues);
+      if (result) {
         if (!cloned) cloned = { ...meta };
-        (cloned as Record<string, unknown>).extractedDataSnapshot = redactedSnapshot;
+        (cloned as Record<string, unknown>).extractedDataSnapshot = result.snapshot;
+        // linked-test-case-runner.service.ts's readFinalVariables needs to
+        // know WHICH keys were masked so an outputBinding sourcing a
+        // redacted key can fail loudly instead of silently resolving to the
+        // literal '***' mask as if it were the real value.
+        (cloned as Record<string, unknown>).redactedSnapshotKeys = result.redactedKeys;
       }
     }
     return cloned ?? meta;

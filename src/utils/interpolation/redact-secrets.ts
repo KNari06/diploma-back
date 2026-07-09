@@ -105,6 +105,47 @@ export function redactWithValues(value: string, secretValues: readonly string[])
   return out;
 }
 
+/** Result of masking a flat key→string snapshot against a secret-value list. */
+export interface SnapshotRedactionResult {
+  /** Same keys as the input, with masked values where a secret matched. */
+  snapshot: Record<string, string>;
+  /** Keys whose value was actually changed by masking — i.e. held a secret. */
+  redactedKeys: string[];
+}
+
+/**
+ * Redact every string VALUE in a flat key→string snapshot (e.g. a
+ * `link_test_case` scratchpad/extractedData snapshot) against a secret-value
+ * list. Keys are dynamic variable names, so every value is checked rather
+ * than a fixed field list — mirrors `redactRuntimeMeta`'s snapshot handling
+ * in `command-executor.ts` (CLAUDE.md Hard invariant #10).
+ *
+ * Returns `undefined` when nothing needed masking (no snapshot / no secrets
+ * / no match) so callers can cheaply skip cloning their meta object.
+ *
+ * `redactedKeys` lets a caller distinguish "this variable legitimately holds
+ * `{{secrets.*}}`" from "this variable never had a secret" — needed so
+ * `link_test_case` outputBinding resolution can fail loudly instead of
+ * silently handing back the literal mask as if it were the real value.
+ */
+export function redactSnapshotValues(
+  snapshot: Record<string, string> | null | undefined,
+  secretValues: readonly string[],
+): SnapshotRedactionResult | undefined {
+  if (!snapshot || secretValues.length === 0) return undefined;
+  let redacted: Record<string, string> | undefined;
+  const redactedKeys: string[] = [];
+  for (const [key, value] of Object.entries(snapshot)) {
+    if (typeof value !== 'string') continue;
+    const r = redactWithValues(value, secretValues);
+    if (r === value) continue;
+    if (!redacted) redacted = { ...snapshot };
+    redacted[key] = r;
+    redactedKeys.push(key);
+  }
+  return redacted ? { snapshot: redacted, redactedKeys } : undefined;
+}
+
 /** Structural shape of the runtime credentials carried by agent configs. */
 export interface RedactableCredentials {
   email?: string;

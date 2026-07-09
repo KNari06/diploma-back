@@ -8,6 +8,7 @@ import type { ExecutableTestCase } from '@/types/testing.types';
  */
 export interface UiStepCountRow {
   id: string;
+  platform?: string | null;
   replay_strategy?: string;
   commands?: unknown[];
   graph_ref?: { steps?: unknown[] };
@@ -32,11 +33,20 @@ export interface UiStepCountRow {
  *
  * @param uiCases the run's `testType:'ui'` cases (carry `platform`)
  * @param rows    step-count rows fetched for those cases (keyed by `id`)
+ * @param expandedLengthById optional override: `steps_json` length to use
+ *   for a row INSTEAD of `row.steps_json.length`, keyed by test case id.
+ *   Produced by `LinkResolutionService.expandLinkedStepCounts` — a
+ *   `link_test_case` step is one entry in `steps_json` but inlines the
+ *   entire linked test case at dispatch time (same-platform links only;
+ *   see that function's docs). Absent/no entry for a row → uses the row's
+ *   own `steps_json.length` unchanged (a test case with no links, the
+ *   overwhelming majority).
  * @returns total UI step credits (web 1×, mobile 4×), incl. a per-case minimum
  */
 export function computeUiStepCredits(
   uiCases: Pick<ExecutableTestCase, 'testCaseId' | 'platform'>[],
   rows: UiStepCountRow[],
+  expandedLengthById?: Map<string, number>,
 ): number {
   if (uiCases.length === 0) return 0;
 
@@ -55,8 +65,10 @@ export function computeUiStepCredits(
     } else if (row.replay_strategy === 'graph_extract' && row.graph_ref?.steps) {
       stepCount = Array.isArray(row.graph_ref.steps) ? row.graph_ref.steps.length : 0;
     } else if (Array.isArray(row.steps_json)) {
-      // Step editor test cases: count steps_json (+ 1 for initial goto)
-      stepCount = row.steps_json.length + 1;
+      // Step editor test cases: count steps_json (+ 1 for initial goto),
+      // expanded for any same-platform link_test_case step it contains.
+      const rawLength = expandedLengthById?.get(row.id) ?? row.steps_json.length;
+      stepCount = rawLength + 1;
     }
     // Phase 3: setup_steps / teardown_steps are prepended / appended at dispatch
     // time by stitchPhases(). The user is billed for what runs, so count those

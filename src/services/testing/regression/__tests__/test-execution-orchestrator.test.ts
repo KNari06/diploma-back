@@ -288,6 +288,128 @@ describe('TestExecutionOrchestratorService.executeTestCasesAsync', () => {
     const call = mockUpdateStatus.mock.calls.find((c: any[]) => c[0].id === 'e1');
     expect(call![0].status).toBe('failed');
     expect(call![0].errorMessage).toContain('cross-platform Link Test Case step');
+
+    // Regression: when this rejected case is the run's ONLY test case,
+    // `uiTestIds` stays empty (never dispatched) and it isn't an API test
+    // either, so the "only API tests exist" finalize branch used to compute
+    // hasFails from `apiFailed` alone (0) and persist a false 'completed'
+    // with a 0/0/0 summary — even though the run's one test case never ran.
+    const finalize = mockUpdateRun.mock.calls.at(-1)![1];
+    expect(finalize.status).toBe('failed');
+    expect((finalize.summary as any).failed).toBe(1);
+  });
+
+  it('does not trip fail-fast on the unresolved cross-platform Link Test Case rejection, letting unrelated tests in the batch still dispatch', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [
+        { id: 'e1', test_case_id: 'ui-1', test_type: 'ui' },
+        { id: 'e2', test_case_id: 'api-1', test_type: 'api' },
+      ],
+      error: null,
+    });
+    mockGetSavedCase.mockResolvedValue({
+      platform: 'mobile_android',
+      steps_json: [
+        {
+          id: 's1',
+          type: 'link_test_case',
+          options: {
+            linkTestCase: {
+              linkedTestCaseId: 'other-tc',
+              linkedPlatform: 'web',
+              inputBindings: [],
+              outputBindings: [],
+            },
+          },
+        },
+      ],
+    });
+    mockExecuteApi.mockResolvedValue({ success: true, id: 'apiexec-1', status_code: 200 });
+
+    // ui-1 (validation-rejected) is dispatched before the unrelated api-1 —
+    // same level, stable priority order preserves input order.
+    await run([uiTC({ testCaseId: 'ui-1' }), apiTC({ testCaseId: 'api-1' })], { failFast: true });
+
+    // the unrelated api test still ran: a ValidationError must not trip fail-fast
+    expect(mockExecuteApi).toHaveBeenCalledTimes(1);
+    const finalize = mockUpdateRun.mock.calls.at(-1)![1];
+    expect((finalize.summary as any).failFastTriggered).not.toBe(true);
+    // Regression: the run overall must still reflect that ui-1 never ran —
+    // not tripping fail-fast (so api-1 still dispatches) is a different
+    // decision from "the run's aggregate outcome ignores the rejection".
+    expect(finalize.status).toBe('failed');
+    expect((finalize.summary as any).passed).toBe(1);
+    expect((finalize.summary as any).failed).toBe(1);
+
+    const call = mockUpdateStatus.mock.calls.find((c: any[]) => c[0].id === 'e1');
+    expect(call![0].status).toBe('failed');
+    expect(call![0].errorMessage).toContain('cross-platform Link Test Case step');
+  });
+
+  // Empirical check for a code-review finding: does a validation-rejected UI
+  // test case's rejection survive when paired with a SECOND UI test case that
+  // dispatches successfully (uiTestIds.length > 0 branch — deferred
+  // finalization via recomputeRunStatus), not just when paired with an API
+  // test case (the immediate-finalize branch, already covered above)?
+  it('marks the execution row failed for a validation-rejected UI case even when a sibling UI case dispatches', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [
+        { id: 'e1', test_case_id: 'ui-1', test_type: 'ui' },
+        { id: 'e2', test_case_id: 'ui-2', test_type: 'ui' },
+      ],
+      error: null,
+    });
+    mockGetSavedCase.mockImplementation(async (testCaseId: string) => {
+      if (testCaseId === 'ui-1') {
+        return {
+          platform: 'mobile_android',
+          steps_json: [{
+            id: 's1',
+            type: 'link_test_case',
+            options: { linkTestCase: { linkedTestCaseId: 'other-tc', linkedPlatform: 'web', inputBindings: [], outputBindings: [] } },
+          }],
+        };
+      }
+      return { platform: 'web' };
+    });
+    mockBuildWebReq.mockResolvedValue({});
+    mockRunTest.mockResolvedValue({ success: true, data: { id: 'test-web-2' } });
+
+    await run([uiTC({ testCaseId: 'ui-1' }), uiTC({ testCaseId: 'ui-2' })]);
+
+    // ui-2 dispatched: this run defers finalization to recomputeRunStatus
+    // rather than finalizing synchronously (matches "routes web UI tests..."
+    // behavior above) — confirmed by checking test_ids was linked, not a
+    // terminal status written here.
+    const linkCall = mockUpdateRun.mock.calls.find((c) => Array.isArray((c[1] as any).test_ids));
+    expect(linkCall).toBeTruthy();
+
+    // The regression-under-test: does ui-1's execution row still get marked
+    // failed here, so recomputeRunStatus's later test_executions-based
+    // aggregation (which has no other way to learn about the rejection) sees
+    // it as a real failure instead of the row staying stuck 'running'/absent?
+    const call = mockUpdateStatus.mock.calls.find((c: any[]) => c[0].id === 'e1');
+    expect(call).toBeTruthy();
+    expect(call![0].status).toBe('failed');
+  });
+
+  it('still trips fail-fast on a genuine dispatch exception (not a ValidationError)', async () => {
+    mockGetExecRefs.mockResolvedValue({
+      rows: [
+        { id: 'e1', test_case_id: 'ui-1', test_type: 'ui' },
+        { id: 'e2', test_case_id: 'api-1', test_type: 'api' },
+      ],
+      error: null,
+    });
+    mockGetSavedCase.mockRejectedValue(new Error('db unreachable'));
+    mockExecuteApi.mockResolvedValue({ success: true, id: 'apiexec-1', status_code: 200 });
+
+    await run([uiTC({ testCaseId: 'ui-1' }), apiTC({ testCaseId: 'api-1' })], { failFast: true });
+
+    // fail-fast tripped on ui-1's crash — api-1 never dispatched
+    expect(mockExecuteApi).not.toHaveBeenCalled();
+    const finalize = mockUpdateRun.mock.calls.at(-1)![1];
+    expect((finalize.summary as any).failFastTriggered).toBe(true);
   });
 
   it('surfaces out-of-run dependencies in the run summary instead of swallowing them', async () => {

@@ -34,11 +34,13 @@ import {
   insertRun,
   updateRunById,
   updateRunByIdIfActive,
-  failZombieRuns,
+  findZombieRunCandidates,
+  forceFailRunsByIds,
   listRunsByProject,
   getRunExecutionStatsRows,
 } from './db/regression-run.db';
 import { getProjectForAccess, getTestBrowsersAndOptions } from './db/regression.db';
+import { isPendingSegmentsStale } from '@/services/testing/results/test-completion-handler.service';
 import { priorityRank } from './resolve-test-case-priority.util';
 import { TestExecutionOrchestratorService } from './test-execution-orchestrator.service';
 
@@ -75,12 +77,33 @@ export class RegressionRunService {
    */
   static async cleanupZombieRuns(): Promise<void> {
     try {
-      const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-      const { ids: zombieRunIds, error } = await failZombieRuns(thirtyMinutesAgo);
+      const now = Date.now();
+      const thirtyMinutesAgo = new Date(now - 30 * 60 * 1000).toISOString();
+      const { candidates, error: findError } = await findZombieRunCandidates(thirtyMinutesAgo);
 
-      if (error) {
+      if (findError) {
         // Use formatError so upstream HTML gateway responses (e.g. Cloudflare 520
         // when Supabase origin is down) don't dump multi-KB of HTML into the logs.
+        logger.error('[REGRESSION_RUN] Failed to find zombie run candidates', { error: formatError(findError) });
+        return;
+      }
+
+      // The candidate query casts a broad net on chain-wide `started_at`
+      // alone. A segmented (link_test_case) chain can legitimately still be
+      // executing despite an old `started_at` — filter those out using the
+      // same per-segment clock recomputeRunStatus's own staleness guard uses
+      // (ADR-0011 update 6), instead of force-failing every old row
+      // unconditionally.
+      const idsToFail = candidates
+        .filter((c) => (c.pending_segments ?? 0) <= 0 || isPendingSegmentsStale(
+          { started_at: c.started_at, last_segment_dispatched_at: c.last_segment_dispatched_at },
+          now,
+        ))
+        .map((c) => c.id);
+
+      const { ids: zombieRunIds, error } = await forceFailRunsByIds(idsToFail);
+
+      if (error) {
         logger.error('[REGRESSION_RUN] Failed to cleanup zombie runs', { error: formatError(error) });
         return;
       }
@@ -158,12 +181,19 @@ export class RegressionRunService {
       // with no links (or only same-platform ones) always segments to
       // exactly one "steps" segment, so this is a no-op for every existing
       // test case.
-      intentCase.steps_json = await LinkResolutionService.resolveSameProlatformLinks(
+      const { resolvedSteps, segments } = await LinkResolutionService.resolveAndCheckForCrossPlatform(
         (intentCase.steps_json as IntentStep[]) || [],
         intentCase.platform || 'web',
         userId,
       );
-      const segments = LinkResolutionService.segmentByLinks(intentCase.steps_json as IntentStep[]);
+      intentCase.steps_json = resolvedSteps;
+      // Segments remaining AFTER the first one dispatches — only set for a
+      // segmented (cross-platform link) chain; every other run leaves this
+      // NULL/undefined so recomputeRunStatus's pending-segments check is a
+      // no-op for the overwhelming majority of runs. See the write-up in
+      // dispatchFirstSegmentAndDetachRest for why this exists.
+      const isSegmentedChain = segments.some((s) => s.kind === 'link');
+      const pendingSegments = isSegmentedChain ? segments.length - 1 : undefined;
 
       // 1b. Credit check + deduction for single test case
       await this.checkCreditBalance(
@@ -173,13 +203,18 @@ export class RegressionRunService {
       );
 
       // 2. Create regression run record (now uses intent_test_case_id)
+      const dispatchStartedAt = new Date().toISOString();
       const { data: run, error: runError } = await insertRun({
         intent_test_case_id: intentTestCaseId,
         project_id: intentCase.project_id,
         user_id: userId,
         trigger,
         status: 'running',
-        started_at: new Date().toISOString(),
+        started_at: dispatchStartedAt,
+        // `last_segment_dispatched_at` starts equal to `started_at` — the
+        // first segment IS the run starting. See the migration file for why
+        // this anchors staleness per-segment instead of chain-wide.
+        ...(pendingSegments !== undefined ? { pending_segments: pendingSegments, last_segment_dispatched_at: dispatchStartedAt } : {}),
       });
 
       if (runError || !run) {
@@ -471,22 +506,18 @@ export class RegressionRunService {
       //
       // `runSegmentedTestCase` only returns once every segment in the chain
       // has succeeded (a failed/cancelled segment throws instead) — so
-      // reaching this line means the run is genuinely done. The outer
-      // `regression_runs` row's `status` otherwise never leaves 'running':
-      // the per-test `handleTestCompletion` → `recomputeRunStatus` hook fires
-      // off the FIRST segment's own completion (it matches by `test_id`,
-      // which points at segment 1 the whole time this method runs) and
-      // finalizes the row prematurely, based on segment 1 alone, before the
-      // rest of the chain even executes — then never rematches later
-      // segments since the row is no longer 'running'/'pending'. Writing the
-      // real terminal status here, last, overwrites that premature value.
-      // Guarded write (`...IfActive`, not the raw `updateRunById`): if the
-      // user cancelled this run (or the stale-run reaper force-failed it)
-      // while the chain was still finishing, the row is no longer
-      // 'running'/'pending' and this must NOT clobber that outcome back to
-      // 'completed'.
+      // reaching this line means the run is genuinely done. `test_id` is
+      // never written to `regression_runs` while this fully-synchronous path
+      // runs (only at the very end, here), so this branch never hits the
+      // premature-finalization race the main path below guards against —
+      // `recomputeRunStatus` has no `test_id` to match an intermediate
+      // segment's completion against. `pending_segments: 0` still clears the
+      // initial "chain has N segments" count set at run creation, and the
+      // guarded write (`...IfActive`, not raw `updateRunById`) protects
+      // against clobbering a status the user cancelled (or the stale-run
+      // reaper force-failed) while this was still finishing.
       const finalTestId = await this.runSegmentedTestCase(intentCase, segments, userId, trigger, parameters, browserOverride, chatSessionId, runId);
-      await updateRunByIdIfActive(runId, { status: 'completed', completed_at: new Date().toISOString() });
+      await updateRunByIdIfActive(runId, { status: 'completed', pending_segments: 0, completed_at: new Date().toISOString() });
       return finalTestId;
     }
 
@@ -542,8 +573,14 @@ export class RegressionRunService {
               runId,
             );
             // Reflect progress so a client re-fetching the run row sees the
-            // CURRENT segment, not just the first.
-            await updateRunById(runId, { test_id: lastTestId });
+            // CURRENT segment, not just the first — and update the pending-
+            // segments count so `recomputeRunStatus` knows how many segments
+            // are still left to dispatch (0 once this was the last one).
+            // Guarded (`...IfActive`, not raw `updateRunById`): a run the
+            // user cancelled (or the stale-run reaper force-failed) mid-chain
+            // must not have its test_id silently reset to a later segment
+            // after the row already went terminal.
+            await this.recordSegmentProgress(runId, remaining.length - 1 - i, { test_id: lastTestId });
 
             const status = await LinkedTestCaseRunnerService.pollUntilTerminal(lastTestId);
             if (status === 'failed' || status === 'cancelled' || status === 'error' || status === 'timeout') {
@@ -559,6 +596,12 @@ export class RegressionRunService {
             });
             for (const [alias, value] of outcome.outputs) linkOutputs.set(alias, value);
             depth += 1;
+            // A "link" segment doesn't update the outer run's own test_id,
+            // but it still consumes one slot of the pending-segments count —
+            // a chain whose last segment is a link must still reach 0, or
+            // `recomputeRunStatus` would defer finalization forever after
+            // the final steps segment (if any) already went terminal.
+            await this.recordSegmentProgress(runId, remaining.length - 1 - i);
           }
         }
 
@@ -587,11 +630,39 @@ export class RegressionRunService {
           runId,
           error: err instanceof Error ? err.message : String(err),
         });
-        await updateRunById(runId, { status: 'failed', completed_at: new Date().toISOString() }).catch(() => { /* best effort */ });
+        // Guarded (`...IfActive`, not raw `updateRunById`): significant time
+        // has passed by the time this catch runs (a whole chain's worth of
+        // dispatch+poll), so a concurrent cancel or stale-run reaper force-
+        // fail is a live possibility here, unlike the top-level synchronous
+        // dispatch failure path elsewhere in this file.
+        await updateRunByIdIfActive(runId, { status: 'failed', completed_at: new Date().toISOString() }).catch(() => { /* best effort */ });
       }
     })();
 
     return firstTestId;
+  }
+
+  /**
+   * Guarded write recording that a segment in a chain just dispatched or
+   * completed — updates `pending_segments` and resets the per-segment
+   * staleness clock (`last_segment_dispatched_at`) together, so a future edit
+   * to this bookkeeping can't update one without the other (that drift would
+   * silently reintroduce the premature-finalization bug this pairing exists
+   * to prevent — see the migration file / ADR-0011 update 6). Was previously
+   * duplicated verbatim at both per-segment call sites in the loop below,
+   * differing only in whether `test_id` was also set — `extraFields` covers
+   * that difference.
+   */
+  private static async recordSegmentProgress(
+    runId: string,
+    pendingSegments: number,
+    extraFields: Record<string, unknown> = {},
+  ): Promise<void> {
+    await updateRunByIdIfActive(runId, {
+      ...extraFields,
+      pending_segments: pendingSegments,
+      last_segment_dispatched_at: new Date().toISOString(),
+    });
   }
 
   /**
@@ -658,12 +729,29 @@ export class RegressionRunService {
     // `testType:'ui'` distinguished by `platform` (mobile_*), so read platform
     // off the case, not the row.
     let uiStepCredits = 0;
+    let hasCrossPlatformLinks = false;
     if (uiCases.length > 0) {
       const uiIds = uiCases.map((tc) => tc.testCaseId);
       const rows = await RegressionTestQueryService.getUiStepCountRows(uiIds);
+      // A link_test_case step is exactly ONE entry in steps_json regardless
+      // of whether the linked test case has 1 or 100 steps. Expand
+      // same-platform links (which inline into THIS execution, same rate,
+      // fully recursively as of ADR-0011 update 6) before costing — see
+      // expandLinkedStepCounts's docs for why cross-platform links are
+      // flagged instead of expanded.
+      const { expandedLengthById, hasCrossPlatformLinks: crossPlatform } =
+        await LinkResolutionService.expandLinkedStepCounts(uiCases, rows);
+      hasCrossPlatformLinks = crossPlatform;
+      if (hasCrossPlatformLinks) {
+        logger.warn('[REGRESSION_RUN] Credit estimate may be understated: unexpanded cross-platform link_test_case step(s)', {
+          userId,
+          source,
+          uiTestCount: uiCases.length,
+        });
+      }
       // Pure arithmetic lives in computeUiStepCredits (unit-tested) — web 1×,
       // mobile MOBILE_STEP_CREDIT_MULTIPLIER×, matching the post-run charge.
-      uiStepCredits = computeUiStepCredits(uiCases, rows);
+      uiStepCredits = computeUiStepCredits(uiCases, rows, expandedLengthById);
     }
 
     // ai-analysis.job charges BUG_REPORT_CREDITS per UI test_result where bugs
@@ -695,6 +783,7 @@ export class RegressionRunService {
       graceLimit: creditCheck.graceLimit,
       effectiveAvailable: creditCheck.effectiveAvailable,
       uiTestCount: uiCases.length,
+      hasCrossPlatformLinks,
     });
     // Gate on effectiveAvailable (balance + grace_limit), matching the runtime
     // per-step gate in CreditCostTrackerService. Using raw `available` here made
@@ -706,7 +795,7 @@ export class RegressionRunService {
       // `code: 'INSUFFICIENT_CREDITS'` to the frontend (which then flips the
       // global "credits exhausted" banner instead of a generic toast).
       throw new InsufficientCreditsError(
-        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost} + ${bugReportBudget} bug-report budget), Available: ${creditCheck.effectiveAvailable}`,
+        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost} + ${bugReportBudget} bug-report budget)${hasCrossPlatformLinks ? ' [estimate may be understated: links to a test case on another platform]' : ''}, Available: ${creditCheck.effectiveAvailable}`,
         {
           required: totalRequired,
           available: creditCheck.effectiveAvailable,
@@ -715,6 +804,7 @@ export class RegressionRunService {
             apiCount,
             apiCreditCost,
             bugReportBudget,
+            hasCrossPlatformLinks,
           },
         },
       );
