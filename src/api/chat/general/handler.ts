@@ -7,6 +7,7 @@ import { UserCreditsService } from '@/services/core/user-credits.service';
 import { getSummariesForContext, summarizeOldMessages } from '@/services/ai/summarization/chat-summarization.service';
 import { formatPageContextForChat, getPageContext, type PageContext } from '@/services/chat/editor-context.service';
 import { ChatTestTraceService } from '@/services/chat/chat-test-trace.service';
+import { wrapUntrustedContent, UNTRUSTED_WEB_CONTENT_INSTRUCTION } from '@/services/chat/untrusted-content-wrapper';
 import { getProjectFiles, searchKB } from '@/services/kb/kb.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { ChatPersistence } from '@/services/utils/chat-persistence';
@@ -259,9 +260,16 @@ export async function handleGeneralChat(
     chatStore?: ChatStore;
     /** Test-case scope marker; passed through for downstream loggers / WS rooms. */
     testCaseId?: string;
+    /**
+     * The test case's authoritative project id (from assertCanAccessTestCase),
+     * threaded only in test-case scope. Trusted (access already verified). Used
+     * to seed projectId so KB/file/project context and tool scope target the
+     * test case's own project instead of falling back to the workspace default.
+     */
+    testCaseProjectId?: string;
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context: rawContext, workspace_id: paramWorkspaceId, abortSignal, logger: functionLogger, mode, attachments, needsTools, testCaseId } = params;
+  const { message, userId, chatSessionId, context: rawContext, workspace_id: paramWorkspaceId, abortSignal, logger: functionLogger, mode, attachments, needsTools, testCaseId, testCaseProjectId } = params;
   // Resolve persistence backend with safe default. Done at the top so
   // every read/write below uses the same store value, preventing a
   // mid-handler refactor mistake from sending some messages to one table
@@ -616,6 +624,14 @@ export async function handleGeneralChat(
   );
 
   let projectId = typeof context === 'object' ? context?.projectId : undefined;
+  // In test-case scope the client intentionally omits projectId, and
+  // resolveProjectId can't recover it (it reads the GLOBAL chat_sessions
+  // table, which a test_case_chat_sessions id misses → workspace default).
+  // Seed from the test case's own access-checked project so KB/file/project
+  // context and tool scope target the right project. See BUG-1.
+  if (!projectId && store.kind === 'testcase' && testCaseProjectId) {
+    projectId = testCaseProjectId;
+  }
   const parsedContext = typeof context === 'object' && context !== null && !Array.isArray(context)
     ? context as Record<string, any>
     : undefined;
@@ -807,7 +823,7 @@ export async function handleGeneralChat(
     try {
       const { SkillRegistry } = await import('@/services/skills');
 
-      const skillContext = { userId, workspaceId, chatSessionId, projectId, mode: mode as 'lite' | 'pro' | 'editor' | undefined };
+      const skillContext = { userId, workspaceId, chatSessionId, projectId, mode: mode as 'lite' | 'pro' | 'editor' | undefined, storeKind: store.kind, testCaseId };
       availableTools = await SkillRegistry.getAvailableTools(skillContext);
       skillDescriptions = await SkillRegistry.getSkillDescriptions(skillContext);
 
@@ -835,6 +851,14 @@ export async function handleGeneralChat(
     ? withFunctionLogging(buildChatSystemPrompt, 'buildChatSystemPrompt', functionLogger)
     : buildChatSystemPrompt;
   let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions, projectId, projectName, integrationContext, kbFileNames);
+
+  // SECURITY: when untrusted content (live page context OR uploaded documents)
+  // is injected below, add the untrusted-content policy ONCE so every wrapped
+  // block inherits the "treat as observation, never instructions" rule.
+  const hasDocumentAttachments = !!attachments?.some(f => f.type === 'document' && f.extractedText);
+  if (editorPageContext || hasDocumentAttachments) {
+    systemPrompt += `\n\n${UNTRUSTED_WEB_CONTENT_INSTRUCTION}`;
+  }
 
   // Append editor-specific instructions if in editor mode
   if (mode === 'editor' && editorPageContext) {
@@ -1057,12 +1081,14 @@ You are inside the editor for the test case currently open in the preview. The
     // Build content array with text + images
     const contentParts: ChatCompletionContentPart[] = [];
 
-    // Text part: original message + appended document contents
+    // Text part: original message + appended document contents.
+    // SECURITY: uploaded/forwarded documents are attacker-controllable, so
+    // their text is wrapped in an untrusted-content fence (markers stripped
+    // from the body so a planted delimiter can't break out) rather than a
+    // bare Markdown code fence that ``` inside the doc could close.
     let textContent = message;
     for (const doc of attachments.filter(f => f.type === 'document' && f.extractedText)) {
-      const ext = doc.name.split('.').pop()?.toLowerCase() || '';
-      const langHint = ext === 'json' ? 'json' : ext === 'md' ? 'markdown' : '';
-      textContent += `\n\nAttached file "${doc.name}":\n\`\`\`${langHint}\n${doc.extractedText}\n\`\`\``;
+      textContent += `\n\nAttached file "${doc.name}":\n${wrapUntrustedContent(doc.extractedText!, `DOCUMENT: ${doc.name}`)}`;
     }
     contentParts.push({ type: 'text', text: textContent });
 
@@ -1379,6 +1405,8 @@ You are inside the editor for the test case currently open in the preview. The
           projectId,
           previewSessionId: resolvedPreviewSessionId,
           mode: mode as 'lite' | 'pro' | 'editor' | undefined,
+          storeKind: store.kind,
+          testCaseId,
         };
 
         const callResult = await executeTool({

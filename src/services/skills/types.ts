@@ -36,6 +36,8 @@ export interface SkillContext {
   projectId?: string;
   previewSessionId?: string; // Active editor preview session (for live preview execution)
   mode?: 'lite' | 'pro' | 'editor'; // Chat execution mode — skills may behave differently in editor mode
+  storeKind?: 'global' | 'testcase'; // Chat scope — lets a skill gate itself to global vs per-test-case chat
+  testCaseId?: string; // Present when storeKind === 'testcase' (the test case being edited)
 }
 
 /**

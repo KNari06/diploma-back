@@ -24,10 +24,15 @@ export const MemorySkill: SkillDefinition = {
   tools: MEMORY_TOOLS,
 
   /**
-   * Memory tools are always available — they don't require external integration tokens.
-   * Only require a workspaceId, which is validated at execution time.
+   * Memory tools don't need external tokens, but they operate at WORKSPACE
+   * scope (writeMemory/searchMemory/forgetMemory key on workspace_id only).
+   * There is no per-test-case memory partition, so exposing them inside the
+   * per-test-case editor chat would let facts/deletes from one test case bleed
+   * into global chat and every other test case. Keep them to global chat until
+   * a test-case-scoped memory store exists. (Reads via getMemoryForContext are
+   * unaffected — workspace memory is intentionally injected everywhere.)
    */
-  isAvailable: async () => true,
+  isAvailable: async (context) => context.storeKind !== 'testcase',
 
   /**
    * Route to the existing executeMemoryTool dispatcher.
