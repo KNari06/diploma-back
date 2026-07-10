@@ -37,6 +37,11 @@ describe('extractJson', () => {
     expect(extractJson('result:\n```\n[5,6]\n```')).toEqual([5, 6]);
   });
 
+  it('recovers a plain ```json-fenced object with nothing else around it (Gemini 2.5 Flash vision incident, 2026-07-10)', () => {
+    const content = '```json\n{\n"anomalyDetected": false,\n"category": null,\n"description": "",\n"confidence": 0\n}\n```';
+    expect(extractJson(content)).toEqual({ anomalyDetected: false, category: null, description: '', confidence: 0 });
+  });
+
   it('returns null when there is no JSON at all', () => {
     expect(extractJson('just some prose, nothing structured')).toBeNull();
   });
