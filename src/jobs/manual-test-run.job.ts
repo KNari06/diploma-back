@@ -495,6 +495,17 @@ export class ManualTestRunJobHandler {
           testId,
           browser,
         });
+      }
+      // ADR-0012 — best-effort, never blocks the test path. No-ops internally
+      // when VISUAL_ANOMALY_SWEEP_ENABLED is off.
+      try {
+        await QueueManager.addVisualAnomalySweepJob(resultId, testId);
+      } catch (sweepError) {
+        logger.warn(`[TEST-RUN] Failed to queue visual anomaly sweep job: ${testId}`, {
+          error: sweepError instanceof Error ? sweepError.message : String(sweepError),
+          resultId,
+          testId,
+        });
         // Continue execution - test result is saved, WebSocket events sent
       }
 
@@ -643,6 +654,17 @@ export class ManualTestRunJobHandler {
         browser,
         resultId,
         error: aiJobError instanceof Error ? aiJobError.message : String(aiJobError),
+      });
+    }
+
+    // ADR-0012 — best-effort visual anomaly sweep, useful for failures too.
+    try {
+      await QueueManager.addVisualAnomalySweepJob(resultId, testId);
+    } catch (sweepError) {
+      logger.warn('[TEST-RUN] Failed to queue visual anomaly sweep job for failed result', {
+        testId,
+        resultId,
+        error: sweepError instanceof Error ? sweepError.message : String(sweepError),
       });
     }
 
@@ -842,6 +864,9 @@ export class ManualTestResultJobHandler {
 
       // Add AI analysis job
       await QueueManager.addAIAnalysisJob((savedResult as any).id, testId);
+
+      // ADR-0012 — best-effort visual anomaly sweep. No-ops internally when disabled.
+      await QueueManager.addVisualAnomalySweepJob((savedResult as any).id, testId);
 
       // Update overall test status
       await this.updateOverallTestStatus(testId);

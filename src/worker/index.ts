@@ -15,6 +15,7 @@ import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manu
 import { MobileTestRunJobHandler } from '@/jobs/mobile-test-run.job';
 import { processNegativeGeneration } from '@/jobs/negative-generation.job';
 import { RegressionDoctorJobHandler } from '@/jobs/regression-doctor.job';
+import { VisualAnomalySweepJobHandler } from '@/jobs/visual-anomaly-sweep.job';
 import { StaleReaperService } from '@/services/testing/results/stale-reaper.service';
 import { logger } from '@/utils/core/logger';
 import { startLeaderElection, stopLeaderElection } from '@/scheduler/leader';
@@ -169,6 +170,29 @@ const aiAnalysisWorker = new Worker(
     }
 
     return await AIAnalysisJobHandler.process(job);
+  },
+  workerOptions
+);
+
+// Visual anomaly sweep worker — ADR-0012. One job per test execution, same
+// trigger shape as aiAnalysisWorker. See src/jobs/visual-anomaly-sweep.job.ts.
+const visualAnomalySweepWorker = new Worker(
+  QUEUE_NAMES.VISUAL_ANOMALY_SWEEP,
+  async (job) => {
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    logger.info(`[VISUAL_ANOMALY_SWEEP_WORKER] Processing job: ${job.id}`, {
+      testId: job.data?.testId,
+      testResultId: job.data?.testResultId,
+    });
+
+    if (!VisualAnomalySweepJobHandler || typeof VisualAnomalySweepJobHandler.process !== 'function') {
+      throw new Error('VisualAnomalySweepJobHandler.process is not a function');
+    }
+
+    return await VisualAnomalySweepJobHandler.process(job);
   },
   workerOptions
 );
@@ -640,6 +664,7 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
 setupWorkerEvents(testRunWorker, 'TestRun');
 setupWorkerEvents(testResultWorker, 'TestResult');
 setupWorkerEvents(aiAnalysisWorker, 'AIAnalysis');
+setupWorkerEvents(visualAnomalySweepWorker, 'VisualAnomalySweep');
 setupWorkerEvents(regressionDoctorWorker, 'RegressionDoctor');
 setupWorkerEvents(notificationWorker, 'Notification');
 setupWorkerEvents(webhookWorker, 'Webhook');
@@ -686,6 +711,7 @@ const gracefulShutdown = async (signal: string) => {
       testRunWorker.close(),
       testResultWorker.close(),
       aiAnalysisWorker.close(),
+      visualAnomalySweepWorker.close(),
       regressionDoctorWorker.close(),
       notificationWorker.close(),
       webhookWorker.close(),
@@ -821,5 +847,6 @@ export {
   regressionDoctorWorker,
   testResultWorker,
   testRunWorker,
+  visualAnomalySweepWorker,
   webhookWorker
 };

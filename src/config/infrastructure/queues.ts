@@ -4,6 +4,7 @@ import type { MobileTestJobData } from '@/services/mobile/mobile-runner.types';
 import type { AllureImportJobData } from '@/services/allure-import/allure-import.types';
 import { handleQueueError } from '@/utils/core/error-handler';
 import { logQueueEvent, logger } from '@/utils/core/logger';
+import { VisualAnomalySweepFeature } from '../features/visual-anomaly-sweep';
 import { Queue, QueueEvents } from 'bullmq';
 import IORedis from 'ioredis';
 import { env } from '../environment/env';
@@ -218,6 +219,12 @@ export const QUEUE_NAMES = {
   // Phase 5 — auto-learn from trace. One job per successful test run;
   // extracts facts from executed_steps, upserts into project_kb_chunks.
   AUTO_LEARN: 'auto-learn',
+  // ADR-0012 — sampled visual anomaly sweep. One job per test execution,
+  // same trigger shape as AI_ANALYSIS (see the 6 addAIAnalysisJob call
+  // sites this mirrors). Gated at the call site by
+  // VisualAnomalySweepFeature.isEnabled() BEFORE enqueue, not inside the
+  // job — zero queue overhead when the feature is off.
+  VISUAL_ANOMALY_SWEEP: 'visual-anomaly-sweep',
 } as const;
 
 // Test run queue - for executing tests
@@ -256,6 +263,30 @@ export const aiAnalysisQueue = new Queue<{ testResultId: string; testId: string 
     removeOnComplete: 50,
     removeOnFail: 25,
     attempts: 2,
+    backoff: {
+      type: 'exponential',
+      delay: 5000,
+    },
+  },
+});
+
+// Visual anomaly sweep queue — ADR-0012. Same shape as aiAnalysisQueue (its
+// direct trigger-pattern precedent); lower priority (added at priority 8 by
+// addVisualAnomalySweepJob vs 5 for AI analysis) since it's a secondary
+// quality signal, not the primary bug-detection path.
+export const visualAnomalySweepQueue = new Queue<{ testResultId: string; testId: string }>(QUEUE_NAMES.VISUAL_ANOMALY_SWEEP, {
+  connection,
+  prefix: env.QUEUE_PREFIX,
+  defaultJobOptions: {
+    removeOnComplete: 50,
+    removeOnFail: 25,
+    // attempts:3 (not 2, like aiAnalysisQueue) — this job throws-to-retry
+    // while it waits for TestCompletionHandlerService.updateRegressionRuns
+    // to write the regression-run link (a separate, later step; confirmed
+    // live the gap is typically ~2-3s). Exponential backoff gives retries
+    // at ~5s then ~10s — comfortable margin over the observed gap. A retry
+    // here is just a cheap DB lookup, not a repeated vision-LLM call.
+    attempts: 3,
     backoff: {
       type: 'exponential',
       delay: 5000,
@@ -600,6 +631,31 @@ export class QueueManager {
       return job;
     } catch (error) {
       logger.error('Failed to add AI analysis job:', error);
+      throw handleQueueError(error);
+    }
+  }
+
+  /**
+   * Add a visual anomaly sweep job — ADR-0012. Idempotent jobId (same
+   * pattern as `addAIAnalysisJob`) so a duplicate enqueue is a no-op.
+   * The feature-flag gate is centralized HERE (one check) rather than
+   * repeated at each of the 6 call sites across 3 job files — same runtime
+   * effect (no BullMQ `.add()` call, zero queue overhead when off), less
+   * duplication. Returns `null` when disabled instead of throwing, so
+   * every call site can `await` it unconditionally.
+   */
+  static async addVisualAnomalySweepJob(testResultId: string, testId: string) {
+    if (!VisualAnomalySweepFeature.isEnabled()) return null;
+    try {
+      const job = await visualAnomalySweepQueue.add('visual-anomaly-sweep', { testResultId, testId }, {
+        priority: 8,
+        jobId: `visual-anomaly-${testResultId}`,
+      });
+
+      logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.VISUAL_ANOMALY_SWEEP, testResultId });
+      return job;
+    } catch (error) {
+      logger.error('Failed to add visual anomaly sweep job:', error);
       throw handleQueueError(error);
     }
   }
@@ -1061,6 +1117,8 @@ export class QueueManager {
         return testResultQueue;
       case QUEUE_NAMES.AI_ANALYSIS:
         return aiAnalysisQueue;
+      case QUEUE_NAMES.VISUAL_ANOMALY_SWEEP:
+        return visualAnomalySweepQueue;
       case QUEUE_NAMES.NOTIFICATION:
         return notificationQueue;
       case QUEUE_NAMES.WEBHOOK:

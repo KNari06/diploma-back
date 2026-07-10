@@ -72,6 +72,27 @@ export async function getFastAuthByExecIds(execIds: string[]): Promise<FastAuthR
   return (data as FastAuthRow[]) || [];
 }
 
+export interface RunNarrativeFields {
+  release_narrative: Record<string, unknown> | null;
+  release_narrative_generated_at: string | null;
+}
+
+/**
+ * Re-read just the narrative-cache columns — used by
+ * `ReleaseNarrativeService.getOrGenerate` INSIDE its per-run mutex to check
+ * whether a concurrent fetch already generated the narrative while this
+ * caller was waiting on the lock, before paying for a second LLM call.
+ */
+export async function getRunNarrativeFields(runId: string): Promise<RunNarrativeFields | null> {
+  const { data } = await supabaseAdmin
+    .from('regression_runs')
+    .select('release_narrative, release_narrative_generated_at')
+    .eq('id', runId)
+    .maybeSingle();
+
+  return (data as RunNarrativeFields) ?? null;
+}
+
 /**
  * Patch a regression_runs row by id. Returns the query error so the caller
  * can decide whether to log it.

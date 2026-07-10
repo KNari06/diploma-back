@@ -1216,6 +1216,62 @@ export interface RunReportArtifactsSummary {
 }
 
 /**
+ * Release-readiness verdict — ADR-0012. Computed by a pure, deterministic
+ * function (`computeReleaseVerdict` in `release-verdict.util.ts`) over a
+ * run's already-deduped bugs + health checks. NEVER decided by an LLM —
+ * see `ReleaseNarrative` below for the (optional, LLM-written) explanation
+ * layer that sits on top of this without ever being able to contradict it.
+ */
+export type ReleaseVerdictStatus = 'ready' | 'ready_with_warnings' | 'not_ready';
+
+export interface ReleaseVerdictReason {
+  code: string;
+  label: string;
+  refType: 'bug' | 'health_check' | 'visual_anomaly' | 'execution';
+  refId: string;
+}
+
+export interface ReleaseVerdict {
+  status: ReleaseVerdictStatus;
+  rulesetVersion: number;
+  reasons: ReleaseVerdictReason[];
+}
+
+/**
+ * Optional LLM narrative over an already-computed `ReleaseVerdict` — see
+ * `release-narrative.service.ts`. No `status`/verdict field by design: the
+ * narrative explains/prioritizes given facts, it cannot restate a different
+ * verdict. `null` means not yet generated (lazy, first-view-triggered) or
+ * the feature is disabled — the frontend renders nothing in that case, not
+ * a permanent loading state.
+ */
+export interface ReleaseNarrative {
+  headline: string;
+  prioritizedActions: Array<{ bugId: string; why: string }>;
+  summary: string;
+  generatedAt: string;
+}
+
+/**
+ * Visual anomaly sweep finding (ADR-0012) — surfaced into a RunReport once
+ * it has recurred across >= VISUAL_ANOMALY_MIN_RECURRENCE independent runs
+ * (see `visual-anomaly-check.service.ts`). Defaults to 1 (surfaces on first
+ * detection) per 2026-07-10 user decision — the gate is still real and
+ * configurable, just permissive by default now.
+ */
+export interface RunReportVisualAnomaly {
+  id: string;
+  testCaseId: string;
+  testCaseName: string;
+  category: 'placeholder_text' | 'broken_image' | 'overlapping_cutoff_ui' | 'wrong_locale' | 'structurally_broken_layout' | 'other';
+  description: string;
+  confidence: number;
+  screenshotUrl: string;
+  recurrenceCount: number;
+  firstSeenAt: string;
+}
+
+/**
  * Full run report — aggregated data for a regression run
  */
 export interface RunReport {
@@ -1242,6 +1298,13 @@ export interface RunReport {
    * the overwhelming majority of runs (unsegmented, single dispatch).
    */
   chainExecutions?: RunReportExecution[];
+  /** Always present once bugs/healthSummary are computed — see ADR-0012. */
+  releaseVerdict: ReleaseVerdict;
+  /** Frozen audit snapshot, written once at first narrative generation. */
+  releaseVerdictAtCompletion?: ReleaseVerdictStatus;
+  releaseNarrative?: ReleaseNarrative | null;
+  /** Findings scoped to THIS run (status='surfaced' AND this run in affected_run_ids). */
+  visualAnomalies?: RunReportVisualAnomaly[];
 }
 
 /**

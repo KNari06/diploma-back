@@ -16,6 +16,10 @@ import { ExecutionService } from '../executions/execution.service';
 import { HealthCheckAggregatorService } from './health-check-aggregator.service';
 import { TestReportGeneratorService } from '../results/test-report-generator.service';
 import { deriveRunStatus } from '@/utils/testing/run-status.utils';
+import { computeReleaseVerdict, applyVisualAnomalySoftening } from './release-verdict.util';
+import { ReleaseNarrativeService } from './release-narrative.service';
+import { getSurfacedFindingsForRun } from '../visual-anomaly/db/visual-anomaly.db';
+import { logger } from '@/utils/core/logger';
 import type {
   RunReport,
   RunReportExecution,
@@ -232,7 +236,8 @@ export class RegressionReportAssemblerService {
   ): Promise<RunReport | null> {
     const run = await this.getRunWithOwnership(runId, userId);
     if (!run) return null;
-    return RegressionReportAssemblerService.assembleReport(run);
+    const report = await RegressionReportAssemblerService.assembleReport(run);
+    return RegressionReportAssemblerService.attachReleaseNarrative(run, report);
   }
 
   /**
@@ -241,7 +246,42 @@ export class RegressionReportAssemblerService {
   static async buildPublicReport(shareToken: string): Promise<RunReport | null> {
     const run = await this.getRunByShareToken(shareToken);
     if (!run) return null;
-    return RegressionReportAssemblerService.assembleReport(run);
+    const report = await RegressionReportAssemblerService.assembleReport(run);
+    return RegressionReportAssemblerService.attachReleaseNarrative(run, report);
+  }
+
+  /**
+   * Lazy-generate-on-first-fetch the optional release narrative — ADR-0012.
+   * Called from BOTH `buildFullReport` and `buildPublicReport` (not from
+   * `RegressionRunService`'s same-named methods, which are one-line
+   * delegating wrappers with no logic — verified against live code before
+   * this was written) so authed and public-share views get it identically.
+   * Charges the RUN OWNER (`run.user_id`), never the requesting viewer —
+   * matters for the public-share path, which has no authenticated caller.
+   * Best-effort: any failure here still ships the report verdict-only.
+   */
+  private static async attachReleaseNarrative(run: any, report: RunReport): Promise<RunReport> {
+    try {
+      const { narrative, verdictAtCompletion } = await ReleaseNarrativeService.getOrGenerate(
+        run,
+        report.releaseVerdict,
+        report.bugs,
+        report.healthSummary,
+        report.summary,
+        run.user_id ?? null,
+      );
+      return {
+        ...report,
+        ...(narrative && { releaseNarrative: narrative }),
+        ...(verdictAtCompletion && { releaseVerdictAtCompletion: verdictAtCompletion as any }),
+      };
+    } catch (error) {
+      logger.warn('[REGRESSION_REPORT] Release narrative attach failed — shipping verdict-only', {
+        runId: run.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return report;
+    }
   }
 
   /**
@@ -878,6 +918,42 @@ export class RegressionReportAssemblerService {
 
     // Chain view — `chainExecutions` was already fetched in Phase 1's
     // Promise.all above; empty for the overwhelming majority of (unsegmented) runs.
+    // Release-readiness verdict (ADR-0012) — pure, deterministic, computed over
+    // the SAME deduped bugs + health summary this report already carries, PLUS
+    // the run's own status/summary (caught live 2026-07-08: a run that failed
+    // to complete must never show "ready" just because the AI bug-detector
+    // didn't characterize anything as a bug — see release-verdict.util.ts's
+    // header comment). Free (no LLM, no I/O) so it's always present, unlike
+    // the optional narrative (attached separately by `attachReleaseNarrative`,
+    // called from `buildFullReport`/`buildPublicReport` — this function has no
+    // `userId`/credit-charging context available to generate it here).
+    let releaseVerdict = computeReleaseVerdict(dedupedBugs, healthSummary, normalizedStatus, summary);
+
+    // Visual anomaly findings (ADR-0012) — scoped to THIS run
+    // (:runId = ANY(affected_run_ids)), only ever the ones that already
+    // cleared the cross-run recurrence gate (status='surfaced'). A single
+    // run's vision call can never reach this list on its own. Not pulled
+    // into the Phase 1 Promise.all above for simplicity — a cheap, single
+    // indexed query; revisit if report-fetch latency ever needs it.
+    let visualAnomalies: import('@/types/testing.types').RunReportVisualAnomaly[] = [];
+    if (run.project_id) {
+      const findings = await getSurfacedFindingsForRun(run.project_id, run.id);
+      visualAnomalies = findings.map((f) => ({
+        id: f.id,
+        testCaseId: f.test_case_id,
+        testCaseName: f.intent_test_cases?.name || 'Unknown',
+        category: f.category as any,
+        description: f.description,
+        confidence: f.confidence,
+        screenshotUrl: f.example_screenshot_url,
+        recurrenceCount: f.recurrence_count,
+        firstSeenAt: f.first_seen_at,
+      }));
+      if (visualAnomalies.length > 0) {
+        releaseVerdict = applyVisualAnomalySoftening(releaseVerdict, visualAnomalies);
+      }
+    }
+
     return {
       id: run.id,
       planId: run.plan_id || null,
@@ -894,9 +970,11 @@ export class RegressionReportAssemblerService {
       recommendations: [...allRecommendations],
       artifactsSummary: aggArtifacts,
       healthSummary,
+      releaseVerdict,
       ...(negativeSummary && { negativeSummary }),
       ...(negativeExecs.length > 0 && { negativeExecutions: negativeExecs }),
       ...(chainExecutions.length > 0 && { chainExecutions }),
+      ...(visualAnomalies.length > 0 && { visualAnomalies }),
     };
   }
 }

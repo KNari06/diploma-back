@@ -464,7 +464,8 @@ export async function getChatCompletionWithGemini(params: {
 export async function generateTextWithGeminiVision(params: {
   prompt: string;
   imageBase64: string;
-  mimeType?: 'image/png' | 'image/jpeg';
+  /** Gemini natively supports webp alongside png/jpeg. */
+  mimeType?: 'image/png' | 'image/jpeg' | 'image/webp';
   model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.5-flash-lite';
   temperature?: number;
   maxTokens?: number;
@@ -533,6 +534,15 @@ export async function generateTextWithGeminiVision(params: {
     const response = genResult.response;
     const text = response.text();
 
+    // Extract usage and track it BEFORE the finishReason check below, so a
+    // truncated response's real, billed tokens are always recorded — Gemini
+    // charges for tokens actually generated regardless of finish reason.
+    // Confirmed live (2026-07-10): a MAX_TOKENS-truncated vision response
+    // that throws below used to fall through to this same tracking block
+    // (no finishReason check existed yet), so its cost was correctly
+    // recorded. Moving the check before tracking would silently regress
+    // that — every truncated call would show up as $0/0-token in
+    // AIUsageTracker/recordAILog instead of the real spend.
     const usage = response.usageMetadata || {
       promptTokenCount: 0,
       candidatesTokenCount: 0,
@@ -549,7 +559,11 @@ export async function generateTextWithGeminiVision(params: {
       },
     };
 
-    // Track AI usage for billing/analytics
+    const finishReason = response.candidates?.[0]?.finishReason;
+    const finishedCleanly = !finishReason || finishReason === 'STOP';
+
+    // Track AI usage for billing/analytics — always, so cost/usage
+    // dashboards reflect real spend even on a truncated/non-STOP response.
     const aiCostUSD = calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens);
     AIUsageTracker.record({
       provider: 'gemini',
@@ -562,15 +576,36 @@ export async function generateTextWithGeminiVision(params: {
     });
 
     recordAILog({
-      status: 'succeeded',
+      status: finishedCleanly ? 'succeeded' : 'failed',
       provider: 'gemini',
       model,
       inputTokens: result.usage.inputTokens,
       outputTokens: result.usage.outputTokens,
       costUSD: aiCostUSD,
       durationMs: Date.now() - _aiLogStartedAt,
+      error: finishedCleanly ? undefined : `finishReason=${finishReason}`,
       detail: { prompt_excerpt: prompt, response_excerpt: text, has_image: true },
     });
+
+    // Surface non-STOP finish reasons as explicit errors instead of letting
+    // callers try to JSON.parse partial/incomplete text and misdiagnose it
+    // as a markdown-fence or formatting issue. Confirmed live (2026-07-10,
+    // visual anomaly sweep): a MAX_TOKENS-truncated response can still have
+    // non-empty, non-trivial text (80 tokens, cut off mid-word) — the
+    // `!text` guard on the sibling text-completion function below would
+    // have missed this exact case too. Unlike a general chat reply, every
+    // current caller of this vision function (self-healing, element
+    // resolution, visual anomaly) parses the response as structured
+    // JSON/a short verdict, where partial output is never usable — so an
+    // unconditional throw here is safe for all of them.
+    if (!finishedCleanly) {
+      // usageAlreadyTracked: the catch block below must not record this
+      // again (AIUsageTracker.record is additive — a second call would
+      // double-count real spend for one Gemini call).
+      const err = new Error(`Gemini vision response did not finish cleanly (finishReason=${finishReason}): ${text.slice(0, 200)}`);
+      (err as Error & { usageAlreadyTracked?: boolean }).usageAlreadyTracked = true;
+      throw err;
+    }
 
     logger.info('[GEMINI] Vision generation completed', {
       model,
@@ -581,6 +616,9 @@ export async function generateTextWithGeminiVision(params: {
 
     return result;
   } catch (error) {
+    if ((error as Error & { usageAlreadyTracked?: boolean })?.usageAlreadyTracked) {
+      throw error;
+    }
     recordAILog({
       status: 'failed',
       provider: 'gemini',
