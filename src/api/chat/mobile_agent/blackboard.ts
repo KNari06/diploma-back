@@ -52,6 +52,14 @@ export class MobileBlackboard {
   readonly mobileSessionId: string;
   readonly userId: string;
   readonly chatSessionId?: string;
+  /**
+   * Project the chat is scoped to, resolved by the controller BEFORE the
+   * handler runs (test-case access check / warmup binding). Threaded here so
+   * the save tool (mobile_create_test_case) doesn't have to look it up from
+   * chat_sessions.project_id — which is NULL in workspace scope and matches no
+   * row in test-case scope, making save dead-end. Prefer this over the lookup.
+   */
+  readonly projectId?: string;
   /** Workspace of the chat request — scopes list_project_options. */
   readonly workspaceId?: string;
   /** Saved test case the mobile editor is scoped to, when any. */
@@ -106,6 +114,7 @@ export class MobileBlackboard {
     mobileSessionId: string;
     userId: string;
     chatSessionId?: string;
+    projectId?: string;
     workspaceId?: string;
     testCaseId?: string;
   }) {
@@ -113,6 +122,7 @@ export class MobileBlackboard {
     this.mobileSessionId = init.mobileSessionId;
     this.userId = init.userId;
     this.chatSessionId = init.chatSessionId;
+    this.projectId = init.projectId;
     this.workspaceId = init.workspaceId;
     this.testCaseId = init.testCaseId;
   }

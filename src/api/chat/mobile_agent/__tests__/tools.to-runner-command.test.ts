@@ -303,3 +303,47 @@ describe('toRunnerCommand — unknown type', () => {
     });
   });
 });
+
+// ── Our fixes on top of the shared converter (merged from
+//    feature/mobile-agent-draft-steps-inline). These behaviours are NOT
+//    covered by the sync suite above and guard against regressions the
+//    runner's /commands batch route would silently mis-run.
+
+describe('toRunnerCommand — press_key emits a real Android keycode', () => {
+  it('maps enter -> KEYCODE_ENTER (batch route runs the keycode raw)', () => {
+    const r = toRunnerCommand(step({ type: 'press_key', description: 'press enter', value: 'enter' }));
+    expect(r.ok).toBe(true);
+    if (r.ok) expect((r.command.params as any).keycode).toBe('KEYCODE_ENTER');
+  });
+  it('defaults a bare press to KEYCODE_ENTER, never the literal "enter"', () => {
+    const r = toRunnerCommand(step({ type: 'press', description: 'press' }));
+    expect(r.ok).toBe(true);
+    if (r.ok) expect((r.command.params as any).keycode).toBe('KEYCODE_ENTER');
+  });
+});
+
+describe('toRunnerCommand — assertions route so the expected value is verified', () => {
+  it('ai_check + aiCheckSource -> ai_visual_check', () => {
+    const r = toRunnerCommand(
+      step({ type: 'ai_check', description: 'success banner shows', options: { aiCheckSource: 'screenshot' } as any }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.command.type).toBe('ai_visual_check');
+      expect((r.command.params as any).source).toBe('screenshot');
+    }
+  });
+  it('assert with expected text -> assert_text (assert_visible has no expectedText field)', () => {
+    const r = toRunnerCommand(step({ type: 'assert', description: 'check total', assertionText: '$50.00' }));
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.command.type).toBe('assert_text');
+      expect((r.command.params as any).expectedText).toBe('$50.00');
+    }
+  });
+  it('assert with no expected text -> assert_visible (pure visibility)', () => {
+    const r = toRunnerCommand(step({ type: 'assert_visible', description: 'cart icon visible' }));
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.command.type).toBe('assert_visible');
+  });
+});

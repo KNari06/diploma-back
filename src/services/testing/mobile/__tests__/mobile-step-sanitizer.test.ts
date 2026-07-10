@@ -248,4 +248,80 @@ describe('sanitizeMobileSteps', () => {
   it('returns empty results for an empty input list', () => {
     expect(sanitizeMobileSteps([])).toEqual({ steps: [], parametersSchema: {} });
   });
+
+  describe('assertionText redaction', () => {
+    it('masks a secret quoted in the assertion text itself', () => {
+      const step = mkStep({
+        id: 'a',
+        type: 'ai_check' as any,
+        description: 'Confirm token is shown',
+        assertionText: 'The screen shows the API token sk_live_abc123',
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      // The assertion string contains "token" → masked.
+      expect(steps[0].assertionText).toBe('{{param_secret}}');
+      expect(steps[0].assertionText).not.toContain('sk_live_abc123');
+    });
+
+    it('preserves a benign assertion even when the step types a sensitive value', () => {
+      // Keying off the description would wrongly mask this benign assertion.
+      const step = mkStep({
+        id: 'b',
+        description: 'Type password',
+        value: 'hunter2',
+        assertionText: 'Home screen is visible',
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      expect(steps[0].assertionText).toBe('Home screen is visible');
+      expect(steps[0].value).toMatch(PLACEHOLDER); // value still parameterised
+    });
+
+    it('leaves an already-templated assertionText untouched', () => {
+      const step = mkStep({
+        id: 'c',
+        type: 'assert_text' as any,
+        description: 'check',
+        assertionText: '{{param_expected}}',
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      expect(steps[0].assertionText).toBe('{{param_expected}}');
+    });
+  });
+
+  describe('always-secret option fields', () => {
+    it('masks options.totpSecret unconditionally (no keyword gate)', () => {
+      const step = mkStep({
+        id: 'a',
+        type: 'otp' as any,
+        description: 'Sign in with authenticator',
+        options: { otpAction: 'generate_totp', totpSecret: 'JBSWY3DPEHPK3PXP' } as any,
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      const opts = steps[0].options as Record<string, unknown>;
+      expect(opts.totpSecret).toBe('{{param_secret}}');
+      expect(opts.otpAction).toBe('generate_totp'); // non-secret field preserved
+    });
+
+    it('masks options.otpCode', () => {
+      const step = mkStep({
+        id: 'b',
+        type: 'otp' as any,
+        description: 'Enter code',
+        options: { otpAction: 'type_otp', otpCode: '123456' } as any,
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      expect((steps[0].options as Record<string, unknown>).otpCode).toBe('{{param_secret}}');
+    });
+
+    it('does not clone options when there is no secret field', () => {
+      const step = mkStep({
+        id: 'c',
+        type: 'swipe' as any,
+        description: 'swipe',
+        options: { startX: 1, startY: 2, endX: 3, endY: 4 } as any,
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      expect(steps[0]).toBe(step); // identity preserved — no needless clone
+    });
+  });
 });

@@ -752,9 +752,14 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
           // ChatPersistence; legacy handlers receive but ignore it.
           chatStore,
           testCaseId,
-          // Test case's access-checked project id (tc-scope only) so the general
-          // handler scopes KB/file/project context + tools to the right project
-          // instead of the workspace default. See BUG-1.
+          // Controller-resolved project (test-case access check). Two consumers:
+          //  - `projectId` → the mobile agent's save tool resolves the project
+          //    without the chat_sessions.project_id lookup that is NULL in
+          //    mobile scopes.
+          //  - `testCaseProjectId` → the general handler scopes KB/file/project
+          //    context + tools to the right project instead of the workspace
+          //    default. See BUG-1.
+          projectId: testCaseAccess?.projectId,
           testCaseProjectId: testCaseAccess?.projectId,
         }),
         timeoutGuard,

@@ -10,6 +10,7 @@ import { AIUsageQueryService } from '@/services/ai/tracking/ai-usage-query.servi
 import { FixtureService } from '@/services/testing/fixtures/fixture.service';
 import { ApiConfigService } from '@/services/api/api-config.service';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
+import { sanitizeSteps } from '@/services/testing/shared/step-sanitizer';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
 import { ScheduleService } from '@/services/testing/schedules/schedule.service';
@@ -3368,16 +3369,7 @@ export async function handleRunDraftSteps(
     : undefined;
   const confirm = args.confirm === true;
 
-  // 1. Confirm gate
-  if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. You MUST first describe the steps you will run to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
-  }
-
-  // 2. Validate steps array
+  // 2. Validate steps array (needed for both author-only and run paths)
   if (!steps || !Array.isArray(steps) || steps.length === 0) {
     return { success: false, message: 'Missing or empty required field: steps (array of step objects)', displayToUser: false };
   }
@@ -3387,16 +3379,8 @@ export async function handleRunDraftSteps(
     return { success: false, message: 'Missing required field: start_url', displayToUser: false };
   }
 
-  // 4. Validate preview session
-  if (!context.previewSessionId) {
-    return {
-      success: false,
-      message: 'Draft step execution requires an active editor preview session. This tool is only available in editor mode.',
-      displayToUser: false,
-    };
-  }
-
-  // 5. Validate step structure (same validation as handleCreateTestCase)
+  // 5b. Validate step structure up front so the author-only path also rejects
+  //     malformed steps (same checks as the run path / handleCreateTestCase).
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     if (!step.id || typeof step.id !== 'string') {
@@ -3413,6 +3397,54 @@ export async function handleRunDraftSteps(
       return { success: false, message: `Step ${i}: missing or invalid "description" (must be a non-empty string)`, displayToUser: false };
     }
   }
+
+  // 1. Author-only path (confirm=false, the DEFAULT): cache the draft + surface
+  //    it to the chat as editable step widgets, do NOT run on the preview. The
+  //    user reviews/edits in the card, then confirms in the UI (which drives
+  //    web's live-preview run). Mirrors the mobile agent's confirm=false model.
+  //    confirm=true still runs immediately below.
+  if (!confirm) {
+    if (context.chatSessionId) {
+      const { DraftStepsCache } = await import('@/services/testing/ui/preview/draft-steps-cache');
+      DraftStepsCache.set(context.chatSessionId, {
+        steps,
+        startUrl,
+        userId: context.userId,
+        ...(suggestedName ? { suggestedName } : {}),
+      });
+    }
+    // Sanitize credential-like values before they leave the server (invariant
+    // #10) — the card renders these and they may re-enter the prompt.
+    const { steps: draftSteps } = sanitizeSteps(steps);
+    return {
+      success: true,
+      data: {
+        draftSteps,
+        draftMeta: {
+          startUrl,
+          suggestedName,
+          executed: false,
+          platform: 'web',
+        },
+      },
+      message:
+        `Drafted ${steps.length} step(s)${suggestedName ? ` for "${suggestedName}"` : ''}. ` +
+        `They are shown in the chat as editable steps — the user can adjust them, ` +
+        `then confirm in the UI to run on the live preview.`,
+      displayToUser: true,
+    };
+  }
+
+  // 4. Validate preview session (run path only — author-only returned above)
+  if (!context.previewSessionId) {
+    return {
+      success: false,
+      message: 'Draft step execution requires an active editor preview session. This tool is only available in editor mode.',
+      displayToUser: false,
+    };
+  }
+
+  // (step structure already validated in 5b above)
 
   // 6. Check no run already in progress
   const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
@@ -3484,12 +3516,19 @@ export async function handleRunDraftSteps(
       ? ` First failure: ${summary.firstError.substring(0, 200)}`
       : '';
 
+    // Also surface the steps as editable draft widgets so the user can edit +
+    // re-run + save from the chat card after a run (parity with mobile).
+    // Sanitized before leaving the server (invariant #10).
+    const { steps: ranDraftSteps } = sanitizeSteps(steps);
+
     return {
       success: summary.success,
       data: {
         previewSessionId: context.previewSessionId,
         ephemeral: true,
         startUrl,
+        draftSteps: ranDraftSteps,
+        draftMeta: { startUrl, suggestedName, executed: true, platform: 'web' },
         ...summary,
       },
       message: `Run ${statusWord} in ${durationSec}s — ${summary.passedSteps}/${summary.totalSteps} steps passed${summary.failedSteps > 0 ? `, ${summary.failedSteps} failed` : ''}${summary.skippedSteps > 0 ? `, ${summary.skippedSteps} skipped` : ''}.${failedHint}`,
@@ -3583,6 +3622,13 @@ export async function handleCreateTestCase(
     }
   }
 
+  // Sanitize credential-like values to {{param_*}} BEFORE persisting so a
+  // password/token typed into a step doesn't land in steps_json in plaintext,
+  // and persist the resulting parameters_schema so a regression replay can
+  // resolve them (without it the runner types the literal placeholder). Same
+  // fix + shared sanitizer as the mobile agent save path.
+  const { steps: sanitizedSteps, parametersSchema } = sanitizeSteps(steps);
+
   try {
     const created = await IntentTestCaseService.create({
       projectId,
@@ -3590,7 +3636,8 @@ export async function handleCreateTestCase(
       name,
       description: args.description || undefined,
       startUrl: args.start_url || undefined,
-      steps,
+      steps: sanitizedSteps,
+      parametersSchema,
       status: args.status || 'draft',
       // Pass priority straight to create() — eliminates the previous
       // create→update round-trip and avoids the brief window where the
