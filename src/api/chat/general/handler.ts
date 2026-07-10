@@ -623,14 +623,33 @@ export async function handleGeneralChat(
     testCaseId,
   );
 
-  let projectId = typeof context === 'object' ? context?.projectId : undefined;
+  const clientProjectId = typeof context === 'object' ? context?.projectId : undefined;
+  let projectId: string | undefined;
   // In test-case scope the client intentionally omits projectId, and
   // resolveProjectId can't recover it (it reads the GLOBAL chat_sessions
   // table, which a test_case_chat_sessions id misses → workspace default).
   // Seed from the test case's own access-checked project so KB/file/project
   // context and tool scope target the right project. See BUG-1.
-  if (!projectId && store.kind === 'testcase' && testCaseProjectId) {
+  if (store.kind === 'testcase' && testCaseProjectId) {
     projectId = testCaseProjectId;
+  } else if (clientProjectId) {
+    // TIER 0 (global scope): the frontend sends the project the user selected
+    // in the UI switcher. It is the authoritative source — but it's client
+    // input, so verify access (owner OR workspace member) before trusting it,
+    // mirroring the regression handlers' Tier-0. Used directly THIS turn for
+    // KB/file/project context and tool scope. The controller separately syncs
+    // chat_sessions.project_id to this same value so the stale-binding root
+    // cause is cleared for every handler. See global-chat-wrong-project fix.
+    const { getAccessibleProject } = await import('@/services/chat/mobile-project-context.service');
+    const accessible = await getAccessibleProject(userId, clientProjectId);
+    if (accessible) {
+      projectId = accessible.id;
+    } else {
+      logger.warn('[GENERAL_CHAT] Client-supplied projectId rejected (no access) — falling back to resolution', {
+        userId: userId.substring(0, 8) + '...',
+        clientProjectId,
+      });
+    }
   }
   const parsedContext = typeof context === 'object' && context !== null && !Array.isArray(context)
     ? context as Record<string, any>

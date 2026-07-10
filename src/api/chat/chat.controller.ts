@@ -106,6 +106,26 @@ export function decideForceRoute(
 }
 
 /**
+ * Pull the client-selected `projectId` out of the request context, which
+ * arrives either as an already-parsed object or as a JSON string (multipart
+ * uploads). Returns a trimmed non-empty id or undefined. Pure — no validation
+ * of access here; the caller must verify the user may use the project.
+ */
+export function extractContextProjectId(context: unknown): string | undefined {
+  let ctx: unknown = context;
+  if (typeof ctx === 'string') {
+    try {
+      ctx = JSON.parse(ctx);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!ctx || typeof ctx !== 'object' || Array.isArray(ctx)) return undefined;
+  const pid = (ctx as Record<string, unknown>).projectId;
+  return typeof pid === 'string' && pid.trim().length > 0 ? pid.trim() : undefined;
+}
+
+/**
  * ═══════════════════════════════════════════════════════════════════════════
  * MAIN CHAT HANDLER
  * ═══════════════════════════════════════════════════════════════════════════
@@ -344,6 +364,36 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     } else {
       const manageChatSessionWithLogging = withFunctionLogging(manageChatSession, 'manageChatSession', functionLogger);
       chatSessionId = await manageChatSessionWithLogging(userId, sessionId, workspace_id, checkRequestTimeout, functionLogger);
+
+      // TIER-0 PROJECT SYNC (global scope): the frontend sends the project the
+      // user has selected in the UI switcher via `context.projectId`. Several
+      // handlers (general_chat, api_test, ai_test, mobile_agent) resolve their
+      // project from `chat_sessions.project_id`, which otherwise only gets set
+      // once by the platform_test flow and then goes stale — so the chat could
+      // answer about the wrong project after the user switches. Validate the
+      // selection (owner OR workspace member — IDOR guard) and sync the binding
+      // ONCE here so every downstream handler reads the correct project. Best-
+      // effort: never block the turn. See global-chat-wrong-project fix.
+      const selectedProjectId = extractContextProjectId(context);
+      if (selectedProjectId && chatSessionId) {
+        try {
+          const { getAccessibleProject } = await import('@/services/chat/mobile-project-context.service');
+          const accessible = await getAccessibleProject(userId, selectedProjectId);
+          if (accessible) {
+            await ChatService.updateSessionProject(chatSessionId, accessible.id, userId);
+          } else {
+            logger.warn('[CHAT] Client-supplied projectId rejected (no access) — leaving session binding as-is', {
+              userId: userId.substring(0, 8) + '...',
+              selectedProjectId,
+            });
+          }
+        } catch (syncErr) {
+          logger.warn('[CHAT] Failed to sync chat_sessions.project_id to selected project', {
+            error: syncErr instanceof Error ? syncErr.message : String(syncErr),
+            chatSessionId,
+          });
+        }
+      }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
