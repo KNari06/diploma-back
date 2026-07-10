@@ -3,6 +3,7 @@ import type { InteractiveNode } from '@/services/testing/ui/preview/preview.type
 import type { PreviewConsoleEntry, PreviewNetworkItem } from '@/websocket/types/types';
 import { logger } from '@/utils/core/logger';
 import { PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
+import { wrapUntrustedContent } from './untrusted-content-wrapper';
 
 /**
  * Editor Context Service
@@ -348,41 +349,50 @@ async function extractContentSummary(previewSessionId: string, userId?: string):
 
 /**
  * Format page context as a system message for AI context injection.
+ *
+ * SECURITY: the page under test is attacker-controllable, so all
+ * page-derived fields (URL/title/DOM/text/console/network) are wrapped
+ * in an untrusted-content fence — the model must treat them as
+ * observation, never instructions. The system prompt carries
+ * `UNTRUSTED_WEB_CONTENT_INSTRUCTION` once; this block inherits it.
+ * Our own framing lines stay OUTSIDE the fence.
  */
 export function formatPageContextForChat(pageContext: PageContext): string {
-  let result = '--- CURRENT PAGE CONTEXT (AI Editor) ---\n';
-  result += `URL: ${pageContext.url}\n`;
+  // Build the page-derived body that goes INSIDE the untrusted fence.
+  let body = `URL: ${pageContext.url}\n`;
 
   if (pageContext.title) {
-    result += `Page: ${pageContext.title}\n`;
+    body += `Page: ${pageContext.title}\n`;
   }
 
-  result += `Interactive Elements:\n${pageContext.domSummary}\n`;
+  body += `Interactive Elements:\n${pageContext.domSummary}\n`;
 
   if (pageContext.pageText) {
-    result += `\nVisible Page Text:\n${pageContext.pageText}\n`;
+    body += `\nVisible Page Text:\n${pageContext.pageText}\n`;
   }
 
   if (pageContext.contentSummary) {
-    result += `\nPage Content Structure:\n${pageContext.contentSummary}\n`;
+    body += `\nPage Content Structure:\n${pageContext.contentSummary}\n`;
   }
 
   if (pageContext.consoleErrors) {
-    result += `\nConsole Errors/Warnings:\n${pageContext.consoleErrors}\n`;
+    body += `\nConsole Errors/Warnings:\n${pageContext.consoleErrors}\n`;
   }
 
   if (pageContext.networkSummary) {
-    result += `\nFailed/Slow Network Requests:\n${pageContext.networkSummary}\n`;
+    body += `\nFailed/Slow Network Requests:\n${pageContext.networkSummary}\n`;
   }
 
   if (pageContext.testSteps && pageContext.testSteps.length > 0) {
-    result += `Test Steps:\n`;
+    body += `Test Steps:\n`;
     for (const step of pageContext.testSteps) {
-      result += `  ${step.id}. [${step.type}] ${step.description}\n`;
+      body += `  ${step.id}. [${step.type}] ${step.description}\n`;
     }
   }
 
-  result += '\nYou are in AI Editor mode. The user can see this page in their browser preview. Reference elements by their ref IDs when suggesting actions.';
+  let result = '--- CURRENT PAGE CONTEXT (AI Editor) ---\n';
+  result += wrapUntrustedContent(body, 'PAGE CONTENT');
+  result += '\n\nYou are in AI Editor mode. The user can see this page in their browser preview. Reference elements by their ref IDs when suggesting actions.';
 
   return result;
 }

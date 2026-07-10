@@ -91,9 +91,10 @@ export class ChatPersistence {
 
   /**
    * Generate a title from the first user message — best effort, errors
-   * swallowed. Idempotent: both backends short-circuit if a title was
-   * already generated (test-case backend uses a `WHERE title='New Chat'`
-   * race guard; global backend overwrites — see ChatService.autoGenerateTitle).
+   * swallowed. Idempotent: both backends only set the title when it is
+   * still the default, so a user rename is never overwritten (test-case
+   * backend guards `WHERE title='New Chat'`; global backend guards
+   * `title IS NULL OR title='New Chat'` — see ChatService.autoGenerateTitle).
    *
    * Callers should `void`-call this and not await — title generation
    * must never block the user-visible response.

@@ -46,6 +46,8 @@ export async function routeToHandler(
      * that may emit further WS traffic can target the right room.
      */
     testCaseId?: string;
+    /** Test case's access-checked project id (test-case scope only). See BUG-1. */
+    testCaseProjectId?: string;
   }
 ): Promise<void> {
   // ═══════════════════════════════════════════════════════════════════════
@@ -115,6 +117,7 @@ export async function routeToHandler(
     // (TypeScript widens IntentHandlerParams below to accept extras).
     chatStore: params.chatStore,
     testCaseId: params.testCaseId,
+    testCaseProjectId: params.testCaseProjectId,
   });
 }
 

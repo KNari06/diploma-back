@@ -27,6 +27,7 @@ import { emitMobileAgentThinking } from './progress';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { isReasoningPersistEnabled } from './reasoning-trace';
 import { resolveMobileSessionContext } from '@/services/chat/mobile-context.service';
+import { resolveMobileProjectContext } from '@/services/chat/mobile-project-context.service';
 import { incCounter, observeMs } from '@/utils/core/mobile-chat-metrics';
 import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
@@ -53,6 +54,14 @@ interface MobileAgentParams {
    * chat tables (parallel to web editor_action). Defaults to GLOBAL_STORE.
    */
   chatStore?: ChatStore;
+  /**
+   * Saved test case the mobile editor is scoped to. Set by the controller's
+   * testCaseId branch (access already verified via assertCanAccessTestCase).
+   * Drives the eager project-context resolution: the test case's project is
+   * authoritative, and its existing steps are injected into the prompt so
+   * the agent extends the flow instead of duplicating it.
+   */
+  testCaseId?: string;
 }
 
 export async function handleMobileAgent(
@@ -134,6 +143,23 @@ export async function handleMobileAgent(
     mobileSessionId,
     userId,
     chatSessionId,
+    workspaceId,
+    testCaseId: params.testCaseId,
+  });
+
+  // Resolve project / app / open-test-case context EAGERLY — a couple of
+  // cheap DB reads that run concurrently with the (much slower) device
+  // snapshot fetch below. Landing this on the blackboard up front means
+  // mobile_create_test_case can't dead-end on a missing project after a
+  // successful draft run, and the system prompt can name the app under
+  // test while authoring. Best-effort: the resolver never throws; null
+  // keeps the legacy lazy save-time lookup as the fallback.
+  const projectContextPromise = resolveMobileProjectContext({
+    userId,
+    chatSessionId,
+    testCaseId: params.testCaseId,
+    contextProjectId:
+      typeof ctxObj?.projectId === 'string' ? ctxObj.projectId : undefined,
   });
 
   try {
@@ -203,6 +229,16 @@ export async function handleMobileAgent(
     } else {
       incCounter('mobile_chat.eager_snapshot', 'disabled');
     }
+
+    // Land the eager project context (kicked off before the snapshot
+    // fetch) on the blackboard. Resolver swallows its own errors → a
+    // plain await is safe here.
+    const projectContext = await projectContextPromise;
+    blackboard.setProjectContext(projectContext);
+    incCounter(
+      'mobile_chat.eager_project_context',
+      projectContext ? projectContext.source : 'unresolved',
+    );
 
     // AI-usage tracking — parity with general_chat. mobile_agent is a real
     // multi-step agent, so its decisions (tool calls, duration) must leave a

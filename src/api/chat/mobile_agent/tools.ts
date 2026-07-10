@@ -38,11 +38,15 @@ import {
   type MobilePlatform,
 } from '@/services/mobile/mobile-runner.types';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
+import {
+  getAccessibleProject,
+  listMobileProjectOptions,
+} from '@/services/chat/mobile-project-context.service';
+import { TestCaseResolverService } from '@/services/testing/resolver/test-case-resolver.service';
 import { logger } from '@/utils/core/logger';
 import type { MobileBlackboard } from './blackboard';
-import { generateFlowPlan } from './planner';
+import { generateFlowPlan, type ConcreteFlowPlan } from './planner';
 import { MobileDraftStepsCache } from '@/services/testing/mobile/mobile-draft-steps-cache';
-import { sanitizeMobileSteps } from '@/services/testing/mobile/mobile-step-sanitizer';
 import { RegressionSaveService } from '@/services/testing/regression/regression-save.service';
 import {
   emitMobileAgentThinking,
@@ -399,7 +403,10 @@ const PLAN_FLOW_TOOL: ChatCompletionTool = {
       'Call this ONCE at the start of any flow that needs more than one action ' +
       '(login, checkout, registration, multi-field form fill, exploration of a ' +
       'specific feature). Do NOT call for single-action requests like "tap X". ' +
-      'After planning, walk the plan via start_plan_step / finish_plan_step.',
+      'After planning, walk the plan via start_plan_step / finish_plan_step. ' +
+      'If the goal is too vague to plan (no target flow / no success criteria), ' +
+      'this returns a clarifying question instead of a plan — relay it to the ' +
+      'user and STOP; do not author or run steps until they answer.',
     parameters: {
       type: 'object',
       properties: {
@@ -566,6 +573,15 @@ const MOBILE_RUN_DRAFT_STEPS_TOOL: ChatCompletionTool = {
                 description:
                   'Natural-language assertion for assert_visible / assert_text steps.',
               },
+              isSensitive: {
+                type: 'boolean',
+                description:
+                  'Set true when `value` is a credential (password, OTP, ' +
+                  'token, API key, PIN). On save the value is replaced by a ' +
+                  '{{param_*}} placeholder regardless of wording — this flag ' +
+                  'is the authoritative signal, mirroring type_text\'s ' +
+                  'isSensitive. Default false.',
+              },
             },
             required: ['id', 'type', 'description'],
             additionalProperties: true,
@@ -623,6 +639,14 @@ const MOBILE_CREATE_TEST_CASE_TOOL: ChatCompletionTool = {
             'is testing a Flutter app pass "mobile_flutter" explicitly. Omit ' +
             'for native Android / iOS — the cached draft platform is correct.',
         },
+        projectId: {
+          type: 'string',
+          description:
+            'Target project id. Omit normally — the chat is already scoped to ' +
+            'a project. Pass ONLY when a previous save failed with "could not ' +
+            'resolve a project" and the user has since picked one from ' +
+            'list_project_options.',
+        },
         confirm: {
           type: 'boolean',
           description:
@@ -631,6 +655,51 @@ const MOBILE_CREATE_TEST_CASE_TOOL: ChatCompletionTool = {
         },
       },
       required: ['confirm'],
+      additionalProperties: false,
+    },
+  },
+};
+
+const LIST_PROJECT_OPTIONS_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'list_project_options',
+    description:
+      'List the projects in the user’s workspace a mobile test case could be ' +
+      'saved into (id, name, whether a mobile app is uploaded). Call ONLY when ' +
+      'mobile_create_test_case failed because no project could be resolved — ' +
+      'show the options to the user, ask which one to use, then retry ' +
+      'mobile_create_test_case with the chosen projectId. Read-only.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+};
+
+const SEARCH_SIMILAR_TEST_CASES_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'search_similar_test_cases',
+    description:
+      'Semantic search over the user’s EXISTING saved mobile test cases (by ' +
+      'meaning, not just name). Call this ONCE before authoring a brand-new ' +
+      'test (before mobile_run_draft_steps) to avoid creating a duplicate. If a ' +
+      'close match comes back, tell the user it already exists and offer to run ' +
+      'or extend it instead of re-authoring. Read-only. Skip it when the user is ' +
+      'clearly editing an already-open test case.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description:
+            'What the new test would do, in a few words (e.g. "log in with ' +
+            'email and password", "add item to cart"). Defaults to the user’s ' +
+            'goal when omitted.',
+        },
+      },
       additionalProperties: false,
     },
   },
@@ -764,6 +833,8 @@ export const MOBILE_AGENT_TOOLS: ChatCompletionTool[] = [
   THINK_ALOUD_TOOL,
   MOBILE_RUN_DRAFT_STEPS_TOOL,
   MOBILE_CREATE_TEST_CASE_TOOL,
+  LIST_PROJECT_OPTIONS_TOOL,
+  SEARCH_SIMILAR_TEST_CASES_TOOL,
   // WebView (Phase 8) — only relevant for hybrid apps; native flows
   // never call them. Listing them at the bottom keeps the prompt cache
   // stable for native-only sessions while still giving the LLM access
@@ -852,6 +923,10 @@ export async function executeTool(
         return await runMobileRunDraftSteps(args, bb, opts);
       case 'mobile_create_test_case':
         return await runMobileCreateTestCase(args, bb, opts);
+      case 'list_project_options':
+        return await runListProjectOptions(args, bb);
+      case 'search_similar_test_cases':
+        return await runSearchSimilarTestCases(args, bb);
       case 'list_webview_contexts':
         return await runListWebviewContexts(args, bb, opts);
       case 'switch_to_webview':
@@ -1259,7 +1334,26 @@ async function runPlanFlow(
     };
   }
 
-  bb.setPlan(result.plan);
+  // Ambiguity gate: the goal was too vague to plan (no target flow / no
+  // acceptance criteria). Do NOT install a plan or author any steps — return
+  // the clarifying question so the executor relays it to the user and STOPS.
+  // This is the enforcement point the prompt guidance alone can't guarantee.
+  if (result.plan.needsClarification) {
+    return {
+      ok: true,
+      content:
+        'The goal is too vague to plan without guessing. Do NOT author or run ' +
+        'any steps. Ask the user this clarifying question and wait for their ' +
+        `reply:\n\n"${result.plan.clarifyingQuestion}"`,
+      data: result.plan,
+    };
+  }
+
+  // Past the clarification gate the schema refine guarantees a non-empty
+  // steps[]. Narrow to ConcreteFlowPlan so setPlan + the step count reads are
+  // type-safe without optional chaining.
+  const plan = result.plan as ConcreteFlowPlan;
+  bb.setPlan(plan);
 
   // Surface a planning-specific timeline row so the UI can render
   // "Plan ready: 5 steps" with the planning step-type instead of the
@@ -1275,22 +1369,22 @@ async function runPlanFlow(
   const planProgress = Math.max(65, mobileToolProgress(roundsSoFar, 30));
   emitMobilePlanningStep(
     bb.chatSessionId,
-    `Plan ready: ${result.plan.steps.length} steps`,
+    `Plan ready: ${plan.steps.length} steps`,
     planProgress,
     {
       sessionId: bb.mobileSessionId,
-      stepCount: result.plan.steps.length,
-      goal: result.plan.goal,
+      stepCount: plan.steps.length,
+      goal: plan.goal,
     },
   );
 
   return {
     ok: true,
     content:
-      `Plan installed (${result.plan.steps.length} steps). Walk it by calling ` +
+      `Plan installed (${plan.steps.length} steps). Walk it by calling ` +
       `start_plan_step → action tools → finish_plan_step, in order.\n\n` +
       `${bb.formatPlanStatusForLlm()}`,
-    data: result.plan,
+    data: plan,
   };
 }
 
@@ -1466,14 +1560,15 @@ function runThinkAloud(
  *     `swipe`, `scroll`, `press`, etc.
  *   - runner aliases that toRunnerCommand also handles — `tap`, `type_text`,
  *     `input_text`, `press_key`, `launch_app`.
- * Must be kept in sync with `toRunnerCommand` below; an unknown type would
- * fall through to the catch-all branch and the runner would reject it,
- * leaving the LLM with a vague "unknown failure".
+ * Must be kept in sync with `toRunnerCommand` below: every type here has an
+ * explicit case in its switch, and its default branch rejects with a
+ * "whitelist and converter are out of sync" message (guarded by a unit
+ * test in __tests__/tools.to-runner-command.test.ts).
  */
-const ACCEPTED_STEP_TYPES = new Set<string>([
+export const ACCEPTED_STEP_TYPES = new Set<string>([
   // canonical (mirror of MobileIntentActionType — mobile-runner.types.ts:42-62)
   'click', 'type', 'scroll', 'press', 'hover',
-  'assert', 'ai_check', 'navigate', 'wait', 'wait_for', 'screenshot',
+  'assert', 'ai_check', 'extract_text', 'navigate', 'wait', 'wait_for', 'screenshot',
   'select', 'check', 'uncheck', 'toggle', 'open', 'close',
   'open_app', 'close_app', 'open_notifications',
   'swipe', 'long_press', 'double_tap', 'drag', 'pinch',
@@ -1544,6 +1639,9 @@ async function runMobileRunDraftSteps(
       type: type as MobileIntentStep['type'],
       description,
       ...(typeof r.value === 'string' ? { value: r.value } : {}),
+      // Primary credential signal for save-time sanitisation — must survive
+      // the cache → saveFromRecording round-trip.
+      ...(r.isSensitive === true ? { isSensitive: true } : {}),
       ...(typeof r.assertionText === 'string' ? { assertionText: r.assertionText } : {}),
       ...(r.bindingHints && typeof r.bindingHints === 'object'
         ? { bindingHints: r.bindingHints as MobileIntentStep['bindingHints'] }
@@ -1556,6 +1654,22 @@ async function runMobileRunDraftSteps(
         : {}),
     };
     steps.push(step);
+  }
+
+  // Convert every step to a runner command BEFORE caching/executing.
+  // A step that can't be converted (missing required params, no valid
+  // target) bails the whole batch with an actionable message — same
+  // policy as the shape validation above.
+  const commands: Record<string, unknown>[] = [];
+  for (let i = 0; i < steps.length; i++) {
+    const converted = toRunnerCommand(steps[i]);
+    if (!converted.ok) {
+      return {
+        ok: false,
+        content: `Step #${i + 1} (${steps[i].id}) cannot run: ${converted.reason}`,
+      };
+    }
+    commands.push(converted.command);
   }
 
   // Persist draft in the cache BEFORE running. If the run errors out
@@ -1589,7 +1703,7 @@ async function runMobileRunDraftSteps(
   try {
     const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
-      steps.map(toRunnerCommand),
+      commands,
       { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
     );
     runnerResults = results ?? [];
@@ -1635,8 +1749,9 @@ async function runMobileRunDraftSteps(
 
 /**
  * Persist the draft cached for this chat session as an intent_test_case.
- * Sanitises sensitive values (password / token / secret / ...) BEFORE
- * insert by replacing matched values with `{{param_*}}` placeholders.
+ * Credential sanitisation (values → `{{param_*}}` placeholders + schema)
+ * is enforced by `RegressionSaveService.saveFromRecording` at the
+ * persistence boundary — this tool just hands over the raw draft.
  */
 async function runMobileCreateTestCase(
   args: Record<string, unknown>,
@@ -1682,22 +1797,49 @@ async function runMobileCreateTestCase(
   const description =
     typeof args.description === 'string' ? args.description.trim() : undefined;
 
-  // Sanitise sensitive values BEFORE handing to the save service.
-  // saveFromRecording does NOT sanitise (parity with web step-editor authoring),
-  // so this is the only line of defence against persisting plaintext credentials.
-  const { steps: sanitised, parametersSchema } = sanitizeMobileSteps(draft.steps);
+  // Sanitisation happens at the persistence boundary —
+  // `RegressionSaveService.saveFromRecording` runs `sanitizeMobileSteps` on
+  // every mobile save (credential values → `{{param_*}}`, schema persisted
+  // to parameters_schema). No pre-sanitisation here: a single boundary pass
+  // is what derives the schema.
 
-  // We need a project id. The mobile-agent context is project-aware via
-  // the chat session; but we don't carry it on the blackboard yet. Fall
-  // back to looking it up on the chat session row.
-  const projectId = await resolveProjectId(bb);
+  // We need a project id. Priority:
+  //   1. Explicit `projectId` arg — the recovery path after a failed save,
+  //      where the user picked a project from list_project_options. The
+  //      value is LLM-relayed and therefore untrusted: validate ownership /
+  //      workspace membership before using it.
+  //   2. The eager project context the handler resolved onto the blackboard.
+  //   3. Legacy lazy lookup on the chat session row (kept as the safety net
+  //      for turns where the eager resolution failed transiently).
+  let projectId: string | null = null;
+  const projectIdArg =
+    typeof args.projectId === 'string' && args.projectId.trim()
+      ? args.projectId.trim()
+      : null;
+  if (projectIdArg) {
+    const project = await getAccessibleProject(bb.userId, projectIdArg);
+    if (!project) {
+      MobileDraftStepsCache.set(bb.chatSessionId, draft);
+      return {
+        ok: false,
+        content:
+          `Project ${projectIdArg} does not exist or the user has no access to it. ` +
+          'The draft is still cached. Call list_project_options and let the user pick a valid project.',
+      };
+    }
+    projectId = project.id;
+  } else {
+    projectId = bb.getProjectContext()?.projectId ?? (await resolveProjectId(bb));
+  }
   if (!projectId) {
     // Re-cache so the user can retry after providing project context.
     MobileDraftStepsCache.set(bb.chatSessionId, draft);
     return {
       ok: false,
       content:
-        'Could not resolve a project for this chat session. The draft has been kept in cache — ask the user to confirm the project and retry.',
+        'Could not resolve a project for this chat session. The draft has been kept in cache. ' +
+        'Recovery path: call list_project_options, show the user the available projects, ask which ' +
+        'one to save into, then call mobile_create_test_case again with that projectId.',
     };
   }
 
@@ -1720,13 +1862,20 @@ async function runMobileCreateTestCase(
       ? (overrideRaw as SavePlatform)
       : null;
 
-  // Derive from the detected framework when the LLM didn't override. Failure
-  // to read it is non-fatal — fall through to the cached/host value.
+  // Derive from the detected framework when the LLM didn't override. The
+  // eager project context already carries it when it resolved THIS project —
+  // only hit the DB when it didn't (context miss, or explicit projectId arg
+  // pointing elsewhere). Failure to read it is non-fatal — fall through to
+  // the cached/host value.
   let frameworkPlatform: SavePlatform | null = null;
   if (!override) {
-    const framework = await MobileAppStorageService.getDetectedFramework(projectId).catch(
-      () => undefined,
-    );
+    const eagerCtx = bb.getProjectContext();
+    const framework =
+      eagerCtx?.projectId === projectId && eagerCtx.detectedFramework
+        ? eagerCtx.detectedFramework
+        : await MobileAppStorageService.getDetectedFramework(projectId).catch(
+            () => undefined,
+          );
     if (framework === 'flutter' || framework === 'ios') {
       frameworkPlatform = frameworkToMobilePlatformKey(
         framework,
@@ -1759,26 +1908,26 @@ async function runMobileCreateTestCase(
       description,
       kind: 'standalone',
       platform: finalPlatform,
-      steps: sanitised,
+      steps: draft.steps,
       appPackage: draft.appPackage,
       startActivity: draft.startActivity,
     });
 
     bb.recordToolCall({
       tool: 'mobile_create_test_case',
-      args: { name, stepCount: sanitised.length, parametersCount: Object.keys(parametersSchema).length },
+      args: { name, stepCount: draft.steps.length, parametersCount: result.parametersCount },
       ok: true,
       durationMs: Date.now() - startedAt,
       at: startedAt,
     });
 
-    const paramsLine = Object.keys(parametersSchema).length > 0
-      ? `\nSensitive values were parameterised: ${Object.keys(parametersSchema).join(', ')}.`
+    const paramsLine = result.parametersCount > 0
+      ? `\n${result.parametersCount} sensitive value(s) were parameterised as {{param_*}} placeholders.`
       : '';
     return {
       ok: true,
       content:
-        `✅ Saved as "${name}" (id: ${result.savedTestCaseId}, ${sanitised.length} steps).` +
+        `✅ Saved as "${name}" (id: ${result.savedTestCaseId}, ${draft.steps.length} steps).` +
         paramsLine +
         `\nReplay it later with "run saved ${name}".`,
       data: result,
@@ -1789,7 +1938,7 @@ async function runMobileCreateTestCase(
     const message = err instanceof Error ? err.message : String(err);
     bb.recordToolCall({
       tool: 'mobile_create_test_case',
-      args: { name, stepCount: sanitised.length },
+      args: { name, stepCount: draft.steps.length },
       ok: false,
       error: message,
       durationMs: Date.now() - startedAt,
@@ -1804,14 +1953,40 @@ async function runMobileCreateTestCase(
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
+ * Thrown by the per-type converter when a step is structurally valid but
+ * cannot produce a runnable command (missing required coordinates, no
+ * navigation target, ...). Caught by `toRunnerCommand` and surfaced as an
+ * `{ ok: false, reason }` result so the LLM gets an actionable message
+ * instead of the runner's generic zod validation error.
+ */
+class StepConversionError extends Error {}
+
+export type RunnerCommandConversion =
+  | { ok: true; command: Record<string, unknown> }
+  | { ok: false; reason: string };
+
+/**
  * Convert an authoring-time MobileIntentStep into the runner's command
  * shape. The mapping accepts BOTH canonical storage types (`click`, `type`,
  * `press`, `open_app`) and runner-aliased types (`tap`, `type_text`,
  * `press_key`, `launch_app`) — the LLM may emit either; we normalise here.
- * Anything we don't recognise gets shipped verbatim — the runner's zod
- * schema rejects it cleanly with an error result the LLM can react to.
+ * Mirrors qait-mobile-runner's intent-step-converter.ts so an authored
+ * step converts to the same command a saved test case would replay as.
+ * A step that can't produce a runnable command returns `{ ok: false }`
+ * with a reason the LLM can fix.
  */
-function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
+export function toRunnerCommand(step: MobileIntentStep): RunnerCommandConversion {
+  try {
+    return { ok: true, command: toRunnerCommandInner(step) };
+  } catch (err) {
+    if (err instanceof StepConversionError) {
+      return { ok: false, reason: err.message };
+    }
+    throw err;
+  }
+}
+
+function toRunnerCommandInner(step: MobileIntentStep): Record<string, unknown> {
   const type = step.type as string;
   switch (type) {
     // Canonical "tap" family — both storage names ('click' from
@@ -1825,6 +2000,14 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
     case 'hover':
     case 'select':
       return { type: 'tap', params: { intent: step.description } };
+
+    // ── close: app vs UI element, decided by structure (runner parity).
+    //    A package-like value ("com.example.app") → close_app; otherwise
+    //    tap the close button/icon the description names.
+    case 'close':
+      return isPackageLike(step.value ?? '')
+        ? { type: 'close_app', params: { packageName: step.value } }
+        : { type: 'tap', params: { intent: step.description } };
 
     case 'long_press':
       return { type: 'long_press', params: { intent: step.description } };
@@ -1853,13 +2036,74 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
         },
       };
 
-    case 'swipe':
-      // Swipe needs explicit start/end coords; without options we ship
-      // whatever options the LLM provided (runner validates).
+    case 'swipe': {
+      // Runner zod (swipeParams) requires all four coordinates. Use the
+      // LLM-provided coords when complete; otherwise derive them from the
+      // direction hint — same geometry as the runner's own
+      // inferSwipeCoordinates (centre of a 1080×1920 reference screen,
+      // shorter horizontal span to stay clear of Android's edge back-
+      // gesture zones).
+      const opts = step.options as
+        | {
+            startX?: number;
+            startY?: number;
+            endX?: number;
+            endY?: number;
+            durationMs?: number;
+            direction?: 'up' | 'down' | 'left' | 'right';
+            scrollDirection?: 'up' | 'down' | 'left' | 'right';
+          }
+        | undefined;
+      const coords =
+        opts?.startX != null && opts?.startY != null && opts?.endX != null && opts?.endY != null
+          ? { startX: opts.startX, startY: opts.startY, endX: opts.endX, endY: opts.endY }
+          : inferSwipeCoordinates(opts?.direction ?? opts?.scrollDirection ?? 'down');
       return {
         type: 'swipe',
-        params: (step.options as Record<string, unknown> | undefined) ?? {},
+        params: { ...coords, durationMs: opts?.durationMs ?? 300 },
       };
+    }
+
+    // ── drag: unlike swipe there is no sane default — a drag targets a
+    //    specific element pair, so all four coordinates are required
+    //    (runner parity: its converter rejects a coordinate-less drag).
+    case 'drag': {
+      const opts = step.options as
+        | { startX?: number; startY?: number; endX?: number; endY?: number; durationMs?: number }
+        | undefined;
+      if (opts?.startX == null || opts?.startY == null || opts?.endX == null || opts?.endY == null) {
+        throw new StepConversionError(
+          'drag requires options.startX/startY/endX/endY coordinates.',
+        );
+      }
+      return {
+        type: 'drag',
+        params: {
+          startX: opts.startX,
+          startY: opts.startY,
+          endX: opts.endX,
+          endY: opts.endY,
+          holdDurationMs: 500,
+          durationMs: opts.durationMs ?? 800,
+        },
+      };
+    }
+
+    // ── pinch: zoom gesture. Runner command name is pinch_zoom.
+    case 'pinch': {
+      const opts = step.options as
+        | { pinchDirection?: 'in' | 'out'; pinchScale?: number; startX?: number; startY?: number }
+        | undefined;
+      return {
+        type: 'pinch_zoom',
+        params: {
+          direction: opts?.pinchDirection ?? 'out',
+          scale: opts?.pinchScale ?? 2.0,
+          ...(opts?.startX != null ? { x: opts.startX } : {}),
+          ...(opts?.startY != null ? { y: opts.startY } : {}),
+        },
+      };
+    }
 
     case 'press':
     case 'press_key':
@@ -1917,6 +2161,56 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
           ...(step.assertionText ? { expectedText: step.assertionText } : {}),
         },
       };
+
+    // ── extract_text: read an element's text into the runner scratchpad.
+    //    variableName is required by the runner's zod schema.
+    case 'extract_text': {
+      const opts = step.options as { extractVariable?: string } | undefined;
+      const variableName = opts?.extractVariable?.trim();
+      if (!variableName) {
+        throw new StepConversionError(
+          'extract_text requires options.extractVariable (the scratchpad variable name to store the text under).',
+        );
+      }
+      return {
+        type: 'extract_text',
+        params: { intent: step.description, variableName },
+      };
+    }
+
+    // ── navigate: URL / deep link → open_url; package/bundle ID → launch_app.
+    //    Mirrors the runner's own navigate handling for saved test cases.
+    case 'navigate': {
+      const target =
+        step.value ??
+        (isUrlLike(step.description) || isPackageLike(step.description) ? step.description : '');
+      if (!target) {
+        throw new StepConversionError(
+          'navigate requires a URL, deep link, or package/bundle ID in step.value.',
+        );
+      }
+      return isUrlLike(target)
+        ? { type: 'open_url', params: { url: target } }
+        : { type: 'launch_app', params: { packageName: target } };
+    }
+
+    // ── wait / wait_for: re-snapshot and wait for a stable screen. The
+    //    runner replays these as observe_page; a numeric value extends the
+    //    timeout (runner parity: max(waitMs + 2000, 5000)).
+    case 'wait':
+    case 'wait_for': {
+      const waitMs = step.value ? parseInt(step.value, 10) : NaN;
+      return {
+        type: 'observe_page',
+        params: {},
+        ...(!isNaN(waitMs) && waitMs > 0
+          ? { timeout: Math.max(waitMs + 2000, 5000) }
+          : {}),
+      };
+    }
+
+    case 'screenshot':
+      return { type: 'screenshot', params: {} };
 
     case 'open_notifications':
       return { type: 'open_notifications' };
@@ -2010,6 +2304,47 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
       };
     }
 
+    // ── clipboard: set when a value is provided, otherwise read.
+    case 'clipboard':
+      return step.value
+        ? { type: 'set_clipboard', params: { text: step.value } }
+        : { type: 'get_clipboard', params: {} };
+
+    // ── network: simulate network conditions. Clear vs set decided by
+    //    structure (runner parity): explicit networkAction 'clear', or no
+    //    preset AND no custom params → clear.
+    case 'network': {
+      const opts = step.options as
+        | {
+            networkAction?: string;
+            networkPreset?: string;
+            networkLatencyMs?: number;
+            networkBandwidthKbps?: number;
+            networkPacketLossPercent?: number;
+          }
+        | undefined;
+      const hasCustomParams =
+        opts?.networkLatencyMs != null ||
+        opts?.networkBandwidthKbps != null ||
+        opts?.networkPacketLossPercent != null;
+      if (opts?.networkAction === 'clear' || (!opts?.networkPreset && !hasCustomParams)) {
+        return { type: 'clear_network_condition', params: {} };
+      }
+      return {
+        type: 'set_network_condition',
+        params: {
+          ...(opts?.networkPreset ? { preset: opts.networkPreset } : {}),
+          ...(opts?.networkLatencyMs != null ? { latencyMs: opts.networkLatencyMs } : {}),
+          ...(opts?.networkBandwidthKbps != null
+            ? { bandwidthKbps: opts.networkBandwidthKbps }
+            : {}),
+          ...(opts?.networkPacketLossPercent != null
+            ? { packetLossPercent: opts.networkPacketLossPercent }
+            : {}),
+        },
+      };
+    }
+
     // ── WebView (Phase 8) ────────────────────────────────────────────
     // Saved test cases recorded in WebView context store these step
     // types in steps_json; replay maps them back to runner commands.
@@ -2092,8 +2427,44 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
       return { type: 'web_screenshot', params: {} };
 
     default:
-      // Unknown — let the runner reject it. Don't silently drop.
-      return { type, params: { intent: step.description } };
+      // Only reachable when ACCEPTED_STEP_TYPES and this switch drift
+      // apart — reject loudly so the gap is named, instead of shipping a
+      // half-shaped command the runner rejects with a generic zod error.
+      throw new StepConversionError(
+        `step type "${type}" passed the whitelist but has no runner command mapping — ` +
+          `ACCEPTED_STEP_TYPES and toRunnerCommand are out of sync.`,
+      );
+  }
+}
+
+/** Check if a string looks like a URL or deep link (has a scheme). */
+function isUrlLike(s: string): boolean {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s) || /^(tel|mailto|sms|geo):/.test(s);
+}
+
+/** Check if a string looks like a package/bundle ID (e.g. "com.example.app"). */
+function isPackageLike(s: string): boolean {
+  return /^[a-zA-Z][\w]*(\.[a-zA-Z][\w]*)+$/.test(s);
+}
+
+/**
+ * Direction-based default swipe coordinates on a 1080×1920 reference
+ * screen — same geometry as the runner's inferSwipeCoordinates. The
+ * horizontal span is shorter on purpose: Android 10+ reserves the outer
+ * ~24-32dp of each side as a system back-gesture zone, so a wider swipe
+ * would be intercepted as "go back" before the app sees it.
+ */
+function inferSwipeCoordinates(
+  direction: 'up' | 'down' | 'left' | 'right',
+): { startX: number; startY: number; endX: number; endY: number } {
+  const cx = 540, cy = 960;
+  const HORIZONTAL_DELTA = 320;
+  const VERTICAL_DELTA = 500;
+  switch (direction) {
+    case 'up':    return { startX: cx, startY: cy + VERTICAL_DELTA, endX: cx, endY: cy - VERTICAL_DELTA };
+    case 'down':  return { startX: cx, startY: cy - VERTICAL_DELTA, endX: cx, endY: cy + VERTICAL_DELTA };
+    case 'left':  return { startX: cx + HORIZONTAL_DELTA, startY: cy, endX: cx - HORIZONTAL_DELTA, endY: cy };
+    case 'right': return { startX: cx - HORIZONTAL_DELTA, startY: cy, endX: cx + HORIZONTAL_DELTA, endY: cy };
   }
 }
 
@@ -2206,10 +2577,12 @@ function mapPlatformToMobilePlatform(
 }
 
 /**
- * Best-effort project lookup via the chat session. The blackboard doesn't
- * carry projectId today; rather than wire it through every layer for one
- * tool, we ask the DB. If the chat session has no project, returns null
- * and the tool surfaces a "no project" message to the LLM.
+ * Legacy lazy project lookup via the chat session row. The handler now
+ * resolves project context eagerly onto the blackboard
+ * (`bb.getProjectContext()`); this remains as the fallback for turns where
+ * that resolution failed transiently. Returns null when the chat session
+ * has no project either — the save tool then points the LLM at
+ * list_project_options.
  */
 async function resolveProjectId(bb: MobileBlackboard): Promise<string | null> {
   if (!bb.chatSessionId) return null;
@@ -2229,6 +2602,113 @@ async function resolveProjectId(bb: MobileBlackboard): Promise<string | null> {
     });
     return null;
   }
+}
+
+/**
+ * Recovery tool for the save dead-end: when no project resolves, the LLM
+ * calls this to enumerate the workspace's projects, asks the user to pick,
+ * then retries mobile_create_test_case with the chosen projectId.
+ */
+async function runListProjectOptions(
+  _args: Record<string, unknown>,
+  bb: MobileBlackboard,
+): Promise<ToolResult> {
+  const startedAt = Date.now();
+  const options = await listMobileProjectOptions(bb.workspaceId);
+
+  bb.recordToolCall({
+    tool: 'list_project_options',
+    args: { count: options.length },
+    ok: true,
+    durationMs: Date.now() - startedAt,
+    at: startedAt,
+  });
+
+  if (options.length === 0) {
+    return {
+      ok: false,
+      content:
+        'No projects found in this workspace. The user must create a project ' +
+        '(and upload a mobile app build) in the dashboard before a test case can be saved.',
+    };
+  }
+
+  const lines = options.map((o) => {
+    const app = o.hasMobileApp
+      ? ` — mobile app: ${o.appPackage ?? 'uploaded'}`
+      : ' — no mobile app uploaded';
+    return `- "${o.name}" (id: ${o.id})${app}`;
+  });
+  return {
+    ok: true,
+    content:
+      `Projects available for saving (${options.length}):\n${lines.join('\n')}\n` +
+      'Show these to the user and ask which project to save into, then call ' +
+      'mobile_create_test_case again with that projectId. Prefer projects with a mobile app uploaded.',
+    data: { options },
+  };
+}
+
+/**
+ * Duplicate-avoidance search before authoring. Reuses the shared hybrid
+ * (embedding + name + URL) resolver, scoped to the caller's own MOBILE test
+ * cases. Surfaces the top matches so the LLM can offer to run/extend an
+ * existing test instead of re-authoring one. Best-effort — a resolver failure
+ * degrades to "no matches" so authoring is never blocked.
+ */
+async function runSearchSimilarTestCases(
+  args: Record<string, unknown>,
+  bb: MobileBlackboard,
+): Promise<ToolResult> {
+  const startedAt = Date.now();
+  const query =
+    typeof args.query === 'string' && args.query.trim() ? args.query.trim() : bb.goal;
+
+  if (!bb.workspaceId) {
+    return {
+      ok: true,
+      content:
+        'No workspace scope on this turn — cannot search existing test cases. Proceed with authoring.',
+    };
+  }
+
+  const hits = await TestCaseResolverService.findSimilar({
+    query,
+    userId: bb.userId,
+    workspaceId: bb.workspaceId,
+    platformPrefix: 'mobile_',
+    limit: 3,
+  });
+
+  bb.recordToolCall({
+    tool: 'search_similar_test_cases',
+    args: { query, hitCount: hits.length },
+    ok: true,
+    durationMs: Date.now() - startedAt,
+    at: startedAt,
+  });
+
+  if (hits.length === 0) {
+    return {
+      ok: true,
+      content:
+        'No similar existing mobile test cases found. Safe to author a new one.',
+    };
+  }
+
+  const lines = hits.map(
+    (h) => `- "${h.name}" (id: ${h.id}, similarity ${h.score.toFixed(2)})`,
+  );
+  return {
+    ok: true,
+    content:
+      `Found ${hits.length} existing mobile test case(s) that may overlap:\n` +
+      `${lines.join('\n')}\n` +
+      'If one of these IS what the user wants, tell them it already exists and ' +
+      'offer to run it ("run saved <name>") or extend it — do NOT silently author a duplicate. ' +
+      'If none truly match, proceed with the new test.',
+    data: { hits },
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
