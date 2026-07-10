@@ -43,10 +43,21 @@ describe('sanitizeSteps (shared web + mobile)', () => {
     expect(steps[0].value).toMatch(PLACEHOLDER);
   });
 
-  it('is idempotent — an already-templated value is left alone', () => {
+  it('is idempotent on the value but RE-REGISTERS a param_* placeholder into the schema', () => {
+    // A value pre-sanitized before the save boundary (e.g. the web draft path)
+    // must still contribute to the persisted parameters_schema — the schema is
+    // derived here, so skipping it would persist null and the placeholder would
+    // never resolve on replay. Value itself is left untouched.
     const step = { id: 'a', type: 'type', description: 'password', value: '{{param_password}}' };
     const { steps, parametersSchema } = sanitizeSteps([step]);
     expect(steps[0].value).toBe('{{param_password}}');
+    expect(Object.keys(parametersSchema)).toEqual(['param_password']);
+  });
+
+  it('does NOT register non-parameter placeholders ({{secrets.*}} etc.)', () => {
+    const step = { id: 'a', type: 'type', description: 'password', value: '{{secrets.PW}}' };
+    const { steps, parametersSchema } = sanitizeSteps([step]);
+    expect(steps[0].value).toBe('{{secrets.PW}}');
     expect(Object.keys(parametersSchema)).toHaveLength(0);
   });
 

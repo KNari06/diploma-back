@@ -192,6 +192,60 @@ export class TestCaseResolverService {
   }
 
   /**
+   * Similarity search for AUTHORING: "does a test case like this already exist?"
+   * Reuses the same hybrid scoring as `resolve()` (embedding + name + URL) but
+   * skips the chat-routing concerns — no match-type classification, no
+   * prefilled steps, no thresholds. Returns the top-N ranked candidates so the
+   * caller (e.g. the mobile agent, before authoring a new draft) can warn about
+   * duplicates.
+   *
+   * `platformPrefix` filters candidates in the DB query BEFORE the candidate
+   * cap, so a mobile search on a web-heavy workspace still sees mobile rows.
+   * Never throws — returns [] on any failure (embedding timeout falls back to
+   * name-only scoring, same as `resolve`).
+   */
+  static async findSimilar(params: {
+    query: string;
+    userId: string;
+    workspaceId: string;
+    platformPrefix?: string;
+    limit?: number;
+    config?: Partial<ResolverConfig>;
+  }): Promise<ResolvedTestCase[]> {
+    const config = { ...DEFAULT_CONFIG, ...params.config };
+    const limit = params.limit ?? 3;
+    try {
+      const candidates = await this.fetchCandidates(
+        params.userId,
+        params.workspaceId,
+        config,
+        true, // owner-scoped — matches the owner-scoped save path
+        params.platformPrefix,
+      );
+      if (candidates.length === 0) return [];
+
+      const ranked = await Promise.race([
+        this.scoreAndRank(params.query, candidates),
+        new Promise<ResolvedTestCase[]>((_, reject) =>
+          setTimeout(() => reject(new Error('Resolver timeout')), config.timeoutMs),
+        ),
+      ]).catch((err) => {
+        logger.warn('[RESOLVER] findSimilar scoring timeout, name-only fallback', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return this.scoreByNameOnly(params.query, candidates);
+      });
+
+      return ranked.slice(0, limit);
+    } catch (err) {
+      logger.warn('[RESOLVER] findSimilar failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return [];
+    }
+  }
+
+  /**
    * Does this user have ANY runnable saved tests or regression plans (in
    * projects they OWN within the workspace)? Used by the chat flow to decide
    * between "confirm an existing test" and "suggest exploration". Owner-scoped
@@ -241,6 +295,7 @@ export class TestCaseResolverService {
     workspaceId: string,
     config: ResolverConfig,
     ownerOnly?: boolean,
+    platformPrefix?: string,
   ): Promise<RawCandidate[]> {
     // Get the projects to scan. ownerOnly restricts to projects the user owns
     // (so every candidate is runnable by the owner-scoped runner); otherwise
@@ -261,11 +316,17 @@ export class TestCaseResolverService {
 
     const projectIds = projects.map(p => p.id);
 
-    const { data, error } = await supabaseAdmin
+    let candidateQuery = supabaseAdmin
       .from('intent_test_cases')
       .select('id, name, description, url, start_url, commands, steps_json, project_id, flow_id, tags, platform, updated_at')
       .in('project_id', projectIds)
-      .eq('status', 'published')
+      .eq('status', 'published');
+    // Platform filter BEFORE the cap — otherwise a workspace with many web
+    // tests could evict all mobile rows past `maxCandidates` before scoring.
+    if (platformPrefix) {
+      candidateQuery = candidateQuery.like('platform', `${platformPrefix}%`);
+    }
+    const { data, error } = await candidateQuery
       .order('updated_at', { ascending: false })
       .limit(config.maxCandidates);
 

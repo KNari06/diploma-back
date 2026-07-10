@@ -52,6 +52,8 @@ export async function routeToHandler(
      * save tool uses it so it doesn't dead-end on the chat_sessions lookup.
      */
     projectId?: string;
+    /** Test case's access-checked project id (test-case scope only). See BUG-1. */
+    testCaseProjectId?: string;
   }
 ): Promise<void> {
   // ═══════════════════════════════════════════════════════════════════════
@@ -122,6 +124,7 @@ export async function routeToHandler(
     chatStore: params.chatStore,
     testCaseId: params.testCaseId,
     projectId: params.projectId,
+    testCaseProjectId: params.testCaseProjectId,
   });
 }
 

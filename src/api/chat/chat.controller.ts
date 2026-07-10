@@ -752,10 +752,15 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
           // ChatPersistence; legacy handlers receive but ignore it.
           chatStore,
           testCaseId,
-          // Controller-resolved project (test-case access check). Lets the
-          // mobile agent's save tool resolve the project without the
-          // chat_sessions.project_id lookup that is NULL in mobile scopes.
+          // Controller-resolved project (test-case access check). Two consumers:
+          //  - `projectId` → the mobile agent's save tool resolves the project
+          //    without the chat_sessions.project_id lookup that is NULL in
+          //    mobile scopes.
+          //  - `testCaseProjectId` → the general handler scopes KB/file/project
+          //    context + tools to the right project instead of the workspace
+          //    default. See BUG-1.
           projectId: testCaseAccess?.projectId,
+          testCaseProjectId: testCaseAccess?.projectId,
         }),
         timeoutGuard,
       ]);
@@ -812,8 +817,17 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
     // Unregister request on error. Use the same registry the request was
     // registered against — otherwise we leak the AbortController and
-    // future requests for this session 409 forever.
-    if (chatSessionId && userId) {
+    // future requests for this user/session 409 forever.
+    //
+    // Guard on userId ONLY (not chatSessionId): on the graceful-degrade path
+    // manageChatSession can return chatSessionId=undefined, yet the global
+    // request was still registered under the per-user map (registerActiveRequest
+    // always sets activeRequestsByUser). If we skipped cleanup when
+    // chatSessionId is undefined, that per-user entry would leak and every
+    // future request for this user would 409 until an explicit cancel/restart.
+    // unregisterActiveRequest(undefined, userId) safely clears the user entry
+    // and no-ops the session delete. See BUG-5.
+    if (userId) {
       if (chatStore.kind === 'testcase' && requestKey) {
         await registryUnregister(requestKey, userId);
       } else {

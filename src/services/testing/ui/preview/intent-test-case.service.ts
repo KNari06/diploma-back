@@ -72,6 +72,40 @@ async function canWriteTestCase(
 }
 
 /**
+ * Verify the calling user has access to every `link_test_case` target before
+ * a save persists the reference. Without this, a `linkedTestCaseId` pointing
+ * at another tenant's private test case sits in `steps_json` with no
+ * save-time rejection — the runtime reader
+ * (`RegressionTestQueryService.getSavedTestCase`) happens to re-check
+ * project ownership, but only at run time, so a bad reference currently
+ * fails late and confusingly instead of immediately at save.
+ *
+ * Uses the same owner-or-workspace-member gate as direct writes
+ * (`canWriteTestCase`) rather than the narrower project-owner-only check the
+ * runtime reader applies — this is a save-time floor, not a guarantee that
+ * every future run of the link will succeed for every workspace member.
+ */
+async function validateLinkedTestCaseAccess(linkedIds: string[], userId: string): Promise<void> {
+  const uniqueIds = [...new Set(linkedIds)];
+  const { data: rows, error } = await intentTestCaseDb.getTestCaseOwnersByIds(uniqueIds);
+  if (error) {
+    throw new Error(`Failed to validate linked test cases: ${error.message}`);
+  }
+
+  const byId = new Map((rows || []).map((row: any) => [row.id, row]));
+  for (const linkedId of uniqueIds) {
+    const row = byId.get(linkedId);
+    if (!row) {
+      throw new ValidationError(`Linked test case ${linkedId} was not found`);
+    }
+    const allowed = await canWriteTestCase(row.user_id, row.project_id, userId);
+    if (!allowed) {
+      throw new ValidationError(`You do not have access to linked test case ${linkedId}`);
+    }
+  }
+}
+
+/**
  * Service for managing intent test cases
  */
 export class IntentTestCaseService {
@@ -194,13 +228,54 @@ export class IntentTestCaseService {
       }
     }
 
+    const normalizedSteps = this.normalizeSteps(steps);
+
+    // A `link_test_case` step is a second edge source (alongside dependsOn)
+    // with the same "X requires Y to run first/as part of it" semantics —
+    // see the identical check in update() and utils/graph/link-graph.ts.
+    // update() already validates this on every edit, but create() never did,
+    // so a batch/import path (or a future "duplicate test case" feature)
+    // that calls create() with steps copied from an existing test case could
+    // insert a cyclic link with no check at all until the next edit. A
+    // brand-new row has no id yet, so it can't itself be the target of a
+    // pre-existing edge (nothing can reference an id before it exists) — the
+    // synthetic pending-id node below stands in for it.
+    const linkedIds = extractLinkedTestCaseIds(normalizedSteps);
+    if (linkedIds.length > 0) {
+      await validateLinkedTestCaseAccess(linkedIds, userId);
+
+      const { data: graphRows, error: graphError } = await intentTestCaseDb.getProjectGraphRows(projectId);
+      if (graphError) {
+        throw new Error(`Failed to validate linked test cases: ${graphError.message}`);
+      }
+
+      // Synthetic id standing in for this not-yet-inserted row — a real
+      // UUID can never collide with it, and (unlike an existing row) it
+      // starts with no incoming edges, only the outgoing ones being saved.
+      const pendingId = '__pending_create__';
+      const nodes: LinkGraphNode[] = [
+        { id: pendingId, dependsOn: [], linkedTestCaseIds: linkedIds },
+        ...(graphRows || []).map((row: any) => ({
+          id: row.id,
+          dependsOn: Array.isArray(row.depends_on) ? row.depends_on : [],
+          linkedTestCaseIds: extractLinkedTestCaseIds(row.steps_json),
+        })),
+      ];
+
+      if (wouldCreateCycle(nodes, pendingId, linkedIds)) {
+        throw new ValidationError(
+          'This step links to a test case that (directly or transitively) links back to this one — that would create a circular run',
+        );
+      }
+    }
+
     const { data, error } = await intentTestCaseDb.insertTestCaseRow({
       project_id: projectId,
       user_id: userId,
       name,
       description: description || null,
       start_url: startUrl || null,
-      steps_json: this.normalizeSteps(steps),
+      steps_json: normalizedSteps,
       flow_id: flowId || null,
       status,
       kind,
@@ -700,29 +775,48 @@ export class IntentTestCaseService {
             throw new ValidationError('A test case cannot link to itself');
           }
 
-          const { data: flowProject } = await intentTestCaseDb.getTestCaseFlowProjectForUser(id, userId);
-          if (flowProject?.project_id) {
-            const { data: graphRows, error: graphError } = await intentTestCaseDb.getProjectGraphRows(
-              flowProject.project_id,
-              userId,
+          // Ownership/access check runs unconditionally, independent of the
+          // project lookup below — a bad cross-tenant reference must be
+          // rejected even if the project graph can't be resolved.
+          await validateLinkedTestCaseAccess(linkedIds, userId);
+
+          // `project_id` is NOT NULL in the schema, so a missing `flowProject`
+          // here means either this row can no longer be found for `userId`
+          // (deleted / ownership changed since the caller last read it) or
+          // the query itself failed. Either way, fail closed rather than
+          // silently skipping the multi-hop cycle check below — the query
+          // error used to be discarded (only `data` was destructured), which
+          // let a cyclic link save unvalidated on a transient DB error.
+          const { data: flowProject, error: flowProjectError } =
+            await intentTestCaseDb.getTestCaseFlowProjectForUser(id, userId);
+          if (flowProjectError) {
+            throw new Error(`Failed to validate linked test cases: ${flowProjectError.message}`);
+          }
+          if (!flowProject?.project_id) {
+            throw new ValidationError(
+              "Cannot validate linked test cases — this test case's project could not be resolved",
             );
-            if (graphError) {
-              throw new Error(`Failed to validate linked test cases: ${graphError.message}`);
-            }
+          }
 
-            const nodes: LinkGraphNode[] = (graphRows || []).map((row: any) => ({
-              id: row.id,
-              dependsOn: Array.isArray(row.depends_on) ? row.depends_on : [],
-              // This row's own not-yet-saved steps are what we're validating —
-              // use the new linkedIds rather than the stale DB copy.
-              linkedTestCaseIds: row.id === id ? linkedIds : extractLinkedTestCaseIds(row.steps_json),
-            }));
+          const { data: graphRows, error: graphError } = await intentTestCaseDb.getProjectGraphRows(
+            flowProject.project_id,
+          );
+          if (graphError) {
+            throw new Error(`Failed to validate linked test cases: ${graphError.message}`);
+          }
 
-            if (wouldCreateCycle(nodes, id, linkedIds)) {
-              throw new ValidationError(
-                'This step links to a test case that (directly or transitively) links back to this one — that would create a circular run',
-              );
-            }
+          const nodes: LinkGraphNode[] = (graphRows || []).map((row: any) => ({
+            id: row.id,
+            dependsOn: Array.isArray(row.depends_on) ? row.depends_on : [],
+            // This row's own not-yet-saved steps are what we're validating —
+            // use the new linkedIds rather than the stale DB copy.
+            linkedTestCaseIds: row.id === id ? linkedIds : extractLinkedTestCaseIds(row.steps_json),
+          }));
+
+          if (wouldCreateCycle(nodes, id, linkedIds)) {
+            throw new ValidationError(
+              'This step links to a test case that (directly or transitively) links back to this one — that would create a circular run',
+            );
           }
         }
 

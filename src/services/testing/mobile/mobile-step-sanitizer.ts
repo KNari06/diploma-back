@@ -11,18 +11,27 @@
 import type { MobileIntentStep } from '@/services/mobile/mobile-runner.types';
 import {
   sanitizeSteps,
+  type SanitizableStep,
   type SanitizedStepsResult,
 } from '@/services/testing/shared/step-sanitizer';
 
 export { SECRET_OPTION_FIELDS, slugify } from '@/services/testing/shared/step-sanitizer';
 
-export type SanitizedMobileResult = SanitizedStepsResult<MobileIntentStep>;
+export type SanitizedMobileResult<T extends SanitizableStep = MobileIntentStep> =
+  SanitizedStepsResult<T>;
 
 /**
  * Returns a copy of `steps` with sensitive `value` strings replaced by
  * `{{param_<name>}}` placeholders, plus the `parametersSchema` to persist to
  * `intent_test_cases.parameters_schema`. See the shared sanitizer for details.
+ *
+ * Generic in the step type so BOTH callers keep their own type: the mobile
+ * agent (`MobileIntentStep`) and the save service (web `IntentStep`). Web
+ * `IntentStep` and `MobileIntentStep` are structurally compatible for the
+ * fields the sanitizer reads.
  */
-export function sanitizeMobileSteps(steps: MobileIntentStep[]): SanitizedMobileResult {
-  return sanitizeSteps<MobileIntentStep>(steps);
+export function sanitizeMobileSteps<T extends SanitizableStep = MobileIntentStep>(
+  steps: T[],
+): SanitizedMobileResult<T> {
+  return sanitizeSteps<T>(steps);
 }

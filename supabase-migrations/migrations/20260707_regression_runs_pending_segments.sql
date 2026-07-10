@@ -1,0 +1,36 @@
+-- Segmented (link_test_case) chain awareness for run finalization.
+--
+-- WHY: a single-test-case run (`RegressionRunService.runSavedTestCase`) with
+-- a cross-platform `link_test_case` step dispatches its segments one at a
+-- time, detached from the request (`dispatchFirstSegmentAndDetachRest`).
+-- `regression_runs.test_id` points at whichever segment dispatched most
+-- recently. `TestCompletionHandlerService.recomputeRunStatus`'s legacy path
+-- (used for single-test-case runs — they never get `test_executions` rows,
+-- those are plan/module/flow only) finalizes the run as soon as
+-- `run.test_id`'s own `tests` row goes terminal, with no idea more segments
+-- haven't even dispatched yet — segment 1 finishing (often the fastest leg)
+-- finalized the whole run before segment 2+ ever ran.
+--
+-- This column is a plain counter: NULL/0 for every non-segmented run
+-- (the overwhelming majority — preserves existing behavior exactly), set to
+-- "segments remaining after the first" when a chain is dispatched, and
+-- decremented as each subsequent segment dispatches. `recomputeRunStatus`
+-- defers finalization while this is > 0 (see DECISIONS.md ADR-0011 addendum).
+--
+-- `last_segment_dispatched_at` (ADR-0011 update 6): the staleness check that
+-- decides whether a stuck pending-segments chain should be force-finalized
+-- must NOT anchor on the chain's original `started_at` (set once, at
+-- dispatch) — a legitimately long chain (3+ segments, or slow mobile cold
+-- starts; each segment's own poll budget is already 10 minutes) can exceed
+-- the 30-minute cutoff in aggregate while the CURRENT segment is still
+-- genuinely executing. This column is set alongside `pending_segments` at
+-- every dispatch point (initial + each subsequent segment) so the staleness
+-- check can anchor on "how long has the CURRENT segment been running" instead
+-- of "how long has the whole chain been running". NULL for every
+-- non-segmented run and for any segmented run predating this column —
+-- `recomputeRunStatus` falls back to `started_at` in that case.
+--
+-- Idempotent: IF NOT EXISTS.
+
+ALTER TABLE regression_runs ADD COLUMN IF NOT EXISTS pending_segments INTEGER;
+ALTER TABLE regression_runs ADD COLUMN IF NOT EXISTS last_segment_dispatched_at TIMESTAMPTZ;

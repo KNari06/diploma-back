@@ -14,6 +14,9 @@ jest.mock('../intent-step-dispatch.service', () => ({
     id: raw?.id ?? `step_${i + 1}`,
     type: raw?.type ?? 'click',
     description: raw?.description ?? `Step ${i + 1}`,
+    ...(raw?.value !== undefined ? { value: raw.value } : {}),
+    ...(raw?.bindingHints ? { bindingHints: raw.bindingHints } : {}),
+    ...(raw?.isSensitive === true ? { isSensitive: true } : {}),
   })),
 }));
 
@@ -156,6 +159,76 @@ describe('saveFromRecording strategy and URL sentinel', () => {
       steps,
     });
     expect(result.savedTestCaseId).toBe('tc-new');
+  });
+});
+
+// ── saveFromRecording: sanitization at the persistence boundary ──────────────
+
+describe('saveFromRecording sanitizes mobile steps at the persistence boundary', () => {
+  function saveMobile(steps: any[]) {
+    return RegressionSaveService.saveTestCase({
+      userId: 'user-1',
+      name: 'T',
+      projectId: 'proj-1',
+      platform: 'mobile_android',
+      steps,
+    });
+  }
+
+  it('replaces a plaintext credential with a {{param_*}} placeholder and persists the schema', async () => {
+    const result = await saveMobile([
+      { id: 's1', type: 'type', description: 'Type password into login field', value: 'qwerty123' },
+    ]);
+    const inserted = mockDb.insertIntentTestCase.mock.calls[0][0] as any;
+    expect(inserted.steps_json[0].value).toMatch(/^\{\{param_.+\}\}$/);
+    expect(JSON.stringify(inserted.steps_json)).not.toContain('qwerty123');
+    const [paramName] = Object.keys(inserted.parameters_schema);
+    expect(inserted.parameters_schema[paramName]).toMatchObject({ sensitive: true, required: true });
+    expect(result.parametersCount).toBe(1);
+  });
+
+  it('parameterizes a step flagged isSensitive even with a benign description', async () => {
+    await saveMobile([
+      { id: 's1', type: 'type', description: 'Type into the second field', value: 'hunter2', isSensitive: true },
+    ]);
+    const inserted = mockDb.insertIntentTestCase.mock.calls[0][0] as any;
+    expect(inserted.steps_json[0].value).toMatch(/^\{\{param_.+\}\}$/);
+    expect(JSON.stringify(inserted.steps_json)).not.toContain('hunter2');
+  });
+
+  it('does not touch benign values and persists parameters_schema as null', async () => {
+    const result = await saveMobile([
+      { id: 's1', type: 'type', description: 'Type search keyword', value: 'sneakers' },
+      { id: 's2', type: 'press', description: 'Press key Enter', value: 'Enter' },
+    ]);
+    const inserted = mockDb.insertIntentTestCase.mock.calls[0][0] as any;
+    expect(inserted.steps_json[0].value).toBe('sneakers');
+    expect(inserted.steps_json[1].value).toBe('Enter');
+    expect(inserted.parameters_schema).toBeNull();
+    expect(result.parametersCount).toBe(0);
+  });
+
+  it('registers pre-sanitized {{param_*}} values in the persisted schema', async () => {
+    const result = await saveMobile([
+      { id: 's1', type: 'type', description: 'Type password', value: '{{param_password}}' },
+    ]);
+    const inserted = mockDb.insertIntentTestCase.mock.calls[0][0] as any;
+    expect(inserted.steps_json[0].value).toBe('{{param_password}}');
+    expect(inserted.parameters_schema.param_password).toMatchObject({ sensitive: true });
+    expect(result.parametersCount).toBe(1);
+  });
+
+  it('does NOT sanitize web step-editor saves (parity with existing web authoring)', async () => {
+    await RegressionSaveService.saveTestCase({
+      userId: 'user-1',
+      name: 'T',
+      projectId: 'proj-1',
+      platform: 'web',
+      steps: [{ id: 's1', type: 'type', description: 'Type password', value: 'qwerty123' }],
+    });
+    const inserted = mockDb.insertIntentTestCase.mock.calls[0][0] as any;
+    expect(inserted.steps_json[0].value).toBe('qwerty123');
+    expect(inserted.parameters_schema).toBeNull();
   });
 });
 

@@ -17,12 +17,22 @@ export interface StaleRunRow {
   test_id: string | null;
   test_ids: string[] | null;
   summary: Record<string, unknown> | null;
+  pending_segments: number | null;
+  last_segment_dispatched_at: string | null;
 }
 
 // ── stale-run-reaper ────────────────────────────────────────────────────────
 
+// `pending_segments`/`last_segment_dispatched_at` must be selected here —
+// recomputeRunStatus's pending-segments staleness guard (ADR-0011 update 6)
+// reads them off whatever row it's handed, including a row surfaced through
+// this reaper path. Without them a segmented chain reaching recomputeRunStatus
+// via the reaper (rather than the event-driven test-completion path) would
+// have `pending_segments` silently read as `undefined` — treated as "not
+// segmented" — and fall through to the legacy chain-wide staleness check the
+// fix specifically corrected.
 const RUN_FIELDS =
-  'id, status, started_at, project_id, user_id, plan_id, trigger, test_id, test_ids, summary';
+  'id, status, started_at, project_id, user_id, plan_id, trigger, test_id, test_ids, summary, pending_segments, last_segment_dispatched_at';
 
 /**
  * Fetch regression runs whose OWN row is still 'running'/'pending' and
@@ -169,6 +179,13 @@ export async function forceFailStuckExecutions(
  * mirrored `test_executions.status` CHECK constraint forbids `timeout` — so a
  * `timeout` write propagated to `test_executions` raised 23514 and left the run
  * dirty. `failed` is valid in both vocabularies and carries the same meaning.
+ *
+ * Guarded (`.in('status', ['running','pending'])`) — defense in depth against
+ * the same read-then-write race `updateRunByIdIfActive` guards elsewhere: the
+ * caller's `testIds` snapshot is read moments before this write, and a row
+ * could have already gone terminal in between (e.g. finished for real just as
+ * a staleness sweep decided it looked stuck). Without the filter this would
+ * silently overwrite a legitimately-completed row back to 'failed'.
  */
 export async function forceFailStuckTests(
   testIds: string[],
@@ -178,7 +195,8 @@ export async function forceFailStuckTests(
   const { error } = await supabaseAdmin
     .from('tests')
     .update({ status: 'failed', completed_at: new Date().toISOString() })
-    .in('id', testIds);
+    .in('id', testIds)
+    .in('status', ['running', 'pending']);
 
   return { error };
 }

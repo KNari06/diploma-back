@@ -39,4 +39,40 @@ describe('reduceRuntimeMeta', () => {
     expect(reduceRuntimeMeta(null)).toBeUndefined();
     expect(reduceRuntimeMeta('nope' as any)).toBeUndefined();
   });
+
+  // Regression: these three fields used to be silently dropped by this
+  // function's allowlist, so a link_test_case run's captured variables never
+  // reached `tests.executed_steps` and readFinalVariables always saw them as
+  // undefined — the redacted-key ValidationError check could never fire.
+  describe('link_test_case output-capture fields', () => {
+    it('preserves scratchpadSnapshot (mobile shape)', () => {
+      const snapshot = { otp: '123456', userName: 'alice' };
+      expect(reduceRuntimeMeta({ scratchpadSnapshot: snapshot }).scratchpadSnapshot).toEqual(snapshot);
+    });
+
+    it('preserves extractedDataSnapshot (web shape)', () => {
+      const snapshot = { orderId: 'ord_123' };
+      expect(reduceRuntimeMeta({ extractedDataSnapshot: snapshot }).extractedDataSnapshot).toEqual(snapshot);
+    });
+
+    it('preserves redactedSnapshotKeys', () => {
+      const keys = ['apiToken', 'password'];
+      expect(reduceRuntimeMeta({ redactedSnapshotKeys: keys }).redactedSnapshotKeys).toEqual(keys);
+    });
+
+    it('returns undefined for all three when absent', () => {
+      const out = reduceRuntimeMeta({ runtimeStatus: 'executed' });
+      expect(out.scratchpadSnapshot).toBeUndefined();
+      expect(out.extractedDataSnapshot).toBeUndefined();
+      expect(out.redactedSnapshotKeys).toBeUndefined();
+    });
+
+    it('ignores a non-array redactedSnapshotKeys instead of persisting garbage', () => {
+      expect(reduceRuntimeMeta({ redactedSnapshotKeys: 'not-an-array' as any }).redactedSnapshotKeys).toBeUndefined();
+    });
+
+    it('ignores a non-object scratchpadSnapshot instead of persisting garbage', () => {
+      expect(reduceRuntimeMeta({ scratchpadSnapshot: 'not-an-object' as any }).scratchpadSnapshot).toBeUndefined();
+    });
+  });
 });

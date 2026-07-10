@@ -37,6 +37,13 @@ export interface SanitizableStep {
   assertionText?: unknown;
   bindingHints?: unknown;
   options?: unknown;
+  /**
+   * Explicit authoring-time flag: this step's `value` is a credential. Set by
+   * the mobile agent's `type_text` tool / draft-step authoring. When true it is
+   * the AUTHORITATIVE signal — the value is parameterized regardless of the
+   * description / bindingHints context (and even with no context at all).
+   */
+  isSensitive?: boolean;
 }
 
 export interface StepParametersSchema {
@@ -54,15 +61,21 @@ export interface SanitizedStepsResult<T> {
 }
 
 const SENSITIVE_PATTERNS: RegExp[] = [
-  /password/i,
-  /token/i,
-  /secret/i,
-  /api[_-]?key/i,
-  /auth(?!or)/i, // "auth" but skip "author" / "authoring"
+  /pass[\s_-]?(word|code|phrase|key)/i, // password, passcode, passphrase, passkey
+  /\btoken\b/i,
+  /\bsecret\b/i,
+  /\bapi[\s_-]?key\b/i,
   /credential/i,
-  /\bpin\b/i,
+  /\bpin([\s_-]?code)?\b/i,
   /\botp\b/i,
-  /\bkey\b/i,
+  /one[\s_-]?time[\s_-]?(password|passcode|code|pin)/i,
+  /\bcvv\b|\bcvc\b/i,
+  // "auth" only in a compound that names a credential artifact — a bare
+  // /auth/ would match "Authorize button" / "OAuth login screen".
+  /\bauth(entication|orization)?[\s_-]?(code|token|key|header)\b/i,
+  // Chat descriptions are multilingual (en/ru/kk) — cover the anchor words.
+  /парол/i, // ru: пароль / пароля / паролем
+  /құпия/i, // kk: құпия сөз (password / secret)
 ];
 
 // Option fields that are ALWAYS a secret when present — a TOTP shared seed and
@@ -90,20 +103,41 @@ export function sanitizeSteps<T extends SanitizableStep>(steps: T[]): SanitizedS
     const value = step.value;
     if (typeof value !== 'string' || value.length === 0) return step;
 
-    // Already a placeholder — skip (defends against double-sanitisation).
+    const desc = typeof step.description === 'string' ? step.description : '';
+
+    // Already a placeholder — don't re-substitute. But if it's a `{{param_*}}`
+    // placeholder, RE-REGISTER it into the schema: a caller that sanitized
+    // BEFORE this boundary (e.g. the web draft path) still needs a complete
+    // `parameters_schema` persisted — the schema is derived HERE. Other
+    // namespaces ({{secrets.*}}, {{env.*}}, {{extracted.*}}) are NOT parameters
+    // and stay out of the schema. Persist the trimmed form so a later
+    // double-pass stays idempotent through whitespace drift.
     const trimmed = value.trim();
     if (/^\{\{.+\}\}$/.test(trimmed)) {
+      const paramMatch = /^\{\{(param_[a-zA-Z0-9_]+)\}\}$/.exec(trimmed);
+      if (paramMatch && !(paramMatch[1] in parametersSchema)) {
+        parametersSchema[paramMatch[1]] = {
+          type: 'string',
+          description: `Value for ${desc || step.id || paramMatch[1]}`,
+          required: true,
+          sensitive: true,
+        };
+      }
       return value === trimmed ? step : ({ ...step, value: trimmed } as T);
     }
 
-    // Build the match context from fields that hint at the value's role. We do
-    // NOT inspect `value` itself (would false-positive on a password containing
-    // "key" by accident).
-    const desc = typeof step.description === 'string' ? step.description : '';
-    const context = [desc, ...bindingHintBits(step)].join(' ').trim();
-    if (!context) return step;
+    // Primary signal: the agent flagged the step at authoring time. Wins with
+    // no regex and no context requirement.
+    let sensitive = step.isSensitive === true;
 
-    if (!SENSITIVE_PATTERNS.some((pat) => pat.test(context))) return step;
+    if (!sensitive) {
+      // Fallback: regex over the descriptive context. We do NOT inspect `value`
+      // itself (would false-positive on a password containing "key" by accident).
+      const context = [desc, ...bindingHintBits(step)].join(' ').trim();
+      sensitive = context.length > 0 && SENSITIVE_PATTERNS.some((pat) => pat.test(context));
+    }
+
+    if (!sensitive) return step;
 
     const paramName = makeParamName(step, parametersSchema);
     parametersSchema[paramName] = {

@@ -23,7 +23,8 @@
  */
 
 import type { MobileUiState } from '@/services/mobile/mobile-runner.types';
-import type { FlowPlan, FlowPlanStep } from './planner';
+import type { MobileProjectContext } from '@/services/chat/mobile-project-context.service';
+import type { ConcreteFlowPlan, FlowPlanStep } from './planner';
 import type { ReasoningEntry } from './reasoning-trace';
 import { TRACE_MAX_ENTRIES } from './reasoning-trace';
 
@@ -59,8 +60,18 @@ export class MobileBlackboard {
    * row in test-case scope, making save dead-end. Prefer this over the lookup.
    */
   readonly projectId?: string;
-  /** Saved test case the editor is scoped to, when opened on one. */
+  /** Workspace of the chat request — scopes list_project_options. */
+  readonly workspaceId?: string;
+  /** Saved test case the mobile editor is scoped to, when any. */
   readonly testCaseId?: string;
+
+  // ── Project context (eager, resolved by the handler) ─────────────
+  // Project + app-under-test + open-test-case info resolved BEFORE the
+  // first LLM call so (a) mobile_create_test_case never dead-ends on a
+  // missing project and (b) the system prompt can name the app under
+  // test while authoring. Null when resolution failed — the save tool
+  // then falls back to its legacy lazy lookup.
+  private projectContext: MobileProjectContext | null = null;
 
   private lastSnapshot: MobileUiState | null = null;
   private lastSnapshotAt: number | null = null;
@@ -70,7 +81,10 @@ export class MobileBlackboard {
   // A plan is optional — only set when the LLM calls the `plan_flow` tool.
   // Once set, stepStates tracks progress; the LLM reads it back to know
   // what's next and whether the prior step succeeded.
-  private plan: FlowPlan | null = null;
+  // Always a plan WITH steps — the clarification-only outcome (no steps) is
+  // handled in runPlanFlow and never reaches setPlan, so `plan.steps` is
+  // guaranteed defined here.
+  private plan: ConcreteFlowPlan | null = null;
   private readonly stepStates = new Map<number, PlanStepState>();
 
   // ── Reasoning trace (Phase 7+) ────────────────────────────────────
@@ -101,6 +115,7 @@ export class MobileBlackboard {
     userId: string;
     chatSessionId?: string;
     projectId?: string;
+    workspaceId?: string;
     testCaseId?: string;
   }) {
     this.goal = init.goal;
@@ -108,7 +123,18 @@ export class MobileBlackboard {
     this.userId = init.userId;
     this.chatSessionId = init.chatSessionId;
     this.projectId = init.projectId;
+    this.workspaceId = init.workspaceId;
     this.testCaseId = init.testCaseId;
+  }
+
+  // ── Project context ───────────────────────────────────────────────
+
+  setProjectContext(ctx: MobileProjectContext | null): void {
+    this.projectContext = ctx;
+  }
+
+  getProjectContext(): MobileProjectContext | null {
+    return this.projectContext;
   }
 
   // ── Snapshot state ────────────────────────────────────────────────
@@ -211,7 +237,7 @@ export class MobileBlackboard {
    * deliberately: the LLM may decide to re-plan mid-flow if the observed
    * state diverges enough from expectations. All step states reset.
    */
-  setPlan(plan: FlowPlan): void {
+  setPlan(plan: ConcreteFlowPlan): void {
     this.plan = plan;
     this.stepStates.clear();
     for (const step of plan.steps) {
@@ -223,7 +249,7 @@ export class MobileBlackboard {
     return this.plan !== null && this.plan.steps.length > 0;
   }
 
-  getPlan(): FlowPlan | null {
+  getPlan(): ConcreteFlowPlan | null {
     return this.plan;
   }
 

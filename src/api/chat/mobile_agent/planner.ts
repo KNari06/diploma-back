@@ -66,14 +66,57 @@ export const FlowPlanStepSchema = z.object({
   notes: z.string().max(200).optional(),
 });
 
-export const FlowPlanSchema = z.object({
-  goal: z.string().min(3).max(200),
-  steps: z.array(FlowPlanStepSchema).min(1).max(15),
-  assumesCredentialsFromUser: z.boolean().optional(),
-});
+export const FlowPlanSchema = z
+  .object({
+    goal: z.string().min(3).max(200),
+    // Steps are optional ONLY on the clarification path: when the goal is too
+    // vague to plan (no target flow, no acceptance criteria), the planner
+    // returns needsClarification=true + clarifyingQuestion and NO steps. On
+    // the happy path steps is required and non-empty — enforced by the
+    // refine() below so the executor never installs an empty plan.
+    steps: z.array(FlowPlanStepSchema).max(15).optional(),
+    assumesCredentialsFromUser: z.boolean().optional(),
+    needsClarification: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when the goal is underspecified (no concrete target flow / no ' +
+          'acceptance criteria) and planning would mean guessing. When true, ' +
+          'omit steps and provide clarifyingQuestion instead.',
+      ),
+    clarifyingQuestion: z
+      .string()
+      .min(5)
+      .max(300)
+      .optional()
+      .describe(
+        'A single focused question to disambiguate the goal. Required when ' +
+          'needsClarification is true. Example: "Which flow should I test — ' +
+          'login, sign-up, or something else? And what counts as success?"',
+      ),
+  })
+  .refine(
+    (p) =>
+      p.needsClarification
+        ? typeof p.clarifyingQuestion === 'string' && p.clarifyingQuestion.length >= 5
+        : Array.isArray(p.steps) && p.steps.length >= 1,
+    {
+      message:
+        'Either provide a non-empty steps[] (concrete plan) OR set ' +
+        'needsClarification=true with a clarifyingQuestion (vague goal).',
+    },
+  );
 
 export type FlowPlanStep = z.infer<typeof FlowPlanStepSchema>;
 export type FlowPlan = z.infer<typeof FlowPlanSchema>;
+
+/**
+ * A plan that is guaranteed to carry executable steps — the non-clarification
+ * outcome. `runPlanFlow` narrows a validated `FlowPlan` to this after the
+ * `needsClarification` gate; the blackboard's `setPlan` requires it so the
+ * plan-walking tools never face an undefined `steps`.
+ */
+export type ConcreteFlowPlan = FlowPlan & { steps: FlowPlanStep[] };
 
 // ─────────────────────────────────────────────────────────────────────────
 // Prompt — static, cacheable. Keep it narrow: describe the goal, the
@@ -100,14 +143,28 @@ const PLANNER_SYSTEM_PROMPT = [
   '6. Use the CURRENT SCREEN context to decide the FIRST step. If the user is already',
   '   on the login screen, don\u2019t plan "navigate to login".',
   '7. Keep plans short. 3–6 steps is typical. Max 10.',
+  '8. AMBIGUITY GATE — check BEFORE planning. If the goal is underspecified —',
+  '   no concrete target flow (e.g. "create some test steps", "test the app",',
+  '   "make a test") and no acceptance criteria you could write a `verify`',
+  '   against — do NOT invent a flow. Return needsClarification=true, omit',
+  '   steps, and put ONE focused question in clarifyingQuestion asking what to',
+  '   test and what success looks like. A goal that names a flow ("login test",',
+  '   "sign up and add to cart") is specific enough — plan it, do not ask.',
   '',
-  'Output ONLY valid JSON matching this shape (no prose, no markdown):',
+  'Output ONLY valid JSON. Concrete goal → steps (no markdown):',
   '{',
   '  "goal": "<restated user goal>",',
   '  "steps": [',
   '    { "id": 1, "intent": "...", "verify": "...", "requiresConfirmation": false, "notes": "..." }',
   '  ],',
   '  "assumesCredentialsFromUser": true|false',
+  '}',
+  '',
+  'Vague goal → clarification (no steps):',
+  '{',
+  '  "goal": "<restated user goal>",',
+  '  "needsClarification": true,',
+  '  "clarifyingQuestion": "Which flow should I test, and what counts as success?"',
   '}',
   '',
   UNTRUSTED_CONTENT_INSTRUCTION,
@@ -193,12 +250,21 @@ export async function generateFlowPlan(args: GeneratePlanArgs): Promise<PlannerR
       };
     }
 
+    // Clarification path: the goal was too vague to plan. Return the plan as
+    // validated (no steps) — the caller (runPlanFlow) detects
+    // needsClarification and surfaces the question instead of installing a
+    // plan. Skip id re-numbering since there are no steps.
+    if (validation.data.needsClarification) {
+      return { ok: true, plan: validation.data, durationMs: Date.now() - startedAt };
+    }
+
     // Re-number ids to 1..N regardless of what the LLM produced — the
     // executor indexes by stepState.id and accidental duplicates or gaps
-    // would break lookup.
-    const normalized: FlowPlan = {
+    // would break lookup. `steps` is guaranteed present here by the schema
+    // refine (non-clarification path).
+    const normalized: ConcreteFlowPlan = {
       ...validation.data,
-      steps: validation.data.steps.map((step, idx) => ({
+      steps: (validation.data.steps ?? []).map((step, idx) => ({
         ...step,
         id: idx + 1,
       })),

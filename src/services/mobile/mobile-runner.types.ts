@@ -241,6 +241,15 @@ export interface MobileIntentStep {
   assertionText?: string;
   bindingHints?: MobileBindingHints;
   options?: MobileIntentStepOptions;
+  /**
+   * Authoring-time flag: this step's `value` is a credential (password /
+   * OTP / token / API key). Set by the mobile agent when it authors a
+   * draft step (mirrors the `type_text` tool's isSensitive arg). Primary
+   * signal for `sanitizeMobileSteps` — a flagged value is parameterized on
+   * save regardless of what the description says; the regex catalogue is
+   * only the fallback for unflagged steps.
+   */
+  isSensitive?: boolean;
   isAutoInjected?: boolean;
   expectedOutcome?: 'success' | 'error';
   /**
@@ -303,6 +312,13 @@ export interface MobileStepResult {
    * logged as a system failure.
    */
   aiCheckSkippedReason?: string;
+  /** ai_check steps only, pass or fail: the fully-interpolated assertion text
+   *  actually evaluated (placeholders resolved via the runner's scratchpad). */
+  aiCheckResolvedAssertion?: string;
+  /** ai_check steps only, pass or fail: LLM self-reported 0-1 confidence. */
+  aiCheckConfidence?: number;
+  /** ai_check steps only, pass or fail: 1-2 sentence LLM explanation. */
+  aiCheckExplanation?: string;
   durationMs: number;
   /** Freshly-built compiled plan from this run. Persist onto the IntentStep. */
   compiledPlan?: MobileCompiledPlan;

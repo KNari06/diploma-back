@@ -1346,6 +1346,14 @@ export interface IntentStep {
   /** Hints for element resolution */
   bindingHints?: BindingHints;
   /**
+   * Authoring-time flag: this step's `value` is a credential (password /
+   * OTP / token / API key). Set by the mobile agent's draft authoring
+   * (mirrors the `type_text` tool's isSensitive arg). Primary signal for
+   * `sanitizeMobileSteps` at the save boundary — a flagged value is
+   * parameterized regardless of what the description says.
+   */
+  isSensitive?: boolean;
+  /**
    * Runtime-only marker: set when this step was inlined as a precondition
    * (a transitive dependency's step prepended before the target test's own
    * steps). Holds the owning test-case id. Used by post-run compiled-plan
