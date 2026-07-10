@@ -19,9 +19,10 @@ import { cache } from '@/utils/core/redis-cache';
 
 /**
  * Service for managing test modules.
- * Modules are folders within a platform; a module may nest inside another
- * module (parent_module_id) up to MAX_MODULE_DEPTH levels. Each module belongs
- * to a platform (web_ui, api or mobile).
+ * Modules are folders within a project; a module may nest inside another
+ * module (parent_module_id) up to MAX_MODULE_DEPTH levels. Folders are
+ * platform-agnostic — platform lives on the test (flow), not the folder, so a
+ * folder may hold web, mobile and api tests together (platform_id is nullable).
  */
 export class ModuleService {
   /**
@@ -32,19 +33,17 @@ export class ModuleService {
   static async create(params: CreateTestModuleParams): Promise<TestModule> {
     const { projectId, userId, platformId, parentModuleId, name, description, tags, priority } = params;
 
-    if (!platformId) {
-      throw new Error('platformId is required to create a module');
-    }
-
+    // Folders are platform-agnostic — platform lives on the test (flow), not the
+    // folder. platformId is optional; NULL means "no platform" for the folder.
     const parentId = parentModuleId ?? null;
     if (parentId) {
-      // Parent must exist, be owned by the user, and share platform + project.
+      // Parent must exist, be owned by the user, and share the same project.
       const parent = await moduleDb.getModuleCore(parentId, userId);
       if (!parent) {
         throw new ValidationError('Parent module not found');
       }
-      if (parent.platformId !== platformId || parent.projectId !== projectId) {
-        throw new ValidationError('Parent module belongs to a different platform or project');
+      if (parent.projectId !== projectId) {
+        throw new ValidationError('Parent module belongs to a different project');
       }
       // New module sits one level below its parent.
       const parentDepth = await this.computeDepth(parentId, userId);
@@ -61,7 +60,7 @@ export class ModuleService {
     const module = await moduleDb.insertModule({
       project_id: projectId,
       user_id: userId,
-      platform_id: platformId,
+      platform_id: platformId ?? null,
       parent_module_id: parentId,
       name,
       description: description || null,
@@ -164,24 +163,18 @@ export class ModuleService {
   }
 
   /**
-   * Reorder modules within one level (a platform's top level, or the children
-   * of a single parent). Sets each module's order_index to its position in
-   * `moduleIds`. `projectId` invalidates the platform tree cache so the new
-   * order is visible immediately.
+   * Reorder a sibling group of modules (top-level folders, or the children of a
+   * single parent). Sets each module's order_index to its position in
+   * `moduleIds`. Scoped by project (folders are platform-agnostic). Invalidates
+   * the tree cache so the new order is visible immediately.
    */
-  static async reorder(
-    projectId: string,
-    platformId: string,
-    moduleIds: string[],
-    userId: string,
-  ): Promise<void> {
+  static async reorder(projectId: string, moduleIds: string[], userId: string): Promise<void> {
     logger.info('[MODULE_SERVICE] Reordering modules', {
       projectId,
-      platformId,
       count: moduleIds.length,
     });
 
-    await moduleDb.setModuleOrderIndexes(moduleIds, platformId, userId);
+    await moduleDb.setModuleOrderIndexes(moduleIds, projectId, userId);
 
     await this.invalidateTreeCache(projectId);
   }
@@ -190,8 +183,9 @@ export class ModuleService {
 
   /**
    * Validate a re-parent (move). Rejects self-parenting, cycles (moving a folder
-   * under one of its own descendants), cross-platform/project moves, and moves
-   * that would push the moved subtree past MAX_MODULE_DEPTH.
+   * under one of its own descendants), cross-project moves, and moves that would
+   * push the moved subtree past MAX_MODULE_DEPTH. Cross-platform moves are
+   * allowed — folders are platform-agnostic.
    */
   private static async validateReparent(
     moduleId: string,
@@ -213,8 +207,8 @@ export class ModuleService {
     if (!parentCore) {
       throw new ValidationError('Parent module not found');
     }
-    if (parentCore.platformId !== moduleCore.platformId || parentCore.projectId !== moduleCore.projectId) {
-      throw new ValidationError('Cannot move a folder to a different platform or project');
+    if (parentCore.projectId !== moduleCore.projectId) {
+      throw new ValidationError('Cannot move a folder to a different project');
     }
 
     if (await this.wouldCreateCycle(moduleId, newParentId, userId)) {

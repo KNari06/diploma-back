@@ -8,7 +8,12 @@ import { supabaseAdmin } from '@/db/supabase';
 import type { PlatformKey, Priority, TestModule } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 
-const MODULE_SELECT = '*, test_platforms!inner(platform_key)';
+// LEFT join: a module's platform_id may be NULL (platform-agnostic folder).
+// An inner join would silently drop those rows from every read below.
+const MODULE_SELECT = '*, test_platforms(platform_key)';
+// Inner variant only for the platformKey-filtered list path, where filtering on
+// the embedded column must actually exclude non-matching (and NULL) rows.
+const MODULE_SELECT_PLATFORM_FILTERED = '*, test_platforms!inner(platform_key)';
 
 /** Map a test_modules row (with joined platform_key) to the TestModule type. */
 export function mapModuleRow(row: any): TestModule {
@@ -34,7 +39,8 @@ export function mapModuleRow(row: any): TestModule {
 export interface InsertModuleRow {
   project_id: string;
   user_id: string;
-  platform_id: string;
+  /** NULL = platform-agnostic folder (platform lives on the test, not the folder). */
+  platform_id: string | null;
   parent_module_id: string | null;
   name: string;
   description: string | null;
@@ -94,10 +100,13 @@ export async function deleteModuleRow(id: string, userId: string): Promise<void>
   }
 }
 
-/** Set order_index for a batch of sibling modules. Returns any query errors. */
+/**
+ * Set order_index for a batch of sibling modules (project-scoped). Folders are
+ * platform-agnostic, so ordering is scoped by project + owner, not platform.
+ */
 export async function setModuleOrderIndexes(
   moduleIds: string[],
-  platformId: string,
+  projectId: string,
   userId: string,
 ): Promise<void> {
   const updates = moduleIds.map((moduleId, index) =>
@@ -105,7 +114,7 @@ export async function setModuleOrderIndexes(
       .from('test_modules')
       .update({ order_index: index })
       .eq('id', moduleId)
-      .eq('platform_id', platformId)
+      .eq('project_id', projectId)
       .eq('user_id', userId),
   );
 
@@ -143,7 +152,7 @@ export async function getModuleById(id: string, userId: string): Promise<TestMod
 export interface ModuleCoreRow {
   id: string;
   parentModuleId: string | null;
-  platformId: string;
+  platformId: string | null;
   projectId: string;
 }
 
@@ -165,7 +174,7 @@ export async function getModuleCore(id: string, userId: string): Promise<ModuleC
   return {
     id: data.id,
     parentModuleId: data.parent_module_id ?? null,
-    platformId: data.platform_id,
+    platformId: data.platform_id ?? null,
     projectId: data.project_id,
   };
 }
@@ -224,9 +233,11 @@ export async function listModules(
     .eq('project_id', projectId)
     .eq('user_id', userId);
 
+  // When filtering by platformKey we must use the inner-join select so the
+  // embedded-column filter actually excludes non-matching / NULL-platform rows.
   let itemsQuery = supabaseAdmin
     .from('test_modules')
-    .select(MODULE_SELECT)
+    .select(platformKey ? MODULE_SELECT_PLATFORM_FILTERED : MODULE_SELECT)
     .eq('project_id', projectId)
     .eq('user_id', userId);
 
@@ -270,12 +281,85 @@ export async function listModules(
 
 export interface PlatformModuleTreeRow {
   id: string;
-  platformId: string;
+  platformId: string | null;
+  platformKey?: PlatformKey;
   parentModuleId: string | null;
   name: string;
   description?: string;
   priority?: string;
   orderIndex: number | null;
+}
+
+/** A flow's coarse platform bucket for a module (used by tab filtering). */
+export interface FlowPlatformRow {
+  moduleId: string;
+  platform: string | null;
+  flowType: string | null;
+}
+
+/**
+ * Direct flows' platform/flow_type for a set of modules (owner-scoped). The
+ * tree service buckets these into coarse platform kinds (web_ui/mobile/api) so
+ * the Repository tabs can hide folders that hold no matching test.
+ */
+export async function getFlowPlatformsByModuleIds(
+  moduleIds: string[],
+  userId: string,
+): Promise<FlowPlatformRow[]> {
+  if (moduleIds.length === 0) return [];
+
+  const { data, error } = await supabaseAdmin
+    .from('test_flows')
+    .select('module_id, platform, flow_type')
+    .in('module_id', moduleIds)
+    .eq('user_id', userId);
+
+  if (error) {
+    logger.error('[MODULE_DB] Failed to get flow platforms by module ids', { error });
+    throw new Error(`Failed to get flow platforms: ${error.message}`);
+  }
+
+  return (data || []).map((r: any) => ({
+    moduleId: r.module_id,
+    platform: r.platform ?? null,
+    flowType: r.flow_type ?? null,
+  }));
+}
+
+/**
+ * ALL modules for a project (owner-scoped), unpaginated, for building the
+ * project-level folder forest. Folders are platform-agnostic, so this is NOT
+ * filtered by platform — a folder's platform_id may be NULL. LEFT-joins the
+ * platform_key so a folder that still carries a platform reports it.
+ * Sorted order_index ASC (nulls last), created_at DESC.
+ */
+export async function getProjectModulesForTree(
+  projectId: string,
+  userId: string,
+): Promise<PlatformModuleTreeRow[]> {
+  const { data, error } = await supabaseAdmin
+    .from('test_modules')
+    .select('id, platform_id, parent_module_id, name, description, priority, order_index, created_at, test_platforms(platform_key)')
+    .eq('project_id', projectId)
+    .eq('user_id', userId)
+    .order('order_index', { ascending: true, nullsFirst: false })
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    logger.error('[MODULE_DB] Failed to get project modules for tree', { error, projectId });
+    throw new Error(`Failed to get modules: ${error.message}`);
+  }
+
+  return (data || []).map((m: any) => ({
+    id: m.id,
+    platformId: m.platform_id ?? null,
+    platformKey: m.test_platforms?.platform_key || undefined,
+    parentModuleId: m.parent_module_id ?? null,
+    name: m.name,
+    description: m.description || undefined,
+    priority: m.priority || undefined,
+    orderIndex: typeof m.order_index === 'number' ? m.order_index : null,
+  }));
 }
 
 /**

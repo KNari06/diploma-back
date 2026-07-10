@@ -209,7 +209,8 @@ export interface TestModule {
   id: string;
   projectId: string;
   userId: string;
-  platformId: string;
+  /** Platform the folder was created under. NULL = platform-agnostic folder. */
+  platformId: string | null;
   platformKey?: PlatformKey;
   /** Parent folder (self-reference). null = top-level folder. */
   parentModuleId: string | null;
@@ -236,7 +237,8 @@ export const MAX_MODULE_DEPTH = 3;
 export interface CreateTestModuleParams {
   projectId: string;
   userId: string;
-  platformId: string;
+  /** Optional. NULL / omitted = platform-agnostic folder. */
+  platformId?: string | null;
   /** Parent folder id. Omit / null to create a top-level folder. */
   parentModuleId?: string | null;
   name: string;

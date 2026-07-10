@@ -28,8 +28,9 @@ function getUserId(req: AuthenticatedRequest): string {
 }
 
 /**
- * Create a new test module
- * Requires platformId or platformKey to specify which platform the module belongs to
+ * Create a new test module (folder).
+ * Folders are platform-agnostic: platformId/platformKey are OPTIONAL. When
+ * neither is given the folder is created with no platform (platform_id NULL).
  */
 export async function createModule(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
@@ -40,15 +41,11 @@ export async function createModule(req: AuthenticatedRequest, res: Response): Pr
       return;
     }
 
-    if (!platformId && !platformKey) {
-      res.status(400).json({ success: false, error: 'platformId or platformKey is required' });
-      return;
-    }
-
     const userId = getUserId(req);
 
-    // Resolve platformId from platformKey if needed
-    let resolvedPlatformId = platformId;
+    // Resolve platformId from platformKey when provided; otherwise leave null
+    // (platform-agnostic folder).
+    let resolvedPlatformId: string | null = platformId ?? null;
     if (!resolvedPlatformId && platformKey) {
       // Ensure platforms exist and get the one matching the key
       const platforms = await PlatformService.ensurePlatformsExist(projectId, userId);
@@ -213,28 +210,29 @@ export async function updateModule(req: AuthenticatedRequest, res: Response): Pr
 }
 
 /**
- * Reorder modules within a platform.
- * POST /api/v1/modules/reorder — body { projectId, platformId, moduleIds }
+ * Reorder a sibling group of folders (project-scoped; folders are
+ * platform-agnostic). POST /api/v1/modules/reorder — body { projectId, moduleIds }.
+ * (Legacy `platformId` in the body is accepted but ignored.)
  * Sets each module's order_index to its position in moduleIds.
  */
 export async function reorderModules(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, platformId, moduleIds } = req.body;
+    const { projectId, moduleIds } = req.body;
 
-    if (!projectId || !platformId || !moduleIds || !Array.isArray(moduleIds)) {
+    if (!projectId || !moduleIds || !Array.isArray(moduleIds)) {
       res.status(400).json({
         success: false,
-        error: 'projectId, platformId and moduleIds array are required',
+        error: 'projectId and moduleIds array are required',
       });
       return;
     }
 
     const userId = getUserId(req);
 
-    await ModuleService.reorder(projectId, platformId, moduleIds, userId);
+    await ModuleService.reorder(projectId, moduleIds, userId);
 
     // Tell the project room the tree changed so clients refetch in the new order.
-    emitModuleMutated({ projectId, action: 'updated', id: platformId });
+    emitModuleMutated({ projectId, action: 'updated', id: projectId });
 
     res.json({ success: true, message: 'Modules reordered', timestamp: new Date() });
   } catch (error) {

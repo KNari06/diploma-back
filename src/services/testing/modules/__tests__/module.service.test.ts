@@ -1,7 +1,8 @@
 /**
- * Unit tests for ModuleService nesting rules — depth cap, cross-platform guard,
- * cycle prevention on move, and filter/reorder pass-through. DB stubbed at the
- * `db/module.db` boundary; cache stubbed.
+ * Unit tests for ModuleService nesting rules — depth cap, cross-project guard,
+ * cycle prevention on move, and filter/reorder pass-through. Folders are
+ * platform-agnostic (platform_id nullable, cross-platform moves allowed). DB
+ * stubbed at the `db/module.db` boundary; cache stubbed.
  */
 
 import { ModuleService } from '@/services/testing/modules/module.service';
@@ -31,7 +32,7 @@ const PLATFORM = 'platform-1';
 const PROJECT = 'project-1';
 const USER = 'user-1';
 
-type Core = { id: string; parentModuleId: string | null; platformId: string; projectId: string };
+type Core = { id: string; parentModuleId: string | null; platformId: string | null; projectId: string };
 
 /** Wire getModuleCore to resolve from a fixture map (or null if absent). */
 function useCores(cores: Record<string, Core>) {
@@ -81,11 +82,25 @@ describe('ModuleService.create nesting', () => {
     expect(moduleDb.insertModule).not.toHaveBeenCalled();
   });
 
-  it('rejects a parent on a different platform', async () => {
+  it('creates a platform-agnostic folder (platform_id null) when no platformId given', async () => {
+    await ModuleService.create({ projectId: PROJECT, userId: USER, name: 'Mixed' });
+    expect(moduleDb.insertModule).toHaveBeenCalledWith(
+      expect.objectContaining({ parent_module_id: null, platform_id: null }),
+    );
+  });
+
+  it('allows a parent on a different platform (folders are platform-agnostic)', async () => {
     useCores({ p: { id: 'p', parentModuleId: null, platformId: 'other-platform', projectId: PROJECT } });
+    await ModuleService.create({ projectId: PROJECT, userId: USER, platformId: PLATFORM, parentModuleId: 'p', name: 'x' });
+    expect(moduleDb.insertModule).toHaveBeenCalledWith(expect.objectContaining({ parent_module_id: 'p' }));
+  });
+
+  it('rejects a parent in a different project', async () => {
+    useCores({ p: { id: 'p', parentModuleId: null, platformId: PLATFORM, projectId: 'other-project' } });
     await expect(
       ModuleService.create({ projectId: PROJECT, userId: USER, platformId: PLATFORM, parentModuleId: 'p', name: 'x' }),
-    ).rejects.toThrow(/different platform or project/);
+    ).rejects.toThrow(/different project/);
+    expect(moduleDb.insertModule).not.toHaveBeenCalled();
   });
 
   it(`rejects when nesting would exceed depth ${MAX_MODULE_DEPTH}`, async () => {
@@ -158,6 +173,32 @@ describe('ModuleService.update re-parent', () => {
     );
   });
 
+  it('allows moving a folder under a parent that was on a different platform', async () => {
+    useCores({
+      P: { id: 'P', parentModuleId: null, platformId: 'platform-web', projectId: PROJECT },
+      M: { id: 'M', parentModuleId: null, platformId: 'platform-mobile', projectId: PROJECT },
+    });
+    useChildren({ M: [] });
+    await ModuleService.update({ id: 'M', userId: USER, parentModuleId: 'P' });
+    expect(moduleDb.updateModuleRow).toHaveBeenCalledWith(
+      'M',
+      USER,
+      expect.objectContaining({ parent_module_id: 'P' }),
+    );
+  });
+
+  it('rejects moving a folder under a parent in a different project', async () => {
+    useCores({
+      P: { id: 'P', parentModuleId: null, platformId: PLATFORM, projectId: 'other-project' },
+      M: { id: 'M', parentModuleId: null, platformId: PLATFORM, projectId: PROJECT },
+    });
+    useChildren({ M: [] });
+    await expect(
+      ModuleService.update({ id: 'M', userId: USER, parentModuleId: 'P' }),
+    ).rejects.toThrow(/different project/);
+    expect(moduleDb.updateModuleRow).not.toHaveBeenCalled();
+  });
+
   it('moving to top level (null) skips the parent lookup', async () => {
     await ModuleService.update({ id: 'M', userId: USER, parentModuleId: null });
     expect(moduleDb.getModuleCore).not.toHaveBeenCalled();
@@ -176,9 +217,9 @@ describe('ModuleService list & reorder pass-through', () => {
     );
   });
 
-  it('reorders siblings and invalidates the cache', async () => {
-    await ModuleService.reorder(PROJECT, PLATFORM, ['a', 'b', 'c'], USER);
-    expect(moduleDb.setModuleOrderIndexes).toHaveBeenCalledWith(['a', 'b', 'c'], PLATFORM, USER);
+  it('reorders siblings (project-scoped) and invalidates the cache', async () => {
+    await ModuleService.reorder(PROJECT, ['a', 'b', 'c'], USER);
+    expect(moduleDb.setModuleOrderIndexes).toHaveBeenCalledWith(['a', 'b', 'c'], PROJECT, USER);
     expect(cache.delByPattern).toHaveBeenCalledWith(`qait:cache:ptree:base:${PROJECT}:*`);
   });
 });

@@ -1727,7 +1727,7 @@ export class RegressionPlanService {
     // Phase 1: Fetch modules (scoped by project_id)
     const modulesResult = await supabaseAdmin
       .from('test_modules')
-      .select('id, name, platform_id, parent_module_id, test_platforms!inner(platform_key)')
+      .select('id, name, platform_id, parent_module_id, test_platforms(platform_key)')
       .eq('project_id', projectId)
       .eq('user_id', userId)
       .order('name', { ascending: true });
