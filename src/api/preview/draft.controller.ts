@@ -26,6 +26,7 @@ import { logger } from '@/utils/core/logger';
 import { getPreviewSessionService } from '@/services/testing/ui/preview/preview-session.service';
 import { DraftStepsCache } from '@/services/testing/ui/preview/draft-steps-cache';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
+import { sanitizeSteps } from '@/services/testing/shared/step-sanitizer';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -225,7 +226,11 @@ export async function saveDraftRunAsTestCase(req: Request, res: Response): Promi
     });
 
     // 5. Persist via the same service the LLM tool uses — ensures both paths
-    //    end up with identical DB shape, hooks, validation, etc.
+    //    end up with identical DB shape, hooks, validation, etc. Sanitize
+    //    credential-like values to {{param_*}} + persist the parameters_schema
+    //    first, mirroring handleCreateTestCase (avoids plaintext secrets in
+    //    steps_json + lets a regression replay resolve them).
+    const { steps: sanitizedSteps, parametersSchema } = sanitizeSteps(cached.steps);
     let createdTestCase;
     try {
       createdTestCase = await IntentTestCaseService.create({
@@ -233,7 +238,8 @@ export async function saveDraftRunAsTestCase(req: Request, res: Response): Promi
         userId,
         name: finalName,
         startUrl: cached.startUrl,
-        steps: cached.steps,
+        steps: sanitizedSteps,
+        parametersSchema,
         status: 'draft',
       });
     } catch (createErr) {

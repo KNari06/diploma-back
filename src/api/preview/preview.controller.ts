@@ -384,7 +384,7 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
     }
 
     const { id } = req.params;
-    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers, mobileVariantLabel } = req.body;
+    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers, mobileVariantLabel, parametersSchema } = req.body;
 
     logger.info('[PREVIEW_CONTROLLER] Updating intent test case', {
       intentTestCaseId: id,
@@ -560,6 +560,9 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       triggers,
       // Mobile per-test variant override. `undefined` leaves it; `null`/'' clears.
       ...(mobileVariantLabel !== undefined ? { mobileVariantLabel } : {}),
+      // Placeholder schema for {{param_*}} values (mobile agent draft save).
+      // `undefined` leaves the column untouched.
+      ...(parametersSchema !== undefined ? { parametersSchema } : {}),
     });
 
     logger.info('[PREVIEW_CONTROLLER] Successfully updated intent test case', {

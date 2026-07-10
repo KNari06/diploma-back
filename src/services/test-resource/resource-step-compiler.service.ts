@@ -126,6 +126,16 @@ export interface CompileResult {
    * carried a usable mobileSnapshot — keeps consumer code branch-light.
    */
   fastAuthRestores: FastAuthRestore[];
+  /**
+   * Plaintext values of every `_secret_`-prefixed compiled step (secret /
+   * auth-sensitive / oauth_token kinds — see `SECRET_KEY_PREFIX`). The
+   * mobile job uses this as its redact-value list (mirrors web's
+   * `collectSecretValues(runVariables)`) to mask any of these values that
+   * the runner echoes back in a step result (e.g. `scratchpadSnapshot`)
+   * before persisting/broadcasting — CLAUDE.md Hard invariant #10. Empty
+   * array (not undefined) when nothing sensitive was compiled.
+   */
+  secretValues: string[];
 }
 
 /**
@@ -151,9 +161,26 @@ export interface CompiledResourceStep {
 
 /**
  * Secrets get this prefix so runner log code can match `startsWith` and
- * redact. Not cryptographic — a signal, not a mechanism.
+ * redact. Not cryptographic — a signal, not a mechanism. Exported so the
+ * mobile job's redaction can key off the SAME constant instead of a second
+ * inline literal (see `collectSecretStepValues`).
  */
-const SECRET_KEY_PREFIX = '_secret_';
+export const SECRET_KEY_PREFIX = '_secret_';
+
+/**
+ * Pull the plaintext value out of every compiled `store` step flagged
+ * sensitive (its scratchpad key carries `SECRET_KEY_PREFIX`) — see
+ * `CompileResult.secretValues` for why this list exists. Sorted longest
+ * first, same rationale as `collectSecretValues` in `redact-secrets.ts`: a
+ * long secret containing a shorter one as a substring must be masked
+ * whole, not partially pre-empted by the shorter match.
+ */
+function collectSecretStepValues(steps: CompiledResourceStep[]): string[] {
+  const values = steps
+    .filter((s) => s.type === 'store' && s.description.startsWith(SECRET_KEY_PREFIX) && typeof s.value === 'string')
+    .map((s) => s.value as string);
+  return values.sort((a, b) => b.length - a.length);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Public API
@@ -202,7 +229,7 @@ export class ResourceStepCompilerService {
     const fastAuthRestores: FastAuthRestore[] = [];
 
     if (!bindings || bindings.length === 0) {
-      return { steps, applied, skipped, fastAuthRestores };
+      return { steps, applied, skipped, fastAuthRestores, secretValues: [] };
     }
 
     // Same topological order the web applier uses, so behaviour is
@@ -425,7 +452,7 @@ export class ResourceStepCompilerService {
       fastAuthRestores: fastAuthRestores.length,
     });
 
-    return { steps, applied, skipped, fastAuthRestores };
+    return { steps, applied, skipped, fastAuthRestores, secretValues: collectSecretStepValues(steps) };
   }
 }
 

@@ -7,6 +7,9 @@
  * - It is intentionally NOT started by the API server automatically.
  */
 
+// IMPORTANT: `../instrument` must load before any other import so Sentry can
+// instrument http before it is required. Keep it first.
+import '../instrument';
 import { env } from '@/config/environment/env';
 import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
 import { ArtifactRetentionJob } from '@/jobs/artifact-retention.job';

@@ -18,6 +18,10 @@ jest.mock('@/services/chat/mobile-context.service', () => ({
   resolveMobileSessionContext: jest.fn(),
 }));
 
+jest.mock('@/services/chat/mobile-project-context.service', () => ({
+  resolveMobileProjectContext: jest.fn().mockResolvedValue(null),
+}));
+
 jest.mock('../pipeline', () => ({
   runMobileAgentPipeline: jest.fn(),
 }));

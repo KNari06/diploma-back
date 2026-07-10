@@ -39,6 +39,52 @@ describe('sanitizeMobileSteps', () => {
       const { steps } = sanitizeMobileSteps([step]);
       expect(steps[0]).toBe(step);
     });
+
+    it.each([
+      ['bare "key" in a press step', 'Press key Enter', 'Enter'],
+      ['"keyboard" in the description', 'Dismiss the keyboard hint', 'ok'],
+      ['"keyword" in a search step', 'Type search keyword into search box', 'sneakers'],
+      ['"Authorize" button label', 'Tap Authorize and confirm', 'confirm'],
+      ['OAuth screen mention', 'Type username on the OAuth login screen', 'alice'],
+      ['"author" field', 'Type name into author field', 'Tolstoy'],
+      ['"pinch" gesture', 'Pinch to zoom on the map', 'out'],
+      ['city containing "pin"', 'Type destination into Pinsk field', 'Pinsk'],
+    ])('does NOT parameterize a benign step: %s', (_label, description, value) => {
+      const { steps, parametersSchema } = sanitizeMobileSteps([mkStep({ description, value })]);
+      expect(steps[0].value).toBe(value);
+      expect(parametersSchema).toEqual({});
+    });
+  });
+
+  describe('explicit isSensitive flag is the primary signal', () => {
+    it('parameterizes a flagged value even when the description is benign', () => {
+      const step = mkStep({
+        description: 'Type into the second field',
+        value: 'hunter2',
+        isSensitive: true,
+      });
+      const { steps, parametersSchema } = sanitizeMobileSteps([step]);
+      expect(steps[0].value).toMatch(PLACEHOLDER);
+      expect(Object.keys(parametersSchema)).toHaveLength(1);
+      expect(JSON.stringify(steps)).not.toContain('hunter2');
+    });
+
+    it('parameterizes a flagged value even with no context at all', () => {
+      const step = mkStep({ id: 'otp-entry', description: '', value: '123456', isSensitive: true });
+      const { steps, parametersSchema } = sanitizeMobileSteps([step]);
+      expect(steps[0].value).toBe('{{param_otp_entry}}');
+      expect(parametersSchema.param_otp_entry).toBeDefined();
+    });
+
+    it('isSensitive=false does not suppress the regex fallback', () => {
+      const step = mkStep({
+        description: 'Type password into login field',
+        value: 'qwerty123',
+        isSensitive: false,
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      expect(steps[0].value).toMatch(PLACEHOLDER);
+    });
   });
 
   describe('sensitive values are replaced with placeholders', () => {
@@ -73,17 +119,35 @@ describe('sanitizeMobileSteps', () => {
       ['credential', 'Enter credential'],
       ['pin', 'Enter your PIN'],
       ['otp', 'Type the OTP code'],
-      ['auth', 'Paste the auth header'],
+      ['auth header', 'Paste the auth header'],
+      ['auth code', 'Enter the authentication code'],
+      ['passcode', 'Type your passcode'],
+      ['passphrase', 'Enter the wallet passphrase'],
+      ['passkey', 'Enter your passkey'],
+      ['one-time code', 'Type the one-time code from SMS'],
+      ['cvv', 'Enter card CVV'],
+      ['russian password', 'Введите пароль'],
+      ['kazakh password', 'Құпия сөзді енгізіңіз'],
     ])('redacts values flagged by the "%s" pattern', (_label, description) => {
       const { steps } = sanitizeMobileSteps([mkStep({ description, value: 'sensitive' })]);
       expect(steps[0].value).toMatch(PLACEHOLDER);
     });
 
-    it('matches "auth" but not "author"/"authoring"', () => {
+    it('matches credential compounds but not "author"/"authoring"', () => {
       const authoring = sanitizeMobileSteps([mkStep({ description: 'authoring notes', value: 'v' })]);
       expect(authoring.steps[0].value).toBe('v');
       const author = sanitizeMobileSteps([mkStep({ description: 'author bio', value: 'v' })]);
       expect(author.steps[0].value).toBe('v');
+    });
+
+    it('detects sensitivity from the bindingHints input type', () => {
+      const step = mkStep({
+        description: 'Type into the field',
+        value: 's3cret',
+        bindingHints: { type: 'password' },
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      expect(steps[0].value).toMatch(PLACEHOLDER);
     });
 
     it('does not preserve the original secret anywhere in the output', () => {
@@ -94,10 +158,25 @@ describe('sanitizeMobileSteps', () => {
   });
 
   describe('idempotency', () => {
-    it('leaves an already-templated value untouched', () => {
+    it('leaves an already-templated value untouched but registers it in the schema', () => {
       const step = mkStep({ description: 'Type password', value: '{{param_password}}' });
       const { steps, parametersSchema } = sanitizeMobileSteps([step]);
       expect(steps[0]).toBe(step);
+      // A pre-sanitised caller must still get a complete parameters_schema
+      // persisted at the save boundary.
+      expect(parametersSchema.param_password).toEqual({
+        type: 'string',
+        description: 'Value for Type password',
+        required: true,
+        sensitive: true,
+      });
+    });
+
+    it('does not register non-parameter placeholders ({{secrets.*}}, {{extracted.*}})', () => {
+      const { parametersSchema } = sanitizeMobileSteps([
+        mkStep({ id: 'a', description: 'Type password', value: '{{secrets.login_password}}' }),
+        mkStep({ id: 'b', description: 'Type code', value: '{{extracted.code}}' }),
+      ]);
       expect(parametersSchema).toEqual({});
     });
 
@@ -168,5 +247,81 @@ describe('sanitizeMobileSteps', () => {
 
   it('returns empty results for an empty input list', () => {
     expect(sanitizeMobileSteps([])).toEqual({ steps: [], parametersSchema: {} });
+  });
+
+  describe('assertionText redaction', () => {
+    it('masks a secret quoted in the assertion text itself', () => {
+      const step = mkStep({
+        id: 'a',
+        type: 'ai_check' as any,
+        description: 'Confirm token is shown',
+        assertionText: 'The screen shows the API token sk_live_abc123',
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      // The assertion string contains "token" → masked.
+      expect(steps[0].assertionText).toBe('{{param_secret}}');
+      expect(steps[0].assertionText).not.toContain('sk_live_abc123');
+    });
+
+    it('preserves a benign assertion even when the step types a sensitive value', () => {
+      // Keying off the description would wrongly mask this benign assertion.
+      const step = mkStep({
+        id: 'b',
+        description: 'Type password',
+        value: 'hunter2',
+        assertionText: 'Home screen is visible',
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      expect(steps[0].assertionText).toBe('Home screen is visible');
+      expect(steps[0].value).toMatch(PLACEHOLDER); // value still parameterised
+    });
+
+    it('leaves an already-templated assertionText untouched', () => {
+      const step = mkStep({
+        id: 'c',
+        type: 'assert_text' as any,
+        description: 'check',
+        assertionText: '{{param_expected}}',
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      expect(steps[0].assertionText).toBe('{{param_expected}}');
+    });
+  });
+
+  describe('always-secret option fields', () => {
+    it('masks options.totpSecret unconditionally (no keyword gate)', () => {
+      const step = mkStep({
+        id: 'a',
+        type: 'otp' as any,
+        description: 'Sign in with authenticator',
+        options: { otpAction: 'generate_totp', totpSecret: 'JBSWY3DPEHPK3PXP' } as any,
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      const opts = steps[0].options as Record<string, unknown>;
+      expect(opts.totpSecret).toBe('{{param_secret}}');
+      expect(opts.otpAction).toBe('generate_totp'); // non-secret field preserved
+    });
+
+    it('masks options.otpCode', () => {
+      const step = mkStep({
+        id: 'b',
+        type: 'otp' as any,
+        description: 'Enter code',
+        options: { otpAction: 'type_otp', otpCode: '123456' } as any,
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      expect((steps[0].options as Record<string, unknown>).otpCode).toBe('{{param_secret}}');
+    });
+
+    it('does not clone options when there is no secret field', () => {
+      const step = mkStep({
+        id: 'c',
+        type: 'swipe' as any,
+        description: 'swipe',
+        options: { startX: 1, startY: 2, endX: 3, endY: 4 } as any,
+      });
+      const { steps } = sanitizeMobileSteps([step]);
+      expect(steps[0]).toBe(step); // identity preserved — no needless clone
+    });
   });
 });

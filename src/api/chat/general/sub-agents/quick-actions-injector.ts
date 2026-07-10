@@ -119,3 +119,31 @@ export function injectQuickActions(
 
   return uniqueActions;
 }
+
+/**
+ * Structured draft-step payload surfaced from a `qa_run_draft_steps` tool
+ * result so the chat can render the steps as EDITABLE widgets (parity with the
+ * mobile agent). Present on both the author-only (`confirm:false`) and the
+ * executed (`confirm:true`) paths — the handler sets `draftMeta.executed`.
+ */
+export interface DraftStepsPayload {
+  draftSteps: unknown[];
+  draftMeta: Record<string, unknown>;
+}
+
+/**
+ * Extract the draft-step payload from the LAST `qa_run_draft_steps` tool
+ * result (last authoring call wins, mirroring the cache overwrite). Returns
+ * null when no draft was authored this turn. Pure — no I/O.
+ */
+export function extractDraftSteps(toolResults: ToolExecutionRecord[]): DraftStepsPayload | null {
+  let found: DraftStepsPayload | null = null;
+  for (const record of toolResults) {
+    if (record.toolName !== 'qa_run_draft_steps') continue;
+    const data = record.result?.data as { draftSteps?: unknown; draftMeta?: unknown } | undefined;
+    if (data && Array.isArray(data.draftSteps) && data.draftMeta && typeof data.draftMeta === 'object') {
+      found = { draftSteps: data.draftSteps, draftMeta: data.draftMeta as Record<string, unknown> };
+    }
+  }
+  return found;
+}

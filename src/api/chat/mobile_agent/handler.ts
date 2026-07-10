@@ -27,6 +27,7 @@ import { emitMobileAgentThinking } from './progress';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { isReasoningPersistEnabled } from './reasoning-trace';
 import { resolveMobileSessionContext } from '@/services/chat/mobile-context.service';
+import { resolveMobileProjectContext } from '@/services/chat/mobile-project-context.service';
 import { incCounter, observeMs } from '@/utils/core/mobile-chat-metrics';
 import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
@@ -35,6 +36,126 @@ import {
   MobileSessionAuthzError,
 } from '@/services/mobile/mobile-session-authz';
 import { GLOBAL_STORE, type ChatStore } from '@/services/utils/chat-store';
+import { wrapUntrusted } from '@/services/chat/untrusted-content-wrapper';
+import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
+import { redactPii } from '@/services/chat/pii-redactor';
+import { compressHistoryTurns } from './history-compression';
+import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+
+/**
+ * How many prior messages to load for cross-turn memory. The most recent
+ * MOBILE_HISTORY_VERBATIM are kept as full turns; anything older within this
+ * window is compressed into one summary block so a reference to a much earlier
+ * turn ("what I asked ~20 messages ago") still lands, without blowing the token
+ * budget on full verbatim history.
+ */
+const MOBILE_HISTORY_LIMIT = 20;
+const MOBILE_HISTORY_VERBATIM = 8;
+/** Cap per compressed line so one long older turn can't dominate the summary. */
+const MOBILE_HISTORY_PREVIEW_CHARS = 160;
+
+/**
+ * Load recent conversation turns for the agent so it can resolve references to
+ * earlier turns ("now do the same on signup", "no, the other one", or a much
+ * older ask). Returns oldest→newest, role-mapped for OpenAI, PII/secret-
+ * redacted. The recent tail is verbatim; older turns are compressed into a
+ * single system "earlier conversation" block (deterministic truncation — no
+ * extra LLM call, mirrors the web editor-mode compression). Best-effort — any
+ * failure returns [] and the turn proceeds stateless.
+ *
+ * The current user message is NOT yet persisted at this point (saveMobileChatTurn
+ * runs AFTER the pipeline), so history contains only PRIOR turns — no dupe of
+ * the current goal.
+ */
+async function buildMobileHistory(
+  chatSessionId: string | undefined,
+  userId: string,
+  store: ChatStore,
+): Promise<ChatCompletionMessageParam[]> {
+  if (!chatSessionId) return [];
+  try {
+    // Lazy import: ChatPersistence pulls the Supabase client into the module
+    // graph, which throws at import time without env vars (breaks handler.test).
+    // Same pattern as buildOpenTestCaseBlock / resolveProjectId.
+    const { ChatPersistence } = await import('@/services/utils/chat-persistence');
+    const rows = await ChatPersistence.getRecentMessages(
+      store,
+      chatSessionId,
+      userId,
+      MOBILE_HISTORY_LIMIT,
+    );
+    // Redact BEFORE compression so both the verbatim tail AND the summary are
+    // secret-free (invariant #10 — a new sink for step bodies).
+    const turns = (rows ?? [])
+      .filter((m) => typeof m.content === 'string' && m.content.trim().length > 0)
+      .map((m) => ({
+        role: convertRoleForOpenAI(m.role) as 'user' | 'assistant',
+        content: redactPii(m.content),
+      }));
+
+    // Keep the recent tail verbatim; condense older turns into one summary
+    // block (pure + unit-tested in history-compression.ts).
+    return compressHistoryTurns(turns, {
+      verbatimCount: MOBILE_HISTORY_VERBATIM,
+      previewChars: MOBILE_HISTORY_PREVIEW_CHARS,
+    });
+  } catch (err) {
+    logger.debug('[MOBILE_AGENT] buildMobileHistory skipped', {
+      chatSessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+}
+
+/**
+ * Build the OPEN TEST CASE system block from a saved test case's existing
+ * steps so the agent extends the flow rather than duplicating it. Owner-scoped
+ * read; best-effort — any failure (not found / no access / no steps) returns
+ * null and the turn proceeds without the block. Caps the summary so a long
+ * test doesn't blow the prompt budget.
+ */
+async function buildOpenTestCaseBlock(
+  testCaseId: string | undefined,
+  userId: string,
+): Promise<string | null> {
+  if (!testCaseId) return null;
+  try {
+    // Lazy import: pulling IntentTestCaseService at module top drags the
+    // Supabase client into the graph, which throws at import time without env
+    // vars (breaks handler.test.ts). Dynamic import keeps the handler test-
+    // loadable — same pattern resolveProjectId uses for supabaseAdmin.
+    const { IntentTestCaseService } = await import(
+      '@/services/testing/ui/preview/intent-test-case.service'
+    );
+    const tc = await IntentTestCaseService.getById(testCaseId, userId);
+    const steps = Array.isArray(tc?.stepsJson) ? tc!.stepsJson : [];
+    if (!tc || steps.length === 0) return null;
+    const MAX_STEPS = 40;
+    const shown = steps.slice(0, MAX_STEPS);
+    const lines = shown.map((s: any, i: number) => {
+      const type = String(s?.type ?? 'step');
+      const desc = String(s?.description ?? '').slice(0, 120);
+      return `${i + 1}. ${type}${desc ? ` — ${desc}` : ''}`;
+    });
+    if (steps.length > MAX_STEPS) lines.push(`… (+${steps.length - MAX_STEPS} more)`);
+    const body =
+      `Test case "${tc.name ?? testCaseId}" already has ${steps.length} step(s):\n` +
+      lines.join('\n');
+    return (
+      '## OPEN TEST CASE (the editor is scoped to this saved test)\n' +
+      'These steps ALREADY exist. When the user asks to add/change steps, EXTEND ' +
+      'this flow — do not re-author steps it already has.\n' +
+      wrapUntrusted(body)
+    );
+  } catch (err) {
+    logger.debug('[MOBILE_AGENT] buildOpenTestCaseBlock skipped', {
+      testCaseId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
 
 interface MobileAgentParams {
   message: string;
@@ -53,6 +174,21 @@ interface MobileAgentParams {
    * chat tables (parallel to web editor_action). Defaults to GLOBAL_STORE.
    */
   chatStore?: ChatStore;
+  /**
+   * Project the chat is scoped to, resolved by the controller (test-case
+   * access check or workspace context). Threaded onto the blackboard so the
+   * save tool doesn't dead-end on the chat_sessions.project_id lookup (NULL in
+   * both mobile scopes).
+   */
+  projectId?: string;
+  /**
+   * Saved test case the mobile editor is scoped to. Set by the controller's
+   * testCaseId branch (access already verified via assertCanAccessTestCase).
+   * Drives the eager project-context resolution: the test case's project is
+   * authoritative, and its existing steps are injected into the prompt so
+   * the agent extends the flow instead of duplicating it.
+   */
+  testCaseId?: string;
 }
 
 export async function handleMobileAgent(
@@ -134,6 +270,27 @@ export async function handleMobileAgent(
     mobileSessionId,
     userId,
     chatSessionId,
+    // Prefer the controller-resolved projectId; fall back to the one the
+    // frontend put in context. Either makes the save tool resolve without the
+    // dead-ending chat_sessions lookup.
+    projectId: params.projectId ?? (typeof ctxObj?.projectId === 'string' ? ctxObj.projectId : undefined),
+    workspaceId,
+    testCaseId: params.testCaseId,
+  });
+
+  // Resolve project / app / open-test-case context EAGERLY — a couple of
+  // cheap DB reads that run concurrently with the (much slower) device
+  // snapshot fetch below. Landing this on the blackboard up front means
+  // mobile_create_test_case can't dead-end on a missing project after a
+  // successful draft run, and the system prompt can name the app under
+  // test while authoring. Best-effort: the resolver never throws; null
+  // keeps the legacy lazy save-time lookup as the fallback.
+  const projectContextPromise = resolveMobileProjectContext({
+    userId,
+    chatSessionId,
+    testCaseId: params.testCaseId,
+    contextProjectId:
+      typeof ctxObj?.projectId === 'string' ? ctxObj.projectId : undefined,
   });
 
   try {
@@ -178,6 +335,31 @@ export async function handleMobileAgent(
       observeMs('mobile_chat.eager_snapshot_ms', Date.now() - fetchStartedAt);
       if (snapshot) {
         incCounter('mobile_chat.eager_snapshot', 'success');
+        // Seed the snapshot onto the blackboard so tools that read
+        // bb.getSnapshot() (mobile_run_draft_steps platform/app stamping,
+        // plan_flow currentScreen, list_webview_contexts, screen-size lookup)
+        // see the eagerly-fetched data instead of null. Without this the LLM
+        // could author a draft in round 1 (before any observe_mobile_page) and
+        // the saved test would be mis-stamped platform:android with no app
+        // package, and plan_flow would plan blind. MobileSnapshot is a
+        // MobileUiState minus tree/screenshot with expectedApp aliasing app —
+        // map it back to the getSnapshot() contract.
+        blackboard.setSnapshot({
+          sessionId: snapshot.sessionId,
+          platform: snapshot.platform,
+          app: snapshot.expectedApp,
+          expectedApp: snapshot.expectedApp,
+          activity: snapshot.activity,
+          fingerprint: snapshot.fingerprint,
+          screenSize: snapshot.screenSize,
+          windowInfo: snapshot.windowInfo,
+          formattedTree: snapshot.formattedTree,
+          actualForeground: snapshot.actualForeground,
+          foregroundMismatch: snapshot.foregroundMismatch,
+          recentDisruption: snapshot.recentDisruption,
+          webView: snapshot.webView,
+          capturedAt: snapshot.capturedAt,
+        });
         // foregroundMismatch is the load-bearing reason this whole
         // phase exists — count it as a top-level metric. recentDisruption
         // travels with it for the same dashboard.
@@ -204,6 +386,16 @@ export async function handleMobileAgent(
       incCounter('mobile_chat.eager_snapshot', 'disabled');
     }
 
+    // Land the eager project context (kicked off before the snapshot
+    // fetch) on the blackboard. Resolver swallows its own errors → a
+    // plain await is safe here.
+    const projectContext = await projectContextPromise;
+    blackboard.setProjectContext(projectContext);
+    incCounter(
+      'mobile_chat.eager_project_context',
+      projectContext ? projectContext.source : 'unresolved',
+    );
+
     // AI-usage tracking — parity with general_chat. mobile_agent is a real
     // multi-step agent, so its decisions (tool calls, duration) must leave a
     // trace in ai_usage_log for post-hoc analysis, not only Winston files.
@@ -217,12 +409,23 @@ export async function handleMobileAgent(
       });
     }
 
+    // When the editor is scoped to a saved test case, summarise its existing
+    // steps so the agent EXTENDS the flow instead of re-authoring it (the
+    // duplicate-vs-extend gap). Best-effort + owner-scoped; never blocks the
+    // turn on a read failure.
+    const openTestCaseBlock = await buildOpenTestCaseBlock(params.testCaseId, userId);
+
+    // Prior turns for cross-turn memory (best-effort). Read BEFORE this turn is
+    // saved, so it contains only earlier turns — no dupe of the current goal.
+    const history = await buildMobileHistory(chatSessionId, userId, chatStore);
+
+    const pipelineOpts = { abortSignal, snapshot, openTestCaseBlock, history };
     const result = trackingSessionId && workspaceId
       ? await withAIContext(
           { workspaceId, userId, operationType: 'chat' },
-          () => runMobileAgentPipeline(blackboard, { abortSignal, snapshot }),
+          () => runMobileAgentPipeline(blackboard, pipelineOpts),
         )
-      : await runMobileAgentPipeline(blackboard, { abortSignal, snapshot });
+      : await runMobileAgentPipeline(blackboard, pipelineOpts);
 
     if (trackingSessionId) {
       AIUsageTracker.recordPipelineMetrics(trackingSessionId, {
@@ -278,6 +481,15 @@ export async function handleMobileAgent(
         // inside the LLM prompt. Surfacing the raw stack trace in the
         // chat panel adds noise without help.
       };
+    }
+
+    // Draft steps authored this turn (mobile_run_draft_steps) → the chat
+    // renders them as editable step widgets. `draftMeta.executed` tells the
+    // UI whether they already ran (confirm=true) or await a UI-confirm run
+    // (confirm=false). Values are already sanitised to {{param_*}} by the tool.
+    if (result.draftSteps && result.draftMeta) {
+      visualMetadata.draftSteps = result.draftSteps;
+      visualMetadata.draftMeta = result.draftMeta;
     }
 
     await saveMobileChatTurn(

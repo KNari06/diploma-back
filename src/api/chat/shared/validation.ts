@@ -202,10 +202,16 @@ async function processUploadedFiles(req: Request): Promise<ChatAttachment[]> {
           const os = await import('os');
           const { parseFile } = await import('@/utils/parsing/fileParser');
 
-          // Write buffer to temp file (fileParser requires file path)
+          // Write buffer to temp file (fileParser requires file path).
+          // SECURITY: file.originalname is raw client input — never interpolate
+          // it into a filesystem path (a `../`-laden name would escape tmpDir and
+          // let an authenticated user write their buffer to an arbitrary path).
+          // Use only the sanitised basename on disk; the true display name is
+          // still passed to parseFile for type detection.
           const tmpDir = os.tmpdir();
           const uniqueSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-          const tmpPath = path.join(tmpDir, `chat-upload-${uniqueSuffix}-${file.originalname}`);
+          const safeName = path.basename(file.originalname).replace(/[/\\]/g, '').slice(0, 128) || 'upload';
+          const tmpPath = path.join(tmpDir, `chat-upload-${uniqueSuffix}-${safeName}`);
           await fs.writeFile(tmpPath, file.buffer);
 
           try {

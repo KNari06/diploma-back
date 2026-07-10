@@ -1117,17 +1117,28 @@ export class MobileRunnerClient {
               }
               // The runner's zod validation middleware (`validate.middleware.ts`)
               // returns `{error:'Validation failed', details:[{path,message}]}`
-              // with no `code` — without surfacing `details` here, every such
-              // failure reads as an opaque "Validation failed (runner code:
-              // none)" with no way to tell which field/step was actually
-              // rejected short of adding a temporary log and reproducing.
+              // with no `code`. The internal schema field paths in `details`
+              // (e.g. `body.steps[3].options.linkTestCase.linkedTestCaseId:
+              // Required`) are invaluable for root-causing the rejection
+              // without a temporary log + reproduction — but they're
+              // implementation detail no end user has context for, so they
+              // are logged here (server-side only) and never folded into
+              // `runnerMessage`, which flows verbatim into user-facing
+              // failure copy (mobile-error-mapper.ts, mobile-test-run.job.ts).
               if (Array.isArray(parsed.details) && parsed.details.length > 0) {
                 const detail = parsed.details
                   .map((d) => [d.path, d.message].filter(Boolean).join(': '))
                   .filter(Boolean)
                   .join('; ');
                 if (detail) {
-                  runnerMessage = runnerMessage ? `${runnerMessage} — ${detail}` : detail;
+                  logger.warn('[MOBILE_CLIENT] Runner rejected request: validation failed', {
+                    url,
+                    method,
+                    details: detail,
+                  });
+                  runnerMessage = runnerMessage
+                    ? `${runnerMessage}: invalid step configuration`
+                    : 'Invalid step configuration';
                 }
               }
             } catch {

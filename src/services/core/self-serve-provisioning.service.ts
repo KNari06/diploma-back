@@ -10,7 +10,6 @@ import { cache } from '@/utils/core/redis-cache';
 import {
   approvePendingUser,
   fetchUserStatus,
-  markWorkspaceOnboardingCompleted,
   userHasAnyWorkspace,
 } from '@/services/core/db/self-serve.db';
 
@@ -137,17 +136,16 @@ export class SelfServeProvisioningService {
 
   /**
    * Ensure the user has a workspace. checkOrCreateWorkspace is idempotent —
-   * it resolves an existing active workspace or creates one. We also mark
-   * onboarding as completed on a freshly created workspace so ProtectedRoute
-   * sends the user to /home instead of the wizard.
+   * it resolves an existing active workspace or creates one.
+   *
+   * We deliberately do NOT mark onboarding as completed here: self-serve users
+   * are approved immediately, but must still pass the onboarding wizard (pick
+   * web/mobile, enter a URL, etc.) before landing on /home. The wizard sets
+   * onboarding_completed via saveOnboarding when the user finishes it. Marking
+   * it done here would skip the wizard entirely.
    */
   private static async ensureWorkspace(userId: string): Promise<string | null> {
-    const { workspace_id, is_new } = await WorkspaceService.checkOrCreateWorkspace(userId);
-
-    if (is_new && workspace_id) {
-      await markWorkspaceOnboardingCompleted(workspace_id);
-    }
-
+    const { workspace_id } = await WorkspaceService.checkOrCreateWorkspace(userId);
     return workspace_id;
   }
 

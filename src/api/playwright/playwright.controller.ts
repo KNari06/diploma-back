@@ -79,7 +79,14 @@ export const uploadTrace = async (
 
     const timestamp = Date.now();
     const traceId = uuidv4();
-    const fileName = `trace_${timestamp}_${userId}_${testId || 'standalone'}_${browser || 'chrome'}.zip`;
+    // SECURITY: `browser` is raw req.body input interpolated into the storage
+    // key — a value with `/` or `..` could reshape the object path. Coerce to a
+    // safe slug (alnum + dash only) before it enters the key. testId is already
+    // UUID-validated and userId is JWT-derived, so only `browser` is untrusted.
+    const safeBrowser = (typeof browser === 'string' ? browser : '')
+      .replace(/[^a-zA-Z0-9-]/g, '')
+      .slice(0, 32) || 'chrome';
+    const fileName = `trace_${timestamp}_${userId}_${testId || 'standalone'}_${safeBrowser}.zip`;
     const storagePath = `traces/${userId}/${fileName}`;
     const fileSize = req.file.size;
 

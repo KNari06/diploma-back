@@ -69,19 +69,64 @@ export function getDependencyClosureRows(ids: string[]) {
     .in('id', ids);
 }
 
+/** Page size for `getProjectGraphRows` — PostgREST's default row cap would
+ * otherwise silently truncate the graph for a project with more test cases
+ * than that cap, making the cycle check see (and pass) an incomplete graph. */
+const PROJECT_GRAPH_PAGE_SIZE = 1000;
+
 /**
  * Every case in a project's (id, depends_on, steps_json) — the full graph
  * needed for combined dependsOn + link_test_case cycle detection (see
  * utils/graph/link-graph.ts). Unlike `getDependencyClosureRows`, this is not
  * scoped to a known id list — cycle checks need the whole project's edges,
  * not just one node's closure.
+ *
+ * Scoped by `project_id` ONLY (not `user_id`): a shared workspace project can
+ * contain rows created by different members (create() has no workspace-
+ * ownership gate), and a cycle spanning two members' rows in the same
+ * project would be invisible to the check if it were also filtered by a
+ * single owner. Paginates through the full result in `PROJECT_GRAPH_PAGE_SIZE`
+ * chunks — a single unbounded `.select()` would silently truncate at
+ * PostgREST's default row cap for a large project, making the cycle check
+ * see (and pass) an incomplete graph.
  */
-export function getProjectGraphRows(projectId: string, userId: string) {
+export async function getProjectGraphRows(
+  projectId: string,
+): Promise<{ data: Array<{ id: string; depends_on: string[] | null; steps_json: unknown }> | null; error: { message: string } | null }> {
+  const rows: Array<{ id: string; depends_on: string[] | null; steps_json: unknown }> = [];
+  let offset = 0;
+
+  while (true) {
+    const { data, error } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, depends_on, steps_json')
+      .eq('project_id', projectId)
+      .order('id', { ascending: true })
+      .range(offset, offset + PROJECT_GRAPH_PAGE_SIZE - 1);
+
+    if (error) {
+      return { data: null, error };
+    }
+
+    rows.push(...(data || []));
+    if (!data || data.length < PROJECT_GRAPH_PAGE_SIZE) break;
+    offset += PROJECT_GRAPH_PAGE_SIZE;
+  }
+
+  return { data: rows, error: null };
+}
+
+/**
+ * id / user_id / project_id for a batch of test cases, unscoped by owner —
+ * used to verify save-time access to `link_test_case` targets
+ * (`IntentTestCaseService`'s linked-test-case access check). One round-trip
+ * for the whole batch (never call this per-id in a loop).
+ */
+export function getTestCaseOwnersByIds(ids: string[]) {
   return supabaseAdmin
     .from('intent_test_cases')
-    .select('id, depends_on, steps_json')
-    .eq('project_id', projectId)
-    .eq('user_id', userId);
+    .select('id, user_id, project_id')
+    .in('id', ids);
 }
 
 /** Owner-scoped exact count for a project (+ optional flow filter). */
