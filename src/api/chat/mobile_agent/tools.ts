@@ -407,7 +407,10 @@ const PLAN_FLOW_TOOL: ChatCompletionTool = {
       'Call this ONCE at the start of any flow that needs more than one action ' +
       '(login, checkout, registration, multi-field form fill, exploration of a ' +
       'specific feature). Do NOT call for single-action requests like "tap X". ' +
-      'After planning, walk the plan via start_plan_step / finish_plan_step. ' +
+      'After planning: if the user wants a TEST CASE, turn the plan into ' +
+      'MobileIntentStep[] and surface them with mobile_run_draft_steps (editable ' +
+      'cards) — do NOT drive it live. Only for an explicit live one-off run, walk ' +
+      'the plan via start_plan_step / finish_plan_step. ' +
       'If the goal is too vague to plan (no target flow / no success criteria), ' +
       'this returns a clarifying question instead of a plan — relay it to the ' +
       'user and STOP; do not author or run steps until they answer.',
@@ -522,11 +525,15 @@ const MOBILE_RUN_DRAFT_STEPS_TOOL: ChatCompletionTool = {
   function: {
     name: 'mobile_run_draft_steps',
     description:
-      'Execute a list of mobile test steps as a draft on the live device, ' +
-      'and cache them for the chat session so the user can save them later. ' +
-      'Use this when the user asks you to "run" / "execute" / "try out" a ' +
-      'flow you just designed. Steps are NOT persisted yet — call ' +
-      'mobile_create_test_case afterward if the user asks to save.',
+      'PRIMARY authoring tool. Pass the MobileIntentStep[] you designed and they ' +
+      'render as EDITABLE STEP CARDS in the chat for the user to review, edit, ' +
+      'and confirm. This is how ANY "create / make / build a test case" request ' +
+      '(incl. "make a working test case") is fulfilled — the user must SEE the ' +
+      'steps, so author them here rather than performing the flow live with ' +
+      'tap_element / type_text. Also use it for "run / execute / try out the ' +
+      'flow you designed". The steps run on the device (confirm-then-run) and are ' +
+      'cached for the chat session; they are NOT persisted — call ' +
+      'mobile_create_test_case afterward only if the user asks to save.',
     parameters: {
       type: 'object',
       properties: {
@@ -1385,8 +1392,11 @@ async function runPlanFlow(
   return {
     ok: true,
     content:
-      `Plan installed (${plan.steps.length} steps). Walk it by calling ` +
-      `start_plan_step → action tools → finish_plan_step, in order.\n\n` +
+      `Plan installed (${plan.steps.length} steps). If the user wants a TEST ` +
+      `CASE (create/make/build a test), author the steps as MobileIntentStep[] ` +
+      `and call mobile_run_draft_steps so they show as editable cards — do NOT ` +
+      `walk it live. For a live one-off run, walk it via start_plan_step → ` +
+      `action tools → finish_plan_step, in order.\n\n` +
       `${bb.formatPlanStatusForLlm()}`,
     data: plan,
   };
@@ -1833,8 +1843,12 @@ async function runMobileRunDraftSteps(
   // batching beats N separate calls — we get one round-trip with built-in
   // smart-wait + per-step results.
   const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
+  // Screen fingerprint BEFORE the batch — lets the batch-error path below tell
+  // "nothing ran" from "steps ran but the reply was lost" (see below).
+  const preRunFingerprint = bb.getSnapshot()?.fingerprint;
   let runnerResults: unknown[] = [];
   let batchError: string | null = null;
+  let batchErrorInconclusive = false;
   try {
     const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
@@ -1844,10 +1858,42 @@ async function runMobileRunDraftSteps(
     runnerResults = results ?? [];
   } catch (err) {
     batchError = err instanceof Error ? err.message : String(err);
+    // A timeout (408) or a connection dropped after the batch reached the
+    // device (NETWORK_ERROR / 0) does NOT mean "nothing ran" — a login draft
+    // typically times out AFTER the tap-login step already fired the OTP and
+    // navigated. Distinguish it from a hard error so the message below doesn't
+    // falsely claim "none executed".
+    batchErrorInconclusive =
+      err instanceof MobileRunnerError &&
+      (err.statusCode === 408 || err.statusCode === 0 || err.code === 'NETWORK_ERROR') &&
+      !opts?.abortSignal?.aborted;
+  }
+
+  // Re-observe on an inconclusive batch error BEFORE invalidating: if the
+  // screen changed vs the pre-run snapshot, the batch got at least partway
+  // through (mutating steps landed). We can't recover per-step results from a
+  // thrown batch, but we MUST NOT tell the user "none executed" — the draft is
+  // still cached and likely partially applied.
+  let batchAdvanced = false;
+  if (batchError && batchErrorInconclusive) {
+    try {
+      const snap = await client.fetchUiState(bb.mobileSessionId, {
+        includeTree: false,
+        includeScreenshot: true,
+        signal: opts?.abortSignal,
+        userId: bb.userId,
+      });
+      batchAdvanced =
+        !!preRunFingerprint && !!snap.fingerprint && snap.fingerprint !== preRunFingerprint;
+      bb.setSnapshot(snap);
+    } catch {
+      // best-effort — fall through with batchAdvanced=false
+    }
   }
 
   // Always invalidate snapshot after a draft run — every step is potentially
-  // mutating, so the cached pre-run screen is stale.
+  // mutating, so the cached pre-run screen is stale. (A successful re-observe
+  // above already refreshed it; invalidate covers every other path.)
   bb.invalidateSnapshot();
 
   const summary = summariseRunnerResults(steps, runnerResults, batchError);
@@ -1866,6 +1912,20 @@ async function runMobileRunDraftSteps(
   });
 
   if (batchError) {
+    if (batchAdvanced) {
+      // Screen changed → the batch ran at least partway before the reply was
+      // lost. Report uncertain-partial-success, NOT "none executed".
+      return {
+        ok: false,
+        content:
+          `The draft run did not return a clear result (${batchError}), but the ` +
+          `screen changed — some steps likely ran (e.g. a login that navigated ` +
+          `before the response came back). Call observe_mobile_page to see the ` +
+          `current screen. The draft is still shown in the chat for editing; ` +
+          `the user can re-run or save it.`,
+        data: draftStepsPayload,
+      };
+    }
     return {
       ok: false,
       content:
@@ -3047,11 +3107,33 @@ async function runSwitchToWebview(
     // The runner accepts `switch_context({context: 'WEB'})` — pre-Phase-8
     // it threw "unknown command" because the schema rejected it; the
     // schema patch in command.schema.ts opens the gate.
-    await client.executeBatchCommands(
+    // A FAILED command comes back as HTTP 200 with `{success:false}` (not a
+    // thrown error), so we MUST read results[0].success — otherwise a "no
+    // webview attached" reply would falsely flip web-context and mis-route
+    // every later tap/observe to a DOM that doesn't exist. (Mirrors the
+    // success gate runWebEvaluate already uses.)
+    const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
       [{ type: 'switch_context', params: { context: 'WEB' } }],
       { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
     );
+    const switchResult = results?.[0] as { success?: boolean; error?: string } | undefined;
+    if (!switchResult?.success) {
+      bb.recordToolCall({
+        tool: 'switch_to_webview',
+        args: {},
+        ok: false,
+        error: switchResult?.error || 'switch_context returned no success',
+        durationMs: Date.now() - startedAt,
+        at: startedAt,
+      });
+      return {
+        ok: false,
+        content:
+          `Could not enter WebView: ${switchResult?.error || 'no debuggable WebView on this screen'}. ` +
+          `Staying in native context.`,
+      };
+    }
     bb.enterWebContext();
 
     // Best-effort URL probe so the LLM has something to anchor on. Failure
@@ -3121,11 +3203,29 @@ async function runSwitchToNative(
 
   const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
   try {
-    await client.executeBatchCommands(
+    // Read results[0].success — a failed switch is a 200 body, not a throw
+    // (see runSwitchToWebview). Flipping context on a false success would
+    // mis-route later tools.
+    const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
       [{ type: 'switch_context', params: { context: 'NATIVE' } }],
       { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
     );
+    const switchResult = results?.[0] as { success?: boolean; error?: string } | undefined;
+    if (!switchResult?.success) {
+      bb.recordToolCall({
+        tool: 'switch_to_native',
+        args: {},
+        ok: false,
+        error: switchResult?.error || 'switch_context returned no success',
+        durationMs: Date.now() - startedAt,
+        at: startedAt,
+      });
+      return {
+        ok: false,
+        content: `Could not switch to native context: ${switchResult?.error || 'unknown failure'}.`,
+      };
+    }
     bb.exitWebContext();
     bb.recordToolCall({
       tool: 'switch_to_native',
@@ -3246,6 +3346,61 @@ interface RunnerCommandResult {
   bugReport?: unknown;
 }
 
+/**
+ * Shared post-action re-observe for INCONCLUSIVE mutating commands. Several
+ * runner outcomes leave us unsure whether the action landed — a fail-fast
+ * timeout (408), a connection dropped AFTER the request reached the device
+ * (NETWORK_ERROR / statusCode 0), or a 200 with an empty `results` array. In
+ * all of these the tap/type may have taken effect (the canonical case: tapping
+ * "Login" fires an OTP and navigates, but the reply never made it back). This
+ * takes ONE fresh snapshot and compares the screen fingerprint against the
+ * pre-command one; a change means the action almost certainly succeeded, so we
+ * return an uncertain-success ToolResult instead of a flat failure. Returns
+ * null when the screen did NOT change (or the re-observe failed) — the caller
+ * then falls through to its normal failure. Best-effort: never throws.
+ */
+async function reobserveAfterInconclusive(
+  bb: MobileBlackboard,
+  client: Awaited<ReturnType<typeof getMobileRunnerClientForSession>>,
+  opts: DispatchOpts,
+  preFingerprint: string | undefined,
+  startedAt: number,
+): Promise<ToolResult | null> {
+  try {
+    const snap = await client.fetchUiState(bb.mobileSessionId, {
+      includeTree: false,
+      includeScreenshot: true,
+      signal: opts.abortSignal,
+      userId: bb.userId,
+    });
+    bb.setSnapshot(snap);
+    const screenChanged =
+      !!preFingerprint && !!snap.fingerprint && snap.fingerprint !== preFingerprint;
+    if (!screenChanged) return null;
+    bb.recordToolCall({
+      tool: opts.toolName,
+      args: opts.args,
+      ok: true,
+      error: 'inconclusive_but_screen_changed',
+      durationMs: Date.now() - startedAt,
+      at: startedAt,
+    });
+    return {
+      ok: true,
+      content:
+        `${opts.success({ success: true } as RunnerCommandResult)}\n` +
+        `(The command did not return a clear result, but the screen changed ` +
+        `afterward — the action most likely succeeded. Call observe_mobile_page ` +
+        `to confirm the current screen before continuing.)`,
+      data: snap,
+    };
+  } catch {
+    // Re-observe failed (session gone, still unreadable, aborted) — let the
+    // caller fall through to its normal failure. Best-effort only.
+    return null;
+  }
+}
+
 async function dispatchSingleCommand(
   bb: MobileBlackboard,
   command: unknown,
@@ -3253,6 +3408,12 @@ async function dispatchSingleCommand(
 ): Promise<ToolResult> {
   const startedAt = Date.now();
   const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
+
+  // Screen fingerprint BEFORE the command — used by the post-action re-observe
+  // to tell an action that actually landed (screen changed) apart from one that
+  // genuinely did nothing. Captured here because a mutating command calls
+  // invalidateSnapshot() before the failure paths run.
+  const preFingerprint = bb.getSnapshot()?.fingerprint;
 
   try {
     const { results } = await client.executeBatchCommands(
@@ -3284,6 +3445,17 @@ async function dispatchSingleCommand(
       return { ok: true, content: opts.success(result), data: result };
     }
 
+    // Empty/short results with NO thrown error: the runner returned 200 but no
+    // per-command result (contract violation — serialization edge, session
+    // churn). For a mutating command this is inconclusive, not a clean "did
+    // nothing", so re-observe before declaring failure (same rationale as the
+    // timeout path). A present-but-failed result (result.success === false) is
+    // a real failure — skip the re-observe for it.
+    if (opts.mutating && result === null) {
+      const rescued = await reobserveAfterInconclusive(bb, client, opts, preFingerprint, startedAt);
+      if (rescued) return rescued;
+    }
+
     const msg = result?.error || 'unknown failure';
     return {
       ok: false,
@@ -3301,7 +3473,28 @@ async function dispatchSingleCommand(
       at: startedAt,
     });
     if (opts.mutating) bb.invalidateSnapshot();
+
+    // Inconclusive-error re-observe. A mutating command can LAND on the device
+    // and then lose its reply two ways: a fail-fast TIMEOUT (408 — tapping
+    // "Login" fires an OTP + navigates past the 8s budget), or a connection
+    // dropped AFTER the request reached the device (NETWORK_ERROR / statusCode
+    // 0 — runner restart, LB idle-cut mid-response). Both surface here as a
+    // thrown MobileRunnerError but may mean "the action succeeded, I just
+    // didn't hear back". Re-observe and, if the screen changed, report
+    // uncertain-success instead of the false "could not tap Login". A user
+    // abort (499) or dead session (404/503) is a REAL stop — never re-observe.
+    if (
+      err instanceof MobileRunnerError &&
+      (err.statusCode === 408 || err.statusCode === 0 || err.code === 'NETWORK_ERROR') &&
+      opts.mutating &&
+      !opts.abortSignal?.aborted
+    ) {
+      const rescued = await reobserveAfterInconclusive(bb, client, opts, preFingerprint, startedAt);
+      if (rescued) return rescued;
+    }
+
     if (err instanceof MobileRunnerError) {
+      const inconclusive = err.statusCode === 408 || err.statusCode === 0 || err.code === 'NETWORK_ERROR';
       const hint =
         err.statusCode === 404
           ? 'The mobile session is no longer active.'
@@ -3309,6 +3502,9 @@ async function dispatchSingleCommand(
           ? 'Mobile testing is not enabled on this deployment.'
           : err.statusCode === 499
           ? 'Request was cancelled by the user.'
+          : inconclusive
+          ? `The command did not return a clear result and the screen did not ` +
+            `change — the action may not have registered. ${err.message}`
           : `Runner error ${err.statusCode}: ${err.message}`;
       return { ok: false, content: opts.failure(null, hint) };
     }
