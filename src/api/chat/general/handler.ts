@@ -1127,6 +1127,14 @@ You are inside the editor for the test case currently open in the preview. The
   let pipelineQuickActions:
     | import('@/api/chat/shared/quick-action.types').QuickAction[]
     | undefined;
+  /**
+   * Structured draft steps authored by qa_run_draft_steps this turn. Lifted
+   * onto the AI message metadata + HTTP reply so the chat renders them as
+   * editable step widgets (parity with the mobile agent). Undefined when no
+   * draft was authored.
+   */
+  let pipelineDraftSteps: unknown[] | undefined;
+  let pipelineDraftMeta: Record<string, unknown> | undefined;
   const MAX_TOOL_ROUNDS = 5; // Prevent infinite loops
 
   // Wrap AI calls with tracking context
@@ -1220,6 +1228,10 @@ You are inside the editor for the test case currently open in the preview. The
             // Surface synthesized quick actions to the outer scope so the
             // metadata builder can attach them to the AI message.
             pipelineQuickActions = pipelineResult.quickActions;
+            // Surface authored draft steps so the metadata builder attaches them
+            // to the AI message (editable step widgets in chat).
+            pipelineDraftSteps = pipelineResult.draftSteps;
+            pipelineDraftMeta = pipelineResult.draftMeta;
             // Clarification responses don't deduct credits (user didn't get an answer)
             shouldDeductCredits = !pipelineResult.needsClarification;
             if (pipelineResult.needsClarification) {
@@ -1438,7 +1450,7 @@ You are inside the editor for the test case currently open in the preview. The
     // mode users still get the Save button when sub-agent pipeline is bypassed.
     if (monolithicToolResults.length > 0) {
       try {
-        const { injectQuickActions } = await import('@/api/chat/general/sub-agents/quick-actions-injector');
+        const { injectQuickActions, extractDraftSteps } = await import('@/api/chat/general/sub-agents/quick-actions-injector');
         const monolithicQuickActions = injectQuickActions(monolithicToolResults, {
           mode: mode as 'lite' | 'pro' | 'editor' | undefined,
           previewSessionId: resolvedPreviewSessionId,
@@ -1448,6 +1460,11 @@ You are inside the editor for the test case currently open in the preview. The
         });
         if (monolithicQuickActions.length > 0) {
           pipelineQuickActions = monolithicQuickActions;
+        }
+        const monolithicDraft = extractDraftSteps(monolithicToolResults);
+        if (monolithicDraft) {
+          pipelineDraftSteps = monolithicDraft.draftSteps;
+          pipelineDraftMeta = monolithicDraft.draftMeta;
         }
       } catch (injErr) {
         logger.warn('[GENERAL_CHAT] Failed to inject quick actions from monolithic loop', {
@@ -1670,6 +1687,12 @@ You are inside the editor for the test case currently open in the preview. The
           aiMessageMetadata.hasDraftSteps = true;
         }
       } catch { /* non-critical */ }
+    }
+    // Structured draft steps → editable step widgets in chat (parity with
+    // mobile). Persisted on the message + mirrored to the HTTP reply below.
+    if (Array.isArray(pipelineDraftSteps) && pipelineDraftSteps.length > 0 && pipelineDraftMeta) {
+      aiMessageMetadata.draftSteps = pipelineDraftSteps;
+      aiMessageMetadata.draftMeta = pipelineDraftMeta;
     }
 
     const timestamps = await saveChatMessagesWithLogging(store, chatSessionId, [

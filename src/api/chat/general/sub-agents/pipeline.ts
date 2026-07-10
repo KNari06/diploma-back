@@ -10,7 +10,7 @@ import { formatResponse, generateSimpleResponse } from './agents/responder-agent
 import { reviewExecution } from './agents/reviewer-agent';
 import { validateEditorSteps, extractStepsFromContent, formatValidationWarnings } from './agents/step-validator-agent';
 import { SubAgentSpawner } from './spawner';
-import { injectQuickActions } from './quick-actions-injector';
+import { injectQuickActions, extractDraftSteps } from './quick-actions-injector';
 import type {
   ExecutorResult,
   PipelineContext,
@@ -592,6 +592,7 @@ export class SubAgentPipeline {
           projectId: this.context.projectId,
           userId: this.context.userId,
         });
+        const draft = extractDraftSteps(executorResult.toolResults);
 
         logger.info('[SUB_AGENT_PIPELINE] Single-tool complete', {
           metrics,
@@ -604,6 +605,7 @@ export class SubAgentPipeline {
           path: 'single_tool',
           metrics,
           ...(quickActions.length > 0 ? { quickActions } : {}),
+          ...(draft ? { draftSteps: draft.draftSteps, draftMeta: draft.draftMeta } : {}),
         };
       }
 
@@ -830,6 +832,7 @@ export class SubAgentPipeline {
         projectId: this.context.projectId,
         userId: this.context.userId,
       });
+      const multiToolDraft = extractDraftSteps(executorResult.toolResults);
 
       logger.info('[SUB_AGENT_PIPELINE] Multi-tool complete', {
         metrics,
@@ -842,6 +845,7 @@ export class SubAgentPipeline {
         path: 'multi_tool',
         metrics,
         ...(multiToolQuickActions.length > 0 ? { quickActions: multiToolQuickActions } : {}),
+        ...(multiToolDraft ? { draftSteps: multiToolDraft.draftSteps, draftMeta: multiToolDraft.draftMeta } : {}),
       };
 
     } catch (error) {
