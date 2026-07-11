@@ -362,35 +362,3 @@ export async function getProjectModulesForTree(
   }));
 }
 
-/**
- * All modules for a single platform (owner-scoped), unpaginated, for building
- * the nested folder tree. Sorted order_index ASC (nulls last), created_at DESC
- * so tree assembly preserves sibling order at every level.
- */
-export async function getPlatformModulesForTree(
-  platformId: string,
-  userId: string,
-): Promise<PlatformModuleTreeRow[]> {
-  const { data, error } = await supabaseAdmin
-    .from('test_modules')
-    .select('id, platform_id, parent_module_id, name, description, priority, order_index, created_at')
-    .eq('platform_id', platformId)
-    .eq('user_id', userId)
-    .order('order_index', { ascending: true, nullsFirst: false })
-    .order('created_at', { ascending: false });
-
-  if (error) {
-    logger.error('[MODULE_DB] Failed to get platform modules for tree', { error, platformId });
-    throw new Error(`Failed to get modules: ${error.message}`);
-  }
-
-  return (data || []).map((m: any) => ({
-    id: m.id,
-    platformId: m.platform_id,
-    parentModuleId: m.parent_module_id ?? null,
-    name: m.name,
-    description: m.description || undefined,
-    priority: m.priority || undefined,
-    orderIndex: typeof m.order_index === 'number' ? m.order_index : null,
-  }));
-}
