@@ -2954,17 +2954,22 @@ async function executeAction(
       }
 
       case 'scroll': {
-        if (locator) {
-          await locator.scrollIntoViewIfNeeded({ timeout });
-        } else {
-          // V14: Parse both deltaY and optional deltaX from step.value
-          // Format: "deltaY" or "deltaY,deltaX"
-          const valueParts = (step.value || '').split(',');
-          const rawDeltaY = parseFloat(valueParts[0] || '');
-          const rawDeltaX = valueParts.length > 1 ? parseFloat(valueParts[1] || '') : 0;
-          const deltaY = Number.isFinite(rawDeltaY) ? rawDeltaY : 300;
-          const deltaX = Number.isFinite(rawDeltaX) ? rawDeltaX : 0;
+        // V14: Parse both deltaY and optional deltaX from step.value
+        // Format: "deltaY" or "deltaY,deltaX"
+        const valueParts = (step.value || '').split(',');
+        const rawDeltaY = parseFloat(valueParts[0] || '');
+        const rawDeltaX = valueParts.length > 1 ? parseFloat(valueParts[1] || '') : 0;
+        const deltaY = Number.isFinite(rawDeltaY) ? rawDeltaY : 300;
+        const deltaX = Number.isFinite(rawDeltaX) ? rawDeltaX : 0;
 
+        if (locator) {
+          // Container resolved by description (options.scrollContainerDescription)
+          // — scroll INSIDE the resolved element by the recorded delta.
+          await locator.evaluate(
+            (el, { dx, dy }: { dx: number; dy: number }) => { (el as unknown as { scrollBy: (x: number, y: number) => void }).scrollBy(dx, dy); },
+            { dx: deltaX, dy: deltaY },
+          );
+        } else {
           // Container scroll: if scrollContainer selector recorded, scroll that element instead of window
           const containerSel = step.options?.scrollContainer;
           if (containerSel) {
@@ -3731,9 +3736,37 @@ export class PreviewStepApplyService {
           }, 3000);
         }
 
+        // Scroll-by-container: resolve the named container so executeAction
+        // scrolls INSIDE it (not the page). Reuses the same LLM/vision resolver
+        // as click/fill (via lint), feeding the container description as intent.
+        let scrollContainerLocator: Locator | undefined;
+        if (stepDraft.type === 'scroll' && stepDraft.options?.scrollContainerDescription?.trim()) {
+          const containerLint = await IntentStepLintService.lintStepWithAI({
+            previewSessionId,
+            stepDraft,
+            pageRef: params.pageRef,
+            userId,
+            forceFreshSnapshot: true,
+            auditTrigger: 'apply_prelint',
+          });
+          const containerRef = containerLint.status === 'resolved' ? containerLint.candidates?.[0]?.ref : undefined;
+          if (!containerRef) {
+            return await PreviewStepApplyService._buildFailureResult({
+              previewSessionId,
+              stepDraft,
+              page,
+              error: `Scroll container not found: "${stepDraft.options.scrollContainerDescription}"`,
+              originatingStrategy: 'other',
+              attempts: 1,
+              extra: { url: page.url() },
+            });
+          }
+          scrollContainerLocator = page.locator(`[data-agent-ref="${containerRef}"]`).first();
+        }
+
         let result;
         try {
-          result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 }, undefined, { secretValues: secretValuesForAudit });
+          result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 }, scrollContainerLocator, { secretValues: secretValuesForAudit });
           // Emit complete phase for navigate
           if (stepDraft.type === 'navigate') {
             const navUrl = stepDraft.value || '';
