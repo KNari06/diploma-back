@@ -209,8 +209,11 @@ export interface TestModule {
   id: string;
   projectId: string;
   userId: string;
-  platformId: string;
+  /** Platform the folder was created under. NULL = platform-agnostic folder. */
+  platformId: string | null;
   platformKey?: PlatformKey;
+  /** Parent folder (self-reference). null = top-level folder. */
+  parentModuleId: string | null;
   name: string;
   description?: string;
   tags: string[];
@@ -222,12 +225,22 @@ export interface TestModule {
 }
 
 /**
+ * Maximum module (folder) nesting depth. A top-level folder is depth 1, so this
+ * allows a folder + two levels of sub-folders. Enforced in ModuleService on
+ * create and on re-parent (move). Keep in sync with the frontend depth guard.
+ */
+export const MAX_MODULE_DEPTH = 3;
+
+/**
  * Params for creating a test module
  */
 export interface CreateTestModuleParams {
   projectId: string;
   userId: string;
-  platformId: string;
+  /** Optional. NULL / omitted = platform-agnostic folder. */
+  platformId?: string | null;
+  /** Parent folder id. Omit / null to create a top-level folder. */
+  parentModuleId?: string | null;
   name: string;
   description?: string;
   tags?: string[];
@@ -244,8 +257,13 @@ export interface UpdateTestModuleParams {
   description?: string;
   tags?: string[];
   priority?: Priority;
-  /** Move the module to a manual order position within its platform. */
+  /** Move the module to a manual order position within its (parent) level. */
   orderIndex?: number;
+  /**
+   * Re-parent (move) the folder. undefined = leave parent unchanged;
+   * null = move to top level; a string = move under that folder.
+   */
+  parentModuleId?: string | null;
 }
 
 // ============================================================================

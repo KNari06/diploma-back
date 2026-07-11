@@ -1335,9 +1335,15 @@ export async function handleListTestModules(
   }
 
   try {
+    // LEFT join by default so platform-agnostic folders (platform_id NULL) are
+    // included; inner join only when filtering by platformKey so the embedded
+    // filter actually excludes non-matching rows.
+    const moduleSelect = platformKey
+      ? 'id, name, description, platform_id, tags, priority, created_at, updated_at, test_platforms!inner(platform_key)'
+      : 'id, name, description, platform_id, tags, priority, created_at, updated_at, test_platforms(platform_key)';
     let query = supabaseAdmin
       .from('test_modules')
-      .select('id, name, description, platform_id, tags, priority, created_at, updated_at, test_platforms!inner(platform_key)')
+      .select(moduleSelect)
       .eq('project_id', projectId)
       .order(sortBy, { ascending: sortOrder });
 
