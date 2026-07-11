@@ -7,6 +7,7 @@ import { UserCreditsService } from '@/services/core/user-credits.service';
 import { getSummariesForContext, summarizeOldMessages } from '@/services/ai/summarization/chat-summarization.service';
 import { formatPageContextForChat, getPageContext, type PageContext } from '@/services/chat/editor-context.service';
 import { ChatTestTraceService } from '@/services/chat/chat-test-trace.service';
+import { wrapUntrustedContent, UNTRUSTED_WEB_CONTENT_INSTRUCTION } from '@/services/chat/untrusted-content-wrapper';
 import { getProjectFiles, searchKB } from '@/services/kb/kb.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { ChatPersistence } from '@/services/utils/chat-persistence';
@@ -259,9 +260,16 @@ export async function handleGeneralChat(
     chatStore?: ChatStore;
     /** Test-case scope marker; passed through for downstream loggers / WS rooms. */
     testCaseId?: string;
+    /**
+     * The test case's authoritative project id (from assertCanAccessTestCase),
+     * threaded only in test-case scope. Trusted (access already verified). Used
+     * to seed projectId so KB/file/project context and tool scope target the
+     * test case's own project instead of falling back to the workspace default.
+     */
+    testCaseProjectId?: string;
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context: rawContext, workspace_id: paramWorkspaceId, abortSignal, logger: functionLogger, mode, attachments, needsTools, testCaseId } = params;
+  const { message, userId, chatSessionId, context: rawContext, workspace_id: paramWorkspaceId, abortSignal, logger: functionLogger, mode, attachments, needsTools, testCaseId, testCaseProjectId } = params;
   // Resolve persistence backend with safe default. Done at the top so
   // every read/write below uses the same store value, preventing a
   // mid-handler refactor mistake from sending some messages to one table
@@ -615,7 +623,34 @@ export async function handleGeneralChat(
     testCaseId,
   );
 
-  let projectId = typeof context === 'object' ? context?.projectId : undefined;
+  const clientProjectId = typeof context === 'object' ? context?.projectId : undefined;
+  let projectId: string | undefined;
+  // In test-case scope the client intentionally omits projectId, and
+  // resolveProjectId can't recover it (it reads the GLOBAL chat_sessions
+  // table, which a test_case_chat_sessions id misses → workspace default).
+  // Seed from the test case's own access-checked project so KB/file/project
+  // context and tool scope target the right project. See BUG-1.
+  if (store.kind === 'testcase' && testCaseProjectId) {
+    projectId = testCaseProjectId;
+  } else if (clientProjectId) {
+    // TIER 0 (global scope): the frontend sends the project the user selected
+    // in the UI switcher. It is the authoritative source — but it's client
+    // input, so verify access (owner OR workspace member) before trusting it,
+    // mirroring the regression handlers' Tier-0. Used directly THIS turn for
+    // KB/file/project context and tool scope. The controller separately syncs
+    // chat_sessions.project_id to this same value so the stale-binding root
+    // cause is cleared for every handler. See global-chat-wrong-project fix.
+    const { getAccessibleProject } = await import('@/services/chat/mobile-project-context.service');
+    const accessible = await getAccessibleProject(userId, clientProjectId);
+    if (accessible) {
+      projectId = accessible.id;
+    } else {
+      logger.warn('[GENERAL_CHAT] Client-supplied projectId rejected (no access) — falling back to resolution', {
+        userId: userId.substring(0, 8) + '...',
+        clientProjectId,
+      });
+    }
+  }
   const parsedContext = typeof context === 'object' && context !== null && !Array.isArray(context)
     ? context as Record<string, any>
     : undefined;
@@ -807,7 +842,7 @@ export async function handleGeneralChat(
     try {
       const { SkillRegistry } = await import('@/services/skills');
 
-      const skillContext = { userId, workspaceId, chatSessionId, projectId, mode: mode as 'lite' | 'pro' | 'editor' | undefined };
+      const skillContext = { userId, workspaceId, chatSessionId, projectId, mode: mode as 'lite' | 'pro' | 'editor' | undefined, storeKind: store.kind, testCaseId };
       availableTools = await SkillRegistry.getAvailableTools(skillContext);
       skillDescriptions = await SkillRegistry.getSkillDescriptions(skillContext);
 
@@ -835,6 +870,14 @@ export async function handleGeneralChat(
     ? withFunctionLogging(buildChatSystemPrompt, 'buildChatSystemPrompt', functionLogger)
     : buildChatSystemPrompt;
   let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions, projectId, projectName, integrationContext, kbFileNames);
+
+  // SECURITY: when untrusted content (live page context OR uploaded documents)
+  // is injected below, add the untrusted-content policy ONCE so every wrapped
+  // block inherits the "treat as observation, never instructions" rule.
+  const hasDocumentAttachments = !!attachments?.some(f => f.type === 'document' && f.extractedText);
+  if (editorPageContext || hasDocumentAttachments) {
+    systemPrompt += `\n\n${UNTRUSTED_WEB_CONTENT_INSTRUCTION}`;
+  }
 
   // Append editor-specific instructions if in editor mode
   if (mode === 'editor' && editorPageContext) {
@@ -1057,12 +1100,14 @@ You are inside the editor for the test case currently open in the preview. The
     // Build content array with text + images
     const contentParts: ChatCompletionContentPart[] = [];
 
-    // Text part: original message + appended document contents
+    // Text part: original message + appended document contents.
+    // SECURITY: uploaded/forwarded documents are attacker-controllable, so
+    // their text is wrapped in an untrusted-content fence (markers stripped
+    // from the body so a planted delimiter can't break out) rather than a
+    // bare Markdown code fence that ``` inside the doc could close.
     let textContent = message;
     for (const doc of attachments.filter(f => f.type === 'document' && f.extractedText)) {
-      const ext = doc.name.split('.').pop()?.toLowerCase() || '';
-      const langHint = ext === 'json' ? 'json' : ext === 'md' ? 'markdown' : '';
-      textContent += `\n\nAttached file "${doc.name}":\n\`\`\`${langHint}\n${doc.extractedText}\n\`\`\``;
+      textContent += `\n\nAttached file "${doc.name}":\n${wrapUntrustedContent(doc.extractedText!, `DOCUMENT: ${doc.name}`)}`;
     }
     contentParts.push({ type: 'text', text: textContent });
 
@@ -1127,6 +1172,14 @@ You are inside the editor for the test case currently open in the preview. The
   let pipelineQuickActions:
     | import('@/api/chat/shared/quick-action.types').QuickAction[]
     | undefined;
+  /**
+   * Structured draft steps authored by qa_run_draft_steps this turn. Lifted
+   * onto the AI message metadata + HTTP reply so the chat renders them as
+   * editable step widgets (parity with the mobile agent). Undefined when no
+   * draft was authored.
+   */
+  let pipelineDraftSteps: unknown[] | undefined;
+  let pipelineDraftMeta: Record<string, unknown> | undefined;
   const MAX_TOOL_ROUNDS = 5; // Prevent infinite loops
 
   // Wrap AI calls with tracking context
@@ -1220,6 +1273,10 @@ You are inside the editor for the test case currently open in the preview. The
             // Surface synthesized quick actions to the outer scope so the
             // metadata builder can attach them to the AI message.
             pipelineQuickActions = pipelineResult.quickActions;
+            // Surface authored draft steps so the metadata builder attaches them
+            // to the AI message (editable step widgets in chat).
+            pipelineDraftSteps = pipelineResult.draftSteps;
+            pipelineDraftMeta = pipelineResult.draftMeta;
             // Clarification responses don't deduct credits (user didn't get an answer)
             shouldDeductCredits = !pipelineResult.needsClarification;
             if (pipelineResult.needsClarification) {
@@ -1379,6 +1436,8 @@ You are inside the editor for the test case currently open in the preview. The
           projectId,
           previewSessionId: resolvedPreviewSessionId,
           mode: mode as 'lite' | 'pro' | 'editor' | undefined,
+          storeKind: store.kind,
+          testCaseId,
         };
 
         const callResult = await executeTool({
@@ -1438,7 +1497,7 @@ You are inside the editor for the test case currently open in the preview. The
     // mode users still get the Save button when sub-agent pipeline is bypassed.
     if (monolithicToolResults.length > 0) {
       try {
-        const { injectQuickActions } = await import('@/api/chat/general/sub-agents/quick-actions-injector');
+        const { injectQuickActions, extractDraftSteps } = await import('@/api/chat/general/sub-agents/quick-actions-injector');
         const monolithicQuickActions = injectQuickActions(monolithicToolResults, {
           mode: mode as 'lite' | 'pro' | 'editor' | undefined,
           previewSessionId: resolvedPreviewSessionId,
@@ -1448,6 +1507,11 @@ You are inside the editor for the test case currently open in the preview. The
         });
         if (monolithicQuickActions.length > 0) {
           pipelineQuickActions = monolithicQuickActions;
+        }
+        const monolithicDraft = extractDraftSteps(monolithicToolResults);
+        if (monolithicDraft) {
+          pipelineDraftSteps = monolithicDraft.draftSteps;
+          pipelineDraftMeta = monolithicDraft.draftMeta;
         }
       } catch (injErr) {
         logger.warn('[GENERAL_CHAT] Failed to inject quick actions from monolithic loop', {
@@ -1670,6 +1734,12 @@ You are inside the editor for the test case currently open in the preview. The
           aiMessageMetadata.hasDraftSteps = true;
         }
       } catch { /* non-critical */ }
+    }
+    // Structured draft steps → editable step widgets in chat (parity with
+    // mobile). Persisted on the message + mirrored to the HTTP reply below.
+    if (Array.isArray(pipelineDraftSteps) && pipelineDraftSteps.length > 0 && pipelineDraftMeta) {
+      aiMessageMetadata.draftSteps = pipelineDraftSteps;
+      aiMessageMetadata.draftMeta = pipelineDraftMeta;
     }
 
     const timestamps = await saveChatMessagesWithLogging(store, chatSessionId, [

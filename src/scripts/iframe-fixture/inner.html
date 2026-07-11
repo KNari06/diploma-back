@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Login (in iframe)</title></head>
+<body style="font-family: sans-serif; padding: 16px;">
+  <h2>Account Login</h2>
+  <form id="login-form" onsubmit="event.preventDefault(); document.getElementById('result').textContent = 'Signed in as ' + document.getElementById('email').value;">
+    <div style="margin-bottom:8px;">
+      <label for="email">Email</label><br>
+      <input id="email" name="email" type="email" placeholder="you@example.com" data-testid="email-input" style="padding:6px;width:240px;">
+    </div>
+    <div style="margin-bottom:8px;">
+      <label for="password">Password</label><br>
+      <input id="password" name="password" type="password" placeholder="Your password" data-testid="password-input" style="padding:6px;width:240px;">
+    </div>
+    <button id="login-btn" type="submit" data-testid="login-submit" style="padding:8px 16px;">Sign in</button>
+  </form>
+  <p id="result" role="status" style="margin-top:12px;color:green;"></p>
+</body>
+</html>

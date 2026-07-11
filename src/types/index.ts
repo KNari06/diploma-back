@@ -36,6 +36,12 @@ export interface TestRunRequest {
   intent?: string; // Original user intent for context
   mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
   chatSessionId?: string; // Chat session ID for WebSocket routing isolation
+  /**
+   * Chain-view: the outer `regression_runs.id` this test belongs to (set
+   * only for the single-test-case dispatch path — see `tests.regression_run_id`
+   * migration for the full rationale). Bulk plan/module/flow runs omit this.
+   */
+  regressionRunId?: string;
   /** Prefilled steps from Smart Test Case Resolver for fast replay */
   prefilledSteps?: import('@/services/testing/resolver/resolver.types').PrefilledStep[];
   /**
@@ -589,7 +595,7 @@ export class ValidationError extends QAIError {
 export class InsufficientCreditsError extends ValidationError {
   constructor(
     message: string,
-    details?: { required?: number; available?: number; breakdown?: Record<string, number> },
+    details?: { required?: number; available?: number; breakdown?: Record<string, number | boolean> },
   ) {
     super(message, details);
     this.name = 'InsufficientCreditsError';

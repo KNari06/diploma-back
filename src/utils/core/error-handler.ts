@@ -204,10 +204,14 @@ export const errorHandler = (
     return;
   }
 
-  // ✅ FIX: Handle connection errors that indicate backend is unavailable/restarting
-  // These should return 502 (Bad Gateway) - backend is down, not just temporarily unavailable
+  // Connection errors to an unreachable UPSTREAM → 502 Bad Gateway.
+  // ECONNRESET is deliberately NOT here: it usually means the CLIENT closed the
+  // connection (tab closed, network dropped), not that our upstream failed —
+  // mapping it to 502 produced phantom "gateway down" responses/metrics. If the
+  // client is gone the response goes nowhere anyway; otherwise fall through to a
+  // plain 500 rather than mislabel it as a gateway failure.
   const errorCode = (error as any).code;
-  if (errorCode === 'ECONNREFUSED' || errorCode === 'ETIMEDOUT' || errorCode === 'ENOTFOUND' || errorCode === 'ECONNRESET') {
+  if (errorCode === 'ECONNREFUSED' || errorCode === 'ETIMEDOUT' || errorCode === 'ENOTFOUND') {
     res.status(502).json({
       success: false,
       error: 'Bad Gateway',
@@ -218,11 +222,13 @@ export const errorHandler = (
     return;
   }
 
-  // ✅ FIX: Handle 502 Bad Gateway errors (from proxy/load balancer or error messages)
-  if (error.message && typeof error.message === 'string' && (
-    error.message.includes('502') ||
-    error.message.includes('Bad Gateway')
-  )) {
+  // Only emit 502 when the error EXPLICITLY carries a 502 status code — never on
+  // a substring match of the message. A message that merely mentions "502"
+  // (an upstream's error text we logged, a URL/id/test name containing 502)
+  // must NOT be turned into a gateway response — that misclassified real 4xx/5xx
+  // causes as outages and needlessly triggered the frontend maintenance page.
+  const errStatus = (error as any).status ?? (error as any).statusCode;
+  if (errStatus === 502) {
     res.status(502).json({
       success: false,
       error: 'Bad Gateway',

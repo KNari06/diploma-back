@@ -25,7 +25,7 @@ Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 | Folder                                                               | What's in there                                                                                                                                                                          | Has own CLAUDE.md |
 | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- |
 | [src/services/testing/ui/preview/](src/services/testing/ui/preview/) | **Editor / Preview / Recording / Replay.** The hot zone.                                                                                                                                 | ✅                |
-| [src/agent/core/lite/](src/agent/core/lite/)                         | LiteEngine + 5 multi-agents + Pipeline v2 + Exploration v2.                                                                                                                              | ⏳ TODO           |
+| [src/agent/core/lite/](src/agent/core/lite/)                         | LiteEngine + 5 multi-agents + Pipeline v2 + Exploration v2.                                                                                                                              | ✅ (starter)      |
 | [src/services/ai/](src/services/ai/)                                 | LLM clients (OpenAI/Gemini), prompts, intent parser, cost tracking, embeddings, memory.                                                                                                  | ⏳ TODO           |
 | [src/ai/prompts/](src/ai/prompts/)                                   | All prompt builders. Intent, chat, test plan, API flow, intelligent testing.                                                                                                             | ⏳ TODO           |
 | [src/jobs/](src/jobs/)                                               | BullMQ job handlers (11 types).                                                                                                                                                          | ⏳ TODO           |
@@ -71,9 +71,10 @@ Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 | …run autonomous site exploration                                      | `src/agent/core/lite/exploration/exploration-engine.ts`                                                                                                                                              |
 | …trace AI cost / token usage                                          | `src/services/ai/cost/`, `src/services/ai/tracking/`                                                                                                                                                 |
 | …work on the per-test-case ("AI Agent inside a test case") chat       | `src/api/chat/chat.controller.ts` (testCaseId branch), `src/api/chat/general/handler.ts` (editor flow + trace), `src/services/chat/chat-test-trace.service.ts` — see Hard invariant #16              |
-| …change a user's plan/tier (any write site)                           | `src/services/core/plan.service.ts` (`PlanService.setUserPlan`) — the SINGLE funnel for user-level plan writes (keeps `users.{plan_id,plan,plan_status}` + `user_credits.{subscription_plan,subscription_status,grace_limit}` in sync). Stripe webhooks, admin grant (`assignPlanToUser` is now a thin wrapper), and self-serve all route through it. Workspace B2B plans stay in `workspace-credits.service.ts` (already atomic). |
+| …change a user's plan/tier (any write site)                           | `src/services/core/plan.service.ts` (`PlanService.setUserPlan`) — the SINGLE funnel for user-level plan writes (keeps `users.{plan_id,plan,plan_status}` + `user_credits.{subscription_plan,subscription_status,grace_limit}` in sync). Stripe webhooks, admin grant (`assignPlanToUser` is now a thin wrapper), and self-serve all route through it. **Credits belong to the USER only** — B2B/business Stripe invoices AND the ops `scripts/assign-workspace-plan.ts` grant the plan's credits + grace (incl. pilot) to the buyer's `user_credits` via `UserCreditsService.grantBusinessPlan` (NOT a workspace). Paid-feature gating (`isPaidUser` → `plan-access.db.ts` `userHasPaidBusinessPlan`) reads the user's own `user_credits.subscription_plan`. The `workspace_credits`/`workspace_credit_transactions` tables + `deduct_workspace_credits` RPC are now dead (`workspace-credits.service.ts` removed); a schema-drop migration is deferred to its own PR. |
 | …send a transactional email (welcome/approval/invite/purchase/report) | `src/services/core/email.service.ts` (`EmailService`) — see "Transactional email" flow below                                                                                                         |
 | …check DB schema                                                      | `supabase-migrations/supabase-schema.sql`                                                                                                                                                            |
+| …add/change a **prod** env var (not just `env.ts`)                    | See "Env vars: local vs prod" below — prod env lives in `qait-infra/azure/terraform/.env`, NOT here                                                                                                   |
 | …read a runtime trace / log                                           | `test_logs/<feature>/<YYYY-MM-DD_HH-MM-SS>_<testId>.jsonl` — `editor/` (preview traces), `chat_test/` (per-test-case chat). Always-on JSONL; auto-pruned after `EDITOR_LOG_RETENTION_DAYS` (default 3) by `src/jobs/artifact-retention.job.ts` |
 
 ---
@@ -126,7 +127,7 @@ POST `/api/v1/regression/run` or `/run-plan`
 → [mobile-test-run.job.ts](src/jobs/mobile-test-run.job.ts) — `MobileTestRunJobHandler.process()`
 → `MobileRunnerClient.runSteps(sessionId, intentSteps, { screenshotEachStep:true })` (REST to qait-mobile-runner)
 → runner returns `RunStepsResult` per-step with screenshot + evidence
-→ `persistCompiledPlansFromRun()` writes compiled plans back to `intent_test_cases.steps_json`
+→ `CompiledPlanPersistenceService.persistFromRun` writes compiled plans back to `intent_test_cases.steps_json`
 → per-step screenshots uploaded base64→URL (`uploadMobileStepScreenshots` in [step-screenshot.service.ts](src/services/storage/step-screenshot.service.ts), gated by `SCREENSHOT_EACH_STEP_ENABLED`) → `runtimeMeta.stepScreenshotUrl` + `metadata.steps[].screenshot`
 → `createTestResult()` inserts into `test_results` with aggregated stats
 → **Phase 2 telemetry** ([20260516_mobile_telemetry.sql](supabase-migrations/20260516_mobile_telemetry.sql)): per-test wallclock (`app_setup_ms`, `scenario_steps_ms`, `test_steps_ms`, `session_claim_ms`, `cold_start_used`) written into `test_executions` in `mobile-test-run.job.ts` finally block; aggregated into `regression_runs.total_*` by `TestCompletionHandlerService.recomputeRunStatus()` at run finalisation. Best-effort, NEVER fails the test path.
@@ -136,7 +137,7 @@ POST `/api/v1/regression/run` or `/run-plan`
 not per-step apply; (2) hardcoded `screenshotEachStep: true`; (3) NO heal layer
 above the runner — mobile relies solely on the runner's per-step retry +
 stabilization-retry tail; (4) compiled-plan persistence happens explicitly via
-`persistCompiledPlansFromRun()` (web persists differently); (5) sessions claimed
+`CompiledPlanPersistenceService.persistFromRun` (web persists differently); (5) sessions claimed
 from a runner-side pool (warmup → cold-start fallback) and released in the
 finally block. See `mobile-test-run.job.ts` for the full lifecycle.
 
@@ -258,6 +259,37 @@ See [.claude/rules/architecture.md](.claude/rules/architecture.md) — layer bre
 See [.claude/rules/testing.md](.claude/rules/testing.md) — mock boundary, what to test and where, file placement, naming.
 
 ---
+
+## Env vars: local vs prod (how to actually change a prod value)
+
+Adding a var to [env.ts](src/config/environment/env.ts) makes it exist in code — it
+does **NOT** set it in prod. Local and prod are two separate places:
+
+- **Local:** `qai-backend/.env` (dotenv). Only affects your machine.
+- **Prod:** the backend runs on **Azure Container Apps**, and its env is managed in
+  **`qait-infra/azure/terraform/`**, NOT here and NOT in the deploy pipeline (the
+  GitLab `deploy:api` job only swaps the image). A dev edits **one** file —
+  `qait-infra/azure/terraform/.env` — and the terraform CI ([azure/terraform/.gitlab-ci.yml](../qait-infra/azure/terraform/.gitlab-ci.yml))
+  buckets every line into three:
+  1. **`SECRET_KEYS`** (in that `.gitlab-ci.yml`) → a top-level tfvar feeding a
+     `secret {}` block. A secret ALSO needs a `variable` + `secret {}` +
+     `env { secret_name }` in [container-apps.tf](../qait-infra/azure/terraform/container-apps.tf)
+     (see how `jwt-secret` is wired).
+  2. **`INFRA_KEYS`** → skipped (terraform-controlled OR already a hardcoded `env {}`
+     block in `container-apps.tf`; a name that's hardcoded there MUST be in
+     `INFRA_KEYS` or you get a duplicate-env error).
+  3. **everything else** → an `app_env` map → a `dynamic "env"` block on BOTH
+     containers. **So a plain flag = just add `NAME=value` to that `.env`, nothing
+     else.** (`MOBILE_RUNNER_ENABLED` / `COMPANION_ENABLED` are the examples.)
+
+  Merge to the branch the infra pipeline watches → it runs `terraform plan` →
+  `apply` → the Container App rolls a new revision with the value. No image rebuild.
+
+**The trap (see [../LESSONS.md](../LESSONS.md)):** a feature gated by a
+default-off flag is **dark in prod until the flag is set in that shared `.env`** —
+having it `true` in your local `.env` proves nothing about prod. "Done" isn't done
+until the prod value is wired there. This is exactly how the companion relay shipped
+to prod but returned 503 until `COMPANION_ENABLED=true` was added to the infra `.env`.
 
 ## Pre-commit checks
 

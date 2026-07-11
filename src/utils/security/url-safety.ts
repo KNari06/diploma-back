@@ -267,6 +267,28 @@ export function isCredentialOriginAllowed(currentUrl: string, startingUrl: strin
 }
 
 /**
+ * True when two URLs share the same registrable domain (eTLD+1) — i.e. belong
+ * to the same SITE. `account.bi.group` and `bi.group` are same-site; an
+ * `amplitude.com` analytics call is not. Used to attribute network errors to
+ * the app under test (vs. third-party CDN/analytics noise). Reuses the same
+ * eTLD+1 extraction as the navigation-safety rules (no duplicate heuristic).
+ * Returns false on unparseable input (fail-closed).
+ */
+export function isSameSite(urlA: string, urlB: string): boolean {
+  let a: URL;
+  let b: URL;
+  try {
+    a = new URL(urlA);
+    b = new URL(urlB);
+  } catch {
+    return false;
+  }
+  const da = extractEtldPlusOne(a.hostname);
+  const db = extractEtldPlusOne(b.hostname);
+  return !!da && !!db && da === db;
+}
+
+/**
  * Convenience wrapper: log decision at the right level and return the
  * boolean. Caller passes a context tag (e.g. 'goto' or 'fill').
  */

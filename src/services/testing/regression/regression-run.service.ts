@@ -1,5 +1,6 @@
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
+import { computeUiStepCredits } from './credit-estimate.util';
 import { BUG_REPORT_CREDITS } from '@/jobs/ai-analysis.job';
 import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { NotFoundError, ValidationError, InsufficientCreditsError } from '@/types';
@@ -24,15 +25,22 @@ import {
 } from './regression-report-assembler.service';
 import { MobileTestDispatcherService } from './mobile-test-dispatcher.service';
 import { WebTestRequestBuilderService } from './web-test-request-builder.service';
+import { LinkResolutionService, namespacedMapSource, ExecutionSegment } from './link-resolution.service';
+import { LinkedTestCaseRunnerService } from './linked-test-case-runner.service';
+import { resolvePlaceholders, VariableSource } from '@/utils/interpolation/resolve-placeholders';
+import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import { RegressionTestQueryService } from './db/regression-test-query.db';
 import {
   insertRun,
   updateRunById,
-  failZombieRuns,
+  updateRunByIdIfActive,
+  findZombieRunCandidates,
+  forceFailRunsByIds,
   listRunsByProject,
   getRunExecutionStatsRows,
 } from './db/regression-run.db';
-import { getProjectForAccess } from './db/regression.db';
+import { getProjectForAccess, getTestBrowsersAndOptions } from './db/regression.db';
+import { isPendingSegmentsStale } from '@/services/testing/results/test-completion-handler.service';
 import { priorityRank } from './resolve-test-case-priority.util';
 import { TestExecutionOrchestratorService } from './test-execution-orchestrator.service';
 
@@ -69,12 +77,33 @@ export class RegressionRunService {
    */
   static async cleanupZombieRuns(): Promise<void> {
     try {
-      const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-      const { ids: zombieRunIds, error } = await failZombieRuns(thirtyMinutesAgo);
+      const now = Date.now();
+      const thirtyMinutesAgo = new Date(now - 30 * 60 * 1000).toISOString();
+      const { candidates, error: findError } = await findZombieRunCandidates(thirtyMinutesAgo);
 
-      if (error) {
+      if (findError) {
         // Use formatError so upstream HTML gateway responses (e.g. Cloudflare 520
         // when Supabase origin is down) don't dump multi-KB of HTML into the logs.
+        logger.error('[REGRESSION_RUN] Failed to find zombie run candidates', { error: formatError(findError) });
+        return;
+      }
+
+      // The candidate query casts a broad net on chain-wide `started_at`
+      // alone. A segmented (link_test_case) chain can legitimately still be
+      // executing despite an old `started_at` — filter those out using the
+      // same per-segment clock recomputeRunStatus's own staleness guard uses
+      // (ADR-0011 update 6), instead of force-failing every old row
+      // unconditionally.
+      const idsToFail = candidates
+        .filter((c) => (c.pending_segments ?? 0) <= 0 || isPendingSegmentsStale(
+          { started_at: c.started_at, last_segment_dispatched_at: c.last_segment_dispatched_at },
+          now,
+        ))
+        .map((c) => c.id);
+
+      const { ids: zombieRunIds, error } = await forceFailRunsByIds(idsToFail);
+
+      if (error) {
         logger.error('[REGRESSION_RUN] Failed to cleanup zombie runs', { error: formatError(error) });
         return;
       }
@@ -146,6 +175,26 @@ export class RegressionRunService {
         });
       }
 
+      // 1c. V-cross-app: resolve link_test_case steps. Same-platform links
+      // are inlined in place (recursively); a remaining cross-platform link
+      // is a segment boundary — see link-resolution.service.ts. A test case
+      // with no links (or only same-platform ones) always segments to
+      // exactly one "steps" segment, so this is a no-op for every existing
+      // test case.
+      const { resolvedSteps, segments } = await LinkResolutionService.resolveAndCheckForCrossPlatform(
+        (intentCase.steps_json as IntentStep[]) || [],
+        intentCase.platform || 'web',
+        userId,
+      );
+      intentCase.steps_json = resolvedSteps;
+      // Segments remaining AFTER the first one dispatches — only set for a
+      // segmented (cross-platform link) chain; every other run leaves this
+      // NULL/undefined so recomputeRunStatus's pending-segments check is a
+      // no-op for the overwhelming majority of runs. See the write-up in
+      // dispatchFirstSegmentAndDetachRest for why this exists.
+      const isSegmentedChain = segments.some((s) => s.kind === 'link');
+      const pendingSegments = isSegmentedChain ? segments.length - 1 : undefined;
+
       // 1b. Credit check + deduction for single test case
       await this.checkCreditBalance(
         userId,
@@ -154,13 +203,18 @@ export class RegressionRunService {
       );
 
       // 2. Create regression run record (now uses intent_test_case_id)
+      const dispatchStartedAt = new Date().toISOString();
       const { data: run, error: runError } = await insertRun({
         intent_test_case_id: intentTestCaseId,
         project_id: intentCase.project_id,
         user_id: userId,
         trigger,
         status: 'running',
-        started_at: new Date().toISOString(),
+        started_at: dispatchStartedAt,
+        // `last_segment_dispatched_at` starts equal to `started_at` — the
+        // first segment IS the run starting. See the migration file for why
+        // this anchors staleness per-segment instead of chain-wide.
+        ...(pendingSegments !== undefined ? { pending_segments: pendingSegments, last_segment_dispatched_at: dispatchStartedAt } : {}),
       });
 
       if (runError || !run) {
@@ -168,34 +222,45 @@ export class RegressionRunService {
       }
 
       // 3. Route mobile vs web test
-      const isMobile = intentCase.platform?.startsWith('mobile_');
       let testId: string;
 
       try {
-        if (isMobile) {
-          // Mobile test → dispatch to mobile runner queue. Parameters are
-          // applied inside dispatchMobileTest before the job is queued so
-          // placeholders in steps resolve to concrete values on the runner
-          // (Phase 6 — same substitution pass as the web path below).
-          const mobileResult = await MobileTestDispatcherService.dispatchMobileTest(
+        // Checking segment KIND, not just count: a test case whose entire
+        // steps_json is a single cross-platform link (no steps before or
+        // after it) segments to exactly one — but it's a "link" segment,
+        // not "steps". `segments.length <= 1` alone would misclassify that
+        // as the common case and dispatch the still-unresolved marker.
+        if (!segments.some((s) => s.kind === 'link')) {
+          // Common case — no cross-platform link_test_case steps (same-
+          // platform ones are already inlined into intentCase.steps_json
+          // above). Dispatch exactly as before this feature existed.
+          testId = await this.dispatchStepsSegment(
             intentCase,
+            (intentCase.steps_json as IntentStep[]) || [],
             userId,
             trigger,
-            undefined, // no triggerContext for single-case manual run
             parameters,
-            undefined, // no pre-created analyticsExecutionId for single-case run
-            chatSessionId, // stream progress to chat when launched from chat
+            browserOverride,
+            chatSessionId,
+            undefined,
+            run.id,
           );
-          testId = mobileResult.testId;
         } else {
-          // Web test → dispatch to Playwright queue
-          const testRequest = await WebTestRequestBuilderService.buildTestRequest(intentCase, userId, parameters, browserOverride, trigger, chatSessionId);
-          const testResult = await ManualTestService.runTest(testRequest);
-
-          if (!testResult.success || !testResult.data?.id) {
-            throw new Error('Failed to start test execution');
-          }
-          testId = testResult.data.id;
+          // Dispatches the first segment synchronously and detaches the
+          // rest (see dispatchFirstSegmentAndDetachRest) — a multi-segment
+          // chain's total poll time can legitimately exceed the server's
+          // own request timeout, and this request must return quickly like
+          // every other dispatch path already does.
+          testId = await this.dispatchFirstSegmentAndDetachRest(
+            intentCase,
+            segments,
+            userId,
+            trigger,
+            parameters,
+            run.id,
+            browserOverride,
+            chatSessionId,
+          );
         }
       } catch (execError) {
         // Mark run as failed — it was already created with 'running' status
@@ -234,6 +299,407 @@ export class RegressionRunService {
   }
 
   /**
+   * Dispatches one platform's steps via the existing per-platform mechanism
+   * — the same code `runSavedTestCase` always ran, now also reused for each
+   * "steps" segment of a test case that contains cross-platform
+   * `link_test_case` links (see `runSegmentedTestCase`).
+   */
+  private static async dispatchStepsSegment(
+    intentCase: any,
+    steps: IntentStep[],
+    userId: string,
+    trigger: 'manual' | 'chat' | 'scheduled' | 'webhook',
+    parameters: Record<string, any>,
+    browserOverride?: string,
+    chatSessionId?: string,
+    /**
+     * V-cross-app continuation (mobile only — see `MobileTestJobData`).
+     * Ignored for web segments; there is no equivalent "resume the same
+     * browser session" concept on that path today.
+     */
+    continuation?: {
+      resumeSessionId?: string;
+      resumeSessionSource?: 'pool' | 'warmup' | 'cold' | 'dedicated';
+      keepSessionAlive?: boolean;
+    },
+    /**
+     * Chain-view: the outer `regression_runs.id` this segment belongs to —
+     * see `tests.regression_run_id` migration. Threaded into whichever
+     * platform dispatcher below so every segment's `tests` row can be
+     * queried back together.
+     */
+    runId?: string,
+  ): Promise<string> {
+    const segmentCase = { ...intentCase, steps_json: steps };
+    if (intentCase.platform?.startsWith('mobile_')) {
+      // Parameters are applied inside dispatchMobileTest before the job is
+      // queued so placeholders in steps resolve to concrete values on the
+      // runner (Phase 6 — same substitution pass as the web path below).
+      const mobileResult = await MobileTestDispatcherService.dispatchMobileTest(
+        segmentCase,
+        userId,
+        trigger,
+        undefined, // no triggerContext for single-case manual run
+        parameters,
+        undefined, // no pre-created analyticsExecutionId for single-case run
+        chatSessionId, // stream progress to chat when launched from chat
+        continuation,
+        runId,
+      );
+      return mobileResult.testId;
+    }
+
+    const testRequest = await WebTestRequestBuilderService.buildTestRequest(
+      segmentCase, userId, parameters, browserOverride, trigger, chatSessionId, runId,
+    );
+    const testResult = await ManualTestService.runTest(testRequest);
+    if (!testResult.success || !testResult.data?.id) {
+      throw new Error('Failed to start test execution');
+    }
+    return testResult.data.id;
+  }
+
+  /**
+   * V-cross-app: a test case containing one or more cross-platform
+   * `link_test_case` steps. Each segment dispatches AND is awaited in order
+   * — a "steps" segment via the normal per-platform mechanism
+   * (`dispatchStepsSegment`), a "link" segment via
+   * `LinkedTestCaseRunnerService`, which itself dispatches the linked test
+   * case as its own independent run and polls it to completion. Output
+   * bindings from a link accumulate into `linkOutputs` and are pre-resolved
+   * into every subsequent segment's steps as `{{link.<alias>}}` before that
+   * segment dispatches — no downstream dispatch path otherwise knows this
+   * namespace exists.
+   *
+   * Returns the LAST segment's testId — the same "one trackable id"
+   * contract `runSavedTestCase` already had; a multi-segment run just means
+   * that id now represents the final leg of a chain instead of the whole
+   * (single) dispatch.
+   *
+   * `parameters` (the caller's {{param_*}} substitution values, e.g. from a
+   * scheduled/parameterized run) applies ONLY to the FIRST "steps" segment —
+   * matching what a single-segment dispatch already did before this feature
+   * existed. Segments after a link have no equivalent concept; they get
+   * `{{link.*}}` from accumulated output bindings instead.
+   */
+  private static async runSegmentedTestCase(
+    intentCase: any,
+    segments: ExecutionSegment[],
+    userId: string,
+    trigger: 'manual' | 'chat' | 'scheduled' | 'webhook',
+    parameters: Record<string, any>,
+    browserOverride?: string,
+    chatSessionId?: string,
+    /**
+     * Chain-view: the outer `regression_runs.id` this whole chain belongs
+     * to — see `tests.regression_run_id` migration. Forwarded into every
+     * segment's dispatch below.
+     */
+    runId?: string,
+  ): Promise<string> {
+    const linkOutputs = new Map<string, string>();
+    let lastTestId: string | undefined;
+    let depth = 0;
+    let isFirstStepsSegment = true;
+    // V-cross-app continuation (mobile only) — see dispatchFirstSegmentAndDetachRest's
+    // comment for the full rationale. This method only runs the rare edge
+    // case where the very first segment is itself a link, but every
+    // "steps" segment after that first link still deserves the same fix.
+    const isMobileChain = !!intentCase.platform?.startsWith('mobile_');
+    let resumeSessionId: string | undefined;
+    let resumeSessionSource: 'pool' | 'warmup' | 'cold' | 'dedicated' | undefined;
+
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i];
+      const isLastSegment = i === segments.length - 1;
+      if (segment.kind === 'steps') {
+        const sources: VariableSource[] = linkOutputs.size > 0 ? [namespacedMapSource('link', linkOutputs)] : [];
+        const steps = sources.length === 0 ? segment.steps : segment.steps.map((s) => ({
+          ...s,
+          value: typeof s.value === 'string' ? resolvePlaceholders(s.value, sources) : s.value,
+          assertionText: typeof s.assertionText === 'string' ? resolvePlaceholders(s.assertionText, sources) : s.assertionText,
+          description: typeof s.description === 'string' ? resolvePlaceholders(s.description, sources) : s.description,
+        }));
+
+        const segmentParameters = isFirstStepsSegment ? parameters : {};
+        const isFirstDispatch = isFirstStepsSegment;
+        isFirstStepsSegment = false;
+        lastTestId = await this.dispatchStepsSegment(
+          intentCase, steps, userId, trigger, segmentParameters, browserOverride, chatSessionId,
+          isMobileChain
+            ? (isFirstDispatch
+              ? { keepSessionAlive: !isLastSegment }
+              : { resumeSessionId, resumeSessionSource, keepSessionAlive: !isLastSegment })
+            : undefined,
+          runId,
+        );
+
+        const status = await LinkedTestCaseRunnerService.pollUntilTerminal(lastTestId);
+        if (status === 'failed' || status === 'cancelled' || status === 'error' || status === 'timeout') {
+          throw new ValidationError(`Segment stopped at status "${status}" — linked run halted`);
+        }
+        if (isMobileChain && !isLastSegment) {
+          ({ resumeSessionId, resumeSessionSource } = await this.readRunnerSessionForResume(lastTestId));
+        }
+      } else {
+        const sources: VariableSource[] = linkOutputs.size > 0 ? [namespacedMapSource('link', linkOutputs)] : [];
+        const outcome = await LinkedTestCaseRunnerService.run({
+          step: segment.step,
+          userId,
+          trigger,
+          chatSessionId,
+          parentVariableSources: sources,
+          depth,
+          runId,
+        });
+        for (const [alias, value] of outcome.outputs) linkOutputs.set(alias, value);
+        depth += 1;
+      }
+    }
+
+    if (!lastTestId) {
+      throw new Error('Segmented run produced no dispatched test — this indicates a segmentation bug');
+    }
+    return lastTestId;
+  }
+
+  /**
+   * Dispatches ONLY the first "steps" segment synchronously (fast — matches
+   * the single-segment contract every existing caller of `runSavedTestCase`
+   * already relies on), then continues the rest of the chain (poll segment
+   * 1, then any links/subsequent segments) DETACHED from the caller.
+   *
+   * This exists because `pollUntilTerminal` can legitimately take minutes
+   * per segment (a real mobile cold start, a slow nested run) — awaiting
+   * that end-to-end inside an HTTP request handler risks exceeding the
+   * server's own socket timeout (`server.timeout` in src/index.ts, 3
+   * minutes) while the backend keeps polling with no one listening. The
+   * ORIGINAL single-dispatch path never had this problem (dispatch just
+   * enqueues a job and returns); this keeps that same fast-return contract
+   * for the segmented case by only awaiting the first dispatch, not the
+   * whole chain.
+   *
+   * Errors in the detached continuation are caught and reflected onto the
+   * `regression_runs` row (status: 'failed') rather than thrown into a
+   * request that has already returned.
+   */
+  private static async dispatchFirstSegmentAndDetachRest(
+    intentCase: any,
+    segments: ExecutionSegment[],
+    userId: string,
+    trigger: 'manual' | 'chat' | 'scheduled' | 'webhook',
+    parameters: Record<string, any>,
+    runId: string,
+    browserOverride?: string,
+    chatSessionId?: string,
+  ): Promise<string> {
+    const firstSegment = segments[0];
+
+    if (firstSegment.kind !== 'steps') {
+      // Rare edge case: the test's very first step is itself a
+      // cross-platform link (no steps of its own before it) — there is no
+      // fast dispatch to return early with. Fall back to the fully
+      // synchronous path; residual risk of exceeding the server timeout is
+      // smaller here (typically one link's own dispatch+poll, not a whole
+      // multi-segment chain) and accepted given remaining time (documented
+      // in the plan doc / final report as a smaller, known gap).
+      //
+      // `runSegmentedTestCase` only returns once every segment in the chain
+      // has succeeded (a failed/cancelled segment throws instead) — so
+      // reaching this line means the run is genuinely done. `test_id` is
+      // never written to `regression_runs` while this fully-synchronous path
+      // runs (only at the very end, here), so this branch never hits the
+      // premature-finalization race the main path below guards against —
+      // `recomputeRunStatus` has no `test_id` to match an intermediate
+      // segment's completion against. `pending_segments: 0` still clears the
+      // initial "chain has N segments" count set at run creation, and the
+      // guarded write (`...IfActive`, not raw `updateRunById`) protects
+      // against clobbering a status the user cancelled (or the stale-run
+      // reaper force-failed) while this was still finishing.
+      const finalTestId = await this.runSegmentedTestCase(intentCase, segments, userId, trigger, parameters, browserOverride, chatSessionId, runId);
+      await updateRunByIdIfActive(runId, { status: 'completed', pending_segments: 0, completed_at: new Date().toISOString() });
+      return finalTestId;
+    }
+
+    // V-cross-app continuation (mobile only): a "steps" segment after a
+    // cross-platform link resumes the SAME live mobile session the previous
+    // "steps" segment used, instead of acquiring + prepping (force-stop +
+    // relaunch) a fresh one — which would discard any typed-but-not-yet-
+    // submitted UI state from before the link. See MobileTestJobData for
+    // the full incident writeup (2026-07-06). Web has no equivalent
+    // concept today, so this is a no-op for web test cases.
+    const isMobileChain = !!intentCase.platform?.startsWith('mobile_');
+    const remaining = segments.slice(1);
+
+    const firstTestId = await this.dispatchStepsSegment(
+      intentCase, firstSegment.steps, userId, trigger, parameters, browserOverride, chatSessionId,
+      isMobileChain && remaining.length > 0 ? { keepSessionAlive: true } : undefined,
+      runId,
+    );
+
+    void (async () => {
+      try {
+        const status = await LinkedTestCaseRunnerService.pollUntilTerminal(firstTestId);
+        if (status === 'failed' || status === 'cancelled' || status === 'error' || status === 'timeout') {
+          throw new ValidationError(`Segment stopped at status "${status}" — linked run halted`);
+        }
+
+        let lastTestId = firstTestId;
+        const linkOutputs = new Map<string, string>();
+        let depth = 0;
+        let resumeSessionId: string | undefined;
+        let resumeSessionSource: 'pool' | 'warmup' | 'cold' | 'dedicated' | undefined;
+        if (isMobileChain) {
+          ({ resumeSessionId, resumeSessionSource } = await this.readRunnerSessionForResume(firstTestId));
+        }
+
+        for (let i = 0; i < remaining.length; i++) {
+          const segment = remaining[i];
+          const isLastInChain = i === remaining.length - 1;
+          if (segment.kind === 'steps') {
+            const sources: VariableSource[] = linkOutputs.size > 0 ? [namespacedMapSource('link', linkOutputs)] : [];
+            const steps = sources.length === 0 ? segment.steps : segment.steps.map((s) => ({
+              ...s,
+              value: typeof s.value === 'string' ? resolvePlaceholders(s.value, sources) : s.value,
+              assertionText: typeof s.assertionText === 'string' ? resolvePlaceholders(s.assertionText, sources) : s.assertionText,
+              description: typeof s.description === 'string' ? resolvePlaceholders(s.description, sources) : s.description,
+            }));
+
+            lastTestId = await this.dispatchStepsSegment(
+              intentCase, steps, userId, trigger, {}, browserOverride, chatSessionId,
+              isMobileChain
+                ? { resumeSessionId, resumeSessionSource, keepSessionAlive: !isLastInChain }
+                : undefined,
+              runId,
+            );
+            // Reflect progress so a client re-fetching the run row sees the
+            // CURRENT segment, not just the first — and update the pending-
+            // segments count so `recomputeRunStatus` knows how many segments
+            // are still left to dispatch (0 once this was the last one).
+            // Guarded (`...IfActive`, not raw `updateRunById`): a run the
+            // user cancelled (or the stale-run reaper force-failed) mid-chain
+            // must not have its test_id silently reset to a later segment
+            // after the row already went terminal.
+            await this.recordSegmentProgress(runId, remaining.length - 1 - i, { test_id: lastTestId });
+
+            const status = await LinkedTestCaseRunnerService.pollUntilTerminal(lastTestId);
+            if (status === 'failed' || status === 'cancelled' || status === 'error' || status === 'timeout') {
+              throw new ValidationError(`Segment stopped at status "${status}" — linked run halted`);
+            }
+            if (isMobileChain && !isLastInChain) {
+              ({ resumeSessionId, resumeSessionSource } = await this.readRunnerSessionForResume(lastTestId));
+            }
+          } else {
+            const sources: VariableSource[] = linkOutputs.size > 0 ? [namespacedMapSource('link', linkOutputs)] : [];
+            const outcome = await LinkedTestCaseRunnerService.run({
+              step: segment.step, userId, trigger, chatSessionId, parentVariableSources: sources, depth, runId,
+            });
+            for (const [alias, value] of outcome.outputs) linkOutputs.set(alias, value);
+            depth += 1;
+            // A "link" segment doesn't update the outer run's own test_id,
+            // but it still consumes one slot of the pending-segments count —
+            // a chain whose last segment is a link must still reach 0, or
+            // `recomputeRunStatus` would defer finalization forever after
+            // the final steps segment (if any) already went terminal.
+            await this.recordSegmentProgress(runId, remaining.length - 1 - i);
+          }
+        }
+
+        // Reaching here means every segment succeeded (a failed/cancelled/
+        // errored/timed-out poll throws above instead). Explicitly finalize
+        // the outer row's status — it otherwise never leaves 'running':
+        // `handleTestCompletion` → `recomputeRunStatus` fires off segment 1's
+        // OWN completion (matches this row by `test_id`, which pointed at
+        // segment 1 the moment it was dispatched) and finalizes it based on
+        // segment 1 alone, before segments 2+ have even run; the row then no
+        // longer matches 'running'/'pending' so later segments' real
+        // completions never rematch it. Writing the true terminal status
+        // last, after the whole chain, overwrites that premature value.
+        // Guarded write: if the run was cancelled (or force-failed by the
+        // stale-run reaper) while this last segment was still finishing, the
+        // row is no longer 'running'/'pending' — don't clobber that outcome
+        // back to 'completed'.
+        await updateRunByIdIfActive(runId, {
+          test_id: lastTestId,
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+        });
+        logger.info('[REGRESSION_RUN] Detached segmented continuation completed', { runId, finalTestId: lastTestId });
+      } catch (err) {
+        logger.error('[REGRESSION_RUN] Detached segmented continuation failed', {
+          runId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        // Guarded (`...IfActive`, not raw `updateRunById`): significant time
+        // has passed by the time this catch runs (a whole chain's worth of
+        // dispatch+poll), so a concurrent cancel or stale-run reaper force-
+        // fail is a live possibility here, unlike the top-level synchronous
+        // dispatch failure path elsewhere in this file.
+        await updateRunByIdIfActive(runId, { status: 'failed', completed_at: new Date().toISOString() }).catch(() => { /* best effort */ });
+      }
+    })();
+
+    return firstTestId;
+  }
+
+  /**
+   * Guarded write recording that a segment in a chain just dispatched or
+   * completed — updates `pending_segments` and resets the per-segment
+   * staleness clock (`last_segment_dispatched_at`) together, so a future edit
+   * to this bookkeeping can't update one without the other (that drift would
+   * silently reintroduce the premature-finalization bug this pairing exists
+   * to prevent — see the migration file / ADR-0011 update 6). Was previously
+   * duplicated verbatim at both per-segment call sites in the loop below,
+   * differing only in whether `test_id` was also set — `extraFields` covers
+   * that difference.
+   */
+  private static async recordSegmentProgress(
+    runId: string,
+    pendingSegments: number,
+    extraFields: Record<string, unknown> = {},
+  ): Promise<void> {
+    await updateRunByIdIfActive(runId, {
+      ...extraFields,
+      pending_segments: pendingSegments,
+      last_segment_dispatched_at: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * V-cross-app continuation: read back the runner sessionId (+ its
+   * original acquisition source) a just-completed mobile segment's job
+   * persisted to `tests.options` (see `MobileTestRunJobHandler.
+   * persistRunnerSessionId`), so the NEXT "steps" segment in the chain can
+   * resume it instead of acquiring a fresh one. Best-effort: a missing/
+   * unreadable value just means the next segment falls back to its normal
+   * fresh-acquisition path (logged, not thrown — a continuation regression
+   * shouldn't fail runs that would have passed under the old behaviour).
+   */
+  private static async readRunnerSessionForResume(testId: string): Promise<{
+    resumeSessionId: string | undefined;
+    resumeSessionSource: 'pool' | 'warmup' | 'cold' | 'dedicated' | undefined;
+  }> {
+    try {
+      const row = await getTestBrowsersAndOptions(testId);
+      const options = row?.options as { runnerSessionId?: string; runnerSessionSource?: string } | undefined;
+      if (!options?.runnerSessionId) {
+        logger.warn('[REGRESSION_RUN] No runner sessionId recorded for segment — next segment will acquire fresh', { testId });
+        return { resumeSessionId: undefined, resumeSessionSource: undefined };
+      }
+      return {
+        resumeSessionId: options.runnerSessionId,
+        resumeSessionSource: options.runnerSessionSource as 'pool' | 'warmup' | 'cold' | 'dedicated' | undefined,
+      };
+    } catch (err) {
+      logger.warn('[REGRESSION_RUN] Failed to read back runner sessionId — next segment will acquire fresh', {
+        testId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { resumeSessionId: undefined, resumeSessionSource: undefined };
+    }
+  }
+
+  /**
    * Soft balance check before starting a regression run.
    * Verifies user can afford estimated steps but does NOT deduct credits.
    * Actual credits are deducted per-step during execution.
@@ -254,37 +720,38 @@ export class RegressionRunService {
     const apiCount = testCases.filter((tc) => tc.testType === 'api').length;
     const apiCreditCost = TokenCalculatorService.getTestCreditCost('api');
 
-    // Fetch step counts for UI test cases (1 credit per step)
+    // Fetch step counts for UI test cases. Web = 1 credit/step; MOBILE steps
+    // cost MOBILE_STEP_CREDIT_MULTIPLIER× (emulator COGS) and are charged at
+    // that rate after the run in mobile-test-run.job. The pre-flight must apply
+    // the SAME multiplier or a mobile run passes the gate on a 1× estimate and
+    // then gets charged 4× — the user hits "insufficient credits" (or an
+    // unexpected balance drop) despite a green pre-flight. Mobile cases are
+    // `testType:'ui'` distinguished by `platform` (mobile_*), so read platform
+    // off the case, not the row.
     let uiStepCredits = 0;
+    let hasCrossPlatformLinks = false;
     if (uiCases.length > 0) {
       const uiIds = uiCases.map((tc) => tc.testCaseId);
       const rows = await RegressionTestQueryService.getUiStepCountRows(uiIds);
-
-      for (const row of rows) {
-        let stepCount = 0;
-        if (row.replay_strategy === 'commands' && Array.isArray(row.commands)) {
-          stepCount = row.commands.length;
-        } else if (row.replay_strategy === 'graph_extract' && row.graph_ref?.steps) {
-          stepCount = Array.isArray(row.graph_ref.steps) ? row.graph_ref.steps.length : 0;
-        } else if (Array.isArray(row.steps_json)) {
-          // Step editor test cases: count steps_json (+ 1 for initial goto)
-          stepCount = row.steps_json.length + 1;
-        }
-        // Phase 3: setup_steps and teardown_steps are prepended / appended
-        // at dispatch time by stitchPhases(). The user is billed for what
-        // runs, so count those too. Empty arrays (default for pre-Phase-3
-        // rows) contribute 0 — byte-identical credit to before.
-        const setupCount = Array.isArray(row.setup_steps) ? row.setup_steps.length : 0;
-        const teardownCount = Array.isArray(row.teardown_steps) ? row.teardown_steps.length : 0;
-        stepCount += setupCount + teardownCount;
-        // Minimum 1 credit per test case even if steps can't be counted
-        uiStepCredits += Math.max(stepCount, 1);
+      // A link_test_case step is exactly ONE entry in steps_json regardless
+      // of whether the linked test case has 1 or 100 steps. Expand
+      // same-platform links (which inline into THIS execution, same rate,
+      // fully recursively as of ADR-0011 update 6) before costing — see
+      // expandLinkedStepCounts's docs for why cross-platform links are
+      // flagged instead of expanded.
+      const { expandedLengthById, hasCrossPlatformLinks: crossPlatform } =
+        await LinkResolutionService.expandLinkedStepCounts(uiCases, rows);
+      hasCrossPlatformLinks = crossPlatform;
+      if (hasCrossPlatformLinks) {
+        logger.warn('[REGRESSION_RUN] Credit estimate may be understated: unexpanded cross-platform link_test_case step(s)', {
+          userId,
+          source,
+          uiTestCount: uiCases.length,
+        });
       }
-
-      // If some test case IDs weren't found in DB, charge 1 credit each as minimum
-      const foundIds = new Set((rows || []).map((r: any) => r.id));
-      const missingCount = uiIds.filter((id) => !foundIds.has(id)).length;
-      uiStepCredits += missingCount;
+      // Pure arithmetic lives in computeUiStepCredits (unit-tested) — web 1×,
+      // mobile MOBILE_STEP_CREDIT_MULTIPLIER×, matching the post-run charge.
+      uiStepCredits = computeUiStepCredits(uiCases, rows, expandedLengthById);
     }
 
     // ai-analysis.job charges BUG_REPORT_CREDITS per UI test_result where bugs
@@ -316,6 +783,7 @@ export class RegressionRunService {
       graceLimit: creditCheck.graceLimit,
       effectiveAvailable: creditCheck.effectiveAvailable,
       uiTestCount: uiCases.length,
+      hasCrossPlatformLinks,
     });
     // Gate on effectiveAvailable (balance + grace_limit), matching the runtime
     // per-step gate in CreditCostTrackerService. Using raw `available` here made
@@ -327,7 +795,7 @@ export class RegressionRunService {
       // `code: 'INSUFFICIENT_CREDITS'` to the frontend (which then flips the
       // global "credits exhausted" banner instead of a generic toast).
       throw new InsufficientCreditsError(
-        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost} + ${bugReportBudget} bug-report budget), Available: ${creditCheck.effectiveAvailable}`,
+        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost} + ${bugReportBudget} bug-report budget)${hasCrossPlatformLinks ? ' [estimate may be understated: links to a test case on another platform]' : ''}, Available: ${creditCheck.effectiveAvailable}`,
         {
           required: totalRequired,
           available: creditCheck.effectiveAvailable,
@@ -336,6 +804,7 @@ export class RegressionRunService {
             apiCount,
             apiCreditCost,
             bugReportBudget,
+            hasCrossPlatformLinks,
           },
         },
       );
@@ -425,12 +894,21 @@ export class RegressionRunService {
    * @param projectId - Project ID to list runs for
    * @param userId - User ID for ownership verification
    * @param limit - Maximum number of results (default: 50, max: 500)
+   * @param planId - Optional: scope to a single plan's run history. A run
+   *   counts as "the plan's" if `regression_runs.plan_id` matches OR the run
+   *   is an ad-hoc single-test-case dispatch (`runIntentTestCase`, which never
+   *   sets `plan_id`) of a test case that is currently a member of this plan.
+   *   Without the second clause, running a test case directly (its own "Run"
+   *   button, chat, a git webhook) instead of via "run this plan" makes that
+   *   run permanently invisible on the plan's own Regressions detail page,
+   *   even though the same run shows up in the global Test Runs list.
    * @returns List of regression runs with status and summary
    */
   static async listRuns(
     projectId: string,
     userId: string,
-    limit: number = DEFAULT_LIST_LIMIT
+    limit: number = DEFAULT_LIST_LIMIT,
+    planId?: string,
   ): Promise<any[]> {
     // Verify access
     await this.verifyProjectAccess(projectId, userId);
@@ -438,13 +916,33 @@ export class RegressionRunService {
     // Apply limit bounds
     const safeLimit = Math.min(Math.max(limit, 1), MAX_LIST_LIMIT);
 
-    const { data: runs, error } = await listRunsByProject(projectId, safeLimit);
+    // When scoping to a plan, fetch the full MAX_LIST_LIMIT candidate set
+    // (not just safeLimit) BEFORE filtering — the project can have far more
+    // recent unrelated runs than this plan has, so truncating first can push
+    // this plan's own runs out of the fetched page entirely, then the filter
+    // has nothing left to find. Only the FILTERED result is sliced to
+    // safeLimit, matching the caller's requested page size.
+    const fetchLimit = planId ? MAX_LIST_LIMIT : safeLimit;
+    const { data: allRuns, error } = await listRunsByProject(projectId, fetchLimit);
 
     if (error) {
       throw new Error(`Failed to list runs: ${(error as any)?.message}`);
     }
 
-    if (!runs || runs.length === 0) return [];
+    if (!allRuns || allRuns.length === 0) return [];
+
+    let runs = allRuns;
+    if (planId) {
+      const plan = await RegressionPlanService.getById(planId, userId);
+      const memberTestCaseIds = plan && plan.projectId === projectId
+        ? new Set((await RegressionPlanService.expandPlan(planId)).map((tc) => tc.testCaseId))
+        : new Set<string>();
+      runs = allRuns
+        .filter((r: any) => r.plan_id === planId || memberTestCaseIds.has(r.intent_test_case_id))
+        .slice(0, safeLimit);
+    }
+
+    if (runs.length === 0) return [];
 
     // Batch fetch stats for all runs.
     // Phase 7: also pull `platform` + `test_type` so each run row can

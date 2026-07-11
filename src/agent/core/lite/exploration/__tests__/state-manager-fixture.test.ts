@@ -98,6 +98,41 @@ describe('StateManager.preloadAuthState', () => {
   });
 });
 
+describe('StateManager.getAuthState — runner-to-runner auth handoff (P0.1)', () => {
+  it('returns null before any login', () => {
+    const { browser } = mockBrowser();
+    expect(new StateManager(browser).getAuthState()).toBeNull();
+  });
+
+  it('exports the preloaded state so a second StateManager can reuse the session', async () => {
+    // Simulates the Phase-2.5 handoff: runner A logs in, runner B inherits its
+    // auth state. Before the fix, B started with a null auth state and (with
+    // loginCompleted=true) ran auth-gated flows logged-out.
+    const fixture = {
+      cookies: [{
+        name: 'session', value: 'abc', domain: '.example.com', path: '/',
+        expires: -1, httpOnly: true, secure: true, sameSite: 'Lax',
+      }],
+      origins: [{ origin: 'https://app.example.com', localStorage: [{ name: 'u', value: '42' }] }],
+    };
+
+    const runnerA = new StateManager(mockBrowser().browser);
+    runnerA.preloadAuthState(fixture);
+
+    // Hand A's exported state to B (what restoreFromCheckpoint({authState}) does).
+    const exported = runnerA.getAuthState();
+    expect(exported).toEqual(fixture);
+
+    const { browser: browserB, calls: callsB } = mockBrowser();
+    const runnerB = new StateManager(browserB);
+    runnerB.preloadAuthState(exported!);
+
+    expect(runnerB.hasAuthState()).toBe(true);
+    await runnerB.createAuthenticatedContext();
+    expect(callsB[0].storageState).toEqual(fixture);
+  });
+});
+
 describe('FlowRunner auth routing logic', () => {
   // This mirrors the decision logic in runSingleFlow — if it ever gets
   // refactored, the test should drift with it. The actual FlowRunner is

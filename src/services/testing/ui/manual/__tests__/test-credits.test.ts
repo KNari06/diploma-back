@@ -19,8 +19,12 @@ jest.mock('@/db/supabase', () => ({
   dbService: { getUser: jest.fn(), supabaseAdmin: { rpc: jest.fn() } },
 }));
 const mockGetOrCreate = jest.fn();
+const mockDeduct = jest.fn();
 jest.mock('@/services/core/user-credits.service', () => ({
-  UserCreditsService: { getOrCreateUserCredits: (...a: unknown[]) => mockGetOrCreate(...a) },
+  UserCreditsService: {
+    getOrCreateUserCredits: (...a: unknown[]) => mockGetOrCreate(...a),
+    deductCredits: (...a: unknown[]) => mockDeduct(...a),
+  },
 }));
 jest.mock('@/utils/core/logger', () => ({
   logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
@@ -122,23 +126,27 @@ describe('checkUserCredits', () => {
 describe('deductCredits', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('calls the deduct RPC with the computed amount', async () => {
-    mockRpc.mockResolvedValue({ data: true, error: null });
+  it('charges via the canonical UserCreditsService.deductCredits with the computed amount', async () => {
+    mockDeduct.mockResolvedValue({ success: true, newBalance: 96 });
     await deductCredits('u1', 'test-1', ['chrome', 'mobile-android']); // 1 + 3 = 4
-    expect(mockRpc).toHaveBeenCalledWith('deduct_test_credits', {
-      user_uuid: 'u1',
-      test_uuid: 'test-1',
-      credit_amount: 4,
-    });
+    expect(mockDeduct).toHaveBeenCalledTimes(1);
+    const [userId, amount, , metadata] = mockDeduct.mock.calls[0];
+    expect(userId).toBe('u1');
+    expect(amount).toBe(4);
+    expect(metadata).toMatchObject({ test_id: 'test-1', test_type: 'standard' });
+    // Never calls the old (non-existent) deduct_test_credits RPC.
+    expect(mockRpc).not.toHaveBeenCalled();
   });
 
-  it('throws when the RPC returns an error', async () => {
-    mockRpc.mockResolvedValue({ data: null, error: new Error('rpc failed') });
-    await expect(deductCredits('u1', 't1', ['chrome'])).rejects.toThrow('rpc failed');
+  it('tags intelligent runs as test_type=intelligent', async () => {
+    mockDeduct.mockResolvedValue({ success: true, newBalance: 0 });
+    await deductCredits('u1', 't1', ['chrome'], true, '$0.10');
+    const [, , , metadata] = mockDeduct.mock.calls[0];
+    expect(metadata).toMatchObject({ test_type: 'intelligent' });
   });
 
-  it('throws ValidationError when the RPC reports no deduction (data falsy)', async () => {
-    mockRpc.mockResolvedValue({ data: false, error: null });
+  it('throws ValidationError when the deduction fails (insufficient / error)', async () => {
+    mockDeduct.mockResolvedValue({ success: false, newBalance: 0 });
     await expect(deductCredits('u1', 't1', ['chrome'])).rejects.toBeInstanceOf(ValidationError);
   });
 });

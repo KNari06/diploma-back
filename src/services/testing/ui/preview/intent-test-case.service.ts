@@ -13,6 +13,8 @@ import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 import { emitTestCaseMutated } from '@/websocket/helpers/project-mutation-emit';
 import { validateTriggers, sanitizeTriggers } from '@/services/mobile/trigger-validation.util';
 import { normaliseVariantOverride } from '@/services/mobile/project-mobile-app.helper';
+import { extractLinkedTestCaseIds, wouldCreateCycle, LinkGraphNode } from '@/utils/graph/link-graph';
+import { ValidationError } from '@/types';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Per-testCase in-memory mutex (prevents concurrent read-modify-write races)
@@ -70,6 +72,40 @@ async function canWriteTestCase(
 }
 
 /**
+ * Verify the calling user has access to every `link_test_case` target before
+ * a save persists the reference. Without this, a `linkedTestCaseId` pointing
+ * at another tenant's private test case sits in `steps_json` with no
+ * save-time rejection — the runtime reader
+ * (`RegressionTestQueryService.getSavedTestCase`) happens to re-check
+ * project ownership, but only at run time, so a bad reference currently
+ * fails late and confusingly instead of immediately at save.
+ *
+ * Uses the same owner-or-workspace-member gate as direct writes
+ * (`canWriteTestCase`) rather than the narrower project-owner-only check the
+ * runtime reader applies — this is a save-time floor, not a guarantee that
+ * every future run of the link will succeed for every workspace member.
+ */
+async function validateLinkedTestCaseAccess(linkedIds: string[], userId: string): Promise<void> {
+  const uniqueIds = [...new Set(linkedIds)];
+  const { data: rows, error } = await intentTestCaseDb.getTestCaseOwnersByIds(uniqueIds);
+  if (error) {
+    throw new Error(`Failed to validate linked test cases: ${error.message}`);
+  }
+
+  const byId = new Map((rows || []).map((row: any) => [row.id, row]));
+  for (const linkedId of uniqueIds) {
+    const row = byId.get(linkedId);
+    if (!row) {
+      throw new ValidationError(`Linked test case ${linkedId} was not found`);
+    }
+    const allowed = await canWriteTestCase(row.user_id, row.project_id, userId);
+    if (!allowed) {
+      throw new ValidationError(`You do not have access to linked test case ${linkedId}`);
+    }
+  }
+}
+
+/**
  * Service for managing intent test cases
  */
 export class IntentTestCaseService {
@@ -123,11 +159,18 @@ export class IntentTestCaseService {
      * against the named variant lane regardless of the plan.
      */
     mobileVariantLabel?: string | null;
+    /**
+     * Placeholder schema for {{param_*}} values in `steps` (chat-agent draft
+     * save — sensitive values sanitized to placeholders before persist).
+     * Persisted so a regression replay can resolve them; without it the runner
+     * types the literal placeholder. Empty/undefined → column left null.
+     */
+    parametersSchema?: Record<string, unknown> | null;
   }): Promise<IntentTestCase> {
     const {
       projectId, userId, name, description, startUrl, steps, flowId,
       status = 'draft', kind = 'standalone', platform = 'web',
-      preconditions, importId, sourceStatus, stepsDegraded,
+      preconditions, importId, sourceStatus, stepsDegraded, parametersSchema,
     } = params;
     const mobileVariantLabel = normaliseVariantOverride(params.mobileVariantLabel);
     // Explicit `null` from the caller means "no opinion" → store NULL.
@@ -185,13 +228,54 @@ export class IntentTestCaseService {
       }
     }
 
+    const normalizedSteps = this.normalizeSteps(steps);
+
+    // A `link_test_case` step is a second edge source (alongside dependsOn)
+    // with the same "X requires Y to run first/as part of it" semantics —
+    // see the identical check in update() and utils/graph/link-graph.ts.
+    // update() already validates this on every edit, but create() never did,
+    // so a batch/import path (or a future "duplicate test case" feature)
+    // that calls create() with steps copied from an existing test case could
+    // insert a cyclic link with no check at all until the next edit. A
+    // brand-new row has no id yet, so it can't itself be the target of a
+    // pre-existing edge (nothing can reference an id before it exists) — the
+    // synthetic pending-id node below stands in for it.
+    const linkedIds = extractLinkedTestCaseIds(normalizedSteps);
+    if (linkedIds.length > 0) {
+      await validateLinkedTestCaseAccess(linkedIds, userId);
+
+      const { data: graphRows, error: graphError } = await intentTestCaseDb.getProjectGraphRows(projectId);
+      if (graphError) {
+        throw new Error(`Failed to validate linked test cases: ${graphError.message}`);
+      }
+
+      // Synthetic id standing in for this not-yet-inserted row — a real
+      // UUID can never collide with it, and (unlike an existing row) it
+      // starts with no incoming edges, only the outgoing ones being saved.
+      const pendingId = '__pending_create__';
+      const nodes: LinkGraphNode[] = [
+        { id: pendingId, dependsOn: [], linkedTestCaseIds: linkedIds },
+        ...(graphRows || []).map((row: any) => ({
+          id: row.id,
+          dependsOn: Array.isArray(row.depends_on) ? row.depends_on : [],
+          linkedTestCaseIds: extractLinkedTestCaseIds(row.steps_json),
+        })),
+      ];
+
+      if (wouldCreateCycle(nodes, pendingId, linkedIds)) {
+        throw new ValidationError(
+          'This step links to a test case that (directly or transitively) links back to this one — that would create a circular run',
+        );
+      }
+    }
+
     const { data, error } = await intentTestCaseDb.insertTestCaseRow({
       project_id: projectId,
       user_id: userId,
       name,
       description: description || null,
       start_url: startUrl || null,
-      steps_json: this.normalizeSteps(steps),
+      steps_json: normalizedSteps,
       flow_id: flowId || null,
       status,
       kind,
@@ -210,6 +294,11 @@ export class IntentTestCaseService {
       // Mobile per-test variant override (null = inherit).
       mobile_variant_label: mobileVariantLabel,
       resource_bindings: resourceBindings,
+      // Placeholder schema for sanitized {{param_*}} values — only written when
+      // non-empty so ordinary creates leave the column at its default.
+      ...(parametersSchema && Object.keys(parametersSchema).length > 0
+        ? { parameters_schema: parametersSchema }
+        : {}),
     });
 
     if (error) {
@@ -475,6 +564,13 @@ export class IntentTestCaseService {
     triggers?: unknown;
     /** Mobile per-test variant override. `null` clears it (inherit); `undefined` leaves it untouched. */
     mobileVariantLabel?: string | null;
+    /**
+     * Placeholder schema for {{param_*}} values in `steps` (mobile agent draft
+     * save — sensitive values sanitized to placeholders). Persisted so a
+     * regression replay can resolve them. `undefined` leaves the column
+     * untouched; an object replaces it.
+     */
+    parametersSchema?: Record<string, unknown> | null;
   }): Promise<IntentTestCase> {
     // Serialize concurrent writes to the same test case via the same in-process
     // mutex used by updateStepFromPreviewApply / updateStepAfterHeal /
@@ -483,11 +579,17 @@ export class IntentTestCaseService {
     // that the runner just wrote. No reentrancy risk — none of the already-
     // mutex'd methods call update() internally.
     return withTestCaseMutex(params.id, async () => {
-      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers, mobileVariantLabel } = params;
+      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers, mobileVariantLabel, parametersSchema } = params;
 
       const updates: Record<string, any> = {};
       if (name !== undefined) updates.name = name;
       if (description !== undefined) updates.description = description;
+      if (parametersSchema !== undefined) {
+        // Persist the placeholder schema so {{param_*}} values resolve on
+        // replay. Empty object → null (nothing to parameterise).
+        updates.parameters_schema =
+          parametersSchema && Object.keys(parametersSchema).length > 0 ? parametersSchema : null;
+      }
       if (mobileVariantLabel !== undefined) {
         // `null` (or blank) clears the override → inherit. A non-blank string pins it.
         updates.mobile_variant_label = normaliseVariantOverride(mobileVariantLabel);
@@ -657,6 +759,64 @@ export class IntentTestCaseService {
               id,
               error: mergeError instanceof Error ? mergeError.message : String(mergeError),
             });
+          }
+        }
+
+        // A `link_test_case` step is a second edge source (alongside
+        // dependsOn) with the same "X requires Y to run first/as part of it"
+        // semantics — a save introducing one must be checked against the
+        // COMBINED project graph, the same way updateDependencies already
+        // checks dependsOn additions (saved-test-cases.controller.ts). This
+        // is genuinely new here: nothing previously referenced another test
+        // case from inside steps_json. See utils/graph/link-graph.ts.
+        const linkedIds = extractLinkedTestCaseIds(mergedSteps);
+        if (linkedIds.length > 0) {
+          if (linkedIds.includes(id)) {
+            throw new ValidationError('A test case cannot link to itself');
+          }
+
+          // Ownership/access check runs unconditionally, independent of the
+          // project lookup below — a bad cross-tenant reference must be
+          // rejected even if the project graph can't be resolved.
+          await validateLinkedTestCaseAccess(linkedIds, userId);
+
+          // `project_id` is NOT NULL in the schema, so a missing `flowProject`
+          // here means either this row can no longer be found for `userId`
+          // (deleted / ownership changed since the caller last read it) or
+          // the query itself failed. Either way, fail closed rather than
+          // silently skipping the multi-hop cycle check below — the query
+          // error used to be discarded (only `data` was destructured), which
+          // let a cyclic link save unvalidated on a transient DB error.
+          const { data: flowProject, error: flowProjectError } =
+            await intentTestCaseDb.getTestCaseFlowProjectForUser(id, userId);
+          if (flowProjectError) {
+            throw new Error(`Failed to validate linked test cases: ${flowProjectError.message}`);
+          }
+          if (!flowProject?.project_id) {
+            throw new ValidationError(
+              "Cannot validate linked test cases — this test case's project could not be resolved",
+            );
+          }
+
+          const { data: graphRows, error: graphError } = await intentTestCaseDb.getProjectGraphRows(
+            flowProject.project_id,
+          );
+          if (graphError) {
+            throw new Error(`Failed to validate linked test cases: ${graphError.message}`);
+          }
+
+          const nodes: LinkGraphNode[] = (graphRows || []).map((row: any) => ({
+            id: row.id,
+            dependsOn: Array.isArray(row.depends_on) ? row.depends_on : [],
+            // This row's own not-yet-saved steps are what we're validating —
+            // use the new linkedIds rather than the stale DB copy.
+            linkedTestCaseIds: row.id === id ? linkedIds : extractLinkedTestCaseIds(row.steps_json),
+          }));
+
+          if (wouldCreateCycle(nodes, id, linkedIds)) {
+            throw new ValidationError(
+              'This step links to a test case that (directly or transitively) links back to this one — that would create a circular run',
+            );
           }
         }
 

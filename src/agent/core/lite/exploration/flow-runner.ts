@@ -28,6 +28,7 @@ import { GoalDetector } from '../analysis/goal-detector';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
 import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.service';
 import { OverlayDismisser } from './overlay-dismisser';
+import { buildSelfContainedSteps, type RecordedDismissal } from './overlay-step.util';
 import { VisualStability } from '../collectors/visual-stability';
 
 import {
@@ -41,6 +42,7 @@ import {
   type ErrorClassification,
   type BlockerType,
   type ExplorationProgressCallback,
+  DEFAULT_MAX_CONCURRENCY,
 } from './types';
 import type { NetworkSuccess } from '../lite-types';
 import { attributeCallsToSteps } from './network-assertions';
@@ -58,6 +60,7 @@ import type { ExplorationTraceService } from './exploration-trace.service';
 import { Scout } from './agents/scout';
 import type { ScoutInput, ExplorationBlackboard, CartographerInsight } from './agents/agent-types';
 import { normalizeUrlWithPattern } from './url-pattern';
+import { redactCredentialValues } from '@/utils/interpolation/redact-secrets';
 
 /**
  * Navigation timeout for flow execution (entry-point + login navigations).
@@ -72,6 +75,19 @@ const FLOW_NAV_TIMEOUT_MS = 15_000;
  * against a non-interactive page and flake.
  */
 const FLOW_NAV_WAIT_UNTIL = 'load' as const;
+
+/**
+ * Page-insight hint sent to the Planner (forms / interactive areas / entities).
+ * Caps keep the hint compact so it informs without bloating the prompt budget.
+ */
+const PAGE_INSIGHT_MAX_ITEMS_PER_LIST = 4;
+const PAGE_INSIGHT_MAX_CHARS = 300;
+
+// Cross-flow learnings slice handed to each flow's Planner. Kept tight so it
+// stays a useful signal, not prompt bloat (recency-ordered, capped both ways).
+const PRIOR_LEARNINGS_MAX_ACCOMPLISHMENTS = 5;
+const PRIOR_LEARNINGS_MAX_BLOCKERS = 4;
+const PRIOR_LEARNINGS_MAX_CHARS = 500;
 
 // Step-extraction (rounds → DiscoveredStep + compiled plans) now lives in the
 // shared pipeline-step-extractor so the editor iterative-authoring service
@@ -163,10 +179,32 @@ export class FlowRunner {
     return [...this.knownFlowNames];
   }
 
+  /** Cached auth storageState from this runner's login, for handoff to another runner. Null before login. */
+  getAuthState(): object | null {
+    return this.stateManager.getAuthState();
+  }
+
   restoreFromCheckpoint(cp: FlowRunnerCheckpoint): void {
-    this.loginCompleted = cp.loginCompleted;
     this.knownFlowNames = [...cp.knownFlowNames];
     this.flowsCompleted = cp.flowsCompleted;
+    // Reuse the prior runner's session: preload auth state so a runner that
+    // inherits loginCompleted=true actually has the cookies to back it up
+    // (otherwise createAuthenticatedContext falls through to a clean, logged-out
+    // context and every auth-gated flow silently runs unauthenticated).
+    if (cp.authState) {
+      this.stateManager.preloadAuthState(cp.authState);
+    }
+    // Honor loginCompleted ONLY when a session actually backs it — either the
+    // authState we just preloaded (Phase 2.5 in-process handoff) or a fixture
+    // preloaded by the constructor. The ON-DISK checkpoint deliberately does
+    // NOT persist authState (session cookies at rest), so a crash-resume lands
+    // here with loginCompleted=true and no cookies; keeping the flag would skip
+    // performLogin AND get a clean context = every auth flow silently logged
+    // out. Dropping the flag costs one re-login on demand instead.
+    this.loginCompleted = cp.loginCompleted && this.stateManager.hasAuthState();
+    if (cp.loginCompleted && !this.loginCompleted) {
+      logger.info('[FLOW_RUNNER] Checkpoint had loginCompleted but no auth state — will re-login on demand');
+    }
   }
 
   private emitProgress(
@@ -200,7 +238,7 @@ export class FlowRunner {
    * Returns completed FlowExplorationTask[] (including failed ones).
    */
   async runAll(queue: FlowQueue): Promise<FlowExplorationTask[]> {
-    const maxConcurrency = this.config.maxConcurrency || 5;
+    const maxConcurrency = this.config.maxConcurrency || DEFAULT_MAX_CONCURRENCY;
     const semaphore = new Semaphore(maxConcurrency);
     const results: FlowExplorationTask[] = [];
     const inFlight: Set<Promise<void>> = new Set();
@@ -412,7 +450,10 @@ export class FlowRunner {
         task.status = 'blocked';
         task.blockedReason = 'CAPTCHA required';
         task.canUserHelp = true;
-      } else if (lowerErr.includes('2fa') || lowerErr.includes('two-factor') || lowerErr.includes('verification code') || lowerErr.includes('otp')) {
+        // 2FA — strong authenticator-2FA anchors only. "verification code"/"otp"
+        // are ambiguous (SMS/phone confirmation, password recovery) and were
+        // mislabelling those as 2FA. Kept in sync with extractBlockerInfo below.
+      } else if (lowerErr.includes('2fa') || lowerErr.includes('two-factor') || lowerErr.includes('two factor') || lowerErr.includes('authenticator') || lowerErr.includes('totp')) {
         task.blockerType = '2fa';
         task.status = 'blocked';
         task.blockedReason = '2FA verification required';
@@ -550,6 +591,11 @@ export class FlowRunner {
         }
       }
 
+      // Overlay dismissals recorded across this flow (pre-pipeline here +
+      // intra-round from the pipeline) → prepended as replayable steps so a
+      // re-run clears the same overlays instead of stalling on them.
+      const recordedDismissals: RecordedDismissal[] = [];
+
       // 2.5. Dismiss overlays before pipeline starts (cookie consent, promo modals)
       try {
         const overlayResult = await OverlayDismisser.dismissOverlays(page, {
@@ -557,6 +603,9 @@ export class FlowRunner {
           maxTimeMs: 5000,
           mode: 'flow',
         });
+        for (const attempt of overlayResult.attempts) {
+          if (attempt.dismissed) recordedDismissals.push({ attempt, pageUrl: page.url() });
+        }
         if (overlayResult.overlaysDetected > 0) {
           this.trace?.writeOverlayDetected({
             url: page.url(),
@@ -580,7 +629,7 @@ export class FlowRunner {
       }
 
       // 3. Create pipeline integrations
-      const actionExecutor = new ActionExecutor(page);
+      const actionExecutor = new ActionExecutor(page, { timeoutProfile: 'fast' });
       const networkTracker = new NetworkTracker(page);
       const goalDetector = new GoalDetector(entryPoint.goal, entryPoint.id);
 
@@ -605,6 +654,15 @@ export class FlowRunner {
         timeoutMs: Math.max(5_000, flowTimeoutMs),
         skipDbCancellationCheck: true, // Exploration uses non-UUID testIds (ep-0, ep-1)
         entryPointId: entryPoint.id,
+        // Auth flows EXPECT to land on a login URL — tell the page-health
+        // check so it doesn't misread that as a "session lost" regression.
+        flowIsAuth: entryPoint.category === 'authentication',
+        // Hand the Planner the Cartographer's understanding of this page so it
+        // plans against known forms/entities instead of re-deriving from DOM.
+        pageInsightContext: this.formatPageInsightContext(page.url()),
+        // Cross-flow memory: what sibling flows accomplished / got blocked on +
+        // strategy focus, so the Planner reuses their outcomes (invariant #10 safe).
+        priorLearnings: this.formatPriorLearnings(),
       };
 
       this.trace?.writeFlowPipelineStart({
@@ -631,6 +689,17 @@ export class FlowRunner {
         flowStartTime: pipelineStartTime,
         successfulCalls,
       });
+
+      // Merge intra-round dismissals (from the pipeline) with the pre-pipeline
+      // ones. `recordedDismissals` now holds every overlay the agent cleared
+      // during this flow, in roughly the order they were encountered.
+      recordedDismissals.push(...pipelineResult.dismissals);
+
+      // NOTE: the SELF-CONTAINED step list is built LATER, just before the
+      // return — NOT here. A 2FA/CAPTCHA retry branch below can still append to
+      // `discoveredSteps` + `recordedDismissals`; building the list here would
+      // snapshot it pre-retry and silently drop the retry's actions/dismissals
+      // from the saved test case. See buildSelfContainedSteps at the return.
 
       this.trace?.writeFlowPipelineEnd({
         entryPointId: entryPoint.id,
@@ -712,30 +781,60 @@ export class FlowRunner {
         status = 'completed';
       } else if (pipelineResult.blockedReason) {
         status = 'blocked';
-        const blockerInfo = this.extractBlockerInfo(pipelineResult.insights, pipelineResult.blockedReason);
-        blockerType = blockerInfo.type;
-        canUserHelp = blockerInfo.canUserHelp;
+        // Prefer the STRUCTURED blocker the Executor reported (report_blocked →
+        // pipelineResult.blockerType) over keyword-guessing the reason string;
+        // fall back to keyword extraction when the Executor didn't set one.
+        if (pipelineResult.blockerType) {
+          blockerType = pipelineResult.blockerType as BlockerType;
+          canUserHelp = pipelineResult.canUserHelp ?? true;
+        } else {
+          const blockerInfo = this.extractBlockerInfo(pipelineResult.insights, pipelineResult.blockedReason);
+          blockerType = blockerInfo.type;
+          canUserHelp = blockerInfo.canUserHelp;
+        }
 
         this.trace?.writeFlowBlockerDetected({
           entryPointId: entryPoint.id,
           blockerType,
           canUserHelp,
-          reason: pipelineResult.blockedReason,
+          // The blocked reason is an LLM summary, but it can quote a page string
+          // that echoed a credential — redact before it lands in the (now
+          // prod-uploaded) trace. Belt-and-suspenders for invariant #10.
+          reason: redactCredentialValues(pipelineResult.blockedReason || '', this.config.credentials),
         });
 
-        // 10a. Request user help for captcha/2FA if possible
+        // 10a. Request user help for a user-resolvable blocker. captcha/2fa ask
+        // the user to solve/enter a code; needs_data asks for a real value the
+        // agent could not invent (promo/referral code, account number, a
+        // one-time code that isn't strictly 2FA) — the user types it, we fill it
+        // into the blocking field, and the flow retries. (login_wall is NOT here:
+        // supplying credentials mid-run needs a dedicated SECURE form, not this
+        // free-text channel — see the credentials note; it stays blocked today.)
         if (
           canUserHelp &&
-          (blockerType === 'captcha' || blockerType === '2fa') &&
+          (blockerType === 'captcha' || blockerType === '2fa' || blockerType === 'needs_data') &&
           this.config.chatSessionId
         ) {
-          const clarificationQuestion = blockerType === 'captcha'
-            ? 'A CAPTCHA was encountered during exploration. Please solve it in the browser and click "Done".'
-            : 'A 2FA verification code is required. Please enter the code.';
+          const clarificationType: 'captcha_solve' | '2fa_code' | 'test_data' =
+            blockerType === 'captcha' ? 'captcha_solve'
+            : blockerType === '2fa' ? '2fa_code'
+            : 'test_data';
+
+          const clarificationQuestion =
+            blockerType === 'captcha'
+              ? 'A CAPTCHA was encountered during exploration. Please solve it in the browser and click "Done".'
+              : blockerType === '2fa'
+                ? 'A 2FA verification code is required. Please enter the code.'
+                // needs_data: surface the executor's reason so the user knows WHAT
+                // value is being asked for (redacted — it's a page-derived string).
+                : `The exploration needs a value to continue: ${redactCredentialValues(
+                    pipelineResult.blockedReason || 'a required field value',
+                    this.config.credentials,
+                  )}. Please provide it.`;
 
           this.trace?.writeFlowUserHelpRequested({
             entryPointId: entryPoint.id,
-            type: blockerType === 'captcha' ? 'captcha_solve' : '2fa_code',
+            type: clarificationType,
             timeoutMs: 120_000,
           });
 
@@ -743,13 +842,13 @@ export class FlowRunner {
             explorationId: this.config.explorationId,
             chatSessionId: this.config.chatSessionId,
             question: clarificationQuestion,
-            type: blockerType === 'captcha' ? 'captcha_solve' : '2fa_code',
+            type: clarificationType,
             timeout: 120_000,
           });
 
           this.trace?.writeFlowUserHelpReceived({
             entryPointId: entryPoint.id,
-            type: blockerType === 'captcha' ? 'captcha_solve' : '2fa_code',
+            type: clarificationType,
             received: !!answer,
           });
 
@@ -761,9 +860,13 @@ export class FlowRunner {
             });
 
             try {
-              // If 2FA: type the code the user provided
-              if (blockerType === '2fa' && answer !== 'done') {
-                const codeInputs = await page.$$('input[type="text"], input[type="tel"], input[type="number"]');
+              // 2FA or needs_data: type the user-provided value into the first
+              // editable field, then submit. (captcha is solved in-browser by the
+              // user, so there's nothing to type — answer is just the 'done'
+              // sentinel.) Best-effort: if no input is found the retry still runs
+              // and the Planner re-observes.
+              if ((blockerType === '2fa' || blockerType === 'needs_data') && answer !== 'done') {
+                const codeInputs = await page.$$('input[type="text"], input[type="tel"], input[type="number"], input[type="email"]');
                 if (codeInputs.length > 0) {
                   await codeInputs[0].fill(answer);
                   await page.keyboard.press('Enter');
@@ -777,7 +880,7 @@ export class FlowRunner {
               // Re-run pipeline from current state
               const retryIntegrations: PipelineIntegrations = {
                 page,
-                actionExecutor: new ActionExecutor(page),
+                actionExecutor: new ActionExecutor(page, { timeoutProfile: 'fast' }),
                 networkTracker: new NetworkTracker(page),
                 goalDetector: new GoalDetector(entryPoint.goal, entryPoint.id),
                 browserContext: context,
@@ -789,8 +892,22 @@ export class FlowRunner {
                 credentials: this.config.credentials,
                 hasCredentials: !!this.config.credentials,
                 testId: entryPoint.id,
+                // Exploration testIds are non-UUID (ep-N); without this the retry
+                // pipeline keeps hitting the DB cancellation lookup for a row that
+                // doesn't exist (wasted 5s DB race + warning spam) — the primary
+                // config sets it too.
+                skipDbCancellationCheck: true,
+                // entryPointId ties retry round/command traces back to this flow;
+                // omitting it (as before) left retried rounds uncorrelated.
+                entryPointId: entryPoint.id,
                 maxRounds: Math.max(1, Math.min(5, allocatedRounds)),
                 timeoutMs: Math.max(5_000, flowTimeoutMs - (Date.now() - startTime)),
+                // Keep page-health context consistent with the primary config so
+                // an auth flow's login landing isn't misread as "session lost"
+                // and the Planner keeps its page understanding on retry too.
+                flowIsAuth: entryPoint.category === 'authentication',
+                pageInsightContext: this.formatPageInsightContext(page.url()),
+                priorLearnings: this.formatPriorLearnings(),
               };
               const retryStartTime = Date.now();
               const retryNetworkTracker = retryIntegrations.networkTracker;
@@ -813,6 +930,10 @@ export class FlowRunner {
                     successfulCalls: retryCalls,
                   });
                   discoveredSteps.push(...retryAttributed);
+                  // Carry the retry's intra-round dismissals too, so the
+                  // self-contained step list reflects overlays cleared during
+                  // the retry (same gap as the main path, on the retry branch).
+                  recordedDismissals.push(...retryResult.dismissals);
                 }
               } finally {
                 // Must stop the retry tracker — the outer cleanup only stops
@@ -839,10 +960,25 @@ export class FlowRunner {
       await page.close();
       await this.stateManager.closeContext(context);
 
+      // Build the SELF-CONTAINED step list NOW (after the optional 2FA/CAPTCHA
+      // retry has appended to discoveredSteps/recordedDismissals), so the saved
+      // test case includes retry-path actions + overlay dismissals:
+      //   [navigate to entry URL] + [dismiss overlays] + [flow steps]
+      // Kept SEPARATE from `discoveredSteps` (which Scout consumed above) —
+      // Scout must see only the real flow actions, not the prepended setup.
+      const finalSteps = buildSelfContainedSteps(
+        entryPoint.sourcePageUrl,
+        recordedDismissals,
+        discoveredSteps,
+      );
+
       return {
         entryPoint,
         status,
-        discoveredSteps,
+        // Self-contained list (navigate + dismissals + flow steps). NOT the
+        // raw `discoveredSteps` — that was already handed to Scout above
+        // without the prepended setup.
+        discoveredSteps: finalSteps,
         branchPoints,
         errors,
         errorClassification,
@@ -958,7 +1094,7 @@ export class FlowRunner {
         });
       } catch { /* non-fatal */ }
 
-      const actionExecutor = new ActionExecutor(page);
+      const actionExecutor = new ActionExecutor(page, { timeoutProfile: 'fast' });
       const networkTracker = new NetworkTracker(page);
 
       const integrations: PipelineIntegrations = {
@@ -1194,7 +1330,13 @@ export class FlowRunner {
       return { type: 'captcha', canUserHelp: true };
     }
 
-    if (searchText.includes('2fa') || searchText.includes('two-factor') || searchText.includes('verification code') || searchText.includes('authenticator'))
+    // 2FA — match only STRONG authenticator-2FA anchors. "verification code" /
+    // "otp" alone are ambiguous: SMS/phone-confirmation and password-recovery
+    // flows use them too, and mislabelling those as "2FA" showed a confusing
+    // "2FA verification required" modal on sites that have no 2FA. A generic
+    // code the agent can't obtain still blocks the flow — as a truthful
+    // 'other' (user-help), not a wrong 2FA label.
+    if (searchText.includes('2fa') || searchText.includes('two-factor') || searchText.includes('two factor') || searchText.includes('authenticator') || searchText.includes('totp'))
       return { type: '2fa', canUserHelp: true };
     if (searchText.includes('payment') || searchText.includes('credit card') || searchText.includes('stripe'))
       return { type: 'payment', canUserHelp: false };
@@ -1324,6 +1466,75 @@ export class FlowRunner {
     }
 
     return undefined;
+  }
+
+  /**
+   * Condense the Cartographer insight for a page into a short hint string for
+   * the Planner (forms / interactive areas / data entities). Mirrors the
+   * Scout prompt's "CURRENT PAGE CONTEXT" shape. Returns undefined when the
+   * page wasn't surveyed. Length-capped so it can't bloat the Planner prompt.
+   */
+  private formatPageInsightContext(url: string): string | undefined {
+    const insight = this.findPageInsight(url);
+    if (!insight) return undefined;
+    const formCount = insight.forms?.length ?? 0;
+    const cap = PAGE_INSIGHT_MAX_ITEMS_PER_LIST;
+    const parts = [
+      `Page understanding (from survey): ${insight.pageType}, complexity ${insight.complexity}`,
+      formCount > 0 ? `forms: ${formCount}` : '',
+      insight.interactiveAreas?.length ? `interactive: ${insight.interactiveAreas.slice(0, cap).join(', ')}` : '',
+      insight.dataEntities?.length ? `entities: ${insight.dataEntities.slice(0, cap).join(', ')}` : '',
+    ].filter(Boolean);
+    // Redact any credential value the surveyed page may have echoed into its
+    // form labels / entity names before this string reaches the Planner prompt
+    // (CLAUDE.md invariant #10 — the insight is page-derived, LLM-facing text).
+    const text = redactCredentialValues(parts.join(' | '), this.config.credentials);
+    return text.length > PAGE_INSIGHT_MAX_CHARS ? text.slice(0, PAGE_INSIGHT_MAX_CHARS) : text;
+  }
+
+  /**
+   * Condense what OTHER flows in this exploration already learned into a short,
+   * Planner-facing slice: recent accomplishments (cookies accepted, logged in),
+   * the most recent blockers per category (so this flow doesn't re-hit a dead
+   * end), and the active strategy focus. Returns undefined for the first flow
+   * (nothing learned yet) or when there's no blackboard. Recency-ordered and
+   * capped both ways so it's a signal, not prompt bloat. Credential-redacted
+   * (invariant #10 — accomplishments/blocker reasons are LLM-facing text).
+   */
+  private formatPriorLearnings(): string | undefined {
+    if (!this.blackboard) return undefined;
+    const parts: string[] = [];
+
+    // Active strategy focus (one line — what the Strategist told everyone to prioritise).
+    const focus = this.blackboard.currentStrategy?.focusAreas;
+    if (focus?.length) {
+      parts.push(`Strategy focus: ${focus.slice(0, PAGE_INSIGHT_MAX_ITEMS_PER_LIST).join(', ')}`);
+    }
+
+    // Recent accomplishments — most recent last in the array, so take the tail.
+    const accomplishments = this.blackboard.workingMemory?.accomplishments ?? [];
+    if (accomplishments.length) {
+      const recent = accomplishments.slice(-PRIOR_LEARNINGS_MAX_ACCOMPLISHMENTS);
+      parts.push(`Already done by earlier flows: ${recent.join('; ')}`);
+    }
+
+    // Most recent blocked flows + reason (dedup by category — one dead end per
+    // category is enough signal; repeating them just eats the budget).
+    const blockedByCategory = new Map<string, string>();
+    for (const flow of this.blackboard.completedFlows) {
+      if (flow.status !== 'blocked' || !flow.blockedReason) continue;
+      blockedByCategory.set(flow.category, flow.blockedReason); // keep-last = most recent
+    }
+    if (blockedByCategory.size) {
+      const blockers = Array.from(blockedByCategory.entries())
+        .slice(-PRIOR_LEARNINGS_MAX_BLOCKERS)
+        .map(([cat, reason]) => `${cat}: ${reason}`);
+      parts.push(`Blockers other flows hit: ${blockers.join(' | ')}`);
+    }
+
+    if (!parts.length) return undefined;
+    const text = redactCredentialValues(parts.join('\n'), this.config.credentials);
+    return text.length > PRIOR_LEARNINGS_MAX_CHARS ? text.slice(0, PRIOR_LEARNINGS_MAX_CHARS) : text;
   }
 
   private normalizeUrl(url: string): string {

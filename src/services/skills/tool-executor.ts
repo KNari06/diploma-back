@@ -28,6 +28,7 @@ import type { ChatCompletionMessageParam } from 'openai/resources/chat/completio
 import type { SkillContext, SkillResult, SkillErrorContext } from './types';
 import type { ToolCallTracker } from './hooks/loop-detection.hook';
 import { resolveRetryConfig, isRetryableError, calculateRetryDelay, sleep } from './retry';
+import { buildAgentHint, formatAgentHint, shouldEnrichWithHint } from './agent-hint';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -245,6 +246,18 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
 
   // Safety: ensure toolResult is always set
   toolResult ??= { success: false, message: 'Tool execution failed: no result produced' };
+
+  // Enrich actionable-poor failures with Agent Hints so the LLM gets next steps.
+  // Converges here so BOTH `return {success:false}` and caught-throw paths pass
+  // through. Runs before the loop-warning block so ⚠️ WARNING still appends after
+  // the hint. Guarded + fail-open: a hint failure must never mask the real error.
+  if (toolResult && toolResult.success === false && shouldEnrichWithHint(toolResult.message)) {
+    try {
+      toolResult = { ...toolResult, message: formatAgentHint(buildAgentHint(toolResult.message)) };
+    } catch {
+      // fail-open: keep original message
+    }
+  }
 
   const durationMs = Date.now() - startMs;
 

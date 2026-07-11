@@ -17,6 +17,7 @@ import {
 } from '@/agent/utils/selectors/modal-detection';
 import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { isNavigationSafe, logUrlSafetyDecision } from '@/utils/security/url-safety';
+import { resolveIframeFrame, VALID_REF_RE } from './iframe-ref.util';
 import type { Locator, Page } from 'playwright';
 import { VisualAnchorManager } from '../analysis/visual-anchor-manager';
 import { ShadowDOMHandler } from './shadow-dom-handler';
@@ -78,6 +79,22 @@ export interface ExecuteOptions {
   activeFrame?: import('playwright').Frame;
 }
 
+/**
+ * Timeout profile for action waits. 'default' preserves the long, human-facing
+ * waits used by the AI editor / live preview. 'fast' is for autonomous
+ * exploration where no human is watching and a dead action must fail in seconds
+ * instead of walking the whole self-heal ladder at full timeout (~53s observed).
+ */
+export type ActionTimeoutProfile = 'default' | 'fast';
+
+const TIMEOUT_PROFILES: Record<ActionTimeoutProfile, { default: number; navigation: number; fallback: number }> = {
+  // Editor / preview — unchanged from the original hardcoded values.
+  default: { default: 10_000, navigation: 15_000, fallback: 8_000 },
+  // Exploration — balanced fail-fast: a dead 5-stage click drops from ~53s to
+  // ~18s while a genuinely slow-but-live element on a sluggish site still lands.
+  fast: { default: 4_000, navigation: 6_000, fallback: 3_000 },
+};
+
 export class ActionExecutor {
   private page: Page;
   private elementMap: Map<string, ElementInfo> = new Map();
@@ -101,17 +118,29 @@ export class ActionExecutor {
   /** Test ID for safety-decision audit log entries. */
   private testId?: string;
 
-  // ✅ FIX: Configurable timeouts for different action types
-  private readonly DEFAULT_TIMEOUT = 10000; // 10s for most actions (increased from 5s)
-  private readonly NAVIGATION_TIMEOUT = 15000; // 15s for actions that may trigger navigation
-  private readonly FALLBACK_TIMEOUT = 8000; // 8s for fallback attempts
+  // Action timeouts. Set from the timeout profile in the constructor — the
+  // 'staged self-heal' click walks up to 5 stages, each waiting a full timeout,
+  // so on a DEAD element these compound (default profile ≈ 53s observed).
+  //   - 'default' (AI editor / live preview): a human is watching and forms can
+  //     be genuinely slow, so we wait long before giving up. Unchanged behaviour.
+  //   - 'fast' (autonomous exploration): no human waiting; a dead action should
+  //     fail in seconds, not burn ~53s of the run's budget walking the ladder.
+  // The self-heal STAGES are unchanged — only how long each waits before the
+  // next tries. Values named/centralized here, never inlined (see TIMEOUT_PROFILES).
+  private readonly DEFAULT_TIMEOUT: number;
+  private readonly NAVIGATION_TIMEOUT: number;
+  private readonly FALLBACK_TIMEOUT: number;
 
   // ✅ REMOVED: Hardcoded ENTRY_POINT_KEYWORDS
   // Now passed dynamically via execute() options from GoalDetector's AI-generated strategy
 
-  constructor(page: Page) {
+  constructor(page: Page, options?: { timeoutProfile?: ActionTimeoutProfile }) {
     this.page = page;
     this.currentContext = page;
+    const profile = TIMEOUT_PROFILES[options?.timeoutProfile ?? 'default'];
+    this.DEFAULT_TIMEOUT = profile.default;
+    this.NAVIGATION_TIMEOUT = profile.navigation;
+    this.FALLBACK_TIMEOUT = profile.fallback;
   }
 
   /**
@@ -159,6 +188,7 @@ export class ActionExecutor {
         tag: el.tag,
         type: el.type,
         role: el.role, // ✅ FIX: Include role for Phase 0 dropdown selection
+        iframeSource: el.iframeSource, // iframe elements → frame-scoped locator
       });
     });
 
@@ -352,8 +382,8 @@ export class ActionExecutor {
    * Validate command before execution
    */
   private validateCommand(command: AICommand): void {
-    // Validate ref format if present (e-prefix for light DOM, s-prefix for shadow DOM)
-    if (command.ref && !/^[es]\d+$/.test(command.ref)) {
+    // Validate ref format if present (e=light DOM, s=shadow DOM, ifr{N}_{M}=iframe).
+    if (command.ref && !VALID_REF_RE.test(command.ref)) {
       throw new Error(`Invalid ref format: ${command.ref}`);
     }
 
@@ -415,7 +445,7 @@ export class ActionExecutor {
 
     // Validate scroll extras
     if (command.action === 'scroll') {
-      if (command.targetRef && !/^[es]\d+$/.test(command.targetRef)) {
+      if (command.targetRef && !VALID_REF_RE.test(command.targetRef)) {
         throw new Error(`Invalid targetRef format: ${command.targetRef}`);
       }
       if (command.amount !== undefined) {
@@ -428,10 +458,50 @@ export class ActionExecutor {
   }
 
   /**
+   * Resolve the locator context for a ref. Iframe-scoped refs (collector emits
+   * `ifr{frameIndex}_{idx}` and stamps the matching `data-agent-ref` INSIDE
+   * that frame) must resolve against the Frame, not the main page —
+   * `page.locator()` does not cross frame boundaries. Resolution logic lives in
+   * the pure `iframe-ref.util` helper (unit-tested without a browser). Falls
+   * back to `currentContext` for main-page refs or any miss (then the existing
+   * fallback chain takes over).
+   */
+  private resolveContextForRef(ref: string | undefined): Page | import('playwright').Frame {
+    const expectedSource = ref ? this.elementMap.get(ref)?.iframeSource : undefined;
+    const frame = resolveIframeFrame(this.page, ref, expectedSource);
+    if (!frame && ref && ref.startsWith('ifr')) {
+      // Iframe ref but the frame is gone (reloaded / detached) and the
+      // name/url fallback also missed. Degrade to the main page — the locator
+      // simply won't find the ref there and the fuzzy fallback chain takes
+      // over. Logged so this shows up when iframe replay gets flaky.
+      logger.debug('[ACTION_EXECUTOR] iframe ref did not resolve to a frame, using main page', {
+        ref,
+        expectedSource,
+        frameCount: this.page.frames().length,
+      });
+    }
+    return frame ?? this.currentContext;
+  }
+
+  /**
    * Safe switch/case execution - only whitelisted Playwright methods
    * PHASE B: Pre-scroll to ensure element is in viewport before interaction
    */
   private async executeCommand(cmd: AICommand): Promise<void> {
+    // Iframe-scoped refs (ifr{N}_…) target their Frame. Switch currentContext
+    // for the whole command so every downstream `currentContext.locator(...)`
+    // sub-case (scroll targetRef, select option, drag targetRef) resolves in
+    // the same frame. Main-page refs leave currentContext untouched.
+    //
+    // Consider BOTH ref and targetRef: ref-only commands (click/fill) carry the
+    // element in `ref`, but the targetRef-only commands named above (scroll into
+    // an iframe element, drag target) carry it in `targetRef`. Reading only
+    // `ref` left those scoped to the main page, so a scroll to an iframe element
+    // silently ran against the wrong frame.
+    const contextRef = cmd.ref ?? cmd.targetRef;
+    if (contextRef) {
+      this.currentContext = this.resolveContextForRef(contextRef);
+    }
     const locator = cmd.ref
       ? this.currentContext.locator(`[data-agent-ref="${cmd.ref}"]`)
       : null;
@@ -443,8 +513,17 @@ export class ActionExecutor {
         // PHASE B: Pre-scroll to ensure element is visible before click
         // ═══════════════════════════════════════════════════════════════════
         await this.ensureElementVisible(locator);
-        // ✅ FIX: Use longer timeout for clicks (may trigger navigation/modals)
-        await locator.click({ timeout: this.NAVIGATION_TIMEOUT });
+        // Route through the staged self-healing click instead of a raw
+        // locator.click(): a raw click throws on "intercepts pointer events"
+        // (overlay/cookie/modal in front of the target) and the agent then
+        // burns whole rounds re-picking elements. stagedClickWithSelfHealing
+        // identifies the blocker (Layer 3), dismisses it, and retries — only
+        // throwing if all stages fail (so a genuinely dead element still
+        // surfaces as a real failure). cmd.ref is the target ref Layer 3 needs.
+        await this.stagedClickWithSelfHealing(locator, {
+          targetRef: cmd.ref,
+          stage1Timeout: this.NAVIGATION_TIMEOUT,
+        });
         break;
 
       case 'fill':
@@ -458,6 +537,19 @@ export class ActionExecutor {
         const inputType = await locator.evaluate(
           (el) => (el as HTMLInputElement).type?.toLowerCase() || ''
         ).catch(() => '');
+
+        // Guard: never `fill` a checkbox/radio — Playwright waits the full
+        // timeout ("element is not editable") then fails anyway. This fires
+        // when a stale ref that was a text/tel input at snapshot time now
+        // resolves to a consent checkbox after a re-render (observed: a phone
+        // value filled into `agreeToProcessing`). Fail fast with a message that
+        // tells the agent to use toggle_element instead of re-queuing the fill.
+        if (inputType === 'checkbox' || inputType === 'radio') {
+          throw new Error(
+            `cannot fill a ${inputType} — this is a toggle control, not a text field; ` +
+            'use toggle_element, and re-observe if you meant a different (text/tel) input',
+          );
+        }
 
         if (inputType === 'range') {
           // Range inputs: fill()/pressSequentially() don't work — use evaluate
@@ -1362,11 +1454,51 @@ export class ActionExecutor {
    */
   private async stagedClickWithSelfHealing(
     locator: Locator,
-    options?: ExecuteOptions & { targetRef?: string }
+    options?: ExecuteOptions & { targetRef?: string; stage1Timeout?: number }
   ): Promise<{ usedForce: boolean; blockerInfo?: BlockerInfo }> {
-    // Stage 1: Normal click
+    // Stage 0: LIVE fast-fail probes. The snapshot-based checkRefExists can be
+    // STALE by click time — the DOM changed after the snapshot — so two cases
+    // otherwise burn the full 15-20s Playwright retry and then fail anyway:
+    //   (a) ref no longer in the DOM  → "waiting for locator" for 15s
+    //   (b) element present but disabled → "waiting to be enabled" (29× observed)
+    // These let us fail in well under a second with an actionable message so the
+    // agent replans instead of re-queuing a dead click.
+    //
+    // SAFETY (shared with the AI editor's replay path, not just exploration): a
+    // framework re-render can momentarily detach an element that IS valid, so a
+    // single count()===0 would false-fail a legit click. We therefore re-check
+    // after a short grace wait and only declare the ref stale if it's STILL
+    // absent. A genuinely dead ref still fails fast (~grace, not 15s); a
+    // transiently re-rendering element survives. Fail-soft: probe errors (the
+    // page navigated, context detached) fall through to the normal click.
     try {
-      await locator.click({ timeout: this.FALLBACK_TIMEOUT });
+      if ((await locator.count()) === 0) {
+        // Grace: give a re-rendering framework a beat, then re-check ONCE.
+        await this.page.waitForTimeout(400);
+        if ((await locator.count()) === 0) {
+          throw new Error('stale ref — element no longer present in the DOM; re-observe the page and pick a current element');
+        }
+      }
+      // Present but disabled (a disabled control stays disabled — safe to fail fast).
+      if (await locator.isDisabled({ timeout: 300 })) {
+        throw new Error(
+          'element is disabled — a required field is likely empty or validation is pending; ' +
+          'complete prerequisites first or report blocked',
+        );
+      }
+    } catch (probeErr) {
+      // Re-throw OUR fast-fail errors; swallow probe failures (timeout/detached).
+      const m = probeErr instanceof Error ? probeErr.message : '';
+      if (m.startsWith('stale ref') || m.startsWith('element is disabled')) {
+        throw probeErr;
+      }
+    }
+
+    // Stage 1: Normal click. The primary click path passes NAVIGATION_TIMEOUT
+    // (15s) so a slow navigation-triggering click isn't cut short and mistaken
+    // for an interception; fallback callers keep the shorter FALLBACK_TIMEOUT.
+    try {
+      await locator.click({ timeout: options?.stage1Timeout ?? this.FALLBACK_TIMEOUT });
       return { usedForce: false }; // No force needed
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);

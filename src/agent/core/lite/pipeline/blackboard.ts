@@ -21,6 +21,8 @@
 
 import { logger } from '@/utils/core/logger';
 import type { LiteSnapshot } from '../lite-types';
+import type { DismissalAttempt } from '../exploration/overlay-dismisser';
+import type { RecordedDismissal } from '../exploration/overlay-step.util';
 import type {
   ExecutionRound,
   PipelinePhase,
@@ -33,6 +35,9 @@ import type {
 
 /** Maximum insights before oldest are trimmed */
 const MAX_INSIGHTS = 15;
+/** Bound on recorded overlay dismissals (mirrors MAX_INSIGHTS — a flow that
+ *  dismisses more than this many distinct overlays is pathological). */
+const MAX_DISMISSALS = 15;
 
 export class TestBlackboard {
   private state: TestBlackboardState;
@@ -47,6 +52,7 @@ export class TestBlackboard {
       pipelineStartedAt: Date.now(),
       rounds: [],
       insights: [],
+      dismissals: [],
       progressScore: 0,
     };
   }
@@ -239,6 +245,26 @@ export class TestBlackboard {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // OVERLAY DISMISSALS (recorded so the flow runner can replay them as steps)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /** Record successful overlay dismissals that happened during a round. Only
+   *  `dismissed` attempts are kept (the rest aren't replayable). Bounded. */
+  addDismissals(attempts: readonly DismissalAttempt[], pageUrl: string): void {
+    for (const attempt of attempts) {
+      if (!attempt.dismissed) continue;
+      this.state.dismissals.push({ attempt, pageUrl });
+    }
+    if (this.state.dismissals.length > MAX_DISMISSALS) {
+      this.state.dismissals = this.state.dismissals.slice(-MAX_DISMISSALS);
+    }
+  }
+
+  getDismissals(): readonly RecordedDismissal[] {
+    return this.state.dismissals;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // PROGRESS
   // ═══════════════════════════════════════════════════════════════════════
 
@@ -272,6 +298,69 @@ export class TestBlackboard {
 
   getContextualHints(): string[] | undefined {
     return this.state.contextualHints;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // PRIOR CROSS-FLOW LEARNINGS (set once at pipeline start from config;
+  // read-only summary of sibling flows' accomplishments / blockers + strategy).
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setPriorLearnings(text: string): void {
+    this.state.priorLearnings = text;
+  }
+
+  getPriorLearnings(): string | undefined {
+    return this.state.priorLearnings;
+  }
+
+  /** Structured blocker info from report_blocked (blockerType + canUserHelp + reason). */
+  setBlockedInfo(info: { blockerType: string; canUserHelp: boolean; reason: string }): void {
+    this.state.blockedInfo = info;
+  }
+
+  getBlockedInfo(): { blockerType: string; canUserHelp: boolean; reason: string } | undefined {
+    return this.state.blockedInfo;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // PAGE HEALTH (written by CommandExecutor per action/round, read by
+  // Reviewer prompt + auditDone gate). Best-effort technical-health verdict.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setPageHealth(health: import('../collectors/page-health').PageHealth | undefined): void {
+    this.state.pageHealth = health;
+  }
+
+  getPageHealth(): import('../collectors/page-health').PageHealth | undefined {
+    return this.state.pageHealth;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // ROUND INFO (set by TestPipeline before each Planner call so the Planner
+  // knows how much budget remains and can change strategy / give up).
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setRoundInfo(current: number, max: number): void {
+    this.state.roundInfo = { current, max };
+  }
+
+  getRoundInfo(): { current: number; max: number } | undefined {
+    return this.state.roundInfo;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // NO-PROGRESS COUNTER (set by TestPipeline from same-state detection).
+  // Number of consecutive rounds where the page state did NOT meaningfully
+  // change. Read by the Reviewer to escalate from "retry same action" to
+  // "the action has no effect — pivot or report_blocked" instead of looping.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setNoProgressRounds(n: number): void {
+    this.state.noProgressRounds = n;
+  }
+
+  getNoProgressRounds(): number {
+    return this.state.noProgressRounds ?? 0;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -321,6 +410,7 @@ export class TestBlackboard {
         commands: r.commands.map(c => ({ ...c })),
       })),
       insights: [...this.state.insights],
+      dismissals: this.state.dismissals.map(d => ({ ...d, attempt: { ...d.attempt } })),
     });
   }
 

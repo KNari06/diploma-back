@@ -1,5 +1,5 @@
 /* eslint-disable no-case-declarations */
-import { collectSecretValues, redactWithValues } from '@/utils/interpolation/redact-secrets';
+import { collectSecretValues, redactWithValues, redactSnapshotValues } from '@/utils/interpolation/redact-secrets';
 import { AIExtractService } from '@/services/ai-extract';
 import { SelfHealingService } from '@/services/ai-selector/self-healing.service';
 import { AICostManager } from '@/services/ai/cost/ai-cost-manager.service';
@@ -3431,6 +3431,26 @@ export class CommandExecutor {
       if (r === v) continue;
       if (!cloned) cloned = { ...meta };
       (cloned as Record<string, unknown>)[f] = r;
+    }
+    // link_test_case output capture (extractedDataSnapshot) — the FULL
+    // per-run scratchpad, which can legitimately hold a resolved
+    // {{secrets.*}} value written via a `store`/`extract` step (that's
+    // exactly what makes it useful as a link_test_case output binding).
+    // Redact every VALUE in the map (not just the fixed FIELDS above,
+    // since keys are dynamic variable names) before it's persisted or
+    // broadcast — Hard invariant #10.
+    const snapshot = (meta as Record<string, unknown>).extractedDataSnapshot;
+    if (snapshot && typeof snapshot === 'object') {
+      const result = redactSnapshotValues(snapshot as Record<string, string>, this.redactValues);
+      if (result) {
+        if (!cloned) cloned = { ...meta };
+        (cloned as Record<string, unknown>).extractedDataSnapshot = result.snapshot;
+        // linked-test-case-runner.service.ts's readFinalVariables needs to
+        // know WHICH keys were masked so an outputBinding sourcing a
+        // redacted key can fail loudly instead of silently resolving to the
+        // literal '***' mask as if it were the real value.
+        (cloned as Record<string, unknown>).redactedSnapshotKeys = result.redactedKeys;
+      }
     }
     return cloned ?? meta;
   }

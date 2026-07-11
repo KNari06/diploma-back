@@ -82,6 +82,23 @@ describe('buildStrategyLocator', () => {
     expect(page.locator).toHaveBeenCalledWith('.x');
     expect(result.__method).toBe('locator');
   });
+
+  // Iframe replay: the compiled executor passes a FrameLocator as `scope` so
+  // every strategy resolves INSIDE the frame. The page root must NOT be hit —
+  // that's what makes `page.locator()`-can't-cross-frames a non-issue.
+  it('resolves against the frame scope and leaves the page untouched', () => {
+    const page = makeScope();
+    const frame = makeScope();
+    const result = buildStrategyLocator(
+      page as any,
+      entry({ strategy: 'placeholder', value: 'Card number' }),
+      frame as any,
+    ) as any;
+    expect(frame.getByPlaceholder).toHaveBeenCalledWith('Card number');
+    expect(page.getByPlaceholder).not.toHaveBeenCalled();
+    expect(page.locator).not.toHaveBeenCalled();
+    expect(result.__method).toBe('getByPlaceholder');
+  });
 });
 
 describe('safeCountWithTimeout', () => {

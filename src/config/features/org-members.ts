@@ -6,7 +6,8 @@ import { logger } from '@/utils/core/logger';
  *
  * Staged rollout:
  * 1. FEATURE_ORG_MEMBERS_ENABLED=true - enables membership-based access
- * 2. FEATURE_ORG_CREDITS_ENABLED=true - enables workspace-level credits pool
+ * 2. FEATURE_ORG_CREDITS_ENABLED - legacy/no-op. Credits belong to the user
+ *    account only; there is no workspace-level credits pool in the run path.
  *
  * Both default to true, set to 'false' in env to disable during rollback.
  */
@@ -20,8 +21,10 @@ export const OrgMembersFeature = {
   },
 
   /**
-   * Check if org-level credits are enabled
-   * When enabled, requireCredits middleware uses workspace_credits instead of user_credits
+   * Legacy org-credits flag. Credits belong to the USER account only —
+   * requireCredits and every run path deduct from `user_credits`, never a
+   * workspace pool. This flag no longer gates any credit behavior; kept only to
+   * avoid an env-schema change and surfaced in the status log below.
    */
   isOrgCreditsEnabled(): boolean {
     return env.FEATURE_ORG_CREDITS_ENABLED;

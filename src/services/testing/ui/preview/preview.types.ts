@@ -305,6 +305,12 @@ export interface InteractiveNode {
   sizeHint?: 'small' | 'medium' | 'large';
   /** Source iframe name/id if element is inside a same-origin iframe */
   iframeSource?: string;
+  /**
+   * Durable CSS selector for the owning <iframe> in the parent document.
+   * Threaded from `LiteElement.iframeSelector` so the compiled-plan builder
+   * can persist a frame-scoped replay locator (`action.options.iframe`).
+   */
+  iframeSelector?: string;
 }
 
 /**
@@ -398,7 +404,10 @@ export type IntentActionType =
   | 'swipe'
   | 'click_at'
   // V17: Meta / Scratchpad — store a key-value pair for cross-step memory
-  | 'store';
+  | 'store'
+  // V-cross-app: run another saved test case at this point in the sequence,
+  // possibly on a different platform. See StepOptions.linkTestCase.
+  | 'link_test_case';
 
 /**
  * Binding hints for element resolution
@@ -1299,6 +1308,26 @@ export interface StepOptions {
    * scroll (legacy behaviour). NOT interpolated (see preview CLAUDE.md invariant #11).
    */
   scrollContainerDescription?: string;
+  /**
+   * V-cross-app: configuration for a `link_test_case` step — runs another
+   * saved test case at this point in the sequence, possibly on a different
+   * platform, splicing it into (same-platform) or nesting it beneath
+   * (cross-platform) this test's own execution.
+   */
+  linkTestCase?: {
+    /** ID of the test case to run at this point */
+    linkedTestCaseId: string;
+    /** Platform the linked test case runs on — may differ from this step's own test case's platform */
+    linkedPlatform: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
+    /** Values passed INTO the linked test case's own runtime parameters before it runs */
+    inputBindings?: Array<{ targetParam: string; valueExpr: string }>;
+    /**
+     * Named values pulled OUT of the linked test case's own variable scope
+     * after it completes (e.g. `extracted.orderId`), exposed to later steps
+     * in THIS test case as `{{link.<alias>}}`.
+     */
+    outputBindings?: Array<{ alias: string; sourceVariable: string }>;
+  };
 }
 
 /**
@@ -1324,6 +1353,14 @@ export interface IntentStep {
   options?: StepOptions;
   /** Hints for element resolution */
   bindingHints?: BindingHints;
+  /**
+   * Authoring-time flag: this step's `value` is a credential (password /
+   * OTP / token / API key). Set by the mobile agent's draft authoring
+   * (mirrors the `type_text` tool's isSensitive arg). Primary signal for
+   * `sanitizeMobileSteps` at the save boundary — a flagged value is
+   * parameterized regardless of what the description says.
+   */
+  isSensitive?: boolean;
   /**
    * Runtime-only marker: set when this step was inlined as a precondition
    * (a transitive dependency's step prepended before the target test's own

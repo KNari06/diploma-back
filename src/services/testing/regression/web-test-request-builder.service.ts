@@ -25,6 +25,12 @@ export class WebTestRequestBuilderService {
     trigger?: 'manual' | 'chat' | 'scheduled' | 'webhook',
     /** When set, the job routes progress/result WS events to chat:<sessionId>. */
     chatSessionId?: string,
+    /**
+     * Chain-view: the outer `regression_runs.id` this segment belongs to —
+     * see `tests.regression_run_id` migration. Only the single-test-case
+     * dispatch path passes this; bulk runs omit it.
+     */
+    runId?: string,
   ): Promise<any> {
     // Validate URL exists first (with fallback to start_url)
     const targetUrl = intentCase.url || intentCase.start_url;
@@ -155,6 +161,7 @@ export class WebTestRequestBuilderService {
       resourceBindings,
       // Routes WS progress/result to chat:<sessionId> when launched from chat.
       ...(chatSessionId ? { chatSessionId } : {}),
+      ...(runId ? { regressionRunId: runId } : {}),
       metadata: {
         intentTestCaseId: intentCase.id,
         intentTestCaseName: intentCase.name,

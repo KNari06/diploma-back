@@ -29,6 +29,7 @@ import {
   getPlatformTreeId,
   resolveHierarchy,
   convertImportedStepsWithAI,
+  finalizeTypedSteps,
   HierarchyCache,
 } from './allure-mapper';
 import { processAllureDocumentation } from './allure-kb-processor';
@@ -688,9 +689,15 @@ async function processCsvPdfImport(
             continue;
           }
 
-          // Convert steps using AI (determines correct action types, cleans descriptions)
-          // Falls back to 'click' type for all steps if AI fails (degraded).
-          const { steps, degraded: stepsDegraded } = await convertImportedStepsWithAI(tc.name, tc.steps);
+          // PDF steps already carry real action types + expected results from
+          // the PDF parser's LLM pass — finalize them deterministically instead
+          // of running a SECOND lossy LLM pass over the same data (that double
+          // conversion dropped steps in production). CSV steps are placeholder
+          // 'click' entries that still need AI type inference.
+          const { steps, degraded: stepsDegraded } =
+            sourceFormat === 'pdf'
+              ? { steps: finalizeTypedSteps(tc.steps), degraded: false }
+              : await convertImportedStepsWithAI(tc.name, tc.steps, options.platform);
 
           // Resolve hierarchy (module + flow) via cache
           const { moduleId, flowId } = await resolveHierarchy(

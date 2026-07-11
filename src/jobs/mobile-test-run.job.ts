@@ -48,6 +48,7 @@ import { MobileSessionAcquisitionService } from '@/services/mobile/session-acqui
 import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import type { TestStepCompletedPayload } from '@/websocket/types/types';
 import { FastAuthOrchestratorService } from '@/services/mobile/fast-auth-orchestrator.service';
+import { redactWithValues, redactSnapshotValues } from '@/utils/interpolation/redact-secrets';
 
 // ============================================================================
 // JOB HANDLER
@@ -135,7 +136,7 @@ export class MobileTestRunJobHandler {
       // in the run-steps call below (matched before the built-in permission
       // policy).
       triggers,
-      // `intent_test_cases.id`. Required for `persistCompiledPlansFromRun`
+      // `intent_test_cases.id`. Required for `CompiledPlanPersistenceService.persistFromRun`
       // to find the test case row and merge per-step compiled plans back
       // into `intent_test_cases.steps_json`. Pre-fix the worker passed
       // `testId` (which is `tests.id`) and the persist silently failed
@@ -147,6 +148,13 @@ export class MobileTestRunJobHandler {
       // Retry counter — undefined on first attempt, incremented by the
       // worker before re-throwing on retry-able errors. See W5 below.
       retryCount = 0,
+      // V-cross-app continuation (see MobileTestJobData for the full
+      // rationale) — resume an existing session instead of acquiring +
+      // prepping a new one, and/or leave this job's session alive for a
+      // later segment to resume.
+      resumeSessionId,
+      resumeSessionSource,
+      keepSessionAlive,
     } = job.data;
 
     // ── Job-level retry budget ───────────────────────────────────────
@@ -303,6 +311,14 @@ export class MobileTestRunJobHandler {
     // restore loop branch-light. The compiler already suppressed recipe
     // steps for these bindings — they only travel through this channel.
     let fastAuthRestores: FastAuthRestore[] = [];
+    // Redact-value list from compileForMobile's secretValues — plaintext of
+    // every secret/auth-sensitive/oauth_token value compiled into this run's
+    // setup steps. Unlike web, the backend never runs resolvePlaceholders
+    // for mobile (the runner owns interpolation), so this compiled-step list
+    // is the ONLY visibility the backend has into resolved secret values.
+    // Used to mask `scratchpadSnapshot` / `failureExplanation` before they're
+    // persisted or broadcast (CLAUDE.md Hard invariant #10).
+    let mobileSecretValues: string[] = [];
 
     try {
       // Phase 2 telemetry: capture user-step count up-front so a test
@@ -371,6 +387,7 @@ export class MobileTestRunJobHandler {
         // recompile — would double the worker latency for marginal value
         // (Q2 in the design doc).
         fastAuthRestores = compileResult.fastAuthRestores;
+        mobileSecretValues = compileResult.secretValues;
 
         // Pre-build audit snapshot (identical shape to web's AppliedBinding).
         executedResources = [
@@ -417,20 +434,31 @@ export class MobileTestRunJobHandler {
       await this.updateTestStatus(testId, 'running', browser);
 
       // ── Phase 3: Acquire session — Pool → Warmup → Cold Start ─
-      const sessionAcq = await MobileSessionAcquisitionService.acquireSession({
-        client,
-        testId,
-        platform: acquirePlatform,
-        browser,
-        userId,
-        workspaceId,
-        projectId,
-        chatSessionId,
-      });
-      sessionId = sessionAcq.sessionId;
-      sessionSource = sessionAcq.sessionSource;
-      tlm.sessionClaimMs = sessionAcq.sessionClaimMs;
-      tlm.coldStartUsed = sessionAcq.coldStartUsed;
+      // (skipped entirely when resuming a continuation segment — see below)
+      if (resumeSessionId) {
+        sessionId = resumeSessionId;
+        sessionSource = resumeSessionSource ?? 'cold';
+        logger.info('[MOBILE-TEST] Resuming existing session for link_test_case continuation — skipping acquisition + app setup', {
+          testId,
+          sessionId,
+          sessionSource,
+        });
+      } else {
+        const sessionAcq = await MobileSessionAcquisitionService.acquireSession({
+          client,
+          testId,
+          platform: acquirePlatform,
+          browser,
+          userId,
+          workspaceId,
+          projectId,
+          chatSessionId,
+        });
+        sessionId = sessionAcq.sessionId;
+        sessionSource = sessionAcq.sessionSource;
+        tlm.sessionClaimMs = sessionAcq.sessionClaimMs;
+        tlm.coldStartUsed = sessionAcq.coldStartUsed;
+      }
 
       // The session may have been BORN on a companion or dedicated runner (e.g.
       // an editor warmup claimed at Try-2, or the tier-0 dedicated intercept).
@@ -459,6 +487,14 @@ export class MobileTestRunJobHandler {
       }
 
 
+      // ── Phases 3a-3d: permission policy, app prep, fast-auth, Flutter
+      // attach — ALL skipped when resuming a continuation segment. The
+      // resumed session already has the right app installed, wiped,
+      // launched, and (for Flutter) attached from whichever earlier segment
+      // in this chain actually acquired it — redoing any of this would
+      // force-stop/relaunch the app and lose exactly the in-progress UI
+      // state this continuation exists to preserve.
+      if (!resumeSessionId) {
       // ── Phase 3a: Apply project-level runtime-permission policy ────
       // Editor warmup applies this during the warmup HTTP handler, but
       // regression/CI runs reach the runner through this worker WITHOUT
@@ -624,6 +660,15 @@ export class MobileTestRunJobHandler {
         await activeClient.attachFlutter(sessionId, { packageName: appPackage }, { userId });
         logger.info('[MOBILE-TEST] Flutter session attached', { testId, sessionId, appPackage });
       }
+      } // end if (!resumeSessionId) — Phases 3a-3d
+
+      // Persist the session id this test actually ended up using (fresh or
+      // resumed) so a LATER continuation segment in the same link_test_case
+      // chain can resume it in turn. Best-effort — a failed write just means
+      // the next segment falls back to a fresh session instead of resuming.
+      if (sessionId) {
+        await this.persistRunnerSessionId(testId, sessionId, sessionSource);
+      }
 
 
       // ── Phase 4: Run steps ────────────────────────────────────
@@ -688,6 +733,9 @@ export class MobileTestRunJobHandler {
           // Forward the test's user-defined triggers verbatim (no-op when
           // undefined/empty — the client drops the field from the body).
           triggers,
+          // Scope the runner's resolver cache to the app build so a pooled
+          // runner process can't replay a cached pick from a different version.
+          appVersionCode,
           signal: runStepsAbort.signal,
           userId,
         });
@@ -963,6 +1011,16 @@ export class MobileTestRunJobHandler {
             });
           }
 
+          // Redact any {{secrets.*}}-derived plaintext BEFORE it's persisted
+          // or broadcast — mirrors web's `executor.redactRuntimeMeta` in
+          // command-executor.ts/test-executor.ts (CLAUDE.md Hard invariant
+          // #10). `mobileSecretValues` is empty on the common no-secrets
+          // path, so both calls below are a cheap no-op then.
+          const scratchpadRedaction = redactSnapshotValues(stepResult.scratchpadSnapshot, mobileSecretValues);
+          const redactedFailureExplanation = stepResult.error
+            ? redactWithValues(stepResult.error, mobileSecretValues)
+            : stepResult.error;
+
           // Persist to the Redis buffer in-process (the worker owns step
           // persistence), then broadcast. The job's finally drains this buffer
           // via finalizeToDb — no cross-process append round-trip.
@@ -987,7 +1045,7 @@ export class MobileTestRunJobHandler {
               runtimeStatus,
               executionMs: stepResult.durationMs,
               failedReason: stepResult.error ? 'unknown' : undefined,
-              failureExplanation: stepResult.error,
+              failureExplanation: redactedFailureExplanation,
               resolvedVia: stepResult.resolvedVia,
               // Soft-fail signal for the frontend. Absent (not `false`) for
               // hard failures and successes — keeps the field truthy-only
@@ -1007,6 +1065,21 @@ export class MobileTestRunJobHandler {
               ...(typeof stepResult.screenshot === 'string' && stepResult.screenshot.startsWith('http')
                 ? { stepScreenshotUrl: stepResult.screenshot }
                 : {}),
+              // link_test_case output capture: the runner's full scratchpad at
+              // this step (only present when the step modified it — see
+              // MobileStepResult.scratchpadSnapshot). Persisted per-step so a
+              // later read of the LAST defined one gives the run's final
+              // accumulated variable state, which linked-test-case-runner.service.ts
+              // reads to resolve outputBindings. Not new data from the runner —
+              // it was already sent, just not previously read on this side.
+              // Redacted (see scratchpadRedaction above) — redactedSnapshotKeys
+              // tells the link-runner which keys were masked so it can fail
+              // loudly on an outputBinding instead of returning '***' silently.
+              ...(scratchpadRedaction
+                ? { scratchpadSnapshot: scratchpadRedaction.snapshot, redactedSnapshotKeys: scratchpadRedaction.redactedKeys }
+                : stepResult.scratchpadSnapshot
+                  ? { scratchpadSnapshot: stepResult.scratchpadSnapshot }
+                  : {}),
             },
           };
           await TestExecutedStepsRedisService.appendStepCompleted(testId, mobileStepEvent);
@@ -1093,6 +1166,15 @@ export class MobileTestRunJobHandler {
           logger.warn('[MOBILE-TEST] Failed to queue AI analysis', {
             testId,
             error: err instanceof Error ? err.message : String(err),
+          });
+        }
+        // ADR-0012 — best-effort. No-ops internally when disabled.
+        try {
+          await QueueManager.addVisualAnomalySweepJob(testResultId, testId);
+        } catch (sweepErr) {
+          logger.warn('[MOBILE-TEST] Failed to queue visual anomaly sweep', {
+            testId,
+            error: sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
           });
         }
       }
@@ -1325,6 +1407,17 @@ export class MobileTestRunJobHandler {
             error: queueErr instanceof Error ? queueErr.message : String(queueErr),
           });
         }
+        // ADR-0012 — useful for failures too (a visually broken error state
+        // is exactly the kind of thing this sweep should catch).
+        try {
+          await QueueManager.addVisualAnomalySweepJob(failedTestResultId, testId);
+        } catch (sweepErr) {
+          logger.warn('[MOBILE-TEST] Failed to enqueue visual anomaly sweep for failed run', {
+            testId,
+            testResultId: failedTestResultId,
+            error: sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
+          });
+        }
       }
 
       // Emit failure event
@@ -1389,7 +1482,13 @@ export class MobileTestRunJobHandler {
       // destroySession tears down the remote container (emulatorManager.stop →
       // adb emu kill). Pool sessions reset-and-return; everything else (cold /
       // warmup adhoc) is destroyed as before.
-      if (sessionId) {
+      //
+      // `keepSessionAlive` (V-cross-app continuation): a LATER segment in
+      // this link_test_case chain will resume this exact session via
+      // `resumeSessionId` — cleaning it up here would pull the app out from
+      // under that continuation. Skip entirely; the final segment in the
+      // chain always runs without this flag, so cleanup still happens once.
+      if (sessionId && !keepSessionAlive) {
         try {
           if (sessionSource === 'pool') {
             await activeClient.releaseSession(sessionId, { userId });
@@ -1554,6 +1653,7 @@ export class MobileTestRunJobHandler {
             evidence: s.evidence,
             errorClassification: s.errorClassification,
             bugReport: s.bugReport,
+            visualIssues: s.visualIssues,
           })),
           bugReports: runResult.bugReports,
         },
@@ -1803,6 +1903,33 @@ export class MobileTestRunJobHandler {
    * stay null — that's the honest "we don't know" signal for downstream
    * aggregation.
    */
+  /**
+   * V-cross-app continuation: record the runner sessionId (+ its original
+   * acquisition source) this job ended up using, merged into `tests.options`
+   * alongside anything already there. `RegressionRunService`'s segmented
+   * dispatch reads this back (via `getTestBrowsersAndOptions` in
+   * `regression.db.ts`) after polling a segment to completion, so it can
+   * pass `resumeSessionId` to the NEXT segment instead of letting it acquire
+   * a fresh session. Best-effort — a failed write just means the next
+   * segment falls back to its normal fresh-acquisition path.
+   */
+  private static async persistRunnerSessionId(
+    testId: string,
+    sessionId: string,
+    sessionSource: 'pool' | 'warmup' | 'cold' | 'dedicated',
+  ): Promise<void> {
+    try {
+      const existing = await dbAdminService.getTest(testId);
+      const options = { ...(existing?.options ?? {}), runnerSessionId: sessionId, runnerSessionSource: sessionSource };
+      await dbAdminService.updateTest(testId, { options });
+    } catch (err) {
+      logger.warn('[MOBILE-TEST] Failed to persist runner sessionId (continuation fallback will re-acquire)', {
+        testId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   private static async persistTelemetrySnapshot(
     testId: string,
     tlm: {

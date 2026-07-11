@@ -494,7 +494,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     && wantsPhysicalOrAuto;
   const useCompanionRunner = companionRequested
     && CompanionFeature.isEnabled()
-    && companionRegistry.isConnected(userId);
+    && await companionRegistry.isConnected(userId);
   if (useCompanionRunner) {
     logger.info('[MOBILE_SESSION] warmup routing through connected companion', {
       userId,
@@ -719,6 +719,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             staleSessionId: existing.sessionId,
           });
           await redisConnection.del(redisKey);
+          try { cancelIdle(userId); } catch { /* non-fatal */ }
           // Fall through to create a new session below
         } else if (
           // Audit BUG-1 fix: when the caller pinned a new
@@ -771,6 +772,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
               error: err instanceof Error ? err.message : String(err),
             });
           }
+          try { cancelIdle(userId); } catch { /* non-fatal */ }
           // Fall through to create a new session below
         } else if (
           // Routing mismatch: the cached session was born on a different runner
@@ -799,6 +801,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
               error: err instanceof Error ? err.message : String(err),
             });
           }
+          try { cancelIdle(userId); } catch { /* non-fatal */ }
           // Fall through to create a new session below
         } else if (existing.platform !== platform) {
           // Platform mismatch — the cached session's platform must match the
@@ -829,6 +832,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
               error: err instanceof Error ? err.message : String(err),
             });
           }
+          try { cancelIdle(userId); } catch { /* non-fatal */ }
           // Fall through to create a new session below
         } else {
           logger.debug('[MOBILE_SESSION] Reusing existing warmed session', {
@@ -2415,6 +2419,18 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
       return;
     }
 
+    // V-cross-app: link_test_case steps are resolved by RegressionRunService
+    // before dispatch (see link-resolution.service.ts) — this session-scoped
+    // run path has no equivalent resolution wired up. Reject explicitly
+    // rather than forwarding an unresolved step straight to the runner.
+    if (steps.some((s: any) => s?.type === 'link_test_case')) {
+      res.status(400).json({
+        success: false,
+        error: 'This test case links to another test case — trigger a regression run to test it (linked steps are not supported when running on an existing session).',
+      });
+      return;
+    }
+
     logger.info('[MOBILE_SESSION] Running test case on emulator', {
       sessionId,
       intentTestCaseId,
@@ -2737,10 +2753,13 @@ export async function explorationReadiness(req: Request, res: Response): Promise
     logger.warn('[MOBILE_SESSION] Exploration readiness probe failed', {
       error: error instanceof Error ? error.message : String(error),
     });
-    res.status(502).json({
-      success: false,
-      error: 'Runner readiness check failed',
-      message: error instanceof Error ? error.message : String(error),
+    // Route through the shared runner-error mapper instead of a blanket 502:
+    // it forwards the runner's own status (503 at-capacity, 4xx config, 410
+    // session-gone) so the launcher can tell "runner unreachable" from "runner
+    // busy". A truly unreachable runner still surfaces as its connection error.
+    sendMobileRunnerError(res, error, 'Runner readiness check failed', {
+      userId: req.user.id,
+      surfacedBy: 'exploration_readiness',
     });
   }
 }

@@ -1,6 +1,8 @@
 import {
   collectSecretValues,
+  redactCredentialValues,
   redactSecrets,
+  redactSnapshotValues,
   redactWithValues,
 } from '../redact-secrets';
 
@@ -118,5 +120,83 @@ describe('redactWithValues', () => {
 
   it('returns input unchanged when list is empty', () => {
     expect(redactWithValues('hello', [])).toBe('hello');
+  });
+});
+
+describe('redactSnapshotValues', () => {
+  it('returns undefined when snapshot is null/undefined', () => {
+    expect(redactSnapshotValues(null, ['secretvalue'])).toBeUndefined();
+    expect(redactSnapshotValues(undefined, ['secretvalue'])).toBeUndefined();
+  });
+
+  it('returns undefined when there are no secret values (cheap no-op path)', () => {
+    expect(redactSnapshotValues({ orderId: 'abc123' }, [])).toBeUndefined();
+  });
+
+  it('returns undefined when nothing in the snapshot matches a secret', () => {
+    expect(redactSnapshotValues({ orderId: 'abc123' }, ['sk_test_xyz'])).toBeUndefined();
+  });
+
+  it('masks a matching value and reports its key as redacted', () => {
+    const result = redactSnapshotValues(
+      { apiToken: 'sk_test_secretvalue', orderId: 'abc123' },
+      ['sk_test_secretvalue'],
+    );
+    expect(result).toEqual({
+      snapshot: { apiToken: '***', orderId: 'abc123' },
+      redactedKeys: ['apiToken'],
+    });
+  });
+
+  it('masks every key whose value contains a secret, leaves others untouched', () => {
+    const result = redactSnapshotValues(
+      {
+        greeting: 'hello sk_test_secretvalue world',
+        token: 'sk_test_secretvalue',
+        plain: 'nothing sensitive here',
+      },
+      ['sk_test_secretvalue'],
+    );
+    expect(result?.snapshot).toEqual({
+      greeting: 'hello *** world',
+      token: '***',
+      plain: 'nothing sensitive here',
+    });
+    expect(result?.redactedKeys.sort()).toEqual(['greeting', 'token']);
+  });
+
+  it('does not mutate the input snapshot object', () => {
+    const input = { apiToken: 'sk_test_secretvalue' };
+    const result = redactSnapshotValues(input, ['sk_test_secretvalue']);
+    expect(input.apiToken).toBe('sk_test_secretvalue');
+    expect(result?.snapshot).not.toBe(input);
+  });
+});
+
+describe('redactCredentialValues', () => {
+  it('returns input unchanged on the no-creds path', () => {
+    expect(redactCredentialValues('plain text', null)).toBe('plain text');
+    expect(redactCredentialValues('plain text', undefined)).toBe('plain text');
+    expect(redactCredentialValues('plain text', {})).toBe('plain text');
+  });
+
+  it('masks each configured credential value echoed into a string', () => {
+    const out = redactCredentialValues('user user@acme.io failed with hunter2pw', {
+      email: 'user@acme.io',
+      password: 'hunter2pw',
+    });
+    expect(out).not.toContain('user@acme.io');
+    expect(out).not.toContain('hunter2pw');
+  });
+
+  it('masks the longer value fully when a shorter value is its substring', () => {
+    // username "johndoe" is a prefix of email "johndoe@acme.io" — longest-first
+    // ordering must mask the email whole, leaving no "@acme.io" tail exposed.
+    const out = redactCredentialValues('contact johndoe@acme.io now', {
+      username: 'johndoe',
+      email: 'johndoe@acme.io',
+    });
+    expect(out).not.toContain('@acme.io');
+    expect(out).toBe('contact *** now');
   });
 });

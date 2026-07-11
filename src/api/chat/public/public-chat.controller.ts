@@ -171,11 +171,30 @@ export async function handlePublicChat(req: Request, res: Response): Promise<voi
     });
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    logger.error('[PUBLIC_CHAT] LLM call failed', { error: errMsg });
-    res.status(502).json({
-      success: false,
-      error: 'Assistant is temporarily unavailable',
-      debug: errMsg,
-    });
+    // openai.service enriches thrown errors with `.status` = the real upstream
+    // HTTP code (openai.service.ts:456). Map it honestly instead of flattening
+    // EVERYTHING to 502: a 502 wrongly tells the client "our gateway is down"
+    // for what is really a rate limit, a bad prompt, or our own key being bad.
+    const upstreamStatus = typeof (err as { status?: unknown })?.status === 'number'
+      ? (err as { status: number }).status
+      : undefined;
+    logger.error('[PUBLIC_CHAT] LLM call failed', { error: errMsg, upstreamStatus });
+
+    if (upstreamStatus === 429) {
+      // Rate limited upstream — the client should back off, not think we're down.
+      res.status(429).json({ success: false, error: 'Assistant is busy, please retry shortly.' });
+    } else if (upstreamStatus !== undefined && upstreamStatus >= 400 && upstreamStatus < 500) {
+      // Bad request / auth from the model call. That's not a gateway failure;
+      // surface a 500 (our own problem — prompt shape or credentials), not 502.
+      res.status(500).json({ success: false, error: 'Assistant could not process the request.' });
+    } else {
+      // 5xx from the model, a timeout, or a network error to it → the upstream
+      // really is unavailable. 503 (service unavailable) is the honest code.
+      res.status(503).json({
+        success: false,
+        error: 'Assistant is temporarily unavailable',
+        debug: errMsg,
+      });
+    }
   }
 }

@@ -45,6 +45,11 @@ const router = Router();
  *           type: string
  *           enum: [web_ui, api]
  *       - in: query
+ *         name: parentModuleId
+ *         description: Filter by parent folder. "null" = top-level only, a UUID = children of that folder.
+ *         schema:
+ *           type: string
+ *       - in: query
  *         name: limit
  *         schema:
  *           type: integer
@@ -84,6 +89,10 @@ const router = Router();
  *                 type: string
  *                 enum: [web_ui, api]
  *                 description: Platform key (required if platformId not provided)
+ *               parentModuleId:
+ *                 type: string
+ *                 format: uuid
+ *                 description: Parent folder id. Omit for a top-level folder. Nesting capped at 3 levels.
  *               name:
  *                 type: string
  *               description:
@@ -150,6 +159,10 @@ router.post('/reorder', requireAuth, reorderModules);
  *                   type: string
  *               priority:
  *                 type: string
+ *               parentModuleId:
+ *                 type: string
+ *                 nullable: true
+ *                 description: Re-parent (move) the folder. null = move to top level, a UUID = move under that folder. Omit to leave unchanged.
  *     responses:
  *       200:
  *         description: Module updated

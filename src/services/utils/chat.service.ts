@@ -891,16 +891,32 @@ export class ChatService {
         title = 'New Chat';
       }
 
-      // Update session title
-      const { error: updateError } = await supabaseAdmin
+      // Update session title ONLY if it's still the default. A user can rename
+      // a session (updateChatTitle); without this guard the next message's
+      // auto-title would silently overwrite that rename. Mirrors the test-case
+      // path's updateTitleIfDefault. The default is NULL (the INSERT omits
+      // title, the column has no default) OR the literal 'New Chat' fallback —
+      // guard on both, else a bare title='New Chat' never matches a fresh
+      // session and auto-title never runs. See BUG-2.
+      const { data: updatedRows, error: updateError } = await supabaseAdmin
         .from('chat_sessions')
         .update({ title })
-        .eq('id', sessionId);
+        .eq('id', sessionId)
+        .or('title.is.null,title.eq.New Chat')
+        .select('id');
 
       if (updateError) {
         logger.error('[CHAT_SERVICE] Failed to update auto-generated title', {
           error: updateError instanceof Error ? updateError.message : String(updateError),
           code: updateError.code,
+          sessionId,
+        });
+        return null;
+      }
+
+      // No row updated → the user had renamed the session. Leave it untouched.
+      if (!Array.isArray(updatedRows) || updatedRows.length === 0) {
+        logger.info('[CHAT_SERVICE] Skipped auto-title — session already has a custom title', {
           sessionId,
         });
         return null;

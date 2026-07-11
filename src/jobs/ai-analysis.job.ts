@@ -437,6 +437,15 @@ export class AIAnalysisJobHandler {
         bugsCount: bugs.length,
         criticalCount: criticalBugs.length,
       });
+
+      // Telegram: non-critical analyses that found issues. A 0-bug "all clear"
+      // result stays in-app only (not actionable enough for a push notification).
+      // Critical bugs are EXCLUDED here — handleCriticalIssues (elsewhere in
+      // this job) already sends its own dedicated Telegram message for those,
+      // so this would otherwise double-notify the user for the same analysis.
+      if (bugs.length > 0 && criticalBugs.length === 0) {
+        await this.sendAIAnalysisTelegramNotification(userId, testId, bugs.length, confidencePct);
+      }
     } catch (error) {
       logger.error('[AI-ANALYSIS] Failed to create background AI notifications', {
         error: error instanceof Error ? error.message : String(error),
@@ -444,6 +453,43 @@ export class AIAnalysisJobHandler {
         testResultId,
       });
       // Don't throw - notification failure shouldn't break AI analysis
+    }
+  }
+
+  /**
+   * Send Telegram notification for a completed AI analysis that found
+   * issues (any severity). Best-effort — logs and swallows on failure.
+   */
+  private static async sendAIAnalysisTelegramNotification(
+    userId: string,
+    testId: string,
+    bugsCount: number,
+    confidencePct: number
+  ): Promise<void> {
+    try {
+      const { getTelegramToken, sendTelegramNotification } = await import('@/utils/notifications/telegram-notify');
+      const tokenData = await getTelegramToken(userId);
+      if (!tokenData?.external_id) {
+        return;
+      }
+
+      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+      await sendTelegramNotification(tokenData, {
+        icon: '🤖',
+        title: 'AI analysis completed',
+        fields: [
+          { label: 'Issues found', value: String(bugsCount) },
+          { label: 'Confidence', value: `${confidencePct}%` },
+        ],
+        ctaLabel: 'View AI analysis →',
+        ctaUrl: `${frontendUrl}/tests/${testId}`,
+      });
+
+      logger.info(`[AI-ANALYSIS] Sent Telegram notification for analysis completion: ${testId}`);
+    } catch (error) {
+      logger.warn(`[AI-ANALYSIS] Failed to send Telegram notification for analysis completion ${testId}:`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -563,6 +609,15 @@ export class AIAnalysisJobHandler {
    * Convert database result to TestResult type
    */
   private static convertToTestResult(dbResult: any) {
+    // Mobile runs store their rich per-step evidence (device logcat, WebView
+    // CDP console/network errors, system alerts, per-step error classification)
+    // under metadata.steps[].evidence — NOT in the flat errors/logs/network_logs
+    // columns the analyzer reads. Without folding it in, mobile bug detection
+    // ran on a screenshot + a generic "element not found" string. Merge that
+    // evidence into the SAME channels the analyzer already consumes (errors /
+    // logs / networkLogs) so no analyzer or prompt change is needed.
+    const mobileEvidence = this.extractMobileEvidence(dbResult);
+
     return {
       id: dbResult.id,
       testId: dbResult.test_id,
@@ -570,9 +625,9 @@ export class AIAnalysisJobHandler {
       status: dbResult.status,
       screenshot: dbResult.screenshot,
       dom: dbResult.dom,
-      logs: dbResult.logs || [],
-      networkLogs: dbResult.network_logs || [],
-      errors: dbResult.errors || [],
+      logs: [...(dbResult.logs || []), ...mobileEvidence.logs],
+      networkLogs: [...(dbResult.network_logs || []), ...mobileEvidence.networkLogs],
+      errors: [...(dbResult.errors || []), ...mobileEvidence.errors],
       performance: dbResult.performance,
       qualityChecks: dbResult.quality_checks,
       aiSummary: dbResult.ai_summary,
@@ -581,6 +636,81 @@ export class AIAnalysisJobHandler {
       createdAt: new Date(dbResult.created_at),
       completedAt: dbResult.completed_at ? new Date(dbResult.completed_at) : undefined,
     };
+  }
+
+  /**
+   * Fold mobile per-step evidence (metadata.steps[].evidence / errorClassification)
+   * into the flat error/log/network channels the analyzer reads. No-op for web
+   * results (no metadata.platform === 'mobile'). Best-effort — any shape mismatch
+   * is swallowed so a malformed step never breaks analysis.
+   */
+  private static extractMobileEvidence(dbResult: any): {
+    errors: string[];
+    logs: string[];
+    networkLogs: any[];
+  } {
+    const out = { errors: [] as string[], logs: [] as string[], networkLogs: [] as any[] };
+    try {
+      const meta = dbResult?.metadata;
+      if (!meta || meta.platform !== 'mobile' || !Array.isArray(meta.steps)) return out;
+
+      meta.steps.forEach((step: any, idx: number) => {
+        const label = `Step ${idx + 1}${step?.stepId ? ` (${step.stepId})` : ''}`;
+        const ev = step?.evidence;
+
+        // Per-step classification is the analyzer's strongest signal: it already
+        // names the failure kind (app_crash / anr / network_error / …) with a
+        // one-line summary. Surface it as a high-signal error line.
+        const cls = step?.errorClassification;
+        if (cls?.type && cls.type !== 'unknown') {
+          out.errors.push(`${label}: [${cls.type}] ${cls.summary || 'classified failure'}`);
+        }
+
+        if (ev) {
+          // Device logcat / iOS syslog lines → logs channel.
+          if (Array.isArray(ev.logErrors)) {
+            for (const line of ev.logErrors) out.logs.push(`${label} device: ${line}`);
+          }
+          // WebView JS console errors/exceptions → errors channel.
+          if (Array.isArray(ev.consoleErrors)) {
+            for (const c of ev.consoleErrors) {
+              out.errors.push(`${label} console ${c.type}: ${c.message}${c.source ? ` (${c.source}${c.line ? `:${c.line}` : ''})` : ''}`);
+            }
+          }
+          // WebView network failures → networkLogs channel (analyzer truncates).
+          if (Array.isArray(ev.networkErrors)) {
+            for (const n of ev.networkErrors) {
+              out.networkLogs.push({ url: n.url, method: n.method, status: n.status, statusText: n.statusText, error: n.error });
+            }
+          }
+          // On-screen error alert/toast → errors channel.
+          if (ev.systemAlert?.isError && ev.systemAlert.text) {
+            out.errors.push(`${label} alert: ${ev.systemAlert.text}`);
+          }
+        }
+
+        // Per-step AI visual issues (text truncation, overlap, contrast, blank
+        // screen, …) → high-signal errors channel so the analyzer reasons over
+        // them alongside functional failures. Sibling of evidence on the step.
+        const visualIssues = step?.visualIssues;
+        if (Array.isArray(visualIssues)) {
+          for (const v of visualIssues as Array<Record<string, unknown>>) {
+            const sev = v.severity === 'critical' ? 'CRITICAL' : 'warning';
+            const desc = typeof v.description === 'string' ? v.description : '';
+            if (!desc) continue;
+            out.errors.push(
+              `${label} visual-issue (${sev}) [${v.type ?? 'other'}]: ${desc}` +
+              (typeof v.location === 'string' && v.location ? ` @ ${v.location}` : ''),
+            );
+          }
+        }
+      });
+    } catch (err) {
+      logger.debug('[AI-ANALYSIS] extractMobileEvidence failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return out;
   }
 
   /**

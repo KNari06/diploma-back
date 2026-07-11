@@ -21,6 +21,48 @@ import { AutomationActionService } from '@/services/automation/automation-action
 import { getProjectWorkspaceMemberIds } from '@/services/testing/regression/regression-report-assembler.service';
 import * as crypto from 'crypto';
 
+const STALE_RUN_THRESHOLD_MS = 30 * 60 * 1000;
+
+/**
+ * Pure predicate: has `iso` aged past `thresholdMs` relative to `nowMs`?
+ * `false` for a missing/unparseable timestamp (fails safe — treated as "not
+ * old enough to judge" rather than silently misjudging an anomaly either
+ * way; the DB columns this is used against are TIMESTAMPTZ, always written
+ * as `new Date().toISOString()`, so a malformed value isn't reachable through
+ * any current write path). Shared by every "has this run/execution been
+ * running too long" check in this file — previously duplicated inline three
+ * times with the same three lines each.
+ */
+function isTimestampStale(iso: string | null | undefined, nowMs: number, thresholdMs: number): boolean {
+  const ms = iso ? new Date(iso).getTime() : 0;
+  return ms > 0 && ms < nowMs - thresholdMs;
+}
+
+/**
+ * Pure predicate for `recomputeRunStatus`'s pending-segments staleness check —
+ * extracted so it's directly unit-testable without mocking Supabase (this
+ * file has no `db/` sublayer yet to mock against instead, per testing.md's
+ * mock-boundary rule).
+ *
+ * Anchors on the CURRENT segment's own clock (`last_segment_dispatched_at`,
+ * reset every time a segment dispatches — see `regression-run.service.ts` and
+ * the `20260707_regression_runs_pending_segments.sql` migration), not the
+ * chain's `started_at`. A chain-wide clock false-positives on a legitimately
+ * long chain: each segment's own poll budget is already 10 minutes
+ * (`MAX_WAIT_MS` in `linked-test-case-runner.service.ts`), so a 3+ segment
+ * chain (or slow mobile cold starts) can exceed 30 minutes in aggregate while
+ * the CURRENT segment is still genuinely executing (ADR-0011 update 6).
+ * Falls back to `started_at` for a segmented run that predates the new
+ * column, or any non-segmented run (this branch is a no-op for those either
+ * way, since it's only consulted when `pending_segments > 0`).
+ */
+export function isPendingSegmentsStale(
+  run: { started_at?: string | null; last_segment_dispatched_at?: string | null },
+  nowMs: number,
+): boolean {
+  return isTimestampStale(run.last_segment_dispatched_at ?? run.started_at, nowMs, STALE_RUN_THRESHOLD_MS);
+}
+
 /**
  * ═══════════════════════════════════════════════════════════════════════════
  * TEST COMPLETION HANDLER SERVICE - Post-test completion pipeline
@@ -377,12 +419,53 @@ export class TestCompletionHandlerService {
         userId: test.user_id,
         status: test.status,
       });
+
+      // Telegram: failures/cancellations only — mirrors the ad-hoc-test
+      // Telegram behavior in manual-test-run.job.ts (failure-only, no
+      // success spam). Best-effort, never breaks the completion path.
+      if (status === 'failed' || status === 'cancelled') {
+        await this.sendBackgroundTestTelegramNotification(test.user_id, title, message, test.id);
+      }
     } catch (error) {
       logger.error('[TEST_COMPLETION] Failed to create background test notification', {
         error: error instanceof Error ? error.message : String(error),
         testId: test.id,
       });
       // Don't throw - notification failure shouldn't break test completion
+    }
+  }
+
+  /**
+   * Send Telegram notification for a background/ad-hoc single-test failure
+   * or cancellation. Failures are logged but never thrown.
+   */
+  private static async sendBackgroundTestTelegramNotification(
+    userId: string,
+    title: string,
+    message: string,
+    testId: string
+  ): Promise<void> {
+    try {
+      const tokenData = await getTelegramToken(userId);
+      if (!tokenData || !tokenData.external_id) {
+        return;
+      }
+
+      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+      const htmlMessage = `<b>${escTg(title)}</b>\n\n${escTg(message)}\n\n<a href="${escTg(`${frontendUrl}/tests/${testId}`)}">View test</a>`;
+
+      await sendTelegramMessage(tokenData.access_token, tokenData.external_id, htmlMessage, 'HTML');
+
+      logger.info('[TEST_COMPLETION] Sent Telegram notification for background test', {
+        userId,
+        testId,
+      });
+    } catch (error) {
+      logger.warn('[TEST_COMPLETION] Failed to send Telegram notification for background test', {
+        error: error instanceof Error ? error.message : String(error),
+        userId,
+        testId,
+      });
     }
   }
 
@@ -553,12 +636,12 @@ export class TestCompletionHandlerService {
       const [directResult, batchResult, execResult] = await Promise.all([
         supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at, summary')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at, summary, pending_segments, last_segment_dispatched_at')
           .eq('test_id', testId)
           .in('status', ['running', 'pending']),
         supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at, summary')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at, summary, pending_segments, last_segment_dispatched_at')
           .filter('test_ids', 'cs', `["${testId}"]`)
           .in('status', ['running', 'pending']),
         // Fallback: find via test_executions table (most reliable for plan runs)
@@ -579,7 +662,7 @@ export class TestCompletionHandlerService {
       if (execRunId && !runMap.has(execRunId)) {
         const { data: execRun } = await supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at, summary')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at, summary, pending_segments, last_segment_dispatched_at')
           .eq('id', execRunId)
           .in('status', ['running', 'pending'])
           .maybeSingle();
@@ -960,9 +1043,7 @@ export class TestCompletionHandlerService {
             statuses = (freshExecs || []).map((e: any) => e.status);
           } else {
             // Check if stuck executions are older than 30 minutes — force-fail them
-            const thirtyMinutesAgo = Date.now() - 30 * 60 * 1000;
-            const runStarted = run.started_at ? new Date(run.started_at).getTime() : 0;
-            const isStale = runStarted > 0 && runStarted < thirtyMinutesAgo;
+            const isStale = isTimestampStale(run.started_at, Date.now(), STALE_RUN_THRESHOLD_MS);
 
             if (isStale) {
               logger.warn('[TEST_COMPLETION] Force-failing stuck executions for stale run', {
@@ -1238,6 +1319,37 @@ export class TestCompletionHandlerService {
         return;
       }
 
+      // V-cross-app segmented-chain awareness: a single-test-case run
+      // (`RegressionRunService.runSavedTestCase`) dispatching a cross-
+      // platform `link_test_case` chain never gets `test_executions` rows
+      // (those are plan/module/flow only — see the branch above), so it
+      // always reaches this legacy path keyed on `run.test_id` alone. Mid-
+      // chain, `test_id` points at whichever segment dispatched most
+      // recently — that segment going terminal does NOT mean the run is
+      // done while more segments haven't even dispatched yet. See
+      // DECISIONS.md ADR-0011 addendum for the full incident writeup.
+      if ((run.pending_segments ?? 0) > 0) {
+        const isStale = isPendingSegmentsStale(run, Date.now());
+
+        if (!isStale) {
+          logger.debug('[TEST_COMPLETION] Run still has pending segments — deferring finalization', {
+            runId: run.id,
+            pendingSegments: run.pending_segments,
+          });
+          return;
+        }
+
+        // Stale — same 30-minute cutoff the stuck-execution/stuck-test
+        // branches above use. The detached continuation is presumed dead;
+        // fall through and finalize on whatever `test_id` currently points
+        // at rather than leaving the row 'running' forever with no future
+        // trigger to finalize it.
+        logger.warn('[TEST_COMPLETION] Finalizing stale run despite pending segments', {
+          runId: run.id,
+          pendingSegments: run.pending_segments,
+        });
+      }
+
       let underlyingTestIds: string[] = [];
 
       // Determine which test IDs to check
@@ -1282,9 +1394,7 @@ export class TestCompletionHandlerService {
 
       if (hasRunning) {
         // Check if run is stale (>30 min) — force-fail stuck tests
-        const thirtyMinutesAgo = Date.now() - 30 * 60 * 1000;
-        const runStarted = run.started_at ? new Date(run.started_at).getTime() : 0;
-        const isStale = runStarted > 0 && runStarted < thirtyMinutesAgo;
+        const isStale = isTimestampStale(run.started_at, Date.now(), STALE_RUN_THRESHOLD_MS);
 
         if (!isStale) {
           logger.debug('[TEST_COMPLETION] Run still has running tests', {

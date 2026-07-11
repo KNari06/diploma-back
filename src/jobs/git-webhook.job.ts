@@ -1,10 +1,12 @@
 import { Job } from 'bullmq';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { env } from '@/config/environment/env';
 
 import { GitWebhookService } from '@/services/integrations/git-webhook.service';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
+import { getTelegramToken, sendTelegramNotification } from '@/utils/notifications/telegram-notify';
 
 export class GitWebhookJobHandler {
   static async process(
@@ -180,6 +182,8 @@ export class GitWebhookJobHandler {
           error: errorMessage,
         });
 
+        const insufficientCreditsMessage = `Your ${provider} webhook triggered a test run but failed due to insufficient credits. Please add credits to continue.`;
+
         // Create in-app notification
         try {
           await NotificationService.createNotification({
@@ -187,7 +191,7 @@ export class GitWebhookJobHandler {
             type: 'personal',
             category: 'billing',
             title: 'Insufficient credits for CI run',
-            message: `Your ${provider} webhook triggered a test run but failed due to insufficient credits. Please add credits to continue.`,
+            message: insufficientCreditsMessage,
             metadata: {
               provider,
               deliveryId,
@@ -205,6 +209,25 @@ export class GitWebhookJobHandler {
         } catch (notifError) {
           logger.error('[GIT_WEBHOOK_JOB] Failed to create insufficient credits notification', {
             error: notifError instanceof Error ? notifError.message : String(notifError),
+            userId: project.user_id,
+          });
+        }
+
+        try {
+          const tokenData = await getTelegramToken(project.user_id);
+          if (tokenData?.external_id) {
+            const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+            await sendTelegramNotification(tokenData, {
+              icon: '⚠️',
+              title: 'Insufficient credits for CI run',
+              fields: [{ label: 'Provider', value: provider }],
+              ctaLabel: 'View billing →',
+              ctaUrl: `${frontendUrl}/billing`,
+            });
+          }
+        } catch (tgError) {
+          logger.warn('[GIT_WEBHOOK_JOB] Failed to send Telegram notification for insufficient credits', {
+            error: tgError instanceof Error ? tgError.message : String(tgError),
             userId: project.user_id,
           });
         }

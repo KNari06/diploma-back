@@ -82,6 +82,14 @@ export interface OverlayCleanupResult {
 /** Max iterations for loading wait loop */
 const MAX_LOADING_WAIT_ITERATIONS = 5;
 
+/**
+ * Keyboard key used to dismiss a dialog/overlay. Exported as the single source
+ * so the dismissal-as-step mapping ([overlay-step.util.ts]) emits the exact
+ * key this dismisser presses — no divergence between what we did and what we
+ * record for replay.
+ */
+export const ESCAPE_KEY = 'Escape';
+
 // Loading delay replaced by network idle + VisualStability smart wait
 
 /**
@@ -511,7 +519,7 @@ export class OverlayDismisser {
    * Adapted from ActionExecutor.tryDismissWithEscape().
    */
   private static async tryEscape(page: Page): Promise<boolean> {
-    await page.keyboard.press('Escape');
+    await page.keyboard.press(ESCAPE_KEY);
     await waitForDomSettle(page);
     return !(await this.isModalPresent(page));
   }

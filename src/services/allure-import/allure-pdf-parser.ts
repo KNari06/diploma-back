@@ -131,10 +131,11 @@ Extract any Jira issue keys (e.g. MFT-1003, MGOSAPP-4268) and convert to full UR
 
 ## Rules
 1. Each distinct test case becomes one entry — do NOT merge different test cases
-2. Preserve the original language (do NOT translate)
-3. Skip header/footer lines like "1 of 8 Test Cases", "TestCases report", "Created by..."
-4. If the text chunk has no test cases, return {"testCases": []}
-5. Return ONLY the JSON, no markdown fences`;
+2. Include EVERY numbered step of a test case — never drop, merge, or summarize steps. N numbered steps in the source must produce N entries in "steps". These steps go into the test case as-is (no later cleanup pass).
+3. Preserve the original language (do NOT translate)
+4. Skip header/footer lines like "1 of 8 Test Cases", "TestCases report", "Created by..."
+5. If the text chunk has no test cases, return {"testCases": []}
+6. Return ONLY the JSON, no markdown fences`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Text extraction

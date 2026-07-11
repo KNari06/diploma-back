@@ -46,6 +46,14 @@ export async function routeToHandler(
      * that may emit further WS traffic can target the right room.
      */
     testCaseId?: string;
+    /**
+     * Controller-resolved project (from the test-case access check). Threaded
+     * to handlers that need it without a second lookup — the mobile agent's
+     * save tool uses it so it doesn't dead-end on the chat_sessions lookup.
+     */
+    projectId?: string;
+    /** Test case's access-checked project id (test-case scope only). See BUG-1. */
+    testCaseProjectId?: string;
   }
 ): Promise<void> {
   // ═══════════════════════════════════════════════════════════════════════
@@ -115,6 +123,8 @@ export async function routeToHandler(
     // (TypeScript widens IntentHandlerParams below to accept extras).
     chatStore: params.chatStore,
     testCaseId: params.testCaseId,
+    projectId: params.projectId,
+    testCaseProjectId: params.testCaseProjectId,
   });
 }
 

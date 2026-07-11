@@ -34,6 +34,7 @@ export async function createTest(testRequest: TestRunRequest): Promise<Test> {
     project_id: validProjectId,
     user_id: userId,
     status: 'pending' as const,
+    regression_run_id: testRequest.regressionRunId ?? null,
     browsers: testRequest.browsers,
     // Persist execution mode inside options (tests table has no dedicated mode column).
     // This allows retries and downstream flows to preserve user's mode choice.

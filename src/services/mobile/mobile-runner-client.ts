@@ -579,6 +579,9 @@ export class MobileRunnerClient {
        *  reach the runner and free its session mutex. */
       signal?: AbortSignal;
       userId?: string;
+      /** App build versionCode — scopes the runner's resolver cache key so a
+       *  cached pick from a different build isn't replayed against this one. */
+      appVersionCode?: number;
     },
   ): Promise<MobileRunStepsResponse> {
     const body: MobileRunStepsRequest = {
@@ -589,6 +592,7 @@ export class MobileRunnerClient {
       // Only attach when present so a no-trigger run sends a byte-identical
       // body to pre-trigger behaviour (the runner schema treats it optional).
       ...(opts?.triggers && opts.triggers.length > 0 ? { triggers: opts.triggers } : {}),
+      ...(typeof opts?.appVersionCode === 'number' ? { appVersionCode: opts.appVersionCode } : {}),
     };
 
     return this.request<MobileRunStepsResponse>(
@@ -1094,7 +1098,12 @@ export class MobileRunnerClient {
           let runnerReason: string | undefined;
           if (errorBody) {
             try {
-              const parsed = JSON.parse(errorBody) as { code?: string; error?: string; reason?: string };
+              const parsed = JSON.parse(errorBody) as {
+                code?: string;
+                error?: string;
+                reason?: string;
+                details?: Array<{ path?: string; message?: string }>;
+              };
               if (typeof parsed.code === 'string' && parsed.code) {
                 runnerCode = parsed.code;
               }
@@ -1105,6 +1114,32 @@ export class MobileRunnerClient {
               // the editor expiry trace to record WHY the session vanished.
               if (typeof parsed.reason === 'string' && parsed.reason) {
                 runnerReason = parsed.reason;
+              }
+              // The runner's zod validation middleware (`validate.middleware.ts`)
+              // returns `{error:'Validation failed', details:[{path,message}]}`
+              // with no `code`. The internal schema field paths in `details`
+              // (e.g. `body.steps[3].options.linkTestCase.linkedTestCaseId:
+              // Required`) are invaluable for root-causing the rejection
+              // without a temporary log + reproduction — but they're
+              // implementation detail no end user has context for, so they
+              // are logged here (server-side only) and never folded into
+              // `runnerMessage`, which flows verbatim into user-facing
+              // failure copy (mobile-error-mapper.ts, mobile-test-run.job.ts).
+              if (Array.isArray(parsed.details) && parsed.details.length > 0) {
+                const detail = parsed.details
+                  .map((d) => [d.path, d.message].filter(Boolean).join(': '))
+                  .filter(Boolean)
+                  .join('; ');
+                if (detail) {
+                  logger.warn('[MOBILE_CLIENT] Runner rejected request: validation failed', {
+                    url,
+                    method,
+                    details: detail,
+                  });
+                  runnerMessage = runnerMessage
+                    ? `${runnerMessage}: invalid step configuration`
+                    : 'Invalid step configuration';
+                }
               }
             } catch {
               // Body wasn't JSON — fall back to raw text below.

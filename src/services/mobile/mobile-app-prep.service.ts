@@ -432,10 +432,22 @@ export class MobileAppPrepService {
           skipLaunch: skipLaunch === true,
         });
         emit('launching_app', 80);
-        if (!skipLaunch) {
-          // Hard reset on every prep: `pm clear --user N` wipes the app's
-          // data dir + revokes runtime perms (auto-re-granted by the runner
-          // per session policy), then cold-launch lands on first-run UI.
+        // Hard reset on every prep, REGARDLESS of skipLaunch: `pm clear
+        // --user N` wipes the app's data dir + revokes runtime perms
+        // (auto-re-granted by the runner per session policy). `skipLaunch`
+        // means the CALLER launches (the Flutter path — attachFlutter does
+        // its own force-stop + launch to land the VM-Service scan window
+        // correctly), but attachFlutter's force-stop is process-level only
+        // and never wipes data — so skipping the wipe here left every
+        // regression run against an already-installed Flutter app inheriting
+        // the previous run's logged-in/onboarded state forever (confirmed
+        // 2026-07-06: this is what kept "Password login (flutter)" stuck on
+        // a logged-in screen across every dispatch — see LESSONS.md L-0009).
+        if (skipLaunch) {
+          await time('branch1_close_only', () => client.executeBatchCommands(sessionId, [
+            { type: 'close_app', params: { packageName: cachedPackage, hard: true } },
+          ], { timeoutMs: 60_000, userId }));
+        } else {
           // 60s budget: pm clear 5–15s + cold am start with first-launch dex
           // opt 10–20s = ~15-35s typical. Tighter than the legacy 90s so the
           // user sees a clear failure faster when the runner is wedged
@@ -502,11 +514,17 @@ export class MobileAppPrepService {
           skipLaunch: skipLaunch === true,
         });
         emit('launching_app', 80);
-        if (!skipLaunch) {
-          // Same hard-reset as the Redis fast path above — keeps the prep
-          // contract consistent: every successful prep leaves the app in
-          // a freshly-data-wiped state regardless of which install
-          // branch fired. Same 60s budget as branch 1.
+        // Same hard-reset as the Redis fast path above, and same fix: the
+        // wipe runs regardless of skipLaunch — see branch 1's comment for
+        // why (attachFlutter's own relaunch never clears data on its own).
+        if (skipLaunch) {
+          await time('branch2_close_only', () => client.executeBatchCommands(sessionId, [
+            { type: 'close_app', params: { packageName: knownPackage, hard: true } },
+          ], { timeoutMs: 60_000, userId }));
+        } else {
+          // Keeps the prep contract consistent: every successful prep
+          // leaves the app in a freshly-data-wiped state regardless of
+          // which install branch fired. Same 60s budget as branch 1.
           await time('branch2_close_launch', () => client.executeBatchCommands(sessionId, [
             { type: 'close_app', params: { packageName: knownPackage, hard: true } },
             { type: 'launch_app', params: { packageName: knownPackage } },

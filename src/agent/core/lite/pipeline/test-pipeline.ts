@@ -47,6 +47,8 @@ import type { LiteTraceWriter } from '../trace/lite-trace-writer';
 import { checkTestCancelled, withCancellation } from '../../../playwright/utils/test-cancellation-checker';
 import { SupervisorAgent } from '../agents/supervisor-agent';
 import type { MultiAgentInput } from '../agents/types';
+import { PreflightCheckAgent } from './preflight-agent';
+import { env } from '@/config/environment/env';
 
 import { TestBlackboard } from './blackboard';
 import { CommandExecutor, type CommandExecutorIntegrations } from './command-executor';
@@ -109,6 +111,16 @@ export class TestPipeline {
   private static readonly MAX_SAME_STATE_ROUNDS = 3;
 
   /**
+   * Consecutive PreflightCheck 'revise' verdicts. A 'revise' replans without
+   * executing — if the Planner keeps producing a plan the gate rejects, this
+   * would loop forever burning rounds. After MAX_PREFLIGHT_REVISES in a row we
+   * stop revising and let the plan run (the Reviewer catches it post-hoc), so
+   * the gate can never itself become the loop it exists to prevent.
+   */
+  private consecutivePreflightRevises: number = 0;
+  private static readonly MAX_PREFLIGHT_REVISES = 2;
+
+  /**
    * PR-Hybrid: SupervisorAgent instance, created lazily when
    * enableHybridSafety is true. ONE instance per run — state (interventionCount,
    * stateHashes, knownGoodUrls, tier2InvocationCount) accumulates across
@@ -155,6 +167,22 @@ export class TestPipeline {
     // PR-Hybrid: propagate goalUrl into blackboard for Supervisor wrong-page detection
     if (config.goalUrl) {
       this.blackboard.setGoalUrl(config.goalUrl);
+    }
+
+    // Seed the Planner's contextual hints with the Cartographer's page
+    // understanding (forms/entities) so round 1 plans against known structure
+    // instead of re-deriving it from raw DOM. GoalDetector replaces hints in
+    // later rounds (per-round navigation guidance), by which point the Planner
+    // also has the live snapshot — so seeding once, up front, is the right scope.
+    if (config.pageInsightContext) {
+      this.blackboard.setContextualHints([config.pageInsightContext]);
+    }
+
+    // Seed cross-flow learnings (what sibling flows accomplished / got blocked
+    // on + active strategy). Read-only, set once — the Planner reuses solved
+    // obstacles instead of re-hitting a dead end another flow already found.
+    if (config.priorLearnings) {
+      this.blackboard.setPriorLearnings(config.priorLearnings);
     }
 
     // PR-Hybrid: Create SupervisorAgent ONCE per run when hybrid safety is on.
@@ -271,6 +299,9 @@ export class TestPipeline {
         // ════════════════════════════════════════════════════════════
 
         this.blackboard.setPhase('planning');
+        // Give the Planner budget awareness so it can change strategy or give
+        // up when rounds run low (closes the "stuck at low progress" link).
+        this.blackboard.setRoundInfo(pipelineRound, maxRounds);
         this.emitProgress(
           pipelineRound,
           maxRounds,
@@ -300,6 +331,55 @@ export class TestPipeline {
           summary: plan.summary.slice(0, 60),
           steps: plan.steps.length,
         });
+
+        // ════════════════════════════════════════════════════════════
+        // STEP 1.5: PREFLIGHT CHECK — pre-action gate (before Executor)
+        // Inspects the plan BEFORE it runs so a doomed round (repeat dead end,
+        // hallucinated ref, unreachable goal) is caught proactively instead of
+        // only by the reactive Reviewer after a wasted round. Exploration-only,
+        // flag-gated, best-effort (fail-open → 'go'). See preflight-agent.ts.
+        // ════════════════════════════════════════════════════════════
+        if (env.EXPLORATION_PREFLIGHT_ENABLED) {
+          const preflight = await withCancellation(
+            config.testId,
+            PreflightCheckAgent.inspect(this.blackboard, this.integrations.traceWriter),
+            'preflight_check',
+          );
+
+          if (preflight.verdict === 'block') {
+            this.blackboard.addInsight(`Preflight gate: ${preflight.reason}`);
+            this.blackboard.setPhase('blocked');
+            this.trace('preflight_block', { round: pipelineRound, reason: preflight.reason });
+            break;
+          }
+
+          // 'revise' → skip the Executor this round and let the Planner replan
+          // with guidance. Bounded by MAX_PREFLIGHT_REVISES so a stubborn
+          // Planner can't trap the flow in a plan→revise→plan loop.
+          if (
+            preflight.verdict === 'revise' &&
+            this.consecutivePreflightRevises < TestPipeline.MAX_PREFLIGHT_REVISES
+          ) {
+            this.consecutivePreflightRevises++;
+            this.blackboard.resetFailedSteps();
+            if (preflight.guidance) {
+              this.blackboard.addInsight(`Preflight guidance: ${preflight.guidance}`);
+            }
+            this.trace('preflight_revise', {
+              round: pipelineRound,
+              reason: preflight.reason,
+              reviseStreak: this.consecutivePreflightRevises,
+            });
+            this.emitProgress(pipelineRound, maxRounds, `Preflight revise — replanning`);
+            // NOTE: do NOT increment pipelineRound here — the loop head (`while`
+            // body starts with `pipelineRound++`) advances it. `continue` alone
+            // costs one round, same as a normal replan.
+            continue; // replan next round; do NOT execute this plan
+          }
+
+          // 'go' (or revise budget exhausted → let it run, Reviewer will judge).
+          this.consecutivePreflightRevises = 0;
+        }
 
         // ════════════════════════════════════════════════════════════
         // CANCELLATION CHECK — between Planner and Executor
@@ -401,6 +481,9 @@ export class TestPipeline {
           this.consecutiveSameStateRounds = 0;
         }
         this.previousSnapshotHash = currentHash;
+        // Surface the count to the Reviewer (read before its verdict) so a
+        // repeatedly-no-effect action escalates to pivot/blocked, not a loop.
+        this.blackboard.setNoProgressRounds(this.consecutiveSameStateRounds);
 
         // ════════════════════════════════════════════════════════════
         // POST-EXECUTION: Check for new tabs/popups
@@ -1066,10 +1149,15 @@ export class TestPipeline {
       durationMs: Date.now() - this.startTime,
       rounds: [...this.blackboard.getRounds()],
       insights: [...this.blackboard.getInsights()],
+      dismissals: [...this.blackboard.getDismissals()],
       finalSnapshot: this.blackboard.getCurrentPageSnapshot(),
       blockedReason: phase === 'blocked'
         ? this.blackboard.getReview()?.reason || 'Unknown blocker'
         : undefined,
+      // Structured blocker (from report_blocked) — lets FlowRunner route to the
+      // right clarification instead of keyword-guessing the reason.
+      blockerType: this.blackboard.getBlockedInfo()?.blockerType,
+      canUserHelp: this.blackboard.getBlockedInfo()?.canUserHelp,
     };
   }
 

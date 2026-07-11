@@ -10,6 +10,7 @@ import {
 } from '@/utils/validation/businessEmail';
 import * as crypto from 'crypto';
 import { notifyAdminsOfNewUser } from './new-user-notification.service';
+import { resolveEffectiveStatus } from './effective-status';
 
 // Thrown when signup is rejected because the email domain is a free/consumer
 // or disposable provider. The controller catches this and returns a 400
@@ -293,7 +294,7 @@ export async function signInWithEmail(
         email: data.user.email || email,
         name: userData?.name || data.user.user_metadata?.name,
         role: userData?.role || 'user',
-        status: userData?.status || 'pending_approval',
+        status: resolveEffectiveStatus(userData?.status),
         avatar: userData?.avatar_url || data.user.user_metadata?.avatar_url,
         showLogs: userData?.show_logs === true,
       },
@@ -648,7 +649,7 @@ export async function exchangeCodeForSession(
           email: userData.user.email || '',
           name: dbUser?.name || userData.user.user_metadata?.name || userData.user.email?.split('@')[0] || 'User',
           role: dbUser?.role || 'user',
-          status: dbUser?.status || 'pending_approval',
+          status: resolveEffectiveStatus(dbUser?.status),
           avatar: dbUser?.avatar_url || userData.user.user_metadata?.avatar_url,
         },
         tokens: {
@@ -705,7 +706,7 @@ export async function exchangeCodeForSession(
           email: data.user.email || '',
           name: dbUser?.name || data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'User',
           role: dbUser?.role || 'user',
-          status: dbUser?.status || 'pending_approval',
+          status: resolveEffectiveStatus(dbUser?.status),
           avatar: dbUser?.avatar_url || data.user.user_metadata?.avatar_url,
         },
         tokens: {
@@ -896,7 +897,7 @@ export async function verifyToken(accessToken: string): Promise<AuthUser | null>
       email: data.user.email || '',
       name: userData?.name || data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'User',
       role: userData?.role || 'user',
-      status: userData?.status || 'pending_approval',
+      status: resolveEffectiveStatus(userData?.status),
       avatar: userData?.avatar_url || data.user.user_metadata?.avatar_url,
     };
 
@@ -1019,7 +1020,7 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
             email: userEmail,
             name: retryUserData.name,
             role: retryUserData.role,
-            status: retryUserData.status || 'pending_approval',
+            status: resolveEffectiveStatus(retryUserData.status),
             avatar: retryUserData.avatar_url,
             credits: creditsBalance,
             subscription: retryUserData.subscription,
@@ -1053,7 +1054,7 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
         email: userEmail,
         name: createdUser.name,
         role: createdUser.role,
-        status: createdUser.status || 'pending_approval',
+        status: resolveEffectiveStatus(createdUser.status),
         avatar: createdUser.avatar_url,
         credits: creditsBalance,
         subscription: createdUser.subscription,
@@ -1072,7 +1073,7 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
       email: userEmail,
       name: userData.name,
       role: userData.role || 'user',
-      status: userData.status || 'pending_approval',
+      status: resolveEffectiveStatus(userData.status),
       avatar: userData.avatar_url,
       credits: creditsBalance,
       subscription: userData.subscription,

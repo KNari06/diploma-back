@@ -150,21 +150,30 @@ export class ExplorationRunJobHandler {
         },
       };
 
+      // Persist hook: save test cases to DB. Passed INTO engine.run() so the
+      // save runs before the trace is finalized — the trace then records the
+      // real save outcome and a failed save shows status 'failed' (not the old
+      // bug where the trace closed first and always said 'completed').
+      let savedIds: string[] = [];
+      const onResultReady = async (result: ExplorationResult) => {
+        try {
+          savedIds = await ExplorationStorageService.saveTestCases(result.testCases, projectId, userId);
+          return { savedCount: savedIds.length };
+        } catch (err) {
+          return { savedCount: 0, error: err instanceof Error ? err.message : String(err) };
+        }
+      };
+
       // Run exploration (resume from checkpoint or fresh start)
       let result: ExplorationResult;
       if (isResume && existingCheckpoint) {
+        // Resume path persists the legacy way (its trace lifecycle is separate).
         result = await ExplorationEngine.resumeFromCheckpoint(browser, explorationConfig, existingCheckpoint);
+        savedIds = await ExplorationStorageService.saveTestCases(result.testCases, projectId, userId);
       } else {
         const engine = new ExplorationEngine(browser, explorationConfig);
-        result = await engine.run();
+        result = await engine.run(onResultReady);
       }
-
-      // Save test cases to DB
-      const savedIds = await ExplorationStorageService.saveTestCases(
-        result.testCases,
-        projectId,
-        userId,
-      );
 
       // Mark run as completed
       await ExplorationStorageService.completeRun(explorationId, result);

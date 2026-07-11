@@ -16,7 +16,8 @@ import type {
   TargetFingerprint,
 } from './preview.types';
 import { TIER_ORDER } from './preview.types';
-import { CELL_SEP, escapeHasText, normalizeText } from './text-normalizer.util';
+import { CELL_SEP, escapeCssAttrValue, escapeHasText, normalizeText } from './text-normalizer.util';
+import { buildAncestorScopedLocators } from './ancestor-scoped-locator.util';
 import { extractStableTokensViaLLM } from './stable-tokens-llm.service';
 import { buildStrategyLocator, safeCountWithTimeout } from './locator-resolution.util';
 import {
@@ -25,25 +26,8 @@ import {
   type LocatorConfig,
 } from '@/config/testing/locator-config';
 
-/**
- * Escape value for CSS attribute selector.
- * Keeps selector valid even if value contains quotes/backslashes/brackets/
- * newlines. V22 Audit-fix H2: previous version only handled `\` and `"`,
- * which broke when bsTarget contained CSS metacharacters like `]`
- * (closing the attribute selector) or `[` (re-opening). Newlines also
- * break selector parsing in Playwright.
- *
- * Order matters: `\` MUST be escaped first, otherwise we double-escape
- * the backslashes we just added.
- */
-function escapeCssAttrValue(value: string): string {
-  return value
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\]/g, '\\]')
-    .replace(/\[/g, '\\[')
-    .replace(/[\n\r]/g, ' ');
-}
+// escapeCssAttrValue moved to text-normalizer.util.ts (shared with the
+// ancestor-scoped locator util) — imported above.
 
 /**
  * ARIA roles that are too generic to be useful as locators.
@@ -1312,6 +1296,15 @@ async function validateOnPage(
   plan: LocatorEntry[],
   page: Page,
   config: LocatorConfig,
+  // When the recorded element lives inside a same-origin iframe, its locators
+  // only resolve INSIDE that Frame — `page.locator()` never crosses a frame
+  // boundary, so a build-time count on the main page is always 0 and would drop
+  // every iframe locator, leaving the compiled plan empty. We skip the live
+  // count for iframe-scoped plans (matchCount stays undefined, sortAndCap keeps
+  // them — drop only fires on an explicit 0) and rely on replay-time frame
+  // resolution (action-executor resolveIframeFrame / compiled-locator-executor
+  // frameLocator scope). Mirrors the role-without-roleName skip below.
+  iframeScoped = false,
 ): Promise<LocatorEntry[]> {
   const startedAt = Date.now();
   const PER_LOCATOR_MS = 200;
@@ -1331,6 +1324,13 @@ async function validateOnPage(
       // entirely; sortAndCap keeps it (matchCount undefined, drop only
       // fires on explicit 0).
       if (entry.strategy === 'role' && !entry.roleName) {
+        return { ...entry, validated: false };
+      }
+      // Iframe-scoped plan — can't count against the main page (see the
+      // `iframeScoped` param doc). Skip the count so the entry survives to
+      // replay, where the frame is resolved. validated=false, matchCount
+      // undefined → sortAndCap keeps it.
+      if (iframeScoped) {
         return { ...entry, validated: false };
       }
       const locator = buildStrategyLocator(page, entry);
@@ -1542,6 +1542,34 @@ export class LocatorPlanBuilder {
     // function returns synchronously fast (no LLM call).
     const rawPlan = await buildLocatorChain(resolvedNode, config);
 
+    // Ancestor-scoped strategies (July 2026): the recorded fingerprint's
+    // ancestorSummary carries the ancestors' STABLE testId/#id anchors —
+    // until now only a soft LLM hint. For targets without strong own
+    // identity, chain the innermost anchored ancestor with the most
+    // specific child shape (`#layout-header svg`,
+    // `[data-testid=nav] button:has-text("Войти")`). Uniqueness is
+    // enforced by the SAME validateOnPage count below — ambiguous chains
+    // demote/drop like any other entry.
+    try {
+      const scoped = buildAncestorScopedLocators({
+        fingerprint: step.recordedFingerprint,
+        node: resolvedNode,
+      });
+      if (scoped.length > 0) {
+        rawPlan.push(...scoped);
+        logger.debug('[LOCATOR_PLAN_BUILDER] Added ancestor-scoped strategies', {
+          stepId: step.id,
+          selectors: scoped.map((s) => s.value),
+        });
+      }
+    } catch (err) {
+      // Pure helper — a parse edge case must never break plan building.
+      logger.warn('[LOCATOR_PLAN_BUILDER] ancestor-scoped strategies failed', {
+        stepId: step.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     if (rawPlan.length === 0) {
       logger.warn('[LOCATOR_PLAN_BUILDER] Empty locator plan — element has no durable selectors', {
         stepId: step.id,
@@ -1572,7 +1600,11 @@ export class LocatorPlanBuilder {
 
     if (page && rawPlan.length > 0) {
       const validationStart = Date.now();
-      const validated = await validateOnPage(rawPlan, page, config);
+      // Iframe-scoped elements can't be counted on the main page — skip the
+      // live count for them so their locators aren't dropped as "dead".
+      const iframeScoped = !!step.options?.iframe?.selector
+        || (typeof resolvedNode.ref === 'string' && resolvedNode.ref.startsWith('ifr'));
+      const validated = await validateOnPage(rawPlan, page, config, iframeScoped);
       // Compute aggregate stats from the same `validated` array the
       // logger.info inside validateOnPage already reads. Re-derived
       // here (cheap) so we don't have to plumb a return type through

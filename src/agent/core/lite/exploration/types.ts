@@ -317,7 +317,18 @@ export interface FlowError {
 export type ErrorClassification = 'no_errors' | 'recoverable' | 'blocking' | 'app_bug';
 
 /** Type of blocker that prevents automation */
-export type BlockerType = 'captcha' | '2fa' | 'payment' | 'external_service' | 'login_wall' | 'file_upload' | 'other';
+export type BlockerType =
+  | 'captcha'
+  | '2fa'
+  | 'payment'
+  | 'external_service'
+  | 'login_wall'
+  | 'file_upload'
+  // The flow needs a real value it cannot invent (promo/referral code, account
+  // number, a one-time code that isn't strictly 2FA). User-resolvable via the
+  // test_data clarification: they type the value, it's filled in, the flow retries.
+  | 'needs_data'
+  | 'other';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // FLOW EXPLORATION (Phase 2)
@@ -782,4 +793,12 @@ export interface FlowRunnerCheckpoint {
   knownFlowNames: string[];
   flowsCompleted: number;
   completedTasks: FlowExplorationTask[];
+  /**
+   * Cached auth storageState (cookies + localStorage) captured after the first
+   * successful login. Restored into a Phase-2.5 / resumed FlowRunner's
+   * StateManager so its auth-gated flows reuse the session instead of running
+   * logged-out with a stale `loginCompleted=true`. Optional / null before any
+   * login happened.
+   */
+  authState?: object | null;
 }

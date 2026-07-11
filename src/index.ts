@@ -1,3 +1,8 @@
+// IMPORTANT: `./instrument` must load before any other import so Sentry can
+// instrument http/express. Keep these two lines at the very top of the file.
+import './instrument';
+import * as Sentry from '@sentry/node';
+
 import adminTracesRoutes from '@/api/admin/admin-traces.route';
 import adminRegressionMetricsRoutes from '@/api/admin/admin-regression-metrics.route';
 import allureImportRoutes from '@/api/allure-import/allure-import.route';
@@ -1483,6 +1488,10 @@ app.get('/', (req: express.Request, res: express.Response) => {
     },
   });
 });
+
+// Sentry error handler — after all controllers, before the app's own error
+// middleware (see Sentry docs). It captures the error, then falls through.
+Sentry.setupExpressErrorHandler(app);
 
 // 404 handler
 app.use(notFoundHandler);

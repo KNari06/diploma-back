@@ -156,10 +156,19 @@ const envSchema = z.object({
   // wait. Validate before enabling broadly. See agent/execution/replay-readiness.ts.
   REPLAY_READINESS_RECOLLECT_ENABLED: z.string().transform(v => v === 'true').default('false'),
   EXPLORATION_TIMEOUT_MS: z.string().transform(Number).default('300000'),
+  // PreflightCheck: a pre-action gate that inspects the Planner's plan before
+  // the Executor runs it (catches loops / hallucinated refs / unreachable goals
+  // BEFORE burning a round). Exploration-only. ON by default; flip to disable.
+  EXPLORATION_PREFLIGHT_ENABLED: z.string().transform(v => v === 'true').default('true'),
 
   // Logging
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
   LOG_FORMAT: z.enum(['combined', 'common', 'dev', 'short', 'tiny']).default('combined'),
+
+  // Monitoring — Sentry (errors + tracing + logs). Empty DSN ⇒ SDK disabled
+  // (see src/instrument.ts). Traces rate is 0..1; lower it in production.
+  SENTRY_DSN: z.string().optional(),
+  SENTRY_TRACES_SAMPLE_RATE: z.string().transform(Number).default('1.0'),
 
   // Documentation
   DOCS_PASSWORD: z.string().optional(),
@@ -243,17 +252,19 @@ const envSchema = z.object({
   FEATURE_ORG_CREDITS_ENABLED: z.string().transform(v => v === 'true').default('true'),
 
   // ──────────────────────────────────────────────────────────────────
-  // Self-serve PLG signup. Default false keeps the B2B flow intact
-  // (manual admin approval + business-email gate). When true:
+  // Self-serve PLG signup. Default TRUE — the product is now self-serve B2C:
   //   - new users are provisioned approved on first auth (status set to
   //     'approved', overriding the users.status column default), with a
   //     default workspace + project so they skip the onboarding wizard
   //   - the business-email gate accepts personal domains (Gmail etc.);
   //     the disposable-domain block stays on as anti-abuse
-  // The requireApproved middleware is left in place — flipping this off
-  // restores gated behaviour with no code change.
+  // Set AUTO_APPROVE_SIGNUP=false to restore the gated B2B flow (manual admin
+  // approval + business-email gate). The requireApproved middleware stays in
+  // place, so flipping this off re-gates with no code change.
+  // NOTE: default true means ANY env without an explicit value (staging, local,
+  // a fork) also auto-approves — set it false there if you want manual review.
   // ──────────────────────────────────────────────────────────────────
-  AUTO_APPROVE_SIGNUP: z.string().transform(v => v === 'true').default('false'),
+  AUTO_APPROVE_SIGNUP: z.string().transform(v => v === 'true').default('true'),
 
   // ──────────────────────────────────────────────────────────────────
   // Per-test-case chat (Phase 1-8 backend, frontend integration TBD).
@@ -361,6 +372,41 @@ const envSchema = z.object({
   // (editor traces + per-apply forensic jsonl/ds/html triplets) that otherwise
   // grow without bound — ~16 files per editor session, no upstream cleanup.
   EDITOR_LOG_RETENTION_DAYS: z.string().transform(Number).default('3'),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Release-readiness report — ADR-0012. The verdict itself is a free,
+  // always-on deterministic function (release-verdict.util.ts) with no
+  // flag. These two vars gate only the optional LLM narrative layered
+  // on top of it. Default ON per explicit user decision 2026-07-07 (see
+  // claude-plans/release-readiness-report-20260707.md §4.3) — the author's
+  // own initial recommendation was default OFF, overridden by the user.
+  // ──────────────────────────────────────────────────────────────────
+  RELEASE_NARRATIVE_ENABLED: z.string().transform(v => v === 'true').default('true'),
+  // Text-only model — the narrative call never receives images.
+  RELEASE_NARRATIVE_MODEL: z.string().default('gemini-2.5-flash-lite'),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Visual anomaly sweep — ADR-0012. Sampled vision-LLM pass over
+  // already-stored step screenshots, looking for "common sense" defects
+  // (placeholder text, broken images, structurally broken layout) no
+  // specific assertion was written to catch. Default ON per the same
+  // 2026-07-07 user decision as the narrative flags above.
+  //
+  // VISUAL_ANOMALY_MIN_RECURRENCE defaults to 1 (surface on first
+  // detection) per explicit user decision 2026-07-10, overriding this
+  // plan's original default of 2 (a cross-run recurrence gate, since a
+  // single run's vision call was judged the least reliable signal in the
+  // whole design). The gate mechanism itself is untouched — the DB status
+  // enum still has 'below_threshold', VISUAL_ANOMALY_RECURRENCE_WINDOW_DAYS
+  // still applies, and the value here is still fully configurable back up
+  // — only the default changed.
+  // ──────────────────────────────────────────────────────────────────
+  VISUAL_ANOMALY_SWEEP_ENABLED: z.string().transform(v => v === 'true').default('true'),
+  VISUAL_ANOMALY_SAMPLE_STRATEGY: z.enum(['final_and_failure', 'final_only', 'all_failures']).default('final_and_failure'),
+  VISUAL_ANOMALY_MAX_SCREENSHOTS: z.string().transform(Number).default('2'),
+  VISUAL_ANOMALY_MODEL: z.string().default('gemini-2.5-flash'),
+  VISUAL_ANOMALY_MIN_RECURRENCE: z.string().transform(Number).default('1'),
+  VISUAL_ANOMALY_RECURRENCE_WINDOW_DAYS: z.string().transform(Number).default('30'),
 
   // Phase B1: mobile-editor force-route. When `true` (default), chat
   // requests carrying `context.mobileEditorMode=true` with a non-empty

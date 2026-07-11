@@ -211,6 +211,13 @@ export interface MobileApplyOutput {
       message: string;
       packageName?: string;
     }>;
+    /** ai_check steps only, pass or fail: the fully-interpolated assertion
+     *  text actually evaluated (placeholders already resolved). */
+    aiCheckResolvedAssertion?: string;
+    /** ai_check steps only, pass or fail: LLM self-reported 0-1 confidence. */
+    aiCheckConfidence?: number;
+    /** ai_check steps only, pass or fail: 1-2 sentence LLM explanation. */
+    aiCheckExplanation?: string;
   };
   appliedStep?: {
     id: string;
@@ -243,6 +250,33 @@ export class MobileStepApplyService {
    */
   static async apply(input: MobileApplyInput): Promise<MobileApplyOutput> {
     const { sessionId, stepDraft, signal, userId } = input;
+
+    // V-cross-app: a link_test_case step runs a whole other test case — that
+    // has no meaning for single-step "Apply" (a one-step preview concept).
+    // Reject explicitly rather than forwarding it toward the runner.
+    //
+    // The message MUST also land in `stepResult.error`, not just the
+    // top-level `error` — every caller on this path (REST controller
+    // response, the mobile editor's single-step "Apply" handler, AND the
+    // sequential "Run from start" loop that drives per-step UI state) reads
+    // `result.stepResult.error` / `sr.error`, never the top-level field (see
+    // `TestSuitesMobile.jsx` handleApply and onPreviewRunFromStart). Omitting
+    // it here meant this specific rejection was the only failure mode in the
+    // whole service whose message never reached the step row's red-X badge —
+    // the run correctly stopped on a failed step, but with no visible reason.
+    if ((stepDraft.type || stepDraft.kind) === 'link_test_case') {
+      const message = 'Linked test case steps cannot be applied individually — trigger a regression run to test them.';
+      return {
+        success: false,
+        status: 'failed',
+        error: message,
+        stepResult: {
+          success: false,
+          error: message,
+        },
+      };
+    }
+
     const client = await getMobileRunnerClientForSession(sessionId);
 
     const rawStepType = stepDraft.type || stepDraft.kind || 'click';
@@ -485,6 +519,18 @@ export class MobileStepApplyService {
         // frontend can do a truthy-check rather than a length-check.
         ...(stepResult?.warnings && stepResult.warnings.length > 0
           ? { warnings: stepResult.warnings }
+          : {}),
+        // ai_check detail — no redaction needed here: the mobile scratchpad
+        // has no secrets.* namespace, so a resolved assertion can't leak one
+        // (unlike the web ai_check path, which must redact).
+        ...(stepResult?.aiCheckResolvedAssertion !== undefined
+          ? { aiCheckResolvedAssertion: stepResult.aiCheckResolvedAssertion }
+          : {}),
+        ...(stepResult?.aiCheckConfidence !== undefined
+          ? { aiCheckConfidence: stepResult.aiCheckConfidence }
+          : {}),
+        ...(stepResult?.aiCheckExplanation !== undefined
+          ? { aiCheckExplanation: stepResult.aiCheckExplanation }
           : {}),
       },
       appliedStep,
