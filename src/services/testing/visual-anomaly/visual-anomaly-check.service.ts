@@ -1,5 +1,5 @@
 /**
- * Sampled visual anomaly sweep — ADR-0012.
+ * Sampled visual anomaly sweep — ADR-0012, multi-finding schema per ADR-0016.
  *
  * Findings pass through the recurrence gate in `upsertObservation` before
  * becoming visible (`status='surfaced'`). `VISUAL_ANOMALY_MIN_RECURRENCE`
@@ -10,13 +10,31 @@
  * still applies if the threshold is ever configured back up. See
  * `visual_anomaly_findings`'s table comment (migration
  * 20260707_visual_anomaly_findings.sql) for the original rationale.
+ *
+ * ADR-0016 (2026-07-11): one Gemini vision call can now return MULTIPLE
+ * findings per screenshot instead of being forced to pick one category. No
+ * schema/migration change was needed — the fingerprint `upsertObservation`
+ * already gates on (test_case_id, role, category), so each distinct category
+ * from one screenshot naturally lands in its own row. See
+ * `normalizeFindings`/`dedupeByCategory` below for the parsing side.
+ *
+ * Post-review fix (2026-07-11): the fingerprint's collision domain is wider
+ * than "one screenshot" — different screenshots of the same role in one
+ * sweep (or a shared `'other'` category) can also collide. `upsertExisting`
+ * now distinguishes a same-run collision (this row already has `runId` in
+ * `affected_run_ids` from earlier in THIS sweep) from genuine cross-run
+ * recurrence, and only overwrites description/confidence/screenshot on a
+ * same-run collision when the new observation's confidence is at least as
+ * high — logged either way, instead of the prior silent unconditional
+ * overwrite.
  */
 import { createHash } from 'crypto';
 import { generateTextWithGeminiVision } from '@/services/ai/core/gemini.service';
-import { buildVisualAnomalyPrompt, VISUAL_ANOMALY_CATEGORIES, VisualAnomalyCategory } from '@/ai/prompts/visual-anomaly-prompts';
+import { buildVisualAnomalyPrompt, VisualAnomalyCategory } from '@/ai/prompts/visual-anomaly-prompts';
 import { VisualAnomalySweepFeature } from '@/config/features/visual-anomaly-sweep';
 import { extractJson } from '@/services/testing/api/flow/ai-json.util';
 import { logger } from '@/utils/core/logger';
+import { dedupeByCategory, normalizeFindings } from './visual-anomaly-response-parser';
 import {
   getExecutedStepsForTest,
   getFindingByPatternKey,
@@ -81,42 +99,6 @@ async function fetchAsBase64(url: string): Promise<{ base64: string; mimeType: '
   const lower = url.toLowerCase();
   const mimeType = lower.endsWith('.webp') ? 'image/webp' : lower.endsWith('.png') ? 'image/png' : 'image/jpeg';
   return { base64: buf.toString('base64'), mimeType };
-}
-
-/**
- * Confirmed live (2026-07-10): despite the prompt's schema saying `category`
- * is a bare string or null, Gemini sometimes wraps it in a single-element
- * array (`["overlapping_cutoff_ui"]`). Passed through unnormalized, that
- * value fails `visual_anomaly_findings`'s `category` CHECK constraint at
- * insert time (Postgres error 23514) and silently drops an otherwise-valid,
- * high-confidence finding — exactly the failure mode this whole file exists
- * to avoid. Unwraps a one-element array and falls back to 'other' for any
- * value outside the known category set (future schema drift on Gemini's
- * side should degrade gracefully, not throw a DB constraint violation).
- */
-function normalizeCategory(raw: unknown): VisualAnomalyCategory | null {
-  const value = Array.isArray(raw) ? raw[0] : raw;
-  if (typeof value !== 'string') return null;
-  return (VISUAL_ANOMALY_CATEGORIES as readonly string[]).includes(value)
-    ? (value as VisualAnomalyCategory)
-    : 'other';
-}
-
-/**
- * Same untrusted-JSON risk as normalizeCategory above, for the other two
- * fields the gating logic actually branches on. A quoted `"false"` or
- * `"true"` would otherwise pass `!parsed.anomalyDetected` (a non-empty
- * string is truthy in JS) and a quoted `"0.9"` would flow straight into a
- * `confidence: number` DB column unnormalized.
- */
-function normalizeAnomalyDetected(raw: unknown): boolean {
-  if (typeof raw === 'string') return raw.trim().toLowerCase() === 'true';
-  return raw === true;
-}
-
-function normalizeConfidence(raw: unknown): number {
-  const value = typeof raw === 'string' ? Number(raw) : raw;
-  return typeof value === 'number' && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
 }
 
 interface UpsertParams {
@@ -198,6 +180,35 @@ async function upsertExisting(
   const staleMs = windowDays * 24 * 60 * 60 * 1000;
   const isStale = Date.now() - new Date(existing.last_seen_at).getTime() > staleMs;
 
+  // A collision where this row's affected_run_ids ALREADY includes
+  // params.runId (appended by an earlier finding/screenshot processed
+  // earlier in THIS SAME runSweep call) means two potentially-DIFFERENT
+  // findings share one (test_case_id, role, category) fingerprint within one
+  // run — e.g. two different failure screenshots both reporting
+  // 'broken_image', or two 'other' findings dedupeByCategory deliberately
+  // didn't collapse. This is distinct from genuine CROSS-RUN recurrence
+  // (the original, intended case this function exists for), where blindly
+  // refreshing to the latest description/confidence/screenshot is correct —
+  // see visual_anomaly_findings' pattern_key column comment. Unconditionally
+  // overwriting on a same-run collision risks silently discarding a real,
+  // distinct defect with no trace. Gate content overwrite on confidence and
+  // log either way so the trade-off is visible instead of silent — while
+  // recurrence tracking (affected_run_ids/recurrence_count/status) is always
+  // updated regardless, since that bookkeeping must reflect every
+  // observation, win or lose.
+  const isSameRunCollision = !isStale && existing.affected_run_ids.includes(params.runId);
+  const shouldOverwriteContent = !isSameRunCollision || params.confidence >= existing.confidence;
+
+  if (isSameRunCollision) {
+    logger.info('[VISUAL_ANOMALY] Same-fingerprint collision within one run', {
+      testCaseId: params.testCaseId,
+      role: params.role,
+      category: params.category,
+      keptDescription: shouldOverwriteContent ? params.description : existing.description,
+      droppedDescription: shouldOverwriteContent ? existing.description : params.description,
+    });
+  }
+
   const affectedRunIds = isStale
     ? [params.runId]
     : existing.affected_run_ids.includes(params.runId)
@@ -213,9 +224,9 @@ async function upsertExisting(
         : existing.status; // one-way ratchet: never revert 'surfaced' back down
 
   const { error } = await updateFinding(existing.id, {
-    description: params.description,
-    confidence: params.confidence,
-    example_screenshot_url: params.screenshotUrl,
+    ...(shouldOverwriteContent
+      ? { description: params.description, confidence: params.confidence, example_screenshot_url: params.screenshotUrl }
+      : {}),
     affected_run_ids: affectedRunIds,
     recurrence_count: recurrenceCount,
     status: nextStatus,
@@ -318,11 +329,11 @@ export async function runSweep(params: RunSweepParams): Promise<void> {
         model: model as 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.5-flash-lite',
         temperature: 0,
         // gemini-2.5-flash is a THINKING model — thinking tokens count toward
-        // maxOutputTokens (default 300 here). A "no anomaly" verdict is short
-        // enough to survive a small budget, but a real "anomalyDetected: true"
-        // verdict gets truncated mid-JSON, which extractJson correctly can't
-        // recover — silently dropping exactly the positive detections this
-        // sweep exists to catch. Confirmed live (2026-07-10) TWICE: 2048 was
+        // maxOutputTokens (default 300 here). An empty `findings: []` verdict
+        // is short enough to survive a small budget, but a real non-empty
+        // findings list gets truncated mid-JSON, which extractJson correctly
+        // can't recover — silently dropping exactly the positive detections
+        // this sweep exists to catch. Confirmed live (2026-07-10) TWICE: 2048 was
         // itself insufficient for one scene (finishReason=MAX_TOKENS on the
         // response's own `response.candidates[0].finishReason`, surfaced by
         // gemini.service.ts's explicit non-STOP check) — thinking-token
@@ -348,7 +359,7 @@ export async function runSweep(params: RunSweepParams): Promise<void> {
       // Gemini vision responses (esp. thinking-mode 2.5 Flash) sometimes wrap
       // the JSON in a ```json fence despite the prompt saying not to —
       // extractJson tolerates that instead of hard-failing the shot.
-      const parsed = extractJson(response.content) as { anomalyDetected: unknown; category: unknown; description: string; confidence: unknown } | null;
+      const parsed = extractJson(response.content);
       if (!parsed) {
         throw new Error(`Could not extract JSON from Gemini vision response: ${response.content.slice(0, 200)}`);
       }
@@ -357,46 +368,64 @@ export async function runSweep(params: RunSweepParams): Promise<void> {
       // fields (a prior bug logged 'Observation recorded' with the raw,
       // un-normalized category, which mismatched what was actually
       // persisted whenever normalization actually changed something).
-      const category = normalizeCategory(parsed.category);
-      const anomalyDetected = normalizeAnomalyDetected(parsed.anomalyDetected);
-      const confidence = normalizeConfidence(parsed.confidence);
+      // ADR-0016: a screenshot can now yield MULTIPLE findings.
+      const rawFindings = normalizeFindings(parsed);
 
-      // The raw model verdict, logged regardless of outcome — this is the
-      // "what did the AI actually return" visibility a below_threshold /
-      // empty result on its own can't distinguish from a silent failure.
+      // The raw model verdict, logged BEFORE dedup and regardless of
+      // outcome — this must reflect what Gemini actually returned, not what
+      // survived dedupeByCategory's collapse. Logging AFTER dedup would make
+      // this log's own documented purpose ("what did the AI actually
+      // return") false as soon as dedup collapses anything.
       logger.info('[VISUAL_ANOMALY] LLM verdict', {
         testId: params.testId,
         testCaseId: params.testCaseId,
         url: shot.url,
         role: shot.role,
-        anomalyDetected,
-        category,
-        confidence,
-        description: parsed.description,
+        findingCount: rawFindings.length,
+        categories: rawFindings.map((f) => f.category),
       });
 
-      if (!anomalyDetected || !category) continue;
+      // Per-category dedup — see normalizeFindings/dedupeByCategory doc
+      // comments for why expansion + dedup are separate steps from the raw
+      // verdict just logged above.
+      const findings = dedupeByCategory(rawFindings);
+      if (findings.length === 0) continue;
 
-      const outcome = await upsertObservation({
-        projectId: params.projectId,
-        testCaseId: params.testCaseId,
-        userId: params.userId,
-        runId: params.runId,
-        role: shot.role,
-        category,
-        description: parsed.description,
-        confidence,
-        screenshotUrl: shot.url,
-      });
+      for (const finding of findings) {
+        try {
+          const outcome = await upsertObservation({
+            projectId: params.projectId,
+            testCaseId: params.testCaseId,
+            userId: params.userId,
+            runId: params.runId,
+            role: shot.role,
+            category: finding.category,
+            description: finding.description,
+            confidence: finding.confidence,
+            screenshotUrl: shot.url,
+          });
 
-      if (outcome) {
-        logger.info('[VISUAL_ANOMALY] Observation recorded', {
-          testId: params.testId,
-          testCaseId: params.testCaseId,
-          category,
-          recurrenceCount: outcome.recurrenceCount,
-          status: outcome.status,
-        });
+          if (outcome) {
+            logger.info('[VISUAL_ANOMALY] Observation recorded', {
+              testId: params.testId,
+              testCaseId: params.testCaseId,
+              category: finding.category,
+              recurrenceCount: outcome.recurrenceCount,
+              status: outcome.status,
+            });
+          }
+        } catch (error) {
+          // Isolated per finding — a single finding's persistence failure
+          // must not be misreported as the whole shot being skipped, which
+          // would be misleading for any earlier finding in this SAME shot
+          // that already succeeded and logged 'Observation recorded' above.
+          logger.warn('[VISUAL_ANOMALY] Failed to persist one finding — continuing with the rest of this shot', {
+            testId: params.testId,
+            testCaseId: params.testCaseId,
+            category: finding.category,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
     } catch (error) {
       logger.warn('[VISUAL_ANOMALY] Screenshot check failed — skipping this shot', {
