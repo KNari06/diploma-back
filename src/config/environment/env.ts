@@ -373,6 +373,41 @@ const envSchema = z.object({
   // grow without bound — ~16 files per editor session, no upstream cleanup.
   EDITOR_LOG_RETENTION_DAYS: z.string().transform(Number).default('3'),
 
+  // ──────────────────────────────────────────────────────────────────
+  // Release-readiness report — ADR-0012. The verdict itself is a free,
+  // always-on deterministic function (release-verdict.util.ts) with no
+  // flag. These two vars gate only the optional LLM narrative layered
+  // on top of it. Default ON per explicit user decision 2026-07-07 (see
+  // claude-plans/release-readiness-report-20260707.md §4.3) — the author's
+  // own initial recommendation was default OFF, overridden by the user.
+  // ──────────────────────────────────────────────────────────────────
+  RELEASE_NARRATIVE_ENABLED: z.string().transform(v => v === 'true').default('true'),
+  // Text-only model — the narrative call never receives images.
+  RELEASE_NARRATIVE_MODEL: z.string().default('gemini-2.5-flash-lite'),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Visual anomaly sweep — ADR-0012. Sampled vision-LLM pass over
+  // already-stored step screenshots, looking for "common sense" defects
+  // (placeholder text, broken images, structurally broken layout) no
+  // specific assertion was written to catch. Default ON per the same
+  // 2026-07-07 user decision as the narrative flags above.
+  //
+  // VISUAL_ANOMALY_MIN_RECURRENCE defaults to 1 (surface on first
+  // detection) per explicit user decision 2026-07-10, overriding this
+  // plan's original default of 2 (a cross-run recurrence gate, since a
+  // single run's vision call was judged the least reliable signal in the
+  // whole design). The gate mechanism itself is untouched — the DB status
+  // enum still has 'below_threshold', VISUAL_ANOMALY_RECURRENCE_WINDOW_DAYS
+  // still applies, and the value here is still fully configurable back up
+  // — only the default changed.
+  // ──────────────────────────────────────────────────────────────────
+  VISUAL_ANOMALY_SWEEP_ENABLED: z.string().transform(v => v === 'true').default('true'),
+  VISUAL_ANOMALY_SAMPLE_STRATEGY: z.enum(['final_and_failure', 'final_only', 'all_failures']).default('final_and_failure'),
+  VISUAL_ANOMALY_MAX_SCREENSHOTS: z.string().transform(Number).default('2'),
+  VISUAL_ANOMALY_MODEL: z.string().default('gemini-2.5-flash'),
+  VISUAL_ANOMALY_MIN_RECURRENCE: z.string().transform(Number).default('1'),
+  VISUAL_ANOMALY_RECURRENCE_WINDOW_DAYS: z.string().transform(Number).default('30'),
+
   // Phase B1: mobile-editor force-route. When `true` (default), chat
   // requests carrying `context.mobileEditorMode=true` with a non-empty
   // `mobileSessionId` skip the LLM intent classifier and route directly

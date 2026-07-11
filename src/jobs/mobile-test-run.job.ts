@@ -1168,6 +1168,15 @@ export class MobileTestRunJobHandler {
             error: err instanceof Error ? err.message : String(err),
           });
         }
+        // ADR-0012 — best-effort. No-ops internally when disabled.
+        try {
+          await QueueManager.addVisualAnomalySweepJob(testResultId, testId);
+        } catch (sweepErr) {
+          logger.warn('[MOBILE-TEST] Failed to queue visual anomaly sweep', {
+            testId,
+            error: sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
+          });
+        }
       }
 
       // ── Phase 7: Emit completion events ───────────────────────
@@ -1396,6 +1405,17 @@ export class MobileTestRunJobHandler {
             testId,
             testResultId: failedTestResultId,
             error: queueErr instanceof Error ? queueErr.message : String(queueErr),
+          });
+        }
+        // ADR-0012 — useful for failures too (a visually broken error state
+        // is exactly the kind of thing this sweep should catch).
+        try {
+          await QueueManager.addVisualAnomalySweepJob(failedTestResultId, testId);
+        } catch (sweepErr) {
+          logger.warn('[MOBILE-TEST] Failed to enqueue visual anomaly sweep for failed run', {
+            testId,
+            testResultId: failedTestResultId,
+            error: sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
           });
         }
       }

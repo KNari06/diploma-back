@@ -13,7 +13,40 @@ import { logger } from '@/utils/core/logger';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { testRunQueue } from '@/config/infrastructure/queues';
 import { env } from '@/config/environment/env';
+import { getTelegramToken, sendTelegramNotification } from '@/utils/notifications/telegram-notify';
 import type { DueSchedule } from '@/types/testing.types';
+
+/**
+ * Send a Telegram notification for a scheduled-run dispatch failure
+ * (before the test/regression run even started). Best-effort — logs and
+ * swallows on failure, never breaks the scheduler loop.
+ */
+async function sendScheduleFailureTelegramNotification(
+  userId: string,
+  title: string,
+  message: string
+): Promise<void> {
+  try {
+    const tokenData = await getTelegramToken(userId);
+    if (!tokenData?.external_id) {
+      return;
+    }
+
+    const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+    await sendTelegramNotification(tokenData, {
+      icon: '⚠️',
+      title,
+      fields: [{ label: 'Details', value: message }],
+      ctaLabel: 'View schedules →',
+      ctaUrl: `${frontendUrl}/schedules`,
+    });
+  } catch (error) {
+    logger.warn('[TEST_SCHEDULER] Failed to send Telegram notification for schedule failure', {
+      error: error instanceof Error ? error.message : String(error),
+      userId,
+    });
+  }
+}
 
 /**
  * Redis key holding the scheduler's last-tick wall-clock (ms).
@@ -267,13 +300,15 @@ export class TestSchedulerJobHandler {
           error: errorMessage,
         });
 
+        const insufficientCreditsMessage = `Your scheduled ${targetType} could not run due to insufficient credits. Please add credits to continue.`;
+
         try {
           await NotificationService.createNotification({
             userId,
             type: 'personal',
             category: 'billing',
             title: 'Insufficient credits for scheduled run',
-            message: `Your scheduled ${targetType} could not run due to insufficient credits. Please add credits to continue.`,
+            message: insufficientCreditsMessage,
             metadata: {
               scheduleId: schedule.scheduleId,
               targetType,
@@ -294,6 +329,8 @@ export class TestSchedulerJobHandler {
             userId,
           });
         }
+
+        await sendScheduleFailureTelegramNotification(userId, 'Insufficient credits for scheduled run', insufficientCreditsMessage);
 
         throw error;
       }
@@ -323,13 +360,15 @@ export class TestSchedulerJobHandler {
           });
         }
 
+        const orphanTargetMessage = `The ${targetType} this schedule was pointing at no longer exists. The schedule has been disabled.`;
+
         try {
           await NotificationService.createNotification({
             userId,
             type: 'personal',
             category: 'system',
             title: 'Scheduled run disabled — target was deleted',
-            message: `The ${targetType} this schedule was pointing at no longer exists. The schedule has been disabled.`,
+            message: orphanTargetMessage,
             metadata: {
               scheduleId: schedule.scheduleId,
               targetType,
@@ -345,6 +384,8 @@ export class TestSchedulerJobHandler {
             userId,
           });
         }
+
+        await sendScheduleFailureTelegramNotification(userId, 'Scheduled run disabled — target was deleted', orphanTargetMessage);
 
         throw error;
       }
@@ -366,15 +407,18 @@ export class TestSchedulerJobHandler {
         error: errorMessage,
       });
 
+      const genericFailureTitle = isOneTime ? 'One-time scheduled run failed' : 'Scheduled run failed';
+      const genericFailureMessage = isOneTime
+        ? `Your one-time scheduled ${targetType} couldn't start: ${errorMessage.slice(0, 200)}. It will NOT retry — please reschedule it.`
+        : `Your scheduled ${targetType} couldn't start: ${errorMessage.slice(0, 200)}. The next scheduled run will try again.`;
+
       try {
         await NotificationService.createNotification({
           userId,
           type: 'personal',
           category: 'system',
-          title: isOneTime ? 'One-time scheduled run failed' : 'Scheduled run failed',
-          message: isOneTime
-            ? `Your one-time scheduled ${targetType} couldn't start: ${errorMessage.slice(0, 200)}. It will NOT retry — please reschedule it.`
-            : `Your scheduled ${targetType} couldn't start: ${errorMessage.slice(0, 200)}. The next scheduled run will try again.`,
+          title: genericFailureTitle,
+          message: genericFailureMessage,
           metadata: {
             scheduleId: schedule.scheduleId,
             targetType,
@@ -392,6 +436,8 @@ export class TestSchedulerJobHandler {
           userId,
         });
       }
+
+      await sendScheduleFailureTelegramNotification(userId, genericFailureTitle, genericFailureMessage);
 
       // Re-throw to let the caller (processSchedules loop) record it
       // and continue with the next schedule.
@@ -445,6 +491,8 @@ export class TestSchedulerJobHandler {
         userId: schedule.userId,
       });
     }
+
+    await sendScheduleFailureTelegramNotification(schedule.userId, 'Scheduled run disabled', message);
   }
 
   /**
