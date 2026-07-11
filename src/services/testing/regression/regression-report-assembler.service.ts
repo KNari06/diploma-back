@@ -931,10 +931,13 @@ export class RegressionReportAssemblerService {
 
     // Visual anomaly findings (ADR-0012) — scoped to THIS run
     // (:runId = ANY(affected_run_ids)), only ever the ones that already
-    // cleared the cross-run recurrence gate (status='surfaced'). A single
-    // run's vision call can never reach this list on its own. Not pulled
-    // into the Phase 1 Promise.all above for simplicity — a cheap, single
-    // indexed query; revisit if report-fetch latency ever needs it.
+    // cleared the cross-run recurrence gate (status='surfaced'). NOTE: this
+    // does NOT mean "at most one per run" — VISUAL_ANOMALY_MIN_RECURRENCE
+    // defaults to 1 (ADR-0013), so a single run's vision call can already
+    // reach this list on its own, and since ADR-0016 one call can surface
+    // several distinct findings at once. Not pulled into the Phase 1
+    // Promise.all above for simplicity — a cheap, single indexed query;
+    // revisit if report-fetch latency ever needs it.
     let visualAnomalies: import('@/types/testing.types').RunReportVisualAnomaly[] = [];
     if (run.project_id) {
       const findings = await getSurfacedFindingsForRun(run.project_id, run.id);
