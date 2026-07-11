@@ -1,6 +1,5 @@
 import { AIService } from '@/services/ai/analysis/test-results.service';
-import type { TestResult } from '@/types';
-import type { AISummary } from '@/types';
+import type { TestResult, AISummary } from '@/types';
 
 // scrubHallucinatedBugs is a pure private method — access via `as any`
 // (the repo's established pattern for testing internal pure logic).
@@ -12,7 +11,7 @@ const mkResult = (over: Partial<TestResult> = {}): TestResult =>
     logs: [], networkLogs: [], errors: [], createdAt: new Date(), ...over,
   }) as TestResult;
 
-const mkAnalysis = (bugs: Array<{ title: string }>): AISummary =>
+const mkAnalysis = (bugs: Array<{ title: string; severity?: string; category?: string }>): AISummary =>
   ({
     summary: 's', bugs: bugs as any, recommendations: ['keep me'],
     severity: 'high', confidence: 80, generatedAt: new Date(),
@@ -65,5 +64,37 @@ describe('AIService.scrubHallucinatedBugs', () => {
     const analysis = mkAnalysis([]);
     const out = svc.scrubHallucinatedBugs(mkResult(), analysis);
     expect(out).toBe(analysis); // returns the same object untouched
+  });
+
+  it('KEEPS a high/critical accessibility bug on an otherwise clean run — the one exemption', () => {
+    const out = svc.scrubHallucinatedBugs(
+      mkResult(),
+      mkAnalysis([
+        { title: 'Keyboard focus trap blocks checkout for screen reader users', severity: 'critical', category: 'accessibility' },
+      ]),
+    );
+    expect(out.bugs).toHaveLength(1);
+    expect(out.severity).toBe('high'); // untouched — not forced to 'low' since a real bug remains
+  });
+
+  it('still scrubs a high/critical NON-accessibility bug on a clean run — exemption is narrow', () => {
+    const out = svc.scrubHallucinatedBugs(
+      mkResult(),
+      mkAnalysis([{ title: 'invented critical functional bug', severity: 'critical', category: 'functional' }]),
+    );
+    expect(out.bugs).toEqual([]);
+    expect(out.severity).toBe('low');
+  });
+
+  it('scrubs everything else but keeps the exempt accessibility bug when both are present', () => {
+    const out = svc.scrubHallucinatedBugs(
+      mkResult(),
+      mkAnalysis([
+        { title: 'invented low-severity console warning', severity: 'low', category: 'functional' },
+        { title: 'Screen reader cannot complete signup form', severity: 'high', category: 'accessibility' },
+      ]),
+    );
+    expect(out.bugs).toHaveLength(1);
+    expect(out.bugs[0].title).toBe('Screen reader cannot complete signup form');
   });
 });
