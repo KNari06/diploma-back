@@ -1879,12 +1879,40 @@ export interface PreviewRunStepPayload {
   previewSessionId: string;
   stepIndex: number;
   stepId: string;
-  status: 'pending' | 'running' | 'pass' | 'fail' | 'skipped';
+  // `status` and `timestamp` are present on every normal run-step emit, but
+  // OPTIONAL because the standalone native-dialog trigger emit (see
+  // `triggerFired` below and preview-session.service.ts's `attachDialogHandler`)
+  // is additive — it carries only `triggerFired` to tag the currently-running
+  // step, with no status transition of its own.
+  status?: 'pending' | 'running' | 'pass' | 'fail' | 'skipped';
   action?: string; // e.g., "click", "type", "assert", "ai_check"
   description?: string;
   error?: string;
   failedReason?: string;
-  timestamp: string;
+  timestamp?: string;
+  /**
+   * Present when a user-authored web trigger fired for this step — either
+   * bundled into the step's own 'running' emit (DOM-overlay conditions,
+   * checked pre-step) or sent as a standalone additive emit carrying no
+   * `status` (native-dialog `permission_dialog`, emitted directly by
+   * `attachDialogHandler` at the moment the dialog fires — see
+   * web-trigger-engine.ts / preview-session.service.ts).
+   */
+  triggerFired?: {
+    /** Id of the exact authored trigger that fired — lets the editor point back at that trigger row. */
+    triggerId: string;
+    conditionKind: 'permission_dialog' | 'any_dialog' | 'dialog_text';
+    /** condition.contains, only for `dialog_text`. */
+    conditionContains?: string;
+    actionKind: 'permission' | 'tap' | 'back';
+    /** action.text (button label), only for `tap`. */
+    actionText?: string;
+    /** action.decision, only for `permission`. */
+    actionDecision?: 'allow' | 'deny';
+    /** The overlay text that matched (DOM-overlay conditions only). */
+    matchedText?: string;
+    timestamp: string;
+  };
 }
 
 /**

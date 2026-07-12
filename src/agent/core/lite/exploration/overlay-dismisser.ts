@@ -337,7 +337,13 @@ export class OverlayDismisser {
    * 4. Promo modal detection (text-based)
    * 5. Default: unknown
    */
-  private static classifyObstacles(
+  /**
+   * Exported (not private) so other callers needing the SAME deterministic
+   * classification — e.g. `web-trigger-engine.ts`'s overlay detection for
+   * user-authored triggers — don't have to re-derive a cruder heuristic.
+   * See claude-plans/trigger-feature-web-port-20260712.md.
+   */
+  static classifyObstacles(
     facts: ObstacleFact[],
     viewport?: { width: number; height: number },
   ): Array<{ fact: ObstacleFact; type: ObstacleType }> {
@@ -411,7 +417,8 @@ export class OverlayDismisser {
    * - survey mode: dismiss everything except permanent elements (sticky_header/footer)
    * - flow mode: only dismiss blocking overlays (modal, cookie_consent, loading, onboarding)
    */
-  private static filterDismissible(
+  /** Exported alongside `classifyObstacles` — see that method's doc comment. */
+  static filterDismissible(
     classified: Array<{ fact: ObstacleFact; type: ObstacleType }>,
     mode: 'survey' | 'flow',
   ): Array<{ fact: ObstacleFact; type: ObstacleType }> {
