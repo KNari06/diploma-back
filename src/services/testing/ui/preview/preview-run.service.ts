@@ -30,6 +30,8 @@ import { buildStepRedactor } from '@/utils/interpolation/redact-step';
 import { injectAutoWaitForSteps, normalizeUrlForComparison } from './auto-wait-for.utils';
 import { diagnoseStepBlocker, actOnDiagnosis } from './step-blocker-diagnosis.service';
 import { waitForPageInteractive } from './page-interactive.utils';
+import { checkAndHandleWebOverlayTrigger, buildTriggerFiredPayload, type WebTriggerFireResult } from './web-trigger-engine';
+import { sanitizeTriggers } from '@/services/mobile/trigger-validation.util';
 
 /** Base timeout for run setup (navigation, init). */
 /**
@@ -949,6 +951,27 @@ export class PreviewRunService {
         throw new Error('Session has no active page');
       }
 
+      // Web triggers (ADR-0007 port): scope stored triggers to THIS Run only.
+      // Fetched by intentTestCaseId directly (not reused from the "standard
+      // path" testCase load above) because that load is block-scoped and
+      // SKIPPED entirely on the "Apply All" inline-steps-with-startUrl path —
+      // this is the one place in the function guaranteed to run for every
+      // run-start branch. Cleared in the `finally` below.
+      try {
+        const triggerTestCase = intentTestCaseId
+          ? await IntentTestCaseService.getById(intentTestCaseId, userId)
+          : null;
+        session.activeRunTriggers = sanitizeTriggers(triggerTestCase?.triggers);
+      } catch (err) {
+        logger.warn('[PreviewRun] Failed to load triggers for this run (non-fatal)', {
+          previewSessionId, intentTestCaseId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        session.activeRunTriggers = [];
+      }
+      session.currentRunStepId = undefined;
+      session.currentRunStepIndex = undefined;
+
       // V14: Initialize collector now that page is available
       telemetryCollector = new StepTelemetryCollector(session.page, {
         testCaseId: intentTestCaseId || undefined,
@@ -1783,7 +1806,23 @@ export class PreviewRunService {
           } catch { /* non-fatal diagnostic */ }
         })();
 
-        // Emit step running
+        // Web triggers: mark this step as the "current" one BEFORE it can
+        // possibly trigger a native dialog (attachDialogHandler reads this
+        // pointer at the moment a `permission_dialog` trigger fires — see
+        // preview-session.service.ts), then check for an already-showing
+        // DOM overlay (any_dialog / dialog_text) and act on it. Both are
+        // no-ops (cheap array-length check) when the test case has no
+        // triggers for this run.
+        session.currentRunStepId = step.id;
+        session.currentRunStepIndex = originalStepIndex;
+        const overlayTrigger = session.activeRunTriggers?.length
+          ? await checkAndHandleWebOverlayTrigger(session.page, session.activeRunTriggers)
+          : ({ fired: false } as WebTriggerFireResult);
+
+        // Emit step running (carries `triggerFired` when the pre-step check
+        // above just cleared a popup — additive field, never overwrites the
+        // status/error a later emit for this same step sets, since the
+        // frontend reducer merges per-field rather than replacing).
         webSocketService.emitToUser(userId, 'preview:run:step', {
           previewSessionId,
           stepIndex: originalStepIndex,
@@ -1792,6 +1831,9 @@ export class PreviewRunService {
           action: step.type,
           description: step.description,
           timestamp: new Date().toISOString(),
+          ...(overlayTrigger.fired && overlayTrigger.trigger
+            ? { triggerFired: buildTriggerFiredPayload(overlayTrigger.trigger, overlayTrigger.matchedText) }
+            : {}),
         });
 
         // Keep the live preview picture in lockstep with the steps panel.
@@ -2989,6 +3031,17 @@ export class PreviewRunService {
 
       // V13: Reset dialog mode back to passive
       try { sessionService.setDialogMode(previewSessionId, userId, 'passive'); } catch { /* session may be gone */ }
+
+      // Web triggers: scoped to this Run only — clear so stored triggers
+      // don't leak into manual live-preview browsing once the Run ends.
+      try {
+        const s = sessionService.getSession(previewSessionId);
+        if (s) {
+          s.activeRunTriggers = undefined;
+          s.currentRunStepId = undefined;
+          s.currentRunStepIndex = undefined;
+        }
+      } catch { /* session may be gone */ }
 
       // 7. ALWAYS emit completed event — even if run failed before 'started' was emitted.
       //    This guarantees the frontend never stays stuck in 'running' state.

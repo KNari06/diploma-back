@@ -417,6 +417,49 @@ describe('CdpSnapshotService — real Chromium integration', () => {
       expect(snapshot.obstacleFacts![0].hasInteractiveChildren).toBe(true);
     }, PER_TEST_TIMEOUT_MS);
 
+    it('collects a role=dialog obstacle with computed z-index:auto (Radix/shadcn portal pattern, no explicit z-index)', async () => {
+      // Regression test for a real bi.group (2026-07-12) miss: Radix UI /
+      // shadcn/ui portal-rendered dialogs intentionally omit z-index and
+      // rely on DOM/portal order instead, so getComputedStyle(...).zIndex
+      // reads 'auto' — parseInt('auto', 10) is NaN. The obstacle-candidate
+      // filter used to hard-`continue` on isNaN(zIndex), silently dropping
+      // a fully spec-compliant, viewport-covering role="dialog" modal from
+      // obstacleFacts even though it also matched IRON_CLAD_MODAL_SELECTORS.
+      const html = `
+        <button id="outside">Outside</button>
+        <div id="modal" role="dialog" style="position: fixed; inset: 0; display: flex;">
+          <button class="close">×</button>
+          <p>Where do you want to buy property?</p>
+          <button>Astana</button>
+        </div>
+        <div id="decorative-badge" style="position: absolute; top: 4px; right: 4px; width: 10px; height: 10px;">•</div>
+      `;
+      await page.setContent(html);
+      const cdpSnap = await CdpSnapshotService.collect(page);
+
+      const evalPage = await browser.newPage();
+      try {
+        await evalPage.setContent(html);
+        const evalSnap = await SnapshotCollector.collect(evalPage);
+
+        for (const snapshot of [cdpSnap, evalSnap]) {
+          const modalFact = snapshot.obstacleFacts?.find((f) => f.id === 'modal');
+          expect(modalFact).toBeDefined();
+          expect(modalFact!.hintType).toBe('modal');
+          expect(modalFact!.zIndex).toBe(0);
+
+          // Negative case, unchanged: an `absolute`-positioned element with
+          // no z-index stays excluded — the false-positive guard (badges,
+          // carets, in-flow decorative elements) is preserved; only
+          // 'fixed'/'sticky' were relaxed.
+          const badgeFact = snapshot.obstacleFacts?.find((f) => f.id === 'decorative-badge');
+          expect(badgeFact).toBeUndefined();
+        }
+      } finally {
+        await evalPage.close();
+      }
+    }, PER_TEST_TIMEOUT_MS);
+
     it('Layer 1 modal: <dialog open> sets activeModalRef AND propagates isInsideActiveModal', async () => {
       // CRITICAL audit-found bug to regress against: Phase 0 added
       // Layer 2 promotion AFTER Phase 5 sets per-element flags — flags
