@@ -129,6 +129,9 @@ export function normaliseIntentStep(
     ...(raw?.value !== undefined ? { value: raw.value } : {}),
     ...(raw?.assertionText ? { assertionText: raw.assertionText } : {}),
     ...(raw?.bindingHints ? { bindingHints: raw.bindingHints } : {}),
+    // Sanitizer's primary signal — must survive normalisation or the save
+    // boundary can't see the agent's "this is a credential" flag.
+    ...(raw?.isSensitive === true ? { isSensitive: true } : {}),
     ...(raw?.compiled ? { compiled: raw.compiled } : {}),
     ...(raw?.options ? { options: raw.options } : {}),
     ...(raw?.isAutoInjected ? { isAutoInjected: raw.isAutoInjected } : {}),

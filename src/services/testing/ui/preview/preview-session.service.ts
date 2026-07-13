@@ -16,6 +16,9 @@ import { setupThirdPartyBlocker } from '@/agent/playwright/execution/third-party
 import { PREVIEW_SESSION_CONFIG, BROWSER_USER_AGENT, BROWSER_LAUNCH_ARGS, BROWSER_HEADLESS_MODE, BROWSER_EXTRA_HEADERS, BROWSER_STEALTH_SCRIPT } from '@/config/testing/playwright-tuning';
 import { waitForPageInteractive } from './page-interactive.utils';
 import { cancelIdle as cancelPreviewIdle } from './preview-idle.service';
+import type { Trigger } from '@/services/mobile/mobile-runner.types';
+import type { PreviewRunStepPayload } from '@/websocket/types/types';
+import { buildTriggerFiredPayload } from './web-trigger-engine';
 
 const SESSION_TTL_MS = PREVIEW_SESSION_CONFIG.sessionTtlMs;
 const SESSION_CLEANUP_INTERVAL_MS = PREVIEW_SESSION_CONFIG.sessionCleanupIntervalMs;
@@ -579,6 +582,29 @@ interface InternalSession extends PreviewSession {
 
   /** V11: True while page switch is in progress — blocks DOM tick from collecting stale/empty snapshots */
   pageSwitchInProgress?: boolean;
+
+  /**
+   * User-defined triggers active for the CURRENT Run only — set by
+   * `PreviewRunService.runSavedSteps()` from the test case's stored
+   * `triggers`, cleared in the run's `finally`. Absent/empty outside a Run,
+   * so a test case's stored triggers never silently affect manual live
+   * preview browsing. See web-trigger-engine.ts.
+   */
+  activeRunTriggers?: Trigger[];
+  /**
+   * The step currently executing in the Run loop — set by
+   * `PreviewRunService.runSavedSteps()` right as it starts each step (same
+   * point as the "running" WS emit), cleared in the run's `finally`. Lets
+   * `attachDialogHandler`'s trigger check (event-driven — a native dialog
+   * can fire at any point during that step's own action) attribute a
+   * `preview:run:step` `triggerFired` emit to the CORRECT step by reading
+   * this pointer at the moment the dialog fires, instead of bridging the
+   * event back into the loop's own iteration (which misattributes to the
+   * following step, or drops it entirely on the last step — see the plan's
+   * "Plan review" section for the bug this replaced).
+   */
+  currentRunStepId?: string;
+  currentRunStepIndex?: number;
 }
 
 /**
@@ -3451,6 +3477,62 @@ export class PreviewSessionService {
           // Timeout — auto-dismiss to prevent hanging
           logger.warn('[PREVIEW_SESSION] Dialog recording timeout, auto-dismissing', { previewSessionId, type });
           try { await dialog.dismiss(); } catch { /* ok */ }
+          return;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // WEB TRIGGER: a user-authored `permission_dialog` trigger, active
+        // only during a Run (`session.activeRunTriggers`, set by
+        // PreviewRunService.runSavedSteps), takes precedence over the
+        // hardcoded default below. This tail is reached regardless of
+        // `dialogMode`'s value (see the two branches above) — do NOT gate
+        // this check on `mode === 'passive'`, `runSavedSteps` sets
+        // `dialogMode = 'replay'` unconditionally for every Run and this is
+        // still the branch an unauthored dialog falls through to.
+        // ═══════════════════════════════════════════════════════════════════
+        // Require BOTH the permission_dialog condition AND a permission action
+        // in the predicate: a schema-valid but inert `permission_dialog -> tap`
+        // row must not shadow a later, genuinely-applicable
+        // `permission_dialog -> permission` trigger (the old find matched on
+        // condition alone, then bailed on the action check, skipping the rest).
+        const permissionTrigger = session?.activeRunTriggers?.find(
+          (t) => t.condition.kind === 'permission_dialog' && t.action.kind === 'permission',
+        );
+        if (permissionTrigger && permissionTrigger.action.kind === 'permission') {
+          try {
+            if (permissionTrigger.action.decision === 'allow') {
+              await dialog.accept();
+            } else {
+              await dialog.dismiss();
+            }
+            logger.info('[PREVIEW_SESSION] Web trigger fired on native dialog', {
+              previewSessionId, type, triggerId: permissionTrigger.id, decision: permissionTrigger.action.decision,
+            });
+            // Emit directly (not bridged through the run loop) so the badge
+            // lands on whichever step is CURRENTLY running at the exact
+            // moment the dialog fires — correct even if this is the run's
+            // last step, which has no "next iteration" to attach to.
+            if (session?.currentRunStepId !== undefined) {
+              try {
+                // Typed as PreviewRunStepPayload (not an untyped `any` emit) so
+                // buildTriggerFiredPayload's shape is compile-time checked
+                // against the WS `triggerFired` contract — the two shapes are
+                // maintained separately and this catches drift.
+                const stepPayload: PreviewRunStepPayload = {
+                  previewSessionId,
+                  stepIndex: session.currentRunStepIndex ?? 0,
+                  stepId: session.currentRunStepId,
+                  triggerFired: buildTriggerFiredPayload(permissionTrigger),
+                };
+                webSocketService.emitToUser(session.userId, 'preview:run:step', stepPayload);
+              } catch { /* non-critical */ }
+            }
+          } catch (dialogError) {
+            logger.warn('[PREVIEW_SESSION] Web trigger dialog action failed', {
+              previewSessionId, type,
+              error: dialogError instanceof Error ? dialogError.message : String(dialogError),
+            });
+          }
           return;
         }
 

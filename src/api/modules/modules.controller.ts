@@ -28,27 +28,24 @@ function getUserId(req: AuthenticatedRequest): string {
 }
 
 /**
- * Create a new test module
- * Requires platformId or platformKey to specify which platform the module belongs to
+ * Create a new test module (folder).
+ * Folders are platform-agnostic: platformId/platformKey are OPTIONAL. When
+ * neither is given the folder is created with no platform (platform_id NULL).
  */
 export async function createModule(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, platformId, platformKey, name, description, tags, priority } = req.body;
+    const { projectId, platformId, platformKey, name, description, tags, priority, parentModuleId } = req.body;
 
     if (!projectId || !name) {
       res.status(400).json({ success: false, error: 'projectId and name are required' });
       return;
     }
 
-    if (!platformId && !platformKey) {
-      res.status(400).json({ success: false, error: 'platformId or platformKey is required' });
-      return;
-    }
-
     const userId = getUserId(req);
 
-    // Resolve platformId from platformKey if needed
-    let resolvedPlatformId = platformId;
+    // Resolve platformId from platformKey when provided; otherwise leave null
+    // (platform-agnostic folder).
+    let resolvedPlatformId: string | null = platformId ?? null;
     if (!resolvedPlatformId && platformKey) {
       // Ensure platforms exist and get the one matching the key
       const platforms = await PlatformService.ensurePlatformsExist(projectId, userId);
@@ -63,6 +60,7 @@ export async function createModule(req: AuthenticatedRequest, res: Response): Pr
       projectId,
       userId,
       platformId: resolvedPlatformId,
+      parentModuleId: typeof parentModuleId === 'string' ? parentModuleId : null,
       name,
       description,
       tags,
@@ -83,6 +81,7 @@ export async function createModule(req: AuthenticatedRequest, res: Response): Pr
         name: module.name,
         platform_id: module.platformId,
         platform_key: module.platformKey,
+        parent_module_id: module.parentModuleId,
         priority: module.priority,
       },
       ...getAuditContext(req),
@@ -120,7 +119,7 @@ export async function getModule(req: AuthenticatedRequest, res: Response): Promi
  */
 export async function listModules(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, platformId, platformKey } = req.query;
+    const { projectId, platformId, platformKey, parentModuleId } = req.query;
 
     if (!projectId || typeof projectId !== 'string') {
       res.status(400).json({ success: false, error: 'projectId is required' });
@@ -131,11 +130,18 @@ export async function listModules(req: AuthenticatedRequest, res: Response): Pro
     const limit = parseInt(req.query.limit as string) || 50;
     const offset = parseInt(req.query.offset as string) || 0;
 
+    // parentModuleId filter: "null" (literal) = top-level only, a uuid = children
+    // of that folder, absent = no parent filter (all levels).
+    let parentFilter: string | null | undefined;
+    if (parentModuleId === 'null') parentFilter = null;
+    else if (typeof parentModuleId === 'string') parentFilter = parentModuleId;
+
     const result = await ModuleService.listByProject(projectId, userId, {
       limit,
       offset,
       platformId: typeof platformId === 'string' ? platformId : undefined,
       platformKey: typeof platformKey === 'string' ? (platformKey as PlatformKey) : undefined,
+      parentModuleId: parentFilter,
     });
 
     res.json({
@@ -159,6 +165,11 @@ export async function updateModule(req: AuthenticatedRequest, res: Response): Pr
     const { name, description, tags, priority } = req.body;
     const userId = getUserId(req);
 
+    // Distinguish "not provided" (leave parent unchanged) from an explicit
+    // null (move to top level) or a string (move under that folder).
+    const hasParentMove = Object.prototype.hasOwnProperty.call(req.body, 'parentModuleId');
+    const parentModuleId = hasParentMove ? (req.body.parentModuleId ?? null) : undefined;
+
     const module = await ModuleService.update({
       id,
       userId,
@@ -166,6 +177,7 @@ export async function updateModule(req: AuthenticatedRequest, res: Response): Pr
       description,
       tags,
       priority,
+      parentModuleId,
     });
 
     res.json({ success: true, data: module, timestamp: new Date() });
@@ -178,7 +190,7 @@ export async function updateModule(req: AuthenticatedRequest, res: Response): Pr
         name: module.name,
       });
 
-      const changedFields = Object.entries({ name, description, tags, priority })
+      const changedFields = Object.entries({ name, description, tags, priority, parentModuleId })
         .filter(([, v]) => v !== undefined)
         .map(([k]) => k);
       void WorkspaceAuditService.logForProject({
@@ -198,28 +210,29 @@ export async function updateModule(req: AuthenticatedRequest, res: Response): Pr
 }
 
 /**
- * Reorder modules within a platform.
- * POST /api/v1/modules/reorder — body { projectId, platformId, moduleIds }
+ * Reorder a sibling group of folders (project-scoped; folders are
+ * platform-agnostic). POST /api/v1/modules/reorder — body { projectId, moduleIds }.
+ * (Legacy `platformId` in the body is accepted but ignored.)
  * Sets each module's order_index to its position in moduleIds.
  */
 export async function reorderModules(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, platformId, moduleIds } = req.body;
+    const { projectId, moduleIds } = req.body;
 
-    if (!projectId || !platformId || !moduleIds || !Array.isArray(moduleIds)) {
+    if (!projectId || !moduleIds || !Array.isArray(moduleIds)) {
       res.status(400).json({
         success: false,
-        error: 'projectId, platformId and moduleIds array are required',
+        error: 'projectId and moduleIds array are required',
       });
       return;
     }
 
     const userId = getUserId(req);
 
-    await ModuleService.reorder(projectId, platformId, moduleIds, userId);
+    await ModuleService.reorder(projectId, moduleIds, userId);
 
     // Tell the project room the tree changed so clients refetch in the new order.
-    emitModuleMutated({ projectId, action: 'updated', id: platformId });
+    emitModuleMutated({ projectId, action: 'updated', id: projectId });
 
     res.json({ success: true, message: 'Modules reordered', timestamp: new Date() });
   } catch (error) {

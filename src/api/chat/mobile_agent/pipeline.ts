@@ -35,6 +35,8 @@ import {
   formatMobileSnapshotForChat,
   type MobileSnapshot,
 } from '@/services/chat/mobile-context.service';
+import type { MobileIntentStep } from '@/services/mobile/mobile-runner.types';
+import { formatMobileProjectContextForChat } from '@/services/chat/mobile-project-context.service';
 
 // Upper bound on "LLM → tool dispatch" rounds in a single turn.
 //
@@ -79,6 +81,35 @@ export interface MobileAgentResult {
   toolCallsMade: number;
   observed: boolean;
   durationMs: number;
+  /**
+   * Structured draft steps authored by `mobile_run_draft_steps` this turn,
+   * surfaced so the handler can lift them onto the HTTP reply metadata. The
+   * chat UI renders them as editable step widgets (draftMeta.executed tells
+   * it whether they already ran or await a UI-confirm run). Absent on turns
+   * that didn't author a draft. If the tool is called more than once, the
+   * LAST authored draft wins (matches the in-memory draft cache, which the
+   * last call also overwrote).
+   */
+  draftSteps?: MobileIntentStep[];
+  draftMeta?: MobileDraftStepsMeta;
+}
+
+/** Shape of `draftMeta` carried on both the tool result and the reply. */
+export interface MobileDraftStepsMeta {
+  /** Stable per-draft id; the chat card uses it to namespace step ids so two
+   *  drafts (or a remounted one) never collide in editorSteps/status/save. */
+  draftId: string;
+  chatSessionId: string;
+  mobileSessionId: string;
+  platform: string;
+  suggestedName?: string;
+  executed: boolean;
+  /**
+   * Placeholder schema for the sanitized {{param_*}} values in the draft. The
+   * chat card forwards it on Save so the saved test case resolves those values
+   * on regression replay. Absent when no value was parameterised.
+   */
+  parametersSchema?: Record<string, unknown>;
 }
 
 export interface RunMobileAgentPipelineOpts {
@@ -97,6 +128,21 @@ export interface RunMobileAgentPipelineOpts {
    * fires.
    */
   snapshot?: MobileSnapshot | null;
+  /**
+   * When the mobile editor is scoped to a SAVED test case, a formatted summary
+   * of its existing steps. Injected as a system block so the agent EXTENDS the
+   * open flow ("add a logout after login") instead of re-authoring it from
+   * scratch (duplicate). Null/undefined = no open test case (workspace scope).
+   */
+  openTestCaseBlock?: string | null;
+  /**
+   * Prior conversation turns (oldest→newest), already role-mapped for OpenAI
+   * and secret-redacted by the handler. Threaded between the system blocks and
+   * the current user goal so the agent has memory across turns ("now do the
+   * same on signup", "no, the other button", "undo the last step"). Empty when
+   * there's no prior history or the load failed (best-effort).
+   */
+  history?: ChatCompletionMessageParam[];
 }
 
 export async function runMobileAgentPipeline(
@@ -105,17 +151,34 @@ export async function runMobileAgentPipeline(
 ): Promise<MobileAgentResult> {
   const startedAt = Date.now();
 
-  // Eager-inject the runner snapshot as a SECOND system message when
-  // the handler pre-fetched it. We put it AFTER the base system prompt
-  // so the agent's identity / tool guidance always lands first, then
-  // the situational "here's what's on the screen right now" context.
-  // The order matters for prompt-cache hits — the static base prompt
-  // stays at index 0, only index 1 changes per turn.
+  // Eager-inject situational context as extra system messages AFTER the
+  // static base prompt (prompt-cache: index 0 never changes per turn):
+  //   1. Project context (project + app under test + open-test-case steps,
+  //      resolved by the handler). Stable across a session's turns, so it
+  //      sits before the per-turn snapshot for better cache locality.
+  //   2. Device snapshot ("here's what's on the screen right now").
+  const projectContext = blackboard.getProjectContext();
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: buildMobileAgentSystemPrompt() },
+    // Eager project context (app-under-test, resolved before the first LLM
+    // call) BEFORE the device snapshot — stable across the turn (cache-local).
+    ...(projectContext
+      ? [{ role: 'system' as const, content: formatMobileProjectContextForChat(projectContext) }]
+      : []),
+    // Open-test-case steps (when the editor is scoped to a saved test) BEFORE
+    // the device snapshot: the agent should know the existing flow to extend it,
+    // not duplicate it. Stable across the turn (good for prompt cache).
+    ...(opts?.openTestCaseBlock
+      ? [{ role: 'system' as const, content: opts.openTestCaseBlock }]
+      : []),
     ...(opts?.snapshot
       ? [{ role: 'system' as const, content: formatMobileSnapshotForChat(opts.snapshot) }]
       : []),
+    // Prior turns (oldest→newest) BEFORE the current goal so the agent resolves
+    // references to earlier turns. The snapshot/open-test-case system blocks
+    // stay ABOVE history (situational context first), history is the running
+    // dialogue, and the current goal is last.
+    ...(opts?.history ?? []),
     { role: 'user', content: blackboard.goal },
   ];
 
@@ -132,6 +195,10 @@ export async function runMobileAgentPipeline(
 
   let round = 0;
   let toolCallsMade = 0;
+  // Captured from mobile_run_draft_steps' result data whenever it authors a
+  // draft this turn. Lifted onto the reply so the chat renders editable steps.
+  let draftSteps: MobileIntentStep[] | undefined;
+  let draftMeta: MobileDraftStepsMeta | undefined;
 
   while (round < MAX_TOOL_ROUNDS) {
     round++;
@@ -175,6 +242,7 @@ export async function runMobileAgentPipeline(
         toolCallsMade,
         observed: blackboard.getSnapshot() !== null,
         durationMs: Date.now() - startedAt,
+        ...(draftSteps && draftMeta ? { draftSteps, draftMeta } : {}),
       };
     }
 
@@ -283,6 +351,17 @@ export async function runMobileAgentPipeline(
       // network error) leave `data` either undefined or without
       // `screenshotBase64`, so this branch never fires on the unhappy
       // path — the `tool` message above already explained what happened.
+      // Capture authored draft steps (mobile_run_draft_steps). Present on both
+      // the author-only (confirm=false) and executed (confirm=true) paths. Last
+      // authoring call wins — mirrors the in-memory draft cache it overwrote.
+      const draftData = safeResult.data as
+        | { draftSteps?: MobileIntentStep[]; draftMeta?: MobileDraftStepsMeta }
+        | undefined;
+      if (draftData?.draftSteps && draftData.draftMeta) {
+        draftSteps = draftData.draftSteps;
+        draftMeta = draftData.draftMeta;
+      }
+
       const screenshotData = safeResult.data as { screenshotBase64?: string; capturedAt?: string } | undefined;
       if (safeResult.ok && screenshotData?.screenshotBase64) {
         messages.push({
@@ -331,6 +410,7 @@ export async function runMobileAgentPipeline(
     toolCallsMade,
     observed: blackboard.getSnapshot() !== null,
     durationMs: Date.now() - startedAt,
+    ...(draftSteps && draftMeta ? { draftSteps, draftMeta } : {}),
   };
 }
 

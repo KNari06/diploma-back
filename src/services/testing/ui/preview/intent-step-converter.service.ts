@@ -442,6 +442,11 @@ export function convertIntentStepToCommand(
       if (step.options?.scrollContainer && command.intentMeta) {
         (command.intentMeta as any).scrollContainer = step.options.scrollContainer;
       }
+      // Container scroll by description: pass it so background replay resolves the
+      // container (LLM/vision) and scrolls inside it, matching the editor.
+      if (step.options?.scrollContainerDescription && command.intentMeta) {
+        (command.intentMeta as any).scrollContainerDescription = step.options.scrollContainerDescription;
+      }
       break;
 
     case 'drag_and_drop':

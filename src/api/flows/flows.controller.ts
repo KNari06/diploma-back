@@ -116,10 +116,22 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
     });
 
     // Create initial test case
-    // UI test cases (web + mobile) are created in intent_test_cases (unified table)
+    // UI test cases (web + mobile) are created in intent_test_cases (unified table).
+    //
+    // Folders are platform-agnostic, so the test's platform comes from the FLOW
+    // (its explicit `platform` / `flowType`), NOT the folder's `platformKey` —
+    // otherwise a web test created in a platform-null folder would get no test
+    // case, and an api/mobile test in a legacy web folder would be miscreated as
+    // web. `flowType: 'api'` creates NO intent_test_case (API tests are authored
+    // via the API flow builder, not this UI-test path).
     let createdTestCaseId: string | undefined;
 
-    if (platformKey === 'web_ui' || isMobilePlatform) {
+    const flowIsApi = flowType === 'api' || platform === 'api';
+    const isWebTestCase =
+      !isMobilePlatform && !flowIsApi &&
+      (platform === 'web' || !platform || platformKey === 'web_ui');
+
+    if (isWebTestCase || isMobilePlatform) {
         // Sanitize baseUrl if provided (only relevant for web flows)
         let sanitizedBaseUrl: string | null = null;
         if (!isMobilePlatform && baseUrl && typeof baseUrl === 'string' && baseUrl.trim()) {

@@ -1696,6 +1696,7 @@ export class RegressionPlanService {
       id: string;
       name: string;
       platformKey: 'web_ui' | 'api';
+      parentModuleId: string | null;
       testCount: number;
       flowCount: number;
     }>;
@@ -1726,7 +1727,7 @@ export class RegressionPlanService {
     // Phase 1: Fetch modules (scoped by project_id)
     const modulesResult = await supabaseAdmin
       .from('test_modules')
-      .select('id, name, platform_id, test_platforms!inner(platform_key)')
+      .select('id, name, platform_id, parent_module_id, test_platforms(platform_key)')
       .eq('project_id', projectId)
       .eq('user_id', userId)
       .order('name', { ascending: true });
@@ -1823,6 +1824,7 @@ export class RegressionPlanService {
       id: m.id,
       name: m.name,
       platformKey: modulePlatformMap.get(m.id) || 'web_ui',
+      parentModuleId: m.parent_module_id ?? null,
       testCount: moduleTestCount.get(m.id) || 0,
       flowCount: moduleFlowCount.get(m.id) || 0,
     }));

@@ -5768,9 +5768,18 @@ export class CdpSnapshotService {
               if (style.display === 'none' || style.visibility === 'hidden') continue;
               if (parseFloat(style.opacity) < 0.1) continue;
 
-              const zIndex = parseInt(style.zIndex, 10);
-              if (isNaN(zIndex)) continue;
-              if (position !== 'sticky' && zIndex < 1) continue;
+              // 'fixed'/'sticky' elements commonly omit z-index and rely on
+              // DOM/portal order instead (Radix UI, shadcn/ui explicitly do
+              // this — a role="dialog" modal can render with computed
+              // z-index:auto). Only 'absolute' keeps the z-index >= 1
+              // requirement: absolutely-positioned decorative elements
+              // (badges, carets, in-flow tooltip arrows) are common false
+              // positives there, unlike fixed/sticky which are already
+              // viewport-anchored. NaN (unset/auto) coerces to 0, same as
+              // the "best iron-clad" ref search above (`|| 0` fallback).
+              const zIndexParsed = parseInt(style.zIndex, 10);
+              const zIndex = isNaN(zIndexParsed) ? 0 : zIndexParsed;
+              if (position === 'absolute' && zIndex < 1) continue;
 
               const rect = el.getBoundingClientRect();
               const area = rect.width * rect.height;

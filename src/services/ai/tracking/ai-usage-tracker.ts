@@ -319,15 +319,14 @@ export function calculateOpenAICost(model: string, inputTokens: number, outputTo
 
 /**
  * Calculate cost for Gemini models.
- * Gemini pricing (as of 2024):
- * - Flash: $0.075/1M input, $0.30/1M output
- * - Pro: $1.25/1M input, $5.00/1M output
+ * Reuses pricing from ai-cost-manager.service.ts (kept in sync with
+ * token-calculator.service.ts's MODEL_PRICING).
  */
 export function calculateGeminiCost(model: string, inputTokens: number, outputTokens: number): number {
-  const pricing =
-    model.includes('pro')
-      ? { input: 1.25 / 1_000_000, output: 5.0 / 1_000_000 }
-      : { input: 0.075 / 1_000_000, output: 0.3 / 1_000_000 }; // Flash
-
+  const knownPricing = AI_PRICING[model as AIModel];
+  if (!knownPricing) {
+    logger.warn('[AI_USAGE] Unrecognized Gemini model, pricing as gemini-2.5-flash-lite', { model });
+  }
+  const pricing = knownPricing || AI_PRICING['gemini-2.5-flash-lite']; // Fallback to cheapest Gemini tier
   return inputTokens * pricing.input + outputTokens * pricing.output;
 }

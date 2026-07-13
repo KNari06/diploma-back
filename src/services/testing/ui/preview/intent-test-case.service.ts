@@ -159,11 +159,18 @@ export class IntentTestCaseService {
      * against the named variant lane regardless of the plan.
      */
     mobileVariantLabel?: string | null;
+    /**
+     * Placeholder schema for {{param_*}} values in `steps` (chat-agent draft
+     * save — sensitive values sanitized to placeholders before persist).
+     * Persisted so a regression replay can resolve them; without it the runner
+     * types the literal placeholder. Empty/undefined → column left null.
+     */
+    parametersSchema?: Record<string, unknown> | null;
   }): Promise<IntentTestCase> {
     const {
       projectId, userId, name, description, startUrl, steps, flowId,
       status = 'draft', kind = 'standalone', platform = 'web',
-      preconditions, importId, sourceStatus, stepsDegraded,
+      preconditions, importId, sourceStatus, stepsDegraded, parametersSchema,
     } = params;
     const mobileVariantLabel = normaliseVariantOverride(params.mobileVariantLabel);
     // Explicit `null` from the caller means "no opinion" → store NULL.
@@ -287,6 +294,11 @@ export class IntentTestCaseService {
       // Mobile per-test variant override (null = inherit).
       mobile_variant_label: mobileVariantLabel,
       resource_bindings: resourceBindings,
+      // Placeholder schema for sanitized {{param_*}} values — only written when
+      // non-empty so ordinary creates leave the column at its default.
+      ...(parametersSchema && Object.keys(parametersSchema).length > 0
+        ? { parameters_schema: parametersSchema }
+        : {}),
     });
 
     if (error) {
@@ -552,6 +564,13 @@ export class IntentTestCaseService {
     triggers?: unknown;
     /** Mobile per-test variant override. `null` clears it (inherit); `undefined` leaves it untouched. */
     mobileVariantLabel?: string | null;
+    /**
+     * Placeholder schema for {{param_*}} values in `steps` (mobile agent draft
+     * save — sensitive values sanitized to placeholders). Persisted so a
+     * regression replay can resolve them. `undefined` leaves the column
+     * untouched; an object replaces it.
+     */
+    parametersSchema?: Record<string, unknown> | null;
   }): Promise<IntentTestCase> {
     // Serialize concurrent writes to the same test case via the same in-process
     // mutex used by updateStepFromPreviewApply / updateStepAfterHeal /
@@ -560,11 +579,17 @@ export class IntentTestCaseService {
     // that the runner just wrote. No reentrancy risk — none of the already-
     // mutex'd methods call update() internally.
     return withTestCaseMutex(params.id, async () => {
-      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers, mobileVariantLabel } = params;
+      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers, mobileVariantLabel, parametersSchema } = params;
 
       const updates: Record<string, any> = {};
       if (name !== undefined) updates.name = name;
       if (description !== undefined) updates.description = description;
+      if (parametersSchema !== undefined) {
+        // Persist the placeholder schema so {{param_*}} values resolve on
+        // replay. Empty object → null (nothing to parameterise).
+        updates.parameters_schema =
+          parametersSchema && Object.keys(parametersSchema).length > 0 ? parametersSchema : null;
+      }
       if (mobileVariantLabel !== undefined) {
         // `null` (or blank) clears the override → inherit. A non-blank string pins it.
         updates.mobile_variant_label = normaliseVariantOverride(mobileVariantLabel);

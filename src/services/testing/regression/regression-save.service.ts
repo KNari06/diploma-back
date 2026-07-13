@@ -1,4 +1,6 @@
 import * as regressionDb from './db/regression.db';
+import { sanitizeMobileSteps } from '@/services/testing/mobile/mobile-step-sanitizer';
+import { encodeMobileGoal } from '@/services/testing/mobile/mobile-goal-codec';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 
@@ -65,6 +67,13 @@ export class RegressionSaveService {
     appPackage?: string;
     startActivity?: string;
     tags?: string[];
+    /**
+     * Pre-computed parameters schema for {{param_*}} placeholders in `steps`
+     * (mobile agent sanitizes sensitive values to placeholders before save).
+     * Without it, a saved sensitive step can't resolve on regression replay —
+     * resolvePlaceholders leaves the literal and the runner types it verbatim.
+     */
+    parametersSchema?: Record<string, unknown> | null;
     // common
     userId: string;
     name: string;
@@ -92,6 +101,7 @@ export class RegressionSaveService {
         appPackage: params.appPackage,
         startActivity: params.startActivity,
         tags: params.tags,
+        parametersSchema: params.parametersSchema ?? null,
       });
     }
 
@@ -183,6 +193,10 @@ export class RegressionSaveService {
    * Writes directly to `intent_test_cases`:
    *   - mobile_* platforms → `replay_strategy='mobile_steps'`, `steps_json=steps`.
    *     Runner reads `steps_json` at dispatch time in `dispatchMobileTest`.
+   *     Steps are sanitized HERE (`sanitizeMobileSteps`) — credential values
+   *     become `{{param_*}}` placeholders and the schema is persisted to
+   *     `parameters_schema`. This is the enforcement point: callers don't
+   *     have to sanitize (idempotent if they do).
    *   - web (step editor) → `replay_strategy='steps_editor'`, `steps_json=steps`.
    *     `IntentStepConverterService.convertToCommands` handles it at run time.
    *
@@ -200,6 +214,7 @@ export class RegressionSaveService {
     appPackage?: string;
     startActivity?: string;
     tags?: string[];
+    parametersSchema?: Record<string, unknown> | null;
   }): Promise<{
     savedTestCaseId: string;
     projectId: string;
@@ -217,7 +232,17 @@ export class RegressionSaveService {
       appPackage,
       startActivity,
       tags,
+      parametersSchema,
     } = params;
+    // Persist the placeholder schema so {{param_*}} values resolve on replay.
+    // Guard the same limit the from-test path enforces.
+    const paramSchema =
+      parametersSchema && Object.keys(parametersSchema).length > 0 ? parametersSchema : null;
+    if (paramSchema && Object.keys(paramSchema).length > MAX_PARAMETERS_PER_TEST) {
+      throw new ValidationError(
+        `Too many parameters detected (${Object.keys(paramSchema).length}). Maximum allowed: ${MAX_PARAMETERS_PER_TEST}`,
+      );
+    }
 
     if (!projectId) {
       throw new ValidationError(
@@ -264,6 +289,36 @@ export class RegressionSaveService {
       ? 'mobile_steps'
       : 'steps_editor';
 
+    // Sanitize at the persistence boundary. Every mobile save funnels
+    // through here, so a caller that forgets to sanitize cannot persist
+    // plaintext credentials in steps_json. Idempotent — already-templated
+    // `{{param_*}}` values pass through untouched, so callers that
+    // sanitized earlier are unaffected. Web step-editor saves are
+    // intentionally not sanitized here (parity with existing web
+    // authoring; web replay's secret handling lives in resolvePlaceholders
+    // / redactSecrets).
+    let stepsToPersist = normalizedSteps;
+    // Boundary-sanitized schema (mobile secret auto-detection). Falls back to
+    // the caller-supplied `paramSchema` (web draft-save passes a pre-built
+    // schema for its already-sanitized {{param_*}} steps) when the boundary
+    // pass finds nothing — so a web save's schema is still persisted.
+    let sanitizedSchema: Record<string, unknown> | null = paramSchema;
+    let parametersCount = paramSchema ? Object.keys(paramSchema).length : 0;
+    if (isMobile) {
+      const sanitized = sanitizeMobileSteps(normalizedSteps);
+      stepsToPersist = sanitized.steps;
+      const boundaryCount = Object.keys(sanitized.parametersSchema).length;
+      if (boundaryCount > 0) {
+        sanitizedSchema = sanitized.parametersSchema;
+        parametersCount = boundaryCount;
+      }
+      if (parametersCount > MAX_PARAMETERS_PER_TEST) {
+        throw new ValidationError(
+          `Too many parameters detected (${parametersCount}). Maximum allowed: ${MAX_PARAMETERS_PER_TEST}`,
+        );
+      }
+    }
+
     // Mobile cases don't have a web URL; use a sentinel so downstream
     // code that references url/start_url doesn't crash.
     // `dispatchMobileTest` uses `mobile://${shortPlatform}` itself for the
@@ -279,6 +334,7 @@ export class RegressionSaveService {
       platform,
       stepsCount: normalizedSteps.length,
       replayStrategy,
+      parametersCount,
       kind,
     });
 
@@ -293,19 +349,18 @@ export class RegressionSaveService {
       replay_strategy: replayStrategy,
       commands: null,
       graph_ref: null,
-      steps_json: normalizedSteps,
-      parameters_schema: null,
+      steps_json: stepsToPersist,
+      parameters_schema: sanitizedSchema,
       url: effectiveUrl,
       start_url: effectiveUrl,
       tags: tags || null,
       // Mobile app metadata carried inline until we add a dedicated column.
-      ...(isMobile && (appPackage || startActivity)
-        ? {
-            goal: JSON.stringify({
-              appPackage: appPackage || null,
-              startActivity: startActivity || null,
-            }),
-          }
+      // Shape owned by mobile-goal-codec (single writer/reader convention).
+      ...(isMobile
+        ? (() => {
+            const goal = encodeMobileGoal({ appPackage, startActivity });
+            return goal ? { goal } : {};
+          })()
         : {}),
     });
 
@@ -321,7 +376,7 @@ export class RegressionSaveService {
       savedTestCaseId: savedCase.id,
       projectId,
       replayStrategy,
-      parametersCount: 0,
+      parametersCount,
     };
   }
 

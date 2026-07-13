@@ -1301,6 +1301,14 @@ export interface StepOptions {
   /** CSS selector of scrollable container (for container scroll vs page scroll) */
   scrollContainer?: string;
   /**
+   * Natural-language description of a scrollable container to scroll INSIDE.
+   * When set, the scroll step resolves this container via the element resolver
+   * (LLM/vision, same as click/fill targeting) and scrolls the resolved element
+   * by the recorded delta instead of the page. Empty → page / recorded-CSS-container
+   * scroll (legacy behaviour). NOT interpolated (see preview CLAUDE.md invariant #11).
+   */
+  scrollContainerDescription?: string;
+  /**
    * V-cross-app: configuration for a `link_test_case` step — runs another
    * saved test case at this point in the sequence, possibly on a different
    * platform, splicing it into (same-platform) or nesting it beneath
@@ -1345,6 +1353,14 @@ export interface IntentStep {
   options?: StepOptions;
   /** Hints for element resolution */
   bindingHints?: BindingHints;
+  /**
+   * Authoring-time flag: this step's `value` is a credential (password /
+   * OTP / token / API key). Set by the mobile agent's draft authoring
+   * (mirrors the `type_text` tool's isSensitive arg). Primary signal for
+   * `sanitizeMobileSteps` at the save boundary — a flagged value is
+   * parameterized regardless of what the description says.
+   */
+  isSensitive?: boolean;
   /**
    * Runtime-only marker: set when this step was inlined as a precondition
    * (a transitive dependency's step prepended before the target test's own

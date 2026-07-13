@@ -71,10 +71,18 @@ export async function downloadFileForUpload(
     );
   }
 
-  // Determine filename
+  // Determine filename.
+  // SECURITY: both sources are untrusted — options.filename comes from
+  // client/LLM-authored step content (IntentStep.options.upload.filename) or a
+  // client-echoed WS payload (preview:recording:upload:resolve), and the URL
+  // path is attacker-influenced too. A `../`-laden name would escape the
+  // mkdtemp dir and let the fetched buffer be written to an arbitrary path.
+  // Sanitise the FINAL name to a bare basename (no separators) before it ever
+  // touches a filesystem path — same guard as the chat-upload temp path.
   const contentType = response.headers['content-type'];
   const urlFilename = path.basename(parsedUrl.pathname) || 'upload-file';
-  const filename = options?.filename || urlFilename;
+  const rawFilename = options?.filename || urlFilename;
+  const filename = path.basename(rawFilename).replace(/[/\\]/g, '').slice(0, 128) || 'upload-file';
 
   // Create temp directory and write file
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'qai-upload-'));

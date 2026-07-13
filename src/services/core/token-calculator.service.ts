@@ -44,6 +44,10 @@ export const MODEL_PRICING: Record<string, { input: number; output: number }> = 
     input: 0.0001, // $ per 1K tokens
     output: 0.0004, // $ per 1K tokens
   },
+  'gemini-2.5-pro': {
+    input: 0.00125, // $ per 1K tokens (<=200K context tier; see AI_PRICING in ai-cost-manager.service.ts)
+    output: 0.01, // $ per 1K tokens (<=200K context tier; see AI_PRICING in ai-cost-manager.service.ts)
+  },
 };
 
 /**

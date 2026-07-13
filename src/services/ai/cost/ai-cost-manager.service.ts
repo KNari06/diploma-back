@@ -27,6 +27,15 @@ export const AI_PRICING = {
     input: 0.0001 / 1000,  // $0.10 per 1M input tokens
     output: 0.0004 / 1000, // $0.40 per 1M output tokens
   },
+  // Flat rate for the <=200K-context tier — the only tier reachable today (no
+  // call site sends >200K input tokens; calculateGeminiCost has no
+  // context-length branching). Google's >200K tier is ~2x pricier ($2.50/$15
+  // per 1M) — a large-context Gemini Pro call site would need a tiered
+  // lookup here, not just a bigger flat number.
+  'gemini-2.5-pro': {
+    input: 0.00125 / 1000, // $1.25 per 1M input tokens
+    output: 0.01 / 1000,   // $10.00 per 1M output tokens
+  },
   'gpt-5.4-mini-vision': {
     input: 0.002 / 1000,   // Same as gpt-5.4-mini
     output: 0.008 / 1000,

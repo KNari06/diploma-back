@@ -36,6 +36,7 @@ function makeBuilder(table: string) {
     },
     eq: (col: string, val: any) => { rec.filters[col] = val; return builder; },
     in: (col: string, val: any) => { rec.filters[col] = val; return builder; },
+    like: (col: string, val: any) => { rec.filters[`${col}__like`] = val; return builder; },
     order: () => builder,
     limit: () => builder,
     // Make the builder awaitable (thenable) like a Supabase query.
@@ -46,6 +47,17 @@ function makeBuilder(table: string) {
 
 jest.mock('@/db/supabase', () => ({
   supabaseAdmin: { from: (table: string) => makeBuilder(table) },
+}));
+
+// Deterministic embeddings so findSimilar's hybrid scoring is stable offline.
+// A name containing "login" embeds as [1,0]; anything else as [0,1] — so a
+// "login" query scores ~1.0 against login candidates, ~0 against others.
+jest.mock('@/services/ai/core/embedding.service', () => ({
+  generateEmbedding: jest.fn(async (text: string) =>
+    /login/i.test(text) ? [1, 0] : [0, 1],
+  ),
+  cosineSimilarity: (a: number[], b: number[]) =>
+    a[0] * b[0] + a[1] * b[1], // unit vectors → dot product
 }));
 
 function reset() {
@@ -122,5 +134,72 @@ describe('TestCaseResolverService.resolve — ownerOnly scoping', () => {
     const proj = recorded.find((r) => r.table === 'projects')!;
     expect(proj.filters.workspace_id).toBe('w1');
     expect(proj.filters.user_id).toBeUndefined(); // workspace-wide
+  });
+});
+
+describe('TestCaseResolverService.findSimilar', () => {
+  beforeEach(reset);
+
+  it('scopes to owner projects and applies the platform prefix in the DB query (before the cap)', async () => {
+    responses['projects'] = { data: [{ id: 'p1' }] };
+    responses['intent_test_cases'] = {
+      data: [
+        { id: 'tc1', name: 'Login with email', platform: 'mobile_android', updated_at: '2026-07-01' },
+      ],
+    };
+    const hits = await TestCaseResolverService.findSimilar({
+      query: 'log in with email and password',
+      userId: 'u1',
+      workspaceId: 'w1',
+      platformPrefix: 'mobile_',
+    });
+    expect(hits).toHaveLength(1);
+    expect(hits[0].id).toBe('tc1');
+    // owner-scoped project lookup + platform filter in the candidate query
+    const proj = recorded.find((r) => r.table === 'projects')!;
+    expect(proj.filters.user_id).toBe('u1');
+    const tc = recorded.find((r) => r.table === 'intent_test_cases')!;
+    expect(tc.filters['platform__like']).toBe('mobile_%');
+    expect(tc.filters.status).toBe('published');
+  });
+
+  it('ranks a semantically-matching case above an unrelated one', async () => {
+    responses['projects'] = { data: [{ id: 'p1' }] };
+    responses['intent_test_cases'] = {
+      data: [
+        { id: 'settings', name: 'Change settings', platform: 'mobile_android', updated_at: '2026-07-02' },
+        { id: 'login', name: 'Login with email', platform: 'mobile_android', updated_at: '2026-07-01' },
+      ],
+    };
+    const hits = await TestCaseResolverService.findSimilar({
+      query: 'login flow',
+      userId: 'u1',
+      workspaceId: 'w1',
+      platformPrefix: 'mobile_',
+    });
+    expect(hits[0].id).toBe('login'); // embedding + name both favour the login row
+  });
+
+  it('returns [] when no candidates exist', async () => {
+    responses['projects'] = { data: [{ id: 'p1' }] };
+    responses['intent_test_cases'] = { data: [] };
+    const hits = await TestCaseResolverService.findSimilar({
+      query: 'anything',
+      userId: 'u1',
+      workspaceId: 'w1',
+      platformPrefix: 'mobile_',
+    });
+    expect(hits).toEqual([]);
+  });
+
+  it('never throws — returns [] on a candidate query error', async () => {
+    responses['projects'] = { data: [{ id: 'p1' }] };
+    responses['intent_test_cases'] = { error: new Error('boom'), data: [] };
+    const hits = await TestCaseResolverService.findSimilar({
+      query: 'x',
+      userId: 'u1',
+      workspaceId: 'w1',
+    });
+    expect(hits).toEqual([]);
   });
 });

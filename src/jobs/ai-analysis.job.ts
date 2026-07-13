@@ -437,6 +437,15 @@ export class AIAnalysisJobHandler {
         bugsCount: bugs.length,
         criticalCount: criticalBugs.length,
       });
+
+      // Telegram: non-critical analyses that found issues. A 0-bug "all clear"
+      // result stays in-app only (not actionable enough for a push notification).
+      // Critical bugs are EXCLUDED here — handleCriticalIssues (elsewhere in
+      // this job) already sends its own dedicated Telegram message for those,
+      // so this would otherwise double-notify the user for the same analysis.
+      if (bugs.length > 0 && criticalBugs.length === 0) {
+        await this.sendAIAnalysisTelegramNotification(userId, testId, bugs.length, confidencePct);
+      }
     } catch (error) {
       logger.error('[AI-ANALYSIS] Failed to create background AI notifications', {
         error: error instanceof Error ? error.message : String(error),
@@ -444,6 +453,43 @@ export class AIAnalysisJobHandler {
         testResultId,
       });
       // Don't throw - notification failure shouldn't break AI analysis
+    }
+  }
+
+  /**
+   * Send Telegram notification for a completed AI analysis that found
+   * issues (any severity). Best-effort — logs and swallows on failure.
+   */
+  private static async sendAIAnalysisTelegramNotification(
+    userId: string,
+    testId: string,
+    bugsCount: number,
+    confidencePct: number
+  ): Promise<void> {
+    try {
+      const { getTelegramToken, sendTelegramNotification } = await import('@/utils/notifications/telegram-notify');
+      const tokenData = await getTelegramToken(userId);
+      if (!tokenData?.external_id) {
+        return;
+      }
+
+      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+      await sendTelegramNotification(tokenData, {
+        icon: '🤖',
+        title: 'AI analysis completed',
+        fields: [
+          { label: 'Issues found', value: String(bugsCount) },
+          { label: 'Confidence', value: `${confidencePct}%` },
+        ],
+        ctaLabel: 'View AI analysis →',
+        ctaUrl: `${frontendUrl}/tests/${testId}`,
+      });
+
+      logger.info(`[AI-ANALYSIS] Sent Telegram notification for analysis completion: ${testId}`);
+    } catch (error) {
+      logger.warn(`[AI-ANALYSIS] Failed to send Telegram notification for analysis completion ${testId}:`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 

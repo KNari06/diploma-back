@@ -5,6 +5,12 @@
  */
 
 import { supabaseAdmin } from '@/db/supabase';
+import {
+  getFlowPlatformsByModuleIds,
+  getProjectModulesForTree,
+  type FlowPlatformRow,
+  type PlatformModuleTreeRow,
+} from '@/services/testing/modules/db/module.db';
 import { logger } from '@/utils/core/logger';
 
 // ============================================================================
@@ -32,11 +38,20 @@ interface PlatformSummary {
 
 interface ModuleSummary {
   id: string;
-  platformId: string;
+  /** Platform the folder was created under. null = platform-agnostic folder. */
+  platformId: string | null;
   platformKey?: 'web_ui' | 'api' | 'mobile';
+  /** Parent folder id (self-reference). null = top-level folder. */
+  parentModuleId: string | null;
   name: string;
   description?: string;
   priority?: string;
+  orderIndex: number | null;
+  /**
+   * Coarse platform kinds (web_ui | mobile | api) of the folder's DIRECT tests.
+   * The frontend rolls these up over the subtree to filter folders by tab.
+   */
+  directPlatforms?: Array<'web_ui' | 'mobile' | 'api'>;
 }
 
 interface FlowSummary {
@@ -46,6 +61,7 @@ interface FlowSummary {
   flowType: 'ui' | 'api' | 'mixed' | 'mobile';
   platform?: string;
   priority?: string;
+  tags: string[];
   orderIndex: number | null;
   mobileVariantLabel?: string | null;
   createdAt: string;
@@ -68,6 +84,13 @@ export interface BaseModeResponse {
       modules: PaginatedList<ModuleSummary>;
     }>;
   };
+  /**
+   * ALL project modules as one flat, project-level list (folders are
+   * platform-agnostic). Each carries its own platformId (may be null) and the
+   * coarse platform kinds present in its direct tests (directPlatforms). The
+   * frontend assembles a single folder forest from this.
+   */
+  modules: PaginatedList<ModuleSummary>;
 }
 
 export interface ModuleModeResponse {
@@ -89,12 +112,21 @@ export interface FlowModeResponse {
  */
 export class PlatformTreeService {
   /**
-   * Base mode: return platforms with paginated modules
+   * Base mode: return the project-level folder forest plus platform metadata.
    *
-   * Queries:
-   *   1. Fetch platforms (1 query)
-   *   2. Fetch paginated modules + counts per platform (parallel, 1 per platform)
-   * Total: 1 + N parallel queries (N = number of platforms, typically 2)
+   * Folders are platform-agnostic (a folder's platform_id may be NULL and it can
+   * hold web/mobile/api tests together), so modules are returned as ONE flat
+   * project-level list carrying parent_module_id; the frontend assembles the
+   * nested tree. Each module also reports the coarse platform kinds present in
+   * its DIRECT tests (directPlatforms) so the Repository tabs can hide folders
+   * that hold no matching test. `platforms.items[]` is kept for tab metadata and
+   * back-compat (its per-platform modules exclude platform-null folders).
+   *
+   * A nested tree CANNOT be offset/limit-paginated — a slice would drop folders
+   * and orphan their children — so the full (depth-capped, breadth-modest)
+   * module set is returned regardless of limit/offset.
+   *
+   * Queries: 1 (platforms) + 1 (all project modules) + 1 (flow platforms) = 3.
    */
   static async getBaseModeTree(
     projectId: string,
@@ -116,7 +148,7 @@ export class PlatformTreeService {
       throw new Error(`Failed to get platforms: ${platformsError.message}`);
     }
 
-    // Custom platform order for UI: web_ui first, then api (then anything else)
+    // Custom platform order for UI: web_ui first, then mobile, then api.
     const preferredOrder: Record<string, number> = { web_ui: 0, mobile: 1, api: 2 };
     const sortedPlatforms = (platforms || []).slice().sort((a: any, b: any) => {
       const wa = preferredOrder[a.platform_key] ?? 99;
@@ -124,54 +156,78 @@ export class PlatformTreeService {
       return wa - wb;
     });
 
+    const emptyPage = { limit, offset, total: 0 };
     if (sortedPlatforms.length === 0) {
-      return { platforms: { items: [] } };
+      return { platforms: { items: [] }, modules: { items: [], pageInfo: emptyPage } };
     }
 
-    // Fetch paginated modules + count per platform in parallel (single query per platform)
-    const platformResults = await Promise.all(
-      sortedPlatforms.map(async (p: any) => {
-        const modulesResult = await supabaseAdmin
-          .from('test_modules')
-          .select('id, platform_id, name, description, priority, order_index, created_at', { count: 'exact' })
-          .eq('platform_id', p.id)
-          .eq('user_id', userId)
-          .order('order_index', { ascending: true, nullsFirst: false })
-          .order('created_at', { ascending: false })
-          .range(offset, offset + limit - 1);
+    // Fetch ALL project modules once (incl. platform-null folders) + the flows'
+    // platforms for those modules, in parallel.
+    const moduleRows = await getProjectModulesForTree(projectId, userId);
+    const moduleIds = moduleRows.map((m) => m.id);
+    const flowPlatformRows = await getFlowPlatformsByModuleIds(moduleIds, userId);
 
-        if (modulesResult.error) {
-          logger.error('[PLATFORM_TREE] Failed to get modules', { error: modulesResult.error, platformId: p.id });
-          throw new Error(`Failed to get modules: ${modulesResult.error.message}`);
-        }
+    // moduleId → set of coarse platform kinds present in its direct tests.
+    const directPlatformMap = new Map<string, Set<'web_ui' | 'mobile' | 'api'>>();
+    for (const row of flowPlatformRows) {
+      const kind = PlatformTreeService.bucketFlowPlatform(row);
+      const set = directPlatformMap.get(row.moduleId) ?? new Set();
+      set.add(kind);
+      directPlatformMap.set(row.moduleId, set);
+    }
 
-        return {
-          id: p.id,
-          projectId: p.project_id,
-          platformKey: p.platform_key,
-          name: p.name,
-          description: p.description || undefined,
-          modules: {
-            items: (modulesResult.data || []).map((m: any) => ({
-              id: m.id,
-              platformId: m.platform_id,
-              platformKey: p.platform_key,
-              name: m.name,
-              description: m.description || undefined,
-              priority: m.priority || undefined,
-              orderIndex: typeof m.order_index === 'number' ? m.order_index : null,
-            })),
-            pageInfo: {
-              limit,
-              offset,
-              total: modulesResult.count || 0,
-            },
-          },
-        };
-      })
-    );
+    const toSummary = (r: PlatformModuleTreeRow): ModuleSummary => ({
+      id: r.id,
+      platformId: r.platformId,
+      platformKey: r.platformKey,
+      parentModuleId: r.parentModuleId,
+      name: r.name,
+      description: r.description,
+      priority: r.priority,
+      orderIndex: r.orderIndex,
+      directPlatforms: Array.from(directPlatformMap.get(r.id) ?? []),
+    });
 
-    return { platforms: { items: platformResults } };
+    const allModules: ModuleSummary[] = moduleRows.map(toSummary);
+
+    // Per-platform lists (back-compat): filter the project modules by platform.
+    // Platform-null folders belong to no platform bucket (they live only in the
+    // project-level `modules` list below).
+    const platformResults = sortedPlatforms.map((p: any) => {
+      const items = allModules.filter((m) => m.platformId === p.id);
+      return {
+        id: p.id,
+        projectId: p.project_id,
+        platformKey: p.platform_key,
+        name: p.name,
+        description: p.description || undefined,
+        modules: {
+          items,
+          pageInfo: { limit, offset, total: items.length },
+        },
+      };
+    });
+
+    return {
+      platforms: { items: platformResults },
+      modules: {
+        items: allModules,
+        pageInfo: { limit, offset, total: allModules.length },
+      },
+    };
+  }
+
+  /**
+   * Bucket a flow's (platform, flow_type) into a coarse platform kind used by
+   * the Repository tabs: api > mobile > web_ui. flow_type wins for api/mobile
+   * classification; platform string refines mobile; everything else is web_ui.
+   */
+  private static bucketFlowPlatform(row: FlowPlatformRow): 'web_ui' | 'mobile' | 'api' {
+    const platform = (row.platform || '').toLowerCase();
+    const flowType = (row.flowType || '').toLowerCase();
+    if (flowType === 'api') return 'api';
+    if (flowType === 'mobile' || platform.startsWith('mobile')) return 'mobile';
+    return 'web_ui';
   }
 
   /**
@@ -189,7 +245,7 @@ export class PlatformTreeService {
     // Get module with platform info
     const { data: moduleData, error: moduleError } = await supabaseAdmin
       .from('test_modules')
-      .select('id, platform_id, name, description, priority, test_platforms!inner(platform_key)')
+      .select('id, platform_id, parent_module_id, name, description, priority, order_index, test_platforms(platform_key)')
       .eq('id', moduleId)
       .eq('user_id', userId)
       .single();
@@ -201,7 +257,7 @@ export class PlatformTreeService {
     // Get paginated flows + count in single query
     const flowsResult = await supabaseAdmin
       .from('test_flows')
-      .select('id, module_id, name, flow_type, platform, priority, order_index, created_at, updated_at, mobile_variant_label', { count: 'exact' })
+      .select('id, module_id, name, flow_type, platform, priority, tags, order_index, created_at, updated_at, mobile_variant_label', { count: 'exact' })
       .eq('module_id', moduleId)
       .eq('user_id', userId)
       .order('order_index', { ascending: true, nullsFirst: false })
@@ -218,9 +274,11 @@ export class PlatformTreeService {
         id: moduleData.id,
         platformId: moduleData.platform_id,
         platformKey: (moduleData.test_platforms as any)?.platform_key,
+        parentModuleId: moduleData.parent_module_id ?? null,
         name: moduleData.name,
         description: moduleData.description || undefined,
         priority: moduleData.priority || undefined,
+        orderIndex: typeof moduleData.order_index === 'number' ? moduleData.order_index : null,
       },
       flows: {
         items: (flowsResult.data || []).map((f: any) => ({
@@ -230,6 +288,7 @@ export class PlatformTreeService {
           flowType: f.flow_type,
           platform: f.platform || undefined,
           priority: f.priority || undefined,
+          tags: f.tags || [],
           orderIndex: f.order_index,
           mobileVariantLabel: f.mobile_variant_label ?? null,
           createdAt: f.created_at,
@@ -265,7 +324,7 @@ export class PlatformTreeService {
       // 1. Flow itself
       supabaseAdmin
         .from('test_flows')
-        .select('id, module_id, name, flow_type, platform, priority, order_index, created_at, updated_at, mobile_variant_label')
+        .select('id, module_id, name, flow_type, platform, priority, tags, order_index, created_at, updated_at, mobile_variant_label')
         .eq('id', flowId)
         .eq('user_id', userId)
         .single(),
@@ -333,6 +392,7 @@ export class PlatformTreeService {
         flowType: flowData.flow_type,
         platform: flowData.platform || undefined,
         priority: flowData.priority || undefined,
+        tags: flowData.tags || [],
         orderIndex: flowData.order_index,
         mobileVariantLabel: flowData.mobile_variant_label ?? null,
         createdAt: flowData.created_at,

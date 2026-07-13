@@ -122,6 +122,14 @@ export interface SubAgentPipelineResult {
    * Empty array when no actions apply (most non-editor cases).
    */
   quickActions?: import('@/api/chat/shared/quick-action.types').QuickAction[];
+  /**
+   * Structured draft steps authored by `qa_run_draft_steps` this turn, surfaced
+   * so the handler can lift them onto the AI message metadata. The chat renders
+   * them as editable step widgets (draftMeta.executed says whether they already
+   * ran). Absent on turns that didn't author a draft.
+   */
+  draftSteps?: unknown[];
+  draftMeta?: Record<string, unknown>;
 }
 
 /**

@@ -57,6 +57,13 @@ export class AIService {
       // Generate AI analysis
       const analysis = await this.generateAnalysis(context);
 
+      // Definition-of-bug code-gate: an automated WCAG scan finding (missing
+      // alt text, missing landmark, unlabeled input, ...) is advisory, not a
+      // bug — see demoteAdvisoryAccessibilityBugs for the full rationale.
+      // Runs unconditionally (unlike the scrub below) because these findings
+      // are never bugs, even on a run that also has a real, unrelated defect.
+      const demoted = this.demoteAdvisoryAccessibilityBugs(analysis);
+
       // Anti-hallucination code-gate. Prompt rule #3 tells the LLM not to
       // manufacture bugs on a clean run, but a soft instruction isn't a
       // guarantee — a model seeing only accessibility warnings / perf metrics
@@ -66,14 +73,15 @@ export class AIService {
       // LLM returned. A failed/timeout run — or any genuine error/5xx — is a
       // legitimate bug source and is left untouched (assertion failures and
       // element-not-found drift produce no console error but ARE real).
-      const scrubbed = this.scrubHallucinatedBugs(testResult, analysis);
+      const scrubbed = this.scrubHallucinatedBugs(testResult, demoted);
 
       const duration = Date.now() - startTime;
       logger.info('[AI_SERVICE] Analysis completed', {
         testId: testResult.testId,
         duration,
         bugsFound: scrubbed.bugs.length,
-        bugsScrubbed: analysis.bugs.length - scrubbed.bugs.length,
+        bugsDemoted: analysis.bugs.length - demoted.bugs.length,
+        bugsScrubbed: demoted.bugs.length - scrubbed.bugs.length,
         severity: scrubbed.severity,
       });
 
@@ -91,6 +99,76 @@ export class AIService {
   }
 
   /**
+   * Definition of "bug" (code-enforced, not just a prompt instruction): a bug
+   * is a defect where the app's actual behavior is broken or diverges from
+   * expected behavior — something errors, fails, or doesn't work. An
+   * automated WCAG scan finding (missing alt text, missing landmark region,
+   * unlabeled input, heading-level skip, ...) is a lint-style observation
+   * about markup, not evidence that anything broke — it's advisory, and
+   * belongs in `recommendations`, never in `bugs`.
+   *
+   * Prompt rule #2 already tells the LLM this, but a soft instruction isn't a
+   * guarantee (same reasoning as scrubHallucinatedBugs below) — and unlike
+   * that scrub, this one must run unconditionally: an accessibility lint
+   * finding doesn't become a "real bug" just because the same run also has an
+   * unrelated genuine defect (e.g. a failed network call) riding alongside
+   * it. That's exactly the case the code-gate below would otherwise miss —
+   * scrubHallucinatedBugs only fires on a fully clean run, so a low-severity
+   * accessibility "bug" that hitched a ride on a real bug's `hasRealSignal`
+   * would previously survive untouched and permanently inflate bug counts
+   * (Bug Summary totals, release-verdict `ready_with_warnings`, Jira sync,
+   * the 5-credit bug-report charge) across every future report that reads
+   * this run's `ai_summary`.
+   *
+   * The one exception: a high/critical accessibility bug is left alone. Per
+   * the prompt, that severity is reserved for a case where the model has
+   * actual evidence an accessibility issue prevents a disabled user from
+   * completing a task — that's a real functional break, not lint noise.
+   * Pure + side-effect-free so it's unit-testable.
+   *
+   * When demotion empties `bugs` entirely, `severity` and (if it was the
+   * demoted item's own justification) `failureClassification` are kept in
+   * sync — otherwise a caller can end up with the self-contradictory
+   * `{bugs: [], severity: 'medium'}`, or a `failureClassification: 'real_bug'`
+   * with no bug left to back it. `scrubHallucinatedBugs` below normalizes
+   * `severity` too, but only when IT does the dropping — its own guard
+   * early-returns on an already-empty `bugs` array, so it never runs when
+   * demotion alone was what zeroed the list. Fixing it here means both
+   * fields stay correct regardless of which gate did the emptying.
+   */
+  private demoteAdvisoryAccessibilityBugs(analysis: AISummary): AISummary {
+    if (!analysis.bugs || analysis.bugs.length === 0) return analysis;
+
+    const advisory = analysis.bugs.filter(
+      (bug) => bug.category === 'accessibility' && (bug.severity === 'low' || bug.severity === 'medium'),
+    );
+    if (advisory.length === 0) return analysis;
+
+    logger.debug('[AI_SERVICE] Demoting advisory accessibility findings to recommendations', {
+      count: advisory.length,
+      titles: advisory.map((b) => b.title).slice(0, 5),
+    });
+
+    const remaining = analysis.bugs.filter((bug) => !advisory.includes(bug));
+    const emptied = remaining.length === 0;
+    // 'real_bug' means "reproducible failure with clear error evidence" — if
+    // the only evidence was the accessibility item we just demoted, that
+    // classification no longer holds. Other classifications (flaky/
+    // environment/test_drift) describe the failure mechanism itself, not
+    // "there is a bug", so they're left untouched.
+    const dropRealBugClassification = emptied && analysis.failureClassification === 'real_bug';
+
+    return {
+      ...analysis,
+      bugs: remaining,
+      severity: emptied ? 'low' : analysis.severity,
+      failureClassification: dropRealBugClassification ? null : analysis.failureClassification,
+      classificationEvidence: dropRealBugClassification ? [] : analysis.classificationEvidence,
+      recommendations: [...analysis.recommendations, ...advisory.map((b) => b.title)],
+    };
+  }
+
+  /**
    * Enforce prompt rule #3 in code: on a genuinely clean run, an LLM must not
    * invent bugs. "Clean" = the test PASSED (status 'completed') AND there is no
    * real error signal — no `errors[]` entries and no 4xx/5xx network responses.
@@ -102,6 +180,17 @@ export class AIService {
    * error signal — those are legitimate bug sources even with an empty console
    * (assertion failures, element-not-found / test-drift produce no console
    * error but ARE real). Pure + side-effect-free so it's unit-testable.
+   *
+   * Exemption: a high/critical `category:'accessibility'` bug that survived
+   * `demoteAdvisoryAccessibilityBugs` above is, by that method's own contract,
+   * the one case the prompt allows without console/network evidence — a
+   * "failed interaction" (e.g. a keyboard focus trap) legitimately produces
+   * neither. Wiping it here on a console/network-quiet run would silently
+   * contradict that guarantee and discard a real, disabled-user-blocking
+   * defect. Every other bug (any severity, any other category) is still
+   * scrubbed exactly as before — this exemption is intentionally as narrow
+   * as the prompt's own carve-out, not a general "spare high-severity bugs"
+   * rule.
    */
   private scrubHallucinatedBugs(testResult: TestResult, analysis: AISummary): AISummary {
     if (!analysis.bugs || analysis.bugs.length === 0) return analysis;
@@ -114,15 +203,21 @@ export class AIService {
     const hasRealSignal = !passed || hasErrors || hasHttpFailure;
     if (hasRealSignal) return analysis; // legitimate bug source — leave untouched
 
+    const isExemptAccessibilityBug = (bug: BugReport) =>
+      bug.category === 'accessibility' && (bug.severity === 'high' || bug.severity === 'critical');
+    const toDrop = analysis.bugs.filter((bug) => !isExemptAccessibilityBug(bug));
+    if (toDrop.length === 0) return analysis; // everything left is exempt — nothing to scrub
+
     logger.warn('[AI_SERVICE] Scrubbing hallucinated bugs on a clean run', {
       testId: testResult.testId,
-      droppedBugs: analysis.bugs.length,
-      droppedTitles: analysis.bugs.map((b) => b.title).slice(0, 5),
+      droppedBugs: toDrop.length,
+      droppedTitles: toDrop.map((b) => b.title).slice(0, 5),
     });
+    const remaining = analysis.bugs.filter(isExemptAccessibilityBug);
     return {
       ...analysis,
-      bugs: [],
-      severity: 'low',
+      bugs: remaining,
+      severity: remaining.length > 0 ? analysis.severity : 'low',
       // Keep the model's recommendations (advisory a11y/perf notes are fine as
       // recommendations — rule #4 in the prompt — just not as bugs).
     };
@@ -334,20 +429,28 @@ OUTPUT: JSON object with this exact schema:
   "confidence": 0-100
 }
 
+WHAT COUNTS AS A BUG:
+A bug is a defect where the app's actual behavior is broken or diverges from
+expected behavior — something errors, fails, crashes, or doesn't work. It is
+NOT a lint-style observation about markup quality. If you can't point to
+something that actually broke (an error, a failed request, an interaction
+that didn't do what it should), it isn't a bug — it's a recommendation.
+
 SEVERITY RULES (strict):
 - critical: app crash, data loss, security breach, complete feature failure, 5xx errors on core flows
 - high: feature partially broken, data corruption, JS errors blocking interaction, failed API calls returning wrong data
 - medium: degraded UX, slow performance (>3s), broken layout on primary viewport, form validation not working
-- low: cosmetic issues, minor accessibility warnings, edge case UI glitches, informational console warnings
+- low: cosmetic issues, edge case UI glitches, informational console warnings
 
 CLASSIFICATION RULES:
 1. "errors" array = REAL bugs (console errors, network failures, JS exceptions). Classify by impact.
-2. "accessibilityWarnings" = WCAG automated scan findings. Default severity: low. Only medium if it blocks a form input. Never high/critical unless it prevents core functionality for disabled users.
+2. "accessibilityWarnings" = automated WCAG scan findings (missing alt text, missing landmark region, unlabeled input, heading-level skip, non-descriptive link text, ...). These are markup lint results, not evidence anything broke — they are NEVER bugs. Always put them in "recommendations", never in "bugs" — even when the same run also has real, unrelated bugs elsewhere. The only exception: if you have actual evidence (a console error, a failed interaction) that an accessibility issue makes a task genuinely impossible to complete for a disabled user, report that as a bug with category "accessibility" and severity high/critical — never low/medium, since anything milder than that is advisory by definition.
 3. If status="completed" AND errors=[] → severity="low", confidence >= 80. Do NOT manufacture bugs from warnings.
 4. Console warnings (not errors) → recommendations, not bugs.
 5. 404s for analytics/tracking scripts → low severity, not high.
 6. CORS errors on third-party scripts (analytics, chat widgets) → low severity.
 7. Never report the same issue twice with different wording.
+8. "summary" must only narrate what's in "bugs". Never describe an accessibility warning (or anything else that belongs in "recommendations" per rule 2/4) as an "issue", "problem", or "bug" in the summary prose — describe it as a noted/advisory finding instead, matching how "recommendations" already frames it.
 
 CONFIDENCE GUIDELINES:
 - 90-100: Clear errors with obvious root cause
@@ -442,6 +545,27 @@ Output:
   "bugs": [],
   "recommendations": ["Add alt text to the flagged image", "Increase footer link contrast to meet WCAG AA"],
   "severity": "low",
+  "confidence": 90
+}
+
+ACCESSIBILITY-WARNINGS-DO-NOT-RIDE-ALONG EXAMPLE (rule #2 — a real bug elsewhere never promotes an automated scan finding into a bug):
+
+Input: status=completed, errors=[], networkLogs=[{url:"/api/checkout",status:500,method:"POST"}], accessibilityWarnings=["2 buttons without accessible name","Page missing <main> landmark region"]
+Output:
+{
+  "summary": "Checkout submission fails with a 500 error. Two automated accessibility warnings noted (missing button names, missing main landmark) — advisory only, not related to the checkout failure.",
+  "bugs": [{
+    "title": "Checkout submission fails with 500 error",
+    "description": "POST /api/checkout returns HTTP 500, so the checkout flow cannot complete.",
+    "severity": "critical",
+    "category": "functional",
+    "steps": ["Fill checkout form", "Submit"],
+    "expectedResult": "Order is placed and confirmation is shown",
+    "actualResult": "Server returns 500, no confirmation shown",
+    "domSelector": null
+  }],
+  "recommendations": ["Fix /api/checkout 500 error", "Add accessible names to the 2 flagged buttons", "Add a <main> landmark region to the page"],
+  "severity": "critical",
   "confidence": 90
 }`;
   }
@@ -548,11 +672,18 @@ ${context}`;
   }
 
   /**
-   * Validate bug category
+   * Validate bug category. Case/whitespace-insensitive — `demoteAdvisoryAccessibilityBugs`
+   * gates on an exact `category === 'accessibility'` match, so a near-miss
+   * the model returns (` Accessibility`, `ACCESSIBILITY`) must still
+   * normalize to the real value here, not silently fall through to
+   * 'functional' and bypass that gate entirely.
    */
   private validateCategory(category: any): 'visual' | 'functional' | 'performance' | 'accessibility' | 'security' {
-    const validCategories = ['visual', 'functional', 'performance', 'accessibility', 'security'];
-    return validCategories.includes(category) ? category : 'functional';
+    const validCategories = ['visual', 'functional', 'performance', 'accessibility', 'security'] as const;
+    const normalized = typeof category === 'string' ? category.trim().toLowerCase() : '';
+    return (validCategories as readonly string[]).includes(normalized)
+      ? (normalized as (typeof validCategories)[number])
+      : 'functional';
   }
 
   /**

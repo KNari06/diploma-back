@@ -167,6 +167,11 @@ export interface MobileIntentStepOptions {
   typeMode?: 'auto' | 'human' | 'instant';
   scrollDirection?: 'up' | 'down' | 'left' | 'right';
   scrollAmount?: number;
+  /** Natural-language description of a scrollable container to scroll INSIDE
+   *  (e.g. "the comments list"). The runner resolves it semantically and
+   *  swipes within the resolved element; empty → full-screen scroll. Mirrors
+   *  the web editor's options.scrollContainerDescription. */
+  scrollContainerDescription?: string;
   /** Swipe direction (mobile swipe step). Distinct from scrollDirection so
    *  editor swipe steps don't conflict with scroll steps semantically.
    *  Forwarded by the frontend; runner reads it via resolveDirection(). */
@@ -241,6 +246,15 @@ export interface MobileIntentStep {
   assertionText?: string;
   bindingHints?: MobileBindingHints;
   options?: MobileIntentStepOptions;
+  /**
+   * Authoring-time flag: this step's `value` is a credential (password /
+   * OTP / token / API key). Set by the mobile agent when it authors a
+   * draft step (mirrors the `type_text` tool's isSensitive arg). Primary
+   * signal for `sanitizeMobileSteps` — a flagged value is parameterized on
+   * save regardless of what the description says; the regex catalogue is
+   * only the fallback for unflagged steps.
+   */
+  isSensitive?: boolean;
   isAutoInjected?: boolean;
   expectedOutcome?: 'success' | 'error';
   /**

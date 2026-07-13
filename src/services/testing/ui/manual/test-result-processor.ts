@@ -173,6 +173,13 @@ export async function processTestResult(resultData: {
     // Add AI analysis job
     await QueueManager.addAIAnalysisJob(testResult.id, resultData.testId);
 
+    // ADR-0012 — best-effort visual anomaly sweep. No-ops internally when
+    // VISUAL_ANOMALY_SWEEP_ENABLED is off. Note: manual/lite runs have no
+    // regression_run_id, so the job itself will skip (see
+    // visual-anomaly-sweep.job.ts) — enqueued unconditionally here for
+    // parity with addAIAnalysisJob rather than duplicating that check here.
+    await QueueManager.addVisualAnomalySweepJob(testResult.id, resultData.testId);
+
     // TODO: Auto-generate final report after AI analysis completes
     // After aiAnalysisQueue finishes, call:
     // await TestReportGeneratorService.generateFinalReport({

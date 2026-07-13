@@ -419,12 +419,53 @@ export class TestCompletionHandlerService {
         userId: test.user_id,
         status: test.status,
       });
+
+      // Telegram: failures/cancellations only — mirrors the ad-hoc-test
+      // Telegram behavior in manual-test-run.job.ts (failure-only, no
+      // success spam). Best-effort, never breaks the completion path.
+      if (status === 'failed' || status === 'cancelled') {
+        await this.sendBackgroundTestTelegramNotification(test.user_id, title, message, test.id);
+      }
     } catch (error) {
       logger.error('[TEST_COMPLETION] Failed to create background test notification', {
         error: error instanceof Error ? error.message : String(error),
         testId: test.id,
       });
       // Don't throw - notification failure shouldn't break test completion
+    }
+  }
+
+  /**
+   * Send Telegram notification for a background/ad-hoc single-test failure
+   * or cancellation. Failures are logged but never thrown.
+   */
+  private static async sendBackgroundTestTelegramNotification(
+    userId: string,
+    title: string,
+    message: string,
+    testId: string
+  ): Promise<void> {
+    try {
+      const tokenData = await getTelegramToken(userId);
+      if (!tokenData || !tokenData.external_id) {
+        return;
+      }
+
+      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+      const htmlMessage = `<b>${escTg(title)}</b>\n\n${escTg(message)}\n\n<a href="${escTg(`${frontendUrl}/tests/${testId}`)}">View test</a>`;
+
+      await sendTelegramMessage(tokenData.access_token, tokenData.external_id, htmlMessage, 'HTML');
+
+      logger.info('[TEST_COMPLETION] Sent Telegram notification for background test', {
+        userId,
+        testId,
+      });
+    } catch (error) {
+      logger.warn('[TEST_COMPLETION] Failed to send Telegram notification for background test', {
+        error: error instanceof Error ? error.message : String(error),
+        userId,
+        testId,
+      });
     }
   }
 
