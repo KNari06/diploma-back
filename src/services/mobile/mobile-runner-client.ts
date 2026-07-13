@@ -810,6 +810,12 @@ export class MobileRunnerClient {
     intentWords?: string[];
     /** Platform that produced the result — labels Flutter vs native in the trace. */
     framework?: 'android' | 'ios' | 'flutter';
+    /**
+     * USER-authored trigger that fired while resolving (a dialog was cleared
+     * mid-lint). Passthrough from the runner; the editor's live-run fast path
+     * reads it to badge which trigger fired. Absent otherwise.
+     */
+    triggerFired?: import('./mobile-runner.types').Trigger & { matchedText?: string };
   }> {
     return this.request('POST', `/api/commands/${sessionId}/lint`, {
       // Only attach bindingHints when we actually have some — keeps the wire

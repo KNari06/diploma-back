@@ -399,6 +399,15 @@ export interface MobileStepResult {
    * this field to get the run's final accumulated state.
    */
   scratchpadSnapshot?: Record<string, string>;
+  /**
+   * The USER-authored trigger that fired while this step ran (a dialog/popup was
+   * cleared mid-step). Forwarded verbatim by the runner (`id` = the editor's
+   * trigger id; `condition`/`action` mirror the `Trigger` contract above, plus
+   * the matched surface text). The backend maps it to the web `TriggerFiredPayload`
+   * via `buildTriggerFiredPayload` for the editor's "TRIGGER"/"FIRED" indicators
+   * and persists it into the saved run report. Absent when no user trigger fired.
+   */
+  triggerFired?: Trigger & { matchedText?: string };
 }
 
 // ── Test Metadata ────────────────────────────────────────────────

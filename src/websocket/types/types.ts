@@ -900,6 +900,29 @@ export interface TestStepCompletedPayload {
       /** Optional app identifier the warning refers to. */
       packageName?: string;
     }>;
+
+    /**
+     * The USER-authored trigger that fired on this step (mobile). Same flattened
+     * shape as `PreviewRunStepPayload.triggerFired` (web live run) so the editor
+     * renders the identical "TRIGGER" step badge + "FIRED" panel highlight.
+     * Persisted into `tests.executed_steps[].runtimeMeta` (see the
+     * `reduceRuntimeMeta` allowlist) so a reopened saved report keeps it.
+     */
+    triggerFired?: {
+      /** Id of the exact authored trigger that fired — the join key for the Triggers panel row. */
+      triggerId: string;
+      conditionKind: 'permission_dialog' | 'any_dialog' | 'dialog_text';
+      /** condition.contains, only for `dialog_text`. */
+      conditionContains?: string;
+      actionKind: 'permission' | 'tap' | 'back';
+      /** action.text (button label), only for `tap`. */
+      actionText?: string;
+      /** action.decision, only for `permission`. */
+      actionDecision?: 'allow' | 'deny';
+      /** The surface text that matched. */
+      matchedText?: string;
+      timestamp: string;
+    };
   };
 }
 
