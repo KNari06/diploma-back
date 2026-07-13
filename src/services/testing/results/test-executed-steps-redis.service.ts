@@ -137,6 +137,16 @@ export function reduceRuntimeMeta(meta: any): any {
     redactedSnapshotKeys: Array.isArray(meta.redactedSnapshotKeys)
       ? safeCloneForStorage(meta.redactedSnapshotKeys, { maxDepth: 1, maxStringLen: 200, maxArrayLen: 200, maxObjectKeys: 200 })
       : undefined,
+    // Which USER trigger fired on this step (mobile). Allowlisted so it survives
+    // the Redis → Postgres round-trip into `tests.executed_steps` — an audit
+    // trail available for a saved-report indicator (the report assembler doesn't
+    // forward it into RunReportStep yet; that's a follow-up). The id/kind/label
+    // fields are user-authored config; `matchedText` is runtime on-screen text,
+    // redacted by the PRODUCER before it reaches here (mobile-test-run.job.ts,
+    // invariant #10) — no extra redaction needed here.
+    triggerFired: meta.triggerFired && typeof meta.triggerFired === 'object'
+      ? safeCloneForStorage(meta.triggerFired, { maxDepth: 2, maxStringLen: 500, maxArrayLen: 10, maxObjectKeys: 20 })
+      : undefined,
   };
 }
 

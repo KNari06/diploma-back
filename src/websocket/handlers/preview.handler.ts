@@ -5655,6 +5655,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         const mobileClient = await getMobileRunnerClientForSession(mobileSessionId);
         const { buildMetadataFromTestCase } = await import('@/services/mobile/mobile-runner.types');
         const { sanitizeTriggers } = await import('@/services/mobile/trigger-validation.util');
+        const { buildTriggerFiredPayload } = await import('@/services/testing/ui/preview/web-trigger-engine');
 
         // Emit started AFTER session is validated
         webSocketService.emitToUser(userId, 'preview:run:started', {
@@ -5718,6 +5719,19 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               // missing on release APK). Only attached when present.
               ...(stepResult.warnings && stepResult.warnings.length > 0
                 ? { warnings: stepResult.warnings }
+                : {}),
+              // Which USER trigger fired on this step — flattened to the web
+              // payload so the mobile editor's "Apply All"/WS run shows the same
+              // "TRIGGER"/"FIRED" indicators as the single-step Apply path.
+              // `matchedText` is intentionally NOT redacted here (unlike the
+              // background job path): this editor run resolves no `{{secrets.*}}`
+              // (no secret values are sent to the runner, and mobile scratchpad
+              // has no secrets namespace), so it can't contain a resolved secret
+              // — consistent with the raw `error`/`screenshot` on this same emit.
+              // If secret resolution is ever added to the editor run path, redact
+              // matchedText here too (invariant #10).
+              ...(stepResult.triggerFired
+                ? { triggerFired: buildTriggerFiredPayload(stepResult.triggerFired, stepResult.triggerFired.matchedText) }
                 : {}),
             });
           }
