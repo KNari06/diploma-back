@@ -409,6 +409,34 @@ describe('RegressionReportAssemblerService.assembleReport', () => {
     expect(exec.artifacts.bugScreenshots).toEqual([]);
   });
 
+  it('forwards runtimeMeta.triggerFired onto the step (drives the reopened-report TRIGGER badge)', async () => {
+    mockGetByRunId.mockResolvedValue([makeExec()]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Login' }]);
+    const fired = {
+      triggerId: 'trg-1',
+      conditionKind: 'permission_dialog',
+      actionKind: 'permission',
+      actionDecision: 'allow',
+      timestamp: '2026-07-13T10:00:00.000Z',
+    };
+    mockGetExecutedSteps.mockResolvedValue([
+      {
+        id: 'test-1',
+        executed_steps: [
+          { type: 'step_completed', data: { success: true, step: 0, stepDescription: 'open', runtimeMeta: { triggerFired: fired } } },
+          { type: 'step_completed', data: { success: true, step: 1, stepDescription: 'tap', runtimeMeta: {} } },
+        ],
+      },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+
+    const steps = report.executions[0].steps as any[];
+    expect(steps[0].triggerFired).toEqual(fired);
+    // Steps where no trigger fired stay clean (badge only shows when present).
+    expect(steps[1].triggerFired).toBeUndefined();
+  });
+
   it('keeps the per-step screenshot separate from the failure bug screenshot', async () => {
     mockGetStats.mockResolvedValue(makeStats({ total: 1, passed: 0, failed: 1 }));
     mockGetByRunId.mockResolvedValue([makeExec({ status: 'failed' })]);
