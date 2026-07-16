@@ -33,7 +33,10 @@ import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { logger } from '@/utils/core/logger';
 
 export const MAX_UPLOAD_SIZE_BYTES = 500 * 1024 * 1024; // 500MB
-export const ALLOWED_UPLOAD_EXTENSIONS = ['.apk', '.ipa', '.aab'] as const;
+// `.zip` is an iOS SIMULATOR build: `flutter build ios --simulator` emits a
+// `Runner.app` bundle (a directory), uploaded zipped. The runner extracts the
+// `.app` before `simctl install`. Device `.ipa` / Android `.apk`/`.aab` unchanged.
+export const ALLOWED_UPLOAD_EXTENSIONS = ['.apk', '.ipa', '.aab', '.zip'] as const;
 
 /** Common error tag returned by service functions. Keep flat — easy to switch on. */
 export type MobileAppError =

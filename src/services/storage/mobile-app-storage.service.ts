@@ -19,7 +19,11 @@ import path from 'path';
 // ── Constants ──────────────────────────────────────────────────────
 
 const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500MB
-const ALLOWED_EXTENSIONS = ['.apk', '.ipa', '.aab'];
+// `.zip` accepted for iOS SIMULATOR builds: `flutter build ios --simulator`
+// emits a `Runner.app` bundle (a directory), uploaded zipped. The runner
+// extracts the `.app` before `simctl install`. Device `.ipa` / Android
+// `.apk`/`.aab` unchanged.
+const ALLOWED_EXTENSIONS = ['.apk', '.ipa', '.aab', '.zip'];
 
 // ── Types ──────────────────────────────────────────────────────────
 
