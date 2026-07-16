@@ -118,6 +118,16 @@ export interface PrepAppArgs {
    */
   platform?: MobilePlatform;
   /**
+   * HOST platform for a Flutter test (`android` default / `ios`). A Flutter app
+   * ships two builds — an Android `.apk` and an iOS simulator `.app`/`.ipa` —
+   * stored in the `android` and `ios` slots respectively. `platform === 'flutter'`
+   * alone doesn't say which host to run on, so this picks the artifact SHARD:
+   * flutter + `ios` → resolve the `ios` slot; flutter + `android` (or unset) →
+   * the `android` slot (unchanged legacy behaviour). Ignored for non-Flutter
+   * platforms (they resolve their own slot directly).
+   */
+  hostPlatform?: 'android' | 'ios';
+  /**
    * Named build-variant lane to install (e.g. 'Staging'). When set and no
    * explicit `appStoragePathOverride` was supplied, prep resolves that lane's
    * build via `MobileAppStorageService.resolveAppForRun` and installs IT
@@ -178,6 +188,7 @@ export class MobileAppPrepService {
       skipLaunch,
       onProgress,
       platform,
+      hostPlatform,
       variantLabel,
     } = args;
     // Mutable so a resolved variant build (below) can fill these in as the
@@ -193,8 +204,18 @@ export class MobileAppPrepService {
     // prep looks up a `flutter` slot that upload never writes → finds nothing →
     // `effectiveStoragePath` stays undefined → install is skipped entirely, so
     // the app is never reinstalled after the emulator is wiped.
+    // A Flutter build maps to the HOST's artifact slot: android by default (the
+    // .apk), or ios when the caller runs it on an iOS simulator (the .app/.ipa).
+    // Non-Flutter platforms resolve their own slot directly.
+    const flutterHostSlot: MobilePlatform = hostPlatform === 'ios' ? 'ios' : 'android';
     const appSlotPlatform: MobilePlatform | undefined =
-      platform === 'flutter' ? 'android' : platform;
+      platform === 'flutter' ? flutterHostSlot : platform;
+    // The platform passed to the VARIANT resolvers below. For android-host
+    // Flutter we keep `'flutter'` so `resolveAppForRun`/`getProjectMobileApp`
+    // apply their existing internal flutter→android mapping (zero behaviour
+    // change); for iOS-host Flutter we resolve the `ios` slot directly.
+    const resolvePlatform: MobilePlatform | undefined =
+      platform === 'flutter' && hostPlatform === 'ios' ? 'ios' : platform;
 
     // True once a named variant resolves to a concrete build. Two builds of
     // the same app share a packageName, so the package-presence dedup (Branch
@@ -216,13 +237,13 @@ export class MobileAppPrepService {
       let effectiveVariant: string | undefined = variantLabel;
       let variantSource = 'explicit';
       if (!effectiveVariant) {
-        effectiveVariant = await MobileAppStorageService.getProjectDefaultVariant(projectId, platform);
+        effectiveVariant = await MobileAppStorageService.getProjectDefaultVariant(projectId, resolvePlatform!);
         variantSource = 'project-default-pointer';
       }
       if (effectiveVariant && effectiveVariant !== DEFAULT_VARIANT_LABEL) {
         const variantBuild = await MobileAppStorageService.resolveAppForRun({
           projectId,
-          platform,
+          platform: resolvePlatform!,
           variantLabel: effectiveVariant,
         });
         if (variantBuild?.storagePath) {
@@ -263,7 +284,7 @@ export class MobileAppPrepService {
         // `platform` so getProjectMobileApp applies its own flutter→android
         // fallback. Force the full install for the same reasons as a variant.
         const proj = await ProjectService.getProject(projectId, userId);
-        const baseBuild = getProjectMobileApp(proj?.settings, platform, DEFAULT_VARIANT_LABEL);
+        const baseBuild = getProjectMobileApp(proj?.settings, resolvePlatform!, DEFAULT_VARIANT_LABEL);
         if (baseBuild?.storagePath) {
           appStoragePathOverride = baseBuild.storagePath;
           appOriginalNameOverride = appOriginalNameOverride ?? baseBuild.originalName;

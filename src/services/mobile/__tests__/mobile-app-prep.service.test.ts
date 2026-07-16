@@ -34,6 +34,7 @@ jest.mock('@/utils/core/logger', () => ({
 }));
 
 import { MobileAppPrepService } from '../mobile-app-prep.service';
+import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 
 const PACKAGE = 'com.aitan.inexport';
 const STORAGE_PATH = 'apps/com.aitan.inexport/app.apk';
@@ -142,5 +143,39 @@ describe('MobileAppPrepService.prepApp — hard-reset vs skipLaunch', () => {
     const resetCall = calls[calls.length - 1];
     const commandTypes = resetCall[1].map((c: any) => c.type);
     expect(commandTypes).toEqual(['close_app', 'launch_app']);
+  });
+});
+
+describe('MobileAppPrepService.prepApp — Flutter host-lane artifact resolution', () => {
+  const defaultVariant = MobileAppStorageService.getProjectDefaultVariant as jest.Mock;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGet.mockResolvedValue(null);
+    // No app configured — we only assert which SLOT was queried, which happens
+    // before the (empty) install decision.
+    mockGetProject.mockResolvedValue({ settings: {} });
+    defaultVariant.mockResolvedValue(undefined);
+  });
+
+  it('resolves a Flutter test against the IOS slot when hostPlatform is ios', async () => {
+    await MobileAppPrepService.prepApp(baseArgs({ platform: 'flutter', hostPlatform: 'ios' }));
+    expect(defaultVariant).toHaveBeenCalledWith('project-1', 'ios');
+  });
+
+  it('keeps the legacy flutter→android mapping when host is android (unchanged)', async () => {
+    await MobileAppPrepService.prepApp(baseArgs({ platform: 'flutter', hostPlatform: 'android' }));
+    // 'flutter' is passed through so resolveAppForRun applies its own android mapping.
+    expect(defaultVariant).toHaveBeenCalledWith('project-1', 'flutter');
+  });
+
+  it('defaults an unset host to the android (flutter) lane', async () => {
+    await MobileAppPrepService.prepApp(baseArgs({ platform: 'flutter' }));
+    expect(defaultVariant).toHaveBeenCalledWith('project-1', 'flutter');
+  });
+
+  it('leaves a non-Flutter iOS test resolving its own ios slot', async () => {
+    await MobileAppPrepService.prepApp(baseArgs({ platform: 'ios' }));
+    expect(defaultVariant).toHaveBeenCalledWith('project-1', 'ios');
   });
 });

@@ -21,6 +21,7 @@ import {
   trimMobileBuildField,
 } from '@/services/storage/mobile-app-storage.service';
 import { CiRunService } from '@/services/mobile/ci-run.service';
+import { ALLOWED_UPLOAD_EXTENSIONS } from '@/services/mobile/mobile-app.service';
 import { ProjectService } from '@/services/core/project.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -202,12 +203,13 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
         const urlPath = new URL(appUrl).pathname;
         const originalName = path.basename(urlPath) || 'app.apk';
 
-        // Validate extension
+        // Validate extension — single source of truth (shared with the editor
+        // upload path), so `.zip` (iOS simulator build) support can't diverge.
         const ext = path.extname(originalName).toLowerCase();
-        if (!['.apk', '.ipa', '.aab'].includes(ext)) {
+        if (!(ALLOWED_UPLOAD_EXTENSIONS as readonly string[]).includes(ext)) {
           res.status(400).json({
             success: false,
-            error: `Invalid file type: ${ext}. Allowed: .apk, .ipa, .aab`,
+            error: `Invalid file type: ${ext}. Allowed: ${ALLOWED_UPLOAD_EXTENSIONS.join(', ')}`,
           });
           return;
         }
