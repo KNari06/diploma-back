@@ -333,7 +333,14 @@ export async function handleMobileAgent(
   const startedAt = Date.now();
 
   const ctxObj = parseMobileContext(context);
-  const mobileSessionId = ctxObj?.mobileSessionId;
+  // Only a non-empty string counts as a session — the controller's
+  // force-route no longer type-gates mobileSessionId, so a malformed
+  // context value (number, object) must land on the no-session reply,
+  // never reach the runner.
+  const mobileSessionId =
+    typeof ctxObj?.mobileSessionId === 'string' && ctxObj.mobileSessionId.length > 0
+      ? ctxObj.mobileSessionId
+      : undefined;
 
   if (!mobileSessionId) {
     logger.warn('[MOBILE_AGENT] No mobileSessionId in context', { userId });
