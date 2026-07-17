@@ -26,6 +26,7 @@ import { parse } from 'csv-parse/sync';
 import { logger } from '@/utils/core/logger';
 import type { ParsedTestCaseFromLLM } from './allure-import.types';
 import { MAX_STEP_DESC_CHARS } from './allure-mapper';
+import { EXPECTED_RESULT_LABEL, isAttachmentMarkerWord } from './allure-labels';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Known column names (case-insensitive lookup)
@@ -191,27 +192,34 @@ function parseScenario(scenario: string): ParsedStep[] {
   const steps: ParsedStep[] = [];
   const lines = scenario.split(/\r?\n/);
 
-  // Regex patterns for step detection (ordered by specificity)
+  // A bracketed marker `[word N]` / `[word N.M]` / `[N]` — the NUMBER is the
+  // real signal, so the word is captured (group 1) and any language works
+  // (incl. combining-mark scripts via \p{L}\p{M}). Its meaning (step vs
+  // attachment) is decided by `isAttachmentMarkerWord(word)`, NOT by hardcoding
+  // the word per language. Group 2 = the marker's text.
+  const bracketMarker = /^\s*\[\s*([\p{L}\p{M}]*)\s*\d+(?:\.\d+)*\s*\]\s*(.+)$/iu;
+
+  // Non-bracketed step markers. Restricted to LEADING NUMBERING (`1.` / `1)`)
+  // — the unambiguous, language-independent form TestOps emits. We deliberately
+  // do NOT match a generic `Word N:/.` prefix: it over-matches ordinary prose
+  // ("Windows 10: click", "Chapter 3. Intro", "Section 2: Overview"), severing
+  // real content into phantom steps. The `Step 1:` / `Шаг 1.` shape, when it
+  // appears, is handled downstream by the LLM step converter instead.
   const stepPatterns = [
-    /^\[step\s+\d+(?:\.\d+)*\]\s*(.+)/i,         // [step 1] Title
-    /^\[шаг\s+\d+(?:\.\d+)*\]\s*(.+)/i,           // [шаг 1] Title (Russian)
-    /^step\s+\d+[:.]\s*(.+)/i,                      // Step 1: Title
-    /^\d+\.\s+(.+)/,                                 // 1. Title
-    /^\d+\)\s+(.+)/,                                 // 1) Title
+    /^\d+\.\s+(.+)/,                                  // 1. Title
+    /^\d+\)\s+(.+)/,                                  // 1) Title
   ];
 
-  // Attachment/sub-item patterns (indented or bracketed)
+  // Non-bracketed attachment/sub-item pattern: tab-indented continuation.
   const attachmentPatterns = [
-    /^\s*\[attachment\s+[\d.]+\]\s*(.+)/i,          // [attachment 1.1] Desc
-    /^\s*\[вложение\s+[\d.]+\]\s*(.+)/i,            // [вложение 1.1] Desc (Russian)
     /^\t+(.+)/,                                       // Tab-indented content
   ];
 
-  // Recognises an "Expected result" sub-line (EN / RU / KZ), with optional
-  // leading "- "/numbering and a trailing ":". The captured group is the
-  // actual expected text (may be empty when the label is on its own line and
-  // the value follows on the next indented line).
-  const EXPECTED_LABEL = /^(?:expected\s*result|ожидаемый\s*результат|күтілетін\s*нәтиже)\s*:?\s*(.*)$/i;
+  // Recognises an "Expected result" sub-line across many languages (not just
+  // EN/RU/KZ — see allure-labels.ts). Optional leading "- "/numbering and a
+  // trailing ":". Group 1 is the actual expected text (may be empty when the
+  // label is on its own line and the value follows on the next indented line).
+  const EXPECTED_LABEL = EXPECTED_RESULT_LABEL;
 
   let currentStep: ParsedStep | null = null;
   const attachmentDescs: string[] = [];
@@ -252,7 +260,25 @@ function parseScenario(scenario: string): ParsedStep[] {
   for (const rawLine of lines) {
     const line = rawLine.replace(/\r$/, '');
 
-    // Try step patterns
+    // Bracketed marker `[word N]` — route by the word: an attachment word (any
+    // language) → attachment; anything else (step/шаг/Schritt/bare number) → a
+    // new step. This is checked FIRST so `[attachment 1.1]` is never mistaken
+    // for a step by the language-agnostic step patterns below.
+    const bracket = line.match(bracketMarker);
+    if (bracket) {
+      const word = bracket[1] ?? '';
+      const text = bracket[2].trim();
+      if (word && isAttachmentMarkerWord(word)) {
+        if (expectedOpen) expectedDescs.push(text);
+        else attachmentDescs.push(text);
+      } else {
+        flushStep();
+        currentStep = { type: 'click', description: text };
+      }
+      continue;
+    }
+
+    // Try non-bracketed step patterns
     let matched = false;
     for (const pattern of stepPatterns) {
       const m = line.match(pattern);
@@ -347,6 +373,19 @@ function mapRowToTestCase(
   const scenarioRaw = col(fields, colMap, 'scenario');
   const steps = parseScenario(scenarioRaw);
 
+  // Degenerate-split signal: the scenario clearly has multiple content lines
+  // but the deterministic parser produced ≤1 step (or one step swallowing
+  // everything). This happens when the step / expected markers are in a
+  // language our registry doesn't cover. We hand the RAW scenario to the AI
+  // converter so it can re-segment by MEANING (no word-list). Kept `undefined`
+  // for the confident common case so we don't pay an extra LLM pass needlessly.
+  const contentLineCount = scenarioRaw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean).length;
+  const rawScenario =
+    contentLineCount >= 3 && steps.length <= 1 ? scenarioRaw : undefined;
+
   // ── Status ───────────────────────────────────────────────────────────────
   const status = col(fields, colMap, 'status') || 'Active';
 
@@ -415,6 +454,7 @@ function mapRowToTestCase(
     links,
     status,
     owner,
+    ...(rawScenario && { rawScenario }),
   };
 }
 

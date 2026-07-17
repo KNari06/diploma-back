@@ -809,6 +809,13 @@ export interface LiteTestResult {
   uniquePagesVisited?: number;
   /** Structured executed steps for /full endpoint */
   executedSteps?: Array<{ ts: string; type: 'step_completed'; data: { step: number; action: string; description: string; success: boolean; url: string } }>;
+  /**
+   * V16 billing parity: true when a per-step credit deduction failed mid-run
+   * (user's balance + grace exhausted). The run continues regardless — this
+   * flag lets the job/report surface a "credits exhausted" banner, matching
+   * the replay path's `creditsExhausted`.
+   */
+  creditsExhausted?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -56,6 +56,8 @@ import { PromptSanitizer } from './security/prompt-sanitizer';
 import { LiteTraceWriter } from './trace/lite-trace-writer';
 import { WorkspaceMemoryService } from '@/services/ai/memory/workspace-memory.service';
 import { WorkspaceService } from '@/services/core/workspace.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { toAICommand } from './pipeline/types';
 // TODO(refactor): page-interactive.utils.ts should move to a shared location
 // (e.g. @/agent/core/lite/collectors/page-interactive) so Lite doesn't depend
 // on preview internals. For now, reuse the preview helper as-is since it's
@@ -90,6 +92,26 @@ export class LiteEngine {
 
   // Flag to prevent non-final graph updates during finalization (race-safe)
   private isFinalizing = false;
+
+  // V16 billing parity: latched true when a per-step credit deduction fails
+  // (balance + grace exhausted). Mirrors the replay path in test-executor.ts —
+  // once set, we stop attempting further deductions but DO NOT stop the run
+  // (the frontend shows a "credits exhausted" banner instead). Surfaced on
+  // LiteTestResult so the job/report reflect it.
+  private creditsExhausted = false;
+
+  // Billable steps accrued for the CURRENT execution path. Billing is settled
+  // ONCE at run end (settleStepCharges in buildResult), NOT eagerly per step.
+  //
+  // Why: the execution paths fall through on failure (hybrid → pipeline v2 →
+  // legacy loop). Charging eagerly billed EVERY path a run touched, so a run
+  // that ran 5 steps in a failed hybrid attempt then finished in 8 pipeline
+  // steps was billed 13 — the user paid for an abandoned internal retry.
+  // Product decision (2026-07-17): bill only the WINNING path (the one that
+  // reaches buildResult). Each path accrues into this tally; a fall-through
+  // boundary calls resetPathCharges() to DISCARD the abandoned path's tally
+  // before the next path starts, so the final settle bills the winner alone.
+  private billableStepCount = 0;
 
   /**
    * PR-Hybrid: Tracks which execution path was actually taken (hybrid,
@@ -1478,6 +1500,9 @@ export class LiteEngine {
           const execResult = await this.executor.execute(command, snapshot, {});
 
           if (execResult.success) {
+            // Billing parity: 1 credit per executed step (see chargeStepCredit).
+            this.chargeStepCredit(command.action);
+
             // Wait for page stability after each action
             try {
               await this.networkTracker.waitForNetworkIdle(3000);
@@ -1573,6 +1598,9 @@ export class LiteEngine {
           traceWriter: this.traceWriter,
           consoleCollector: this.consoleCollector,
           browserContext: this.page.context(),
+          // Billing parity: charge 1cr per successful action executed inside the
+          // pipeline (legacy loop bills via chargeStepCredit; this path bills here).
+          onRoundComplete: (round) => this.chargeForPipelineRound(round),
         });
 
         const hybridResult = await hybridPipeline.run(this.config.goal, {
@@ -1611,6 +1639,9 @@ export class LiteEngine {
 
         // Hybrid ran but did not succeed — fall-through expected. Which
         // path we take next depends on whether Pipeline v2 is enabled.
+        // Discard the abandoned hybrid attempt's accrued step charges so the
+        // next path bills alone (bill-the-winner, see billableStepCount).
+        this.resetPathCharges();
         this.executionPath = LITE_ENGINE_FLAGS.enablePipelineV2
           ? 'hybrid_then_pipeline_v2'
           : 'hybrid_then_legacy';
@@ -1621,7 +1652,9 @@ export class LiteEngine {
         });
       } catch (hybridError) {
         const errorMsg = hybridError instanceof Error ? hybridError.message : String(hybridError);
-        // Same fall-through accounting on exception path
+        // Same fall-through accounting on exception path — discard the
+        // abandoned hybrid attempt's accrued step charges.
+        this.resetPathCharges();
         this.executionPath = LITE_ENGINE_FLAGS.enablePipelineV2
           ? 'hybrid_then_pipeline_v2'
           : 'hybrid_then_legacy';
@@ -1648,6 +1681,9 @@ export class LiteEngine {
           traceWriter: this.traceWriter,
           consoleCollector: this.consoleCollector,
           browserContext: this.page.context(),
+          // Billing parity: charge 1cr per successful action executed inside the
+          // pipeline (legacy loop bills via chargeStepCredit; this path bills here).
+          onRoundComplete: (round) => this.chargeForPipelineRound(round),
         });
 
         const pipelineResult = await pipeline.run(this.config.goal, {
@@ -1690,6 +1726,10 @@ export class LiteEngine {
         );
       } catch (pipelineError) {
         const errorMsg = pipelineError instanceof Error ? pipelineError.message : String(pipelineError);
+        // Pipeline v2 threw mid-run — the legacy loop below will re-attempt the
+        // goal from scratch. Discard this path's accrued step charges so the
+        // legacy path bills alone (bill-the-winner, see billableStepCount).
+        this.resetPathCharges();
         // Fall-through accounting: if hybrid already ran, stay on its
         // transition path; otherwise mark as pipeline_v2_then_legacy.
         if (this.executionPath === 'legacy_only') {
@@ -1983,6 +2023,11 @@ export class LiteEngine {
                   // Timeout is OK — page might not navigate (e.g. validation error).
                   // The next iteration will handle it either way.
                 }
+              }
+
+              // Billing parity: 1 credit per executed step (see chargeStepCredit).
+              if (execResult.success) {
+                this.chargeStepCredit(autoCommand.action);
               }
 
               // Trace action execute end
@@ -3857,6 +3902,13 @@ export class LiteEngine {
           }
         );
 
+        // Billing parity: 1 credit per executed step (see chargeStepCredit).
+        // Charge only on a successful action — a failed step is not billed,
+        // matching the replay path.
+        if (execResult.success) {
+          this.chargeStepCredit(commandWithCredentials.action);
+        }
+
         // ✅ NEW: Trace action execute end
         this.traceWriter.write({
           iteration: i,
@@ -4902,9 +4954,126 @@ export class LiteEngine {
    * ✅ FIX: Emits progress=100 AFTER all finalization is complete
    * ✅ FIX: Captures final page screenshot for results (not during test execution)
    */
+  /**
+   * Deduct 1 credit for a single executed step/action.
+   *
+   * Billing parity with the replay/regression path (test-executor.ts:856):
+   * lite chat runs are UI tests and bill 1 credit per executed step
+   * (`TEST_CREDITS.INTELLIGENT`). Call this AFTER a successful
+   * `executor.execute` — a failed action is not charged.
+   *
+   * V16 semantics (identical to replay):
+   *   - No-op when `config.userId` is absent (anonymous/system runs).
+   *   - Once `creditsExhausted` latches, stop attempting further deductions
+   *     but NEVER stop the run — the work is already done, the frontend shows
+   *     a "credits exhausted" banner. Stopping mid-run wastes completed work.
+   *   - `deductStepCredit` is non-fatal by contract (returns {success}), so a
+   *     transient DB error just latches exhausted for the rest of the run.
+   *
+   * Exploration bills separately (flat 10cr after a successful run), so this
+   * lives in LiteEngine — NOT in the shared ActionExecutor which both engines
+   * use — to avoid charging exploration per-step.
+   */
+  private chargeStepCredit(_action: string): void {
+    if (!this.config.userId) return;
+    // Accrue only — settled once at run end so an abandoned fall-through path's
+    // steps can be discarded (resetPathCharges) without an un-deduct. `_action`
+    // is unused now (every real action bills a flat 1cr) but kept on the
+    // signature so the many call sites read self-documentingly.
+    this.billableStepCount += 1;
+  }
+
+  /**
+   * Discard the current path's accrued billable steps. Called at each
+   * fall-through boundary (hybrid→pipeline v2, pipeline→legacy) so a failed
+   * path's steps are NOT billed on top of the winning path — see
+   * `billableStepCount`.
+   */
+  private resetPathCharges(): void {
+    this.billableStepCount = 0;
+  }
+
+  /**
+   * Settle the winning path's accrued steps as ONE batch of per-step
+   * deductions, called once from buildResult(). Bills 1 credit per accrued
+   * step; latches `creditsExhausted` (no-fatal, mirrors replay) the moment a
+   * deduction fails and stops — the run already ran, the frontend shows the
+   * "credits exhausted" banner. No-op for anonymous/system runs.
+   */
+  private async settleStepCharges(): Promise<void> {
+    if (!this.config.userId || this.billableStepCount <= 0) return;
+    const count = this.billableStepCount;
+    this.billableStepCount = 0; // idempotent — a re-entrant buildResult won't double-charge
+    for (let i = 0; i < count; i++) {
+      if (this.creditsExhausted) break;
+      try {
+        const result = await CreditCostTrackerService.deductStepCredit(
+          this.config.userId,
+          this.config.testId,
+          'Lite step',
+        );
+        if (!result.success) {
+          this.creditsExhausted = true;
+          logger.warn('[LITE_ENGINE] Credits exhausted at settle, continuing without deduction', {
+            testId: this.config.testId,
+            settledSoFar: i,
+            total: count,
+          });
+        }
+      } catch (err) {
+        // A thrown deduction (transient DB/network) must never fail the run —
+        // latch and stop, same terminal effect as a falsy {success:false}.
+        this.creditsExhausted = true;
+        logger.warn('[LITE_ENGINE] Credit deduction threw at settle, continuing', {
+          testId: this.config.testId,
+          settledSoFar: i,
+          total: count,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  /**
+   * Billing hook for the Pipeline v2 / Hybrid executor paths.
+   *
+   * Those paths run actions through TestPipeline's own CommandExecutor, NOT the
+   * three `executor.execute` sites in the legacy loop — so they bypass the
+   * per-step charge above. Wired via TestPipeline's `onRoundComplete` callback
+   * (fired once per completed round with the round's per-command results).
+   *
+   * Charges 1 credit per SUCCESSFUL real browser action, matching the legacy
+   * loop exactly: `toAICommand` returns non-null for real actions
+   * (click/fill/scroll/wait/hover/...) and null for pure-meta commands
+   * (observe_page / mark_done / report_blocked), which are never billed.
+   *
+   * Exploration also uses TestPipeline but bills flat 10cr — it omits
+   * `onRoundComplete`, so this never runs for exploration.
+   *
+   * Best-effort: must never throw into the pipeline loop (`onRoundComplete`
+   * contract). Awaiting is not possible (the callback is sync), so deductions
+   * are fired-and-tracked; the `creditsExhausted` latch still short-circuits.
+   */
+  private chargeForPipelineRound(round: import('./pipeline/types').ExecutionRound): void {
+    if (!this.config.userId) return;
+    for (const executed of round.commands) {
+      if (!executed.result.success) continue;
+      if (toAICommand(executed.command) === null) continue; // meta command, not billable
+      // Accrue into the current path's tally (settled once at run end). Sync +
+      // no I/O, so onRoundComplete's no-throw contract holds trivially.
+      this.chargeStepCredit(executed.command.name);
+    }
+  }
+
   private async buildResult(success: boolean, reason: string): Promise<LiteTestResult> {
     const duration = this.startTime > 0 ? Date.now() - this.startTime : 0;
     const iterations = this.state.getIterationCount();
+
+    // Settle the winning path's accrued per-step credits as ONE batch. Only
+    // this path reaches buildResult; abandoned fall-through paths were cleared
+    // via resetPathCharges, so no double-bill. Best-effort — never fails the
+    // run (settleStepCharges latches on exhaustion, never throws).
+    await this.settleStepCharges();
 
     // ✅ FIX: Clean up cancellation state
     cleanupCancellationState(this.config.testId);
@@ -5246,6 +5415,10 @@ export class LiteEngine {
       // PR-Hybrid: surface which execution path was actually taken so
       // dashboards and debug tools can compare hybrid vs legacy cohorts.
       executionPath: this.executionPath,
+      // V16 billing parity: true when a per-step credit deduction failed
+      // (balance + grace exhausted) mid-run. Surfaced so the job/report can
+      // show a "credits exhausted" banner, matching the replay path.
+      creditsExhausted: this.creditsExhausted,
     };
   }
 
@@ -5351,7 +5524,13 @@ export class LiteEngine {
         const commandWithCreds = this.overrideCredentialFillValue(lastCommand, newSnapshot);
 
         try {
-          await this.executor.execute(commandWithCreds, newSnapshot);
+          const retryResult = await this.executor.execute(commandWithCreds, newSnapshot);
+          // Billing parity: a successful recovery-retry is a real executed
+          // action, billed 1cr like any other step (mirrors the replay path,
+          // where self-heal retries also charge per healed step).
+          if (retryResult.success) {
+            this.chargeStepCredit(commandWithCreds.action);
+          }
           // Wait for potential navigation after retry
           try {
             await this.networkTracker.waitForNetworkIdle(5000);

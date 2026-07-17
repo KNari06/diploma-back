@@ -552,4 +552,13 @@ export interface ParsedTestCaseFromLLM {
   /** Allure TestOps status: Active / Draft / Deprecated. */
   status: string;
   owner?: string;
+  /**
+   * The ORIGINAL, unsegmented scenario text (CSV path only). Carried so the AI
+   * step converter can RE-SEGMENT semantically when the deterministic
+   * marker-based split is degenerate (e.g. a language whose step / expected
+   * labels our registry doesn't cover, so everything collapsed into one step).
+   * Undefined for the PDF path (already LLM-segmented) and when the
+   * deterministic split was confident.
+   */
+  rawScenario?: string;
 }

@@ -460,6 +460,12 @@ export interface IntelligentTestResult {
   pageVisits: PageVisit[];
   screenshots: Array<{ url: string; screenshot: string }>;
   graphData?: any; // ✅ NEW: Complete graph from GraphBuilder
+  /**
+   * V16 billing parity: true when a per-step credit deduction failed mid-run
+   * (balance + grace exhausted). Propagated from LiteTestResult so the job/report
+   * surface a "credits exhausted" banner, matching the replay path.
+   */
+  creditsExhausted?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

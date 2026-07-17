@@ -697,7 +697,7 @@ async function processCsvPdfImport(
           const { steps, degraded: stepsDegraded } =
             sourceFormat === 'pdf'
               ? { steps: finalizeTypedSteps(tc.steps), degraded: false }
-              : await convertImportedStepsWithAI(tc.name, tc.steps, options.platform);
+              : await convertImportedStepsWithAI(tc.name, tc.steps, options.platform, tc.rawScenario);
 
           // Resolve hierarchy (module + flow) via cache
           const { moduleId, flowId } = await resolveHierarchy(
