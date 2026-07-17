@@ -16,26 +16,35 @@ import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { callAiWithRetry, extractJson } from './ai-json.util';
 import {
+  isAuthTokenVar,
+  isAuthOrAuthorizationVar,
+  isAuthCredentialVar,
+  isUserProvidedVar,
+  realmPrefixOf,
+  toSnakeCase,
+  singularize,
+  lastPathSegment,
+  isReferenceIdField,
+  isSnakeIdVar,
+} from './wiring/wiring-policy';
+import { seedNodesFromSpec } from './wiring/spec-seed';
+import { coerceBodyToSchema, missingRequiredFields } from './wiring/body-validator';
+import { scoreDag, securityMapFromSpec, type EvalScore } from './eval/metrics';
+import {
   buildAnalystSystemPrompt,
   buildAnalystPrompt,
-  buildArchitectSystemPrompt,
-  buildArchitectPrompt,
   buildEnricherSystemPrompt,
   buildEnricherPrompt,
-  buildSwaggerDagMergePrompt,
-  buildSwaggerDependencySystemPrompt,
 } from '@/ai/prompts/api-flow-prompts';
 import type {
   DAGNode,
   ExecutionDAG,
   FlowQuestion,
-  HttpMethod,
   ParsedApiSpec,
   ParsedEndpoint,
   UnsupportedEndpoint,
+  VariableInjection,
 } from './flow.types';
-
-const MAX_ENDPOINTS_PER_BATCH = 20;
 
 const MAX_ENRICHER_BATCH = 25;
 const PIPELINE_TIMEOUT_MS = 600_000; // 10 minutes for very large specs (1000+ endpoints)
@@ -105,6 +114,27 @@ function breakCycles(nodes: DAGNode[], cycleEdges: Array<{ from: string; to: str
   }));
 }
 
+/**
+ * Would adding the edge `consumer.dependsOn += producer` create a cycle? True
+ * iff the producer already (transitively) depends on the consumer. `depsOf`
+ * returns a node's CURRENT dependencies (including edges an auto-wire pass added
+ * earlier in the same run), so this catches 3+ node cycles a direct 2-cycle
+ * guard misses. Used by the wiring passes before adding an edge.
+ */
+function wouldCreateCycle(consumerId: string, producerId: string, depsOf: (id: string) => Iterable<string>): boolean {
+  if (consumerId === producerId) return true;
+  const seen = new Set<string>();
+  const stack = [producerId];
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (id === consumerId) return true;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    for (const dep of depsOf(id)) stack.push(dep);
+  }
+  return false;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PARALLEL GROUPS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -113,14 +143,20 @@ function buildParallelGroups(nodes: DAGNode[], executionOrder: string[]): string
   const nodeMap = new Map(nodes.map(n => [n.id, n]));
   const levelCache = new Map<string, number>();
 
-  function getLevel(nodeId: string): number {
+  function getLevel(nodeId: string, onStack: Set<string> = new Set()): number {
     if (levelCache.has(nodeId)) return levelCache.get(nodeId)!;
+    // On-stack guard: if a cycle survived cycle-breaking (or the flat-order
+    // fallback left cyclic edges), treat the back-edge as a root so recursion
+    // terminates instead of overflowing the stack.
+    if (onStack.has(nodeId)) return 0;
     const node = nodeMap.get(nodeId);
     if (!node || node.dependsOn.length === 0) {
       levelCache.set(nodeId, 0);
       return 0;
     }
-    const maxParent = Math.max(...node.dependsOn.map(dep => getLevel(dep)));
+    onStack.add(nodeId);
+    const maxParent = Math.max(...node.dependsOn.map(dep => getLevel(dep, onStack)));
+    onStack.delete(nodeId);
     const level = maxParent + 1;
     levelCache.set(nodeId, level);
     return level;
@@ -139,57 +175,6 @@ function buildParallelGroups(nodes: DAGNode[], executionOrder: string[]): string
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NODE NORMALIZATION
-// ─────────────────────────────────────────────────────────────────────────────
-
-function normalizeNode(raw: any, index: number): DAGNode {
-  const VALID_METHODS: HttpMethod[] = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'];
-  const method = (String(raw.method || 'GET').toUpperCase()) as HttpMethod;
-
-  return {
-    id: String(raw.id || `node_${index}`),
-    method: VALID_METHODS.includes(method) ? method : 'GET',
-    path: String(raw.path || '/'),
-    operationId: String(raw.operationId || raw.id || `op_${index}`),
-    summary: raw.summary ? String(raw.summary) : undefined,
-    tags: Array.isArray(raw.tags) ? raw.tags.map(String) : [],
-    dependsOn: Array.isArray(raw.dependsOn) ? raw.dependsOn.map(String) : [],
-    variableExtractions: Array.isArray(raw.variableExtractions)
-      ? raw.variableExtractions
-          .filter((e: any) => e.variableName && String(e.variableName).trim())
-          .map((e: any) => ({
-            variableName: String(e.variableName).trim(),
-            jsonPath: e.jsonPath ? String(e.jsonPath) : undefined,
-            headerSource: e.headerSource ? String(e.headerSource) : undefined,
-            regex: e.regex ? String(e.regex) : undefined,
-          }))
-      : [],
-    variableInjections: Array.isArray(raw.variableInjections)
-      ? raw.variableInjections
-          .filter((i: any) => i.variableName && String(i.variableName).trim() && i.targetKey)
-          .map((i: any) => ({
-            variableName: String(i.variableName).trim(),
-            injectAs: ['header', 'path_param', 'query_param', 'body_field', 'body_json_path'].includes(i.injectAs)
-              ? i.injectAs : 'header',
-            targetKey: String(i.targetKey),
-            prefix: i.prefix ? String(i.prefix) : undefined,
-          }))
-      : [],
-    priority: typeof raw.priority === 'number' ? raw.priority : 0,
-    isAuthEndpoint: !!raw.isAuthEndpoint,
-    isPagination: !!raw.isPagination,
-    hasFileUpload: !!raw.hasFileUpload,
-    isUnsupported: !!raw.isUnsupported,
-    unsupportedReason: raw.unsupportedReason ? String(raw.unsupportedReason) : undefined,
-    canRunParallel: !!raw.canRunParallel,
-    sampleRequestBody: raw.sampleRequestBody || undefined,
-    sampleQueryParams: raw.sampleQueryParams || undefined,
-    expectedStatusCodes: Array.isArray(raw.expectedStatusCodes) && raw.expectedStatusCodes.length > 0
-      ? raw.expectedStatusCodes.map(Number)
-      : [200, 201],
-  };
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // AGENT 1: ANALYST
 // ─────────────────────────────────────────────────────────────────────────────
@@ -232,121 +217,6 @@ async function runAnalyst(spec: ParsedApiSpec): Promise<string> {
     executionPhases: [{ phase: 1, name: 'All', endpoints: spec.endpoints.map(e => e.operationId), parallelizable: false }],
     edgeCases: ['Analyst could not parse — architect must analyze endpoints directly'],
   });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// AGENT 2: ARCHITECT
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function runArchitect(
-  spec: ParsedApiSpec,
-  endpoints: ParsedEndpoint[],
-  analysisJson: string,
-): Promise<any> {
-  logger.info('[DEPENDENCY_RESOLVER] Agent 2: Architect starting', {
-    endpointCount: endpoints.length,
-  });
-
-  const content = await callAiWithRetry(
-    [
-      { role: 'system', content: buildArchitectSystemPrompt() },
-      { role: 'user', content: buildArchitectPrompt(spec, endpoints, analysisJson) },
-    ],
-    { temperature: 0.2, response_format: { type: 'json_object' }, max_tokens: 65000, model: AI_TASK_MODELS.apiFlowArchitect, timeout: 180000 } as any,
-    'Architect',
-  );
-
-  // Try extracting JSON (Gemini may include reasoning text)
-  const parsed = extractJson(content);
-  if (parsed?.nodes && Array.isArray(parsed.nodes) && parsed.nodes.length > 0) {
-    return parsed;
-  }
-
-  // If extractJson failed or returned no nodes, try salvaging from raw content
-  {
-    logger.warn('[DEPENDENCY_RESOLVER] Architect JSON truncated, attempting repair', {
-      contentLength: content.length,
-    });
-
-    try {
-      // Strategy: find each complete node object in the nodes array
-      const nodesStart = content.indexOf('"nodes"');
-      if (nodesStart === -1) throw new Error('no nodes key');
-
-      const arrayStart = content.indexOf('[', nodesStart);
-      if (arrayStart === -1) throw new Error('no array start');
-
-      // Extract individual node objects by finding balanced {} pairs.
-      // IMPORTANT: the scanner must be STRING-AWARE — otherwise a literal '{'
-      // or '}' inside a JSON string value (e.g. "summary": "uses {userId}")
-      // corrupts the depth counter. Unbalanced braces in strings used to
-      // swallow subsequent nodes entirely (see json-repair test scenario 4b).
-      const recoveredNodes: any[] = [];
-      let depth = 0;
-      let nodeStart = -1;
-      let inString = false;
-      let escaped = false;
-
-      for (let i = arrayStart + 1; i < content.length; i++) {
-        const ch = content[i];
-
-        // Handle escape sequences inside strings (e.g. \" or \\)
-        if (escaped) {
-          escaped = false;
-          continue;
-        }
-
-        if (inString) {
-          if (ch === '\\') escaped = true;
-          else if (ch === '"') inString = false;
-          continue; // braces inside strings are literal, not structural
-        }
-
-        if (ch === '"') {
-          inString = true;
-          continue;
-        }
-
-        if (ch === '{' && depth === 0) {
-          nodeStart = i;
-          depth = 1;
-        } else if (ch === '{') {
-          depth++;
-        } else if (ch === '}') {
-          depth--;
-          if (depth === 0 && nodeStart !== -1) {
-            // Found a complete node object
-            const nodeStr = content.slice(nodeStart, i + 1);
-            try {
-              const node = JSON.parse(nodeStr);
-              if (node.id && node.method && node.path) {
-                recoveredNodes.push(node);
-              }
-            } catch {
-              // Malformed node, skip
-            }
-            nodeStart = -1;
-          }
-        }
-      }
-
-      if (recoveredNodes.length > 0) {
-        logger.info('[DEPENDENCY_RESOLVER] Architect JSON repaired', {
-          nodesRecovered: recoveredNodes.length,
-          totalContentLength: content.length,
-        });
-        return {
-          nodes: recoveredNodes,
-          executionOrder: recoveredNodes.map(n => n.id),
-          summary: `Partially recovered ${recoveredNodes.length} nodes from truncated response`,
-        };
-      }
-    } catch (repairErr: any) {
-      logger.warn('[DEPENDENCY_RESOLVER] JSON repair failed', { error: repairErr.message });
-    }
-
-    throw new Error(`Architect returned invalid JSON (${content.length} chars, likely truncated). Try a smaller API spec or select a specific API group.`);
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -409,87 +279,29 @@ async function runEnricher(
     expected: needsData.length,
   });
 
+  // Validate + repair each fabricated body against the endpoint's own JSON schema:
+  // coerce type mismatches (LLM emits "42"/"true" as strings) and log omitted
+  // required fields. `{{placeholder}}` fields are left untouched (runtime-resolved).
+  const schemaByKey = new Map<string, any>();
+  for (const e of spec.endpoints) if (e.requestBody?.schema) schemaByKey.set(`${e.method}:${e.path}`, e.requestBody.schema);
+
   return nodes.map(n => {
-    if (allSamples[n.id]) {
-      return { ...n, sampleRequestBody: allSamples[n.id] };
+    const sample = allSamples[n.id];
+    if (!sample) return n;
+    const schema = schemaByKey.get(`${n.method}:${n.path}`);
+    if (!schema) return { ...n, sampleRequestBody: sample };
+    const coerced = coerceBodyToSchema(sample, schema);
+    const missing = missingRequiredFields(coerced, schema);
+    if (missing.length > 0) {
+      logger.warn('[DEPENDENCY_RESOLVER] Enricher body missing required fields', { nodeId: n.id, missing });
     }
-    return n;
+    return { ...n, sampleRequestBody: coerced };
   });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST-PROCESSING: Deduplication + Validation
 // ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Remove phantom nodes — nodes fabricated by AI that don't exist in the original spec.
- * The AI sometimes creates helper nodes like "initial_setup", "auth_token_provider"
- * that have no corresponding endpoint in the parsed spec.
- */
-function removePhantomNodes(nodes: DAGNode[], spec: ParsedApiSpec): DAGNode[] {
-  // Build a set of valid method:path combinations from the spec
-  const validPaths = new Set<string>();
-  for (const ep of spec.endpoints) {
-    validPaths.add(`${ep.method}:${ep.path}`);
-    // Also add with/without trailing slash for tolerance
-    const normalized = ep.path.endsWith('/') ? ep.path.slice(0, -1) : ep.path + '/';
-    validPaths.add(`${ep.method}:${normalized}`);
-  }
-
-  const phantoms: string[] = [];
-  const valid: DAGNode[] = [];
-
-  for (const node of nodes) {
-    const key = `${node.method}:${node.path}`;
-    if (validPaths.has(key)) {
-      valid.push(node);
-    } else {
-      phantoms.push(`${node.id} (${node.method} ${node.path})`);
-    }
-  }
-
-  if (phantoms.length > 0) {
-    logger.warn('[DEPENDENCY_RESOLVER] Phantom nodes removed (not in spec)', {
-      count: phantoms.length,
-      phantoms,
-    });
-
-    // Clean up dependsOn references to removed phantom nodes
-    const phantomIds = new Set(nodes.filter(n => !validPaths.has(`${n.method}:${n.path}`)).map(n => n.id));
-    return valid.map(node => ({
-      ...node,
-      dependsOn: node.dependsOn.filter(dep => !phantomIds.has(dep)),
-      variableInjections: node.variableInjections.filter(inj => {
-        // Remove injections that only come from phantom producers
-        const producers = valid.filter(v =>
-          v.variableExtractions.some(ext => ext.variableName === inj.variableName)
-        );
-        return producers.length > 0;
-      }),
-    }));
-  }
-
-  return valid;
-}
-
-function deduplicateNodes(nodes: DAGNode[]): DAGNode[] {
-  const seen = new Map<string, DAGNode>();
-  const duplicates: string[] = [];
-
-  for (const node of nodes) {
-    if (seen.has(node.id)) {
-      duplicates.push(node.id);
-    } else {
-      seen.set(node.id, node);
-    }
-  }
-
-  if (duplicates.length > 0) {
-    logger.warn('[DEPENDENCY_RESOLVER] Duplicate node IDs removed', { duplicates });
-  }
-
-  return Array.from(seen.values());
-}
 
 /**
  * Auto-wire auth dependencies: ensure every node that injects an auth variable
@@ -506,13 +318,10 @@ function autoWireAuthDependencies(nodes: DAGNode[]): DAGNode[] {
     }
   }
 
-  // Common auth variable patterns
-  const AUTH_VAR_PATTERNS = /^(auth_token|access_token|jwt|bearer_token|api_key|session_token|token|authorization)$/i;
-
   // Find auth producer nodes (nodes that extract auth variables)
   const authProducerIds = new Set<string>();
   for (const [varName, producerId] of producerMap) {
-    if (AUTH_VAR_PATTERNS.test(varName)) {
+    if (isAuthCredentialVar(varName)) {
       authProducerIds.add(producerId);
     }
   }
@@ -558,6 +367,379 @@ function autoWireAuthDependencies(nodes: DAGNode[]): DAGNode[] {
   }
 
   return result;
+}
+
+/**
+ * Coverage safety-net for auth: every endpoint the spec marks as auth-required
+ * MUST run after an auth producer so it actually carries a session/token. The
+ * Architect frequently wires only SOME protected endpoints — or schedules them
+ * before login — leaving the rest to fire unauthenticated → 401 (and, under
+ * stop-on-failure, killing the whole run before login even executes). This pass
+ * closes that gap deterministically from the spec's `security` field (ground
+ * truth), not AI guesses.
+ *
+ * Modes, decided by how the primary auth endpoint yields its token:
+ * - COOKIE / session (token extracted from a Set-Cookie header): add ORDERING
+ *   only. The runtime cookie jar carries the session; a raw cookie replayed as
+ *   `Authorization: Bearer` breaks auth, so any such bogus injection the
+ *   Architect added is STRIPPED here.
+ * - BEARER (token extracted from the response body): add ordering AND a missing
+ *   `Authorization: Bearer {{auth_token}}` injection.
+ */
+function autoWireRequiredAuth(nodes: DAGNode[], spec: ParsedApiSpec): DAGNode[] {
+  const secByKey = new Map<string, string[]>();
+  for (const e of spec.endpoints) secByKey.set(`${e.method}:${e.path}`, e.security || []);
+
+  const nodeById = new Map(nodes.map(n => [n.id, n]));
+  const AUTH_ENDPOINT_PRODUCERS = nodes.filter(
+    n => n.isAuthEndpoint && n.variableExtractions.some(e => isAuthTokenVar(e.variableName)),
+  );
+  const ANY_AUTH_PRODUCERS = nodes.filter(n => n.variableExtractions.some(e => isAuthTokenVar(e.variableName)));
+  const producerPool = AUTH_ENDPOINT_PRODUCERS.length ? AUTH_ENDPOINT_PRODUCERS : ANY_AUTH_PRODUCERS;
+  if (producerPool.length === 0) return nodes;
+
+  const authProducerIdSet = new Set(ANY_AUTH_PRODUCERS.map(n => n.id));
+  // Count auth-producer ancestors → the TERMINAL producer in a multi-step chain
+  // (verifyOtp → register → refresh) is the one that ESTABLISHES the session
+  // (register), not the first (verifyOtp yields only a registration token).
+  const countAuthAncestors = (start: DAGNode): number => {
+    const seen = new Set<string>();
+    const stack = [...start.dependsOn];
+    let count = 0;
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (authProducerIdSet.has(id)) count++;
+      const dep = nodeById.get(id);
+      if (dep) stack.push(...dep.dependsOn);
+    }
+    return count;
+  };
+  const isRefreshEndpoint = (n: DAGNode) => /refresh/i.test(n.path) || /refresh/i.test(n.id);
+
+  // Partition producers into REALMS by the path prefix before the auth segment
+  // (e.g. `/api/v1/admin/auth/login` → realm `/api/v1/admin`; `/api/v1/auth/register`
+  // → realm `/api/v1`). A protected endpoint is wired to the producer of the realm
+  // whose prefix is the LONGEST prefix of its path — so `/admin/*` depends on the
+  // admin login and gets the admin token, not the user login's.
+  interface AuthRealm { prefix: string; producer: DAGNode; authVar: string; cookieMode: boolean; }
+  const byPrefix = new Map<string, DAGNode[]>();
+  for (const p of producerPool) {
+    const prefix = realmPrefixOf(p.path);
+    if (!byPrefix.has(prefix)) byPrefix.set(prefix, []);
+    byPrefix.get(prefix)!.push(p);
+  }
+  const buildRealm = (prefix: string, group: DAGNode[]): AuthRealm => {
+    const rankable = group.filter(n => !isRefreshEndpoint(n));
+    const pool = rankable.length ? rankable : group;
+    const producer = pool.reduce((best, n) => (countAuthAncestors(n) > countAuthAncestors(best) ? n : best), pool[0]);
+    const authVar = producer.variableExtractions.find(e => isAuthTokenVar(e.variableName))!.variableName;
+    const ext = producer.variableExtractions.find(e => e.variableName === authVar);
+    return { prefix, producer, authVar, cookieMode: !!ext?.headerSource && /cookie/i.test(ext.headerSource) };
+  };
+  const realms = [...byPrefix.entries()]
+    .map(([prefix, group]) => buildRealm(prefix, group))
+    .sort((a, b) => b.prefix.length - a.prefix.length); // longest prefix first
+  const fallbackRealm = realms[realms.length - 1]; // broadest realm for unmatched paths
+  const resolveRealm = (path: string): AuthRealm => {
+    for (const r of realms) {
+      if (r.prefix && (path === r.prefix || path.startsWith(`${r.prefix}/`))) return r;
+    }
+    return fallbackRealm;
+  };
+
+  // Every node that produces an auth var is part of the auth chain — never make
+  // it depend on auth (avoids register→login→refresh cycles). Expand to the full
+  // BOOTSTRAP closure: anything an auth producer (transitively) depends on runs
+  // before the token exists (e.g. sendOtp before verifyOtp), so it must NOT get
+  // an auth injection either — that token would always be empty.
+  const authBootstrap = new Set(ANY_AUTH_PRODUCERS.map(n => n.id));
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const id of [...authBootstrap]) {
+      for (const dep of nodeById.get(id)?.dependsOn || []) {
+        if (!authBootstrap.has(dep)) { authBootstrap.add(dep); grew = true; }
+      }
+    }
+  }
+
+  const isBogusBearer = (i: VariableInjection, authVar: string): boolean =>
+    i.variableName === authVar &&
+    i.injectAs === 'header' &&
+    String(i.targetKey).toLowerCase() === 'authorization';
+
+  let orderedCount = 0;
+  let injectedCount = 0;
+  let strippedCount = 0;
+
+  const result = nodes.map(node => {
+    if (authBootstrap.has(node.id)) return node;
+
+    const realm = resolveRealm(node.path);
+    const isProtected = (secByKey.get(`${node.method}:${node.path}`) || []).length > 0;
+    let dependsOn = node.dependsOn;
+    let variableInjections = node.variableInjections;
+    let changed = false;
+
+    // Cookie mode: drop bogus "Authorization: Bearer <cookie>" — jar carries it.
+    if (realm.cookieMode) {
+      const filtered = variableInjections.filter(i => !isBogusBearer(i, realm.authVar));
+      if (filtered.length !== variableInjections.length) {
+        variableInjections = filtered;
+        strippedCount += 1;
+        changed = true;
+      }
+    }
+
+    if (isProtected) {
+      // Ordering: run after this realm's auth producer. Skip if it would reverse
+      // an existing dependency (the producer already depends on this node).
+      if (!dependsOn.includes(realm.producer.id) && !realm.producer.dependsOn.includes(node.id)) {
+        dependsOn = [...dependsOn, realm.producer.id];
+        orderedCount += 1;
+        changed = true;
+      }
+      // Bearer mode: ensure the token is actually injected.
+      if (!realm.cookieMode) {
+        const hasAuthInjection = variableInjections.some(
+          i => i.variableName === realm.authVar || (i.injectAs === 'header' && String(i.targetKey).toLowerCase() === 'authorization'),
+        );
+        if (!hasAuthInjection) {
+          variableInjections = [
+            ...variableInjections,
+            { variableName: realm.authVar, injectAs: 'header', targetKey: 'Authorization', prefix: 'Bearer ' },
+          ];
+          injectedCount += 1;
+          changed = true;
+        }
+      }
+    }
+
+    return changed ? { ...node, dependsOn, variableInjections } : node;
+  });
+
+  if (orderedCount > 0 || injectedCount > 0 || strippedCount > 0) {
+    logger.info('[DEPENDENCY_RESOLVER] Auto-wired required auth coverage', {
+      realms: realms.map(r => ({ prefix: r.prefix, producer: r.producer.id, cookieMode: r.cookieMode })),
+      orderedCount, injectedCount, strippedCount,
+    });
+  }
+  return result;
+}
+
+/**
+ * General variable-dependency wiring: whenever a node INJECTS a variable that
+ * another node EXTRACTS from its response, the consumer must run AFTER that
+ * producer — otherwise the placeholder resolves to nothing at run time (the
+ * "extracted value not used downstream" bug: e.g. deleteFile injects file_id but
+ * runs before the upload that produces it). The Architect wires these for auth
+ * and obvious CRUD, but misses cross-resource ids in large/batched specs. This
+ * closes the gap deterministically from the DAG's own extraction/injection map.
+ *
+ * Auth variables are skipped here — they are owned by autoWireAuthDependencies /
+ * autoWireRequiredAuth, which pick the right producer among a multi-step chain.
+ * Only ADDS edges; a direct 2-cycle is avoided and the downstream cycle-breaker
+ * handles anything deeper.
+ */
+function autoWireVariableDependencies(nodes: DAGNode[]): DAGNode[] {
+  const producersByVar = new Map<string, string[]>();
+  for (const n of nodes) {
+    for (const e of n.variableExtractions) {
+      if (isAuthOrAuthorizationVar(e.variableName)) continue;
+      const ids = producersByVar.get(e.variableName) || [];
+      if (!ids.includes(n.id)) ids.push(n.id);
+      producersByVar.set(e.variableName, ids);
+    }
+  }
+
+  // Live dependency map, updated as edges are added, so the cycle check sees
+  // edges added earlier in this same pass (catches transitive A→B→C→A).
+  const liveDeps = new Map(nodes.map(n => [n.id, new Set(n.dependsOn)]));
+  const depsOf = (id: string) => liveDeps.get(id) ?? [];
+  let edgesAdded = 0;
+
+  const result = nodes.map(node => {
+    const deps = liveDeps.get(node.id)!;
+    const before = deps.size;
+    for (const inj of node.variableInjections) {
+      if (isAuthOrAuthorizationVar(inj.variableName)) continue;
+      const producers = producersByVar.get(inj.variableName);
+      if (!producers) continue;
+      const producerId = producers.find(pid => pid !== node.id);
+      if (!producerId || deps.has(producerId)) continue;
+      if (wouldCreateCycle(node.id, producerId, depsOf)) continue; // transitive cycle guard
+      deps.add(producerId);
+    }
+    if (deps.size === before) return node;
+    edgesAdded += deps.size - before;
+    return { ...node, dependsOn: [...deps] };
+  });
+
+  if (edgesAdded > 0) {
+    logger.info('[DEPENDENCY_RESOLVER] Auto-wired variable dependencies', { edgesAdded });
+  }
+  return result;
+}
+
+/**
+ * Reference-id resolution: a request field like `countryId` references an
+ * EXISTING entity and must carry a real id, not a fabricated UUID (else the API
+ * rejects it — "Country not found"). If a prior step already produces that id
+ * (`country_id`), link to it. Otherwise, if a matching GET list endpoint exists
+ * (`/geo/countries`), promote it to a producer (`$[0].id`) and link. Rewrites
+ * ONLY literal fields whose snake-cased name equals the entity var — high
+ * precision, so it does not touch ordinary fake data.
+ *
+ * Exception — auth bootstrap: an endpoint that PRODUCES the auth token (e.g.
+ * `register`) cannot source a reference id from an authed list endpoint, since
+ * that endpoint needs the very token this node has not issued yet (chicken and
+ * egg). Such ids are surfaced as required run-time variables (`requiredVars`)
+ * for the user to provide instead — which also lets the bootstrap node run
+ * early and break the cycle.
+ */
+function autoResolveReferenceIds(nodes: DAGNode[]): { nodes: DAGNode[]; requiredVars: Record<string, string> } {
+  // produced *_id vars → earliest producer node
+  const producedId = new Map<string, string>();
+  for (const n of nodes) {
+    for (const e of n.variableExtractions || []) {
+      if (isSnakeIdVar(e.variableName) && !producedId.has(e.variableName)) producedId.set(e.variableName, n.id);
+    }
+  }
+  // GET *collection* endpoints keyed by singular entity ("country", "city").
+  // Item fetches (`GET /countries/{id}`) are NOT list producers — extracting
+  // `$[0].id` from a single-object response yields nothing, and the item needs
+  // its own `{id}` anyway.
+  const listByEntity = new Map<string, string>();
+  for (const n of nodes) {
+    if (n.method !== 'GET') continue;
+    const rawParts = n.path.split('/').filter(Boolean);
+    if (rawParts[rawParts.length - 1]?.startsWith('{')) continue; // item GET, not a list
+    const entity = singularize(lastPathSegment(n.path)).toLowerCase();
+    if (entity && !listByEntity.has(entity)) listByEntity.set(entity, n.id);
+  }
+  // array-id jsonPath, learned from an existing list extraction (fallback $[0].id)
+  let idPath = '$[0].id';
+  for (const n of nodes) {
+    const e = (n.variableExtractions || []).find(x => isSnakeIdVar(x.variableName) && x.jsonPath && /\[0\]/.test(x.jsonPath));
+    if (e?.jsonPath) { idPath = e.jsonPath; break; }
+  }
+
+  const nodeById = new Map(nodes.map(n => [n.id, n]));
+
+  // Auth-token producers (register / verifyOtp / login …) PLUS their transitive
+  // dependency closure (the bootstrap chain — e.g. sendOtp feeding verifyOtp).
+  // Reference ids on ANY node in this closure must be user-provided, not pulled
+  // from an authed list endpoint: adding an edge from a pre-auth node into an
+  // authed endpoint (which itself depends on the auth chain) creates a cycle.
+  const authBootstrap = new Set(
+    nodes.filter(n => (n.variableExtractions || []).some(e => isAuthTokenVar(e.variableName))).map(n => n.id),
+  );
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const id of [...authBootstrap]) {
+      for (const dep of nodeById.get(id)?.dependsOn || []) {
+        if (!authBootstrap.has(dep)) { authBootstrap.add(dep); grew = true; }
+      }
+    }
+  }
+
+  const extraExtractions = new Map<string, Set<string>>();
+  const extraDeps = new Map<string, Set<string>>();
+  const requiredVars: Record<string, string> = {};
+
+  const resolveField = (field: string, value: unknown, ownerId: string): string | null => {
+    if (typeof value !== 'string' || /\{\{.+?\}\}/.test(value)) return null;
+    if (!isReferenceIdField(field)) return null;
+    const canonical = toSnakeCase(field);
+    if (!isSnakeIdVar(canonical)) return null;
+
+    // Bootstrap node: ask the user rather than link to an authed producer.
+    if (authBootstrap.has(ownerId)) {
+      requiredVars[canonical] = '';
+      return `{{${canonical}}}`;
+    }
+
+    let producerId = producedId.get(canonical);
+    if (!producerId) {
+      const entity = canonical.replace(/_id$/, '');
+      const listId = listByEntity.get(entity);
+      if (!listId || listId === ownerId) return null;
+      if (!extraExtractions.has(listId)) extraExtractions.set(listId, new Set());
+      extraExtractions.get(listId)!.add(canonical);
+      producedId.set(canonical, listId); // let siblings reuse this producer
+      producerId = listId;
+    }
+    if (producerId === ownerId) return null;
+    // Transitive cycle guard: consider the producer's original deps AND edges
+    // added earlier in this same pass (catches 3+ node cycles, not just A<->B).
+    const depsOf = (id: string): Iterable<string> => [
+      ...(nodeById.get(id)?.dependsOn || []),
+      ...(extraDeps.get(id) || []),
+    ];
+    if (wouldCreateCycle(ownerId, producerId, depsOf)) return null;
+    if (!extraDeps.has(ownerId)) extraDeps.set(ownerId, new Set());
+    extraDeps.get(ownerId)!.add(producerId);
+    return `{{${canonical}}}`;
+  };
+
+  const rewriteObj = (val: any, ownerId: string): any => {
+    if (val === null || typeof val !== 'object') return val;
+    if (Array.isArray(val)) return val.map(v => rewriteObj(v, ownerId));
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(val)) {
+      out[k] = v !== null && typeof v === 'object' ? rewriteObj(v, ownerId) : (resolveField(k, v, ownerId) ?? v);
+    }
+    return out;
+  };
+
+  // Pass 1 — rewrite consumer bodies / query (collects producers + deps).
+  let result = nodes.map(node => {
+    let changed = false;
+    let sampleRequestBody = node.sampleRequestBody;
+    if (sampleRequestBody && typeof sampleRequestBody === 'object') {
+      const nb = rewriteObj(sampleRequestBody, node.id);
+      if (JSON.stringify(nb) !== JSON.stringify(sampleRequestBody)) { sampleRequestBody = nb; changed = true; }
+    }
+    let sampleQueryParams = node.sampleQueryParams;
+    if (sampleQueryParams && typeof sampleQueryParams === 'object') {
+      const nq: Record<string, string> = {};
+      let qc = false;
+      for (const [k, v] of Object.entries(sampleQueryParams)) {
+        const r = resolveField(k, v, node.id);
+        if (r) { nq[k] = r; qc = true; } else nq[k] = v as string;
+      }
+      if (qc) { sampleQueryParams = nq; changed = true; }
+    }
+    return changed ? { ...node, sampleRequestBody, sampleQueryParams } : node;
+  });
+
+  // Pass 2 — add the learned extractions to list endpoints + the new deps.
+  result = result.map(node => {
+    let n = node;
+    const addExt = extraExtractions.get(node.id);
+    if (addExt) {
+      const existing = new Set((n.variableExtractions || []).map(e => e.variableName));
+      const fresh = [...addExt].filter(v => !existing.has(v)).map(v => ({ variableName: v, jsonPath: idPath }));
+      if (fresh.length) n = { ...n, variableExtractions: [...(n.variableExtractions || []), ...fresh] };
+    }
+    const addDep = extraDeps.get(node.id);
+    if (addDep) {
+      const deps = new Set(n.dependsOn);
+      const before = deps.size;
+      for (const d of addDep) deps.add(d);
+      if (deps.size !== before) n = { ...n, dependsOn: [...deps] };
+    }
+    return n;
+  });
+
+  const linked = [...extraDeps.values()].reduce((s, set) => s + set.size, 0);
+  if (linked > 0 || Object.keys(requiredVars).length > 0) {
+    logger.info('[DEPENDENCY_RESOLVER] Resolved reference ids', {
+      linked, promotedListEndpoints: extraExtractions.size, askUser: Object.keys(requiredVars),
+    });
+  }
+  return { nodes: result, requiredVars };
 }
 
 /**
@@ -931,9 +1113,18 @@ function autoWireCrudDependencies(nodes: DAGNode[], spec: ParsedApiSpec): DAGNod
   return result;
 }
 
-function validateVariableChain(nodes: DAGNode[], executionOrder: string[]): void {
-  // Build map: which variables are extracted and by which nodes
-  const producerMap = new Map<string, string>(); // variableName → producerNodeId
+/**
+ * Validate-and-REPAIR the variable chain (not warn-only). An injection is kept iff
+ * it can actually resolve at run time; otherwise it is dropped so the executor
+ * never sends an unresolved `{{placeholder}}` literal:
+ *  - no producer AND not a user-provided pattern → orphan, dropped.
+ *  - producer runs at/after the consumer (only possible inside a residual cycle,
+ *    since topo already ordered everything) → unsatisfiable, dropped.
+ * Returns the repaired nodes.
+ */
+function validateVariableChain(nodes: DAGNode[], executionOrder: string[]): DAGNode[] {
+  const producerMap = new Map<string, string>(); // variableName → earliest producerNodeId
+  const orderIdx = new Map(executionOrder.map((id, i) => [id, i]));
   for (const id of executionOrder) {
     const node = nodes.find(n => n.id === id);
     if (!node) continue;
@@ -944,36 +1135,40 @@ function validateVariableChain(nodes: DAGNode[], executionOrder: string[]): void
           firstProducer: producerMap.get(ext.variableName),
           secondProducer: node.id,
         });
+      } else {
+        producerMap.set(ext.variableName, node.id);
       }
-      producerMap.set(ext.variableName, node.id);
     }
   }
 
-  // Check every injection has a matching extraction
-  for (const node of nodes) {
-    for (const inj of node.variableInjections) {
-      if (!producerMap.has(inj.variableName)) {
-        logger.warn('[DEPENDENCY_RESOLVER] Broken injection — no producer', {
-          nodeId: node.id,
-          variable: inj.variableName,
-          injectAs: inj.injectAs,
-          targetKey: inj.targetKey,
-        });
-      } else {
-        // Verify producer is in dependsOn chain (direct or transitive)
-        const producerId = producerMap.get(inj.variableName)!;
-        const producerIdx = executionOrder.indexOf(producerId);
-        const consumerIdx = executionOrder.indexOf(node.id);
-        if (producerIdx >= consumerIdx) {
-          logger.warn('[DEPENDENCY_RESOLVER] Producer runs AFTER consumer', {
-            variable: inj.variableName,
-            producer: producerId,
-            consumer: node.id,
-          });
-        }
+  let droppedOrphan = 0;
+  let droppedOrdering = 0;
+  const repaired = nodes.map(node => {
+    const consumerIdx = orderIdx.get(node.id) ?? Infinity;
+    const kept = node.variableInjections.filter(inj => {
+      const producerId = producerMap.get(inj.variableName);
+      if (producerId === undefined) {
+        if (isUserProvidedVar(inj.variableName)) return true; // user supplies it at run time
+        droppedOrphan++;
+        return false;
       }
-    }
+      const producerIdx = orderIdx.get(producerId) ?? -1;
+      if (producerIdx >= consumerIdx) {
+        droppedOrdering++; // unsatisfiable ordering (residual cycle) → drop
+        return false;
+      }
+      return true;
+    });
+    return kept.length !== node.variableInjections.length ? { ...node, variableInjections: kept } : node;
+  });
+
+  if (droppedOrphan > 0 || droppedOrdering > 0) {
+    logger.info('[DEPENDENCY_RESOLVER] Variable-chain repaired', {
+      droppedOrphanInjections: droppedOrphan,
+      droppedOrderingInjections: droppedOrdering,
+    });
   }
+  return repaired;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -989,12 +1184,20 @@ export interface ResolveResult {
   questions?: FlowQuestion[];
   analysisId?: string; // cache key for resuming
   confidence?: { overall: number; auth: number; dependencies: number; dataFlow: number };
+  // Reference ids on auth-bootstrap nodes that must be user-provided at run time
+  // (var name → '' placeholder). Merged into the flow's variableChain by the builder.
+  requiredVars?: Record<string, string>;
+  // Structural quality of the built DAG (validate-and-repair gate). `passed`
+  // means all hard invariants hold; surfaced for logging / UI.
+  qualityScore?: EvalScore;
 }
 
 export class DependencyResolverService {
   /**
-   * 3-agent pipeline: Analyst → Architect → Enricher
-   * Returns questions if analyst is uncertain — caller must resume with answers.
+   * Pipeline: Analyst (asks clarifying questions) → deterministic candidate graph
+   * from the spec (seedNodesFromSpec + wiring passes) → Enricher (fake bodies) →
+   * validate-and-repair gate (scoreDag). Returns questions if the Analyst is
+   * uncertain — caller must resume with answers.
    */
   static async resolve(
     spec: ParsedApiSpec,
@@ -1034,7 +1237,16 @@ export class DependencyResolverService {
       // Merge user answers into the analysis
       const analysis = JSON.parse(cached.analysis);
       if (options.userAnswers) {
-        analysis._userAnswers = options.userAnswers;
+        const answers = options.userAnswers;
+        // Preserve provided-variable METADATA (name/type/context — never the
+        // values) so the Enricher can wire user-supplied values into request
+        // bodies as {{placeholder}} instead of inventing fake credentials.
+        const askedQuestions: any[] = Array.isArray(analysis.questions) ? analysis.questions : [];
+        const providedVariables = askedQuestions
+          .filter(q => q.variableName && (answers[q.variableName] !== undefined || answers[q.id] !== undefined))
+          .map(q => ({ name: q.variableName, type: q.type, context: q.context || q.question }));
+        if (providedVariables.length > 0) analysis._providedVariables = providedVariables;
+        analysis._userAnswers = answers;
         // Clear questions since user answered them
         analysis.questions = [];
       }
@@ -1085,128 +1297,45 @@ export class DependencyResolverService {
       }
     }
 
-    // ── Agent 2: Architect ──────────────────────────────────────────────
-    let rawDag: any;
-
-    if (endpoints.length <= MAX_ENDPOINTS_PER_BATCH) {
-      emit('building_dag', `AI is building execution plan for ${endpoints.length} endpoints...`, 55);
-      rawDag = await runArchitect(spec, endpoints, analysisJson);
-    } else {
-      const chunks: ParsedEndpoint[][] = [];
-      for (let i = 0; i < endpoints.length; i += MAX_ENDPOINTS_PER_BATCH) {
-        chunks.push(endpoints.slice(i, i + MAX_ENDPOINTS_PER_BATCH));
-      }
-
-      emit('building_dag', `Building execution plan in ${chunks.length} batches (${endpoints.length} endpoints)...`, 55);
-      logger.info('[DEPENDENCY_RESOLVER] Batching', { chunks: chunks.length });
-
-      const partialDags = await Promise.all(
-        chunks.map(async (chunk, idx) => {
-          const result = await runArchitect(spec, chunk, analysisJson);
-          const nodeCount = Array.isArray(result?.nodes) ? result.nodes.length : 0;
-          logger.info('[DEPENDENCY_RESOLVER] Architect batch completed', {
-            batch: idx + 1,
-            totalBatches: chunks.length,
-            inputEndpoints: chunk.length,
-            outputNodes: nodeCount,
-          });
-          return result;
-        })
-      );
-      checkTimeout();
-
-      // Collect all nodes from partial DAGs
-      const allPartialNodes = partialDags.flatMap(d => Array.isArray(d.nodes) ? d.nodes : []);
-      logger.info('[DEPENDENCY_RESOLVER] Partial DAGs collected', {
-        partialDagCount: partialDags.length,
-        totalPartialNodes: allPartialNodes.length,
-      });
-
-      if (allPartialNodes.length === 0) {
-        throw new Error('All Architect batches returned 0 nodes. The API spec may be too complex or malformed.');
-      }
-
-      // For large specs (many batches), skip AI merge — just concatenate
-      // AI merge is unreliable for 100+ nodes and wastes time/tokens
-      if (chunks.length > 4) {
-        logger.info('[DEPENDENCY_RESOLVER] Skipping AI merge for large spec, concatenating directly', {
-          chunks: chunks.length,
-          totalNodes: allPartialNodes.length,
-        });
-        emit('building_dag', `Combining ${allPartialNodes.length} nodes from ${chunks.length} batches...`, 70);
-        rawDag = {
-          nodes: allPartialNodes,
-          executionOrder: allPartialNodes.map((n: any) => n.id),
-          summary: `API flow with ${allPartialNodes.length} endpoints across ${chunks.length} groups`,
-        };
-      } else {
-        // Small number of batches — try AI merge
-        emit('building_dag', `Merging ${chunks.length} batches into one execution plan...`, 70);
-        try {
-          const mergePrompt = buildSwaggerDagMergePrompt(partialDags, spec);
-          logger.info('[DEPENDENCY_RESOLVER] Merger starting', {
-            promptLength: mergePrompt.length,
-            totalNodes: allPartialNodes.length,
-          });
-          const mergeContent = await callAiWithRetry(
-            [
-              { role: 'system', content: buildSwaggerDependencySystemPrompt() },
-              { role: 'user', content: `Domain context:\n${analysisJson.slice(0, 800)}\n\n${mergePrompt}` },
-            ],
-            { temperature: 0.1, response_format: { type: 'json_object' }, max_tokens: 65000, model: AI_TASK_MODELS.apiFlowArchitect, timeout: 180000 } as any,
-            'Merger',
-          );
-          const mergedDag = extractJson(mergeContent);
-
-          if (mergedDag?.nodes && Array.isArray(mergedDag.nodes) && mergedDag.nodes.length > 0) {
-            logger.info('[DEPENDENCY_RESOLVER] Merger succeeded', { mergedNodes: mergedDag.nodes.length });
-            rawDag = mergedDag;
-          } else {
-            logger.warn('[DEPENDENCY_RESOLVER] Merger returned 0 nodes, using concatenation', {
-              mergedContent: (mergeContent || '').slice(0, 200),
-            });
-            rawDag = {
-              nodes: allPartialNodes,
-              executionOrder: allPartialNodes.map((n: any) => n.id),
-              summary: `Concatenated ${chunks.length} partial DAGs`,
-            };
-          }
-        } catch (mergeErr: any) {
-          logger.warn('[DEPENDENCY_RESOLVER] Merger failed, using concatenation', {
-            error: mergeErr.message?.slice(0, 150),
-            totalNodes: allPartialNodes.length,
-          });
-          rawDag = {
-            nodes: allPartialNodes,
-            executionOrder: allPartialNodes.map((n: any) => n.id),
-            summary: `Concatenated ${chunks.length} partial DAGs (merger failed)`,
-          };
-        }
-      }
+    // ── Agent 2: Deterministic candidate graph (replaces the Architect LLM) ──
+    // The DAG's wiring metadata (variableExtractions / variableInjections) is
+    // DERIVED from the spec's own schemas — response fields (producers) and
+    // path/query/body params (consumers) — instead of being hallucinated by an
+    // LLM. This eliminates the ordering violations and fabricated reference ids
+    // the Architect produced; values that genuinely can't be derived surface as
+    // required run-time inputs (handled below) the user is asked to provide.
+    emit('building_dag', `Building execution plan from ${endpoints.length} endpoints...`, 55);
+    let nodes: DAGNode[] = seedNodesFromSpec(spec);
+    if (nodes.length === 0) {
+      throw new Error('Spec produced no endpoints to build a flow from.');
     }
     checkTimeout();
 
-    // ── Post-processing ─────────────────────────────────────────────────
-    const rawNodes: any[] = Array.isArray(rawDag.nodes) ? rawDag.nodes : [];
-    if (rawNodes.length === 0) {
-      throw new Error('AI could not generate any API flow nodes. Try selecting a smaller API group or a different spec.');
-    }
-    let nodes: DAGNode[] = rawNodes.map((n, i) => normalizeNode(n, i));
-
-    // Remove phantom nodes (AI-fabricated endpoints not in spec)
-    nodes = removePhantomNodes(nodes, spec);
-    if (nodes.length === 0) {
-      throw new Error('All nodes were phantom (not in spec). AI may have misunderstood the specification.');
-    }
-
-    // Deduplicate
-    nodes = deduplicateNodes(nodes);
+    // Enrich request bodies BEFORE the wiring/ordering passes, so the passes
+    // that read body content (reference-id resolution) see real fields and the
+    // dependencies they add are reflected in the topological order below.
+    emit('enriching', `Generating test data for ${nodes.filter(n => ['POST', 'PUT', 'PATCH'].includes(n.method)).length} endpoints...`, 78);
+    checkTimeout();
+    nodes = await runEnricher(nodes, spec, analysisJson);
 
     // Safety-net: auto-wire dependencies that AI should have set but missed.
     // These functions only ADD edges — they never remove AI decisions.
     // If they fire, it means the prompt needs improvement for this API pattern.
     const preAuthCount = nodes.reduce((sum, n) => sum + n.dependsOn.length, 0);
     nodes = autoWireAuthDependencies(nodes);
+    // Coverage net: wire EVERY spec-declared auth-required endpoint to the auth
+    // producer (ordering) — and, per mode, add a Bearer injection or strip a
+    // bogus Bearer-of-cookie. Catches protected endpoints the Architect left
+    // unauthenticated and running before login.
+    nodes = autoWireRequiredAuth(nodes, spec);
+    // Generalize the same idea to non-auth vars: consumer of an extracted value
+    // must run after its producer (fixes cross-resource ids like file_id).
+    nodes = autoWireVariableDependencies(nodes);
+    // Reference ids (countryId/cityId/…) fabricated by the Enricher → replace
+    // with a real id from a producer/list endpoint, or ask the user for bootstrap ids.
+    const refResult = autoResolveReferenceIds(nodes);
+    nodes = refResult.nodes;
+    const referenceRequiredVars = refResult.requiredVars;
     const postAuthCount = nodes.reduce((sum, n) => sum + n.dependsOn.length, 0);
     if (postAuthCount > preAuthCount) {
       logger.warn('[DEPENDENCY_RESOLVER] PROMPT_GAP: Auth auto-wire added edges AI missed', {
@@ -1248,7 +1377,10 @@ export class DependencyResolverService {
       nodes = breakCycles(nodes, sortResult.cycleEdges);
       sortResult = topologicalSort(nodes);
       if (sortResult.hasCycle) {
-        logger.error('[DEPENDENCY_RESOLVER] Persistent cycle — forcing flat order');
+        logger.error('[DEPENDENCY_RESOLVER] Persistent cycle — dropping remaining cycle edges + forcing flat order');
+        // Strip the still-cyclic edges so the DAG is actually acyclic downstream
+        // (buildParallelGroups.getLevel walks dependsOn) — not just non-crashing.
+        nodes = breakCycles(nodes, sortResult.cycleEdges);
         sortResult = { order: nodes.map(n => n.id), hasCycle: false, cycleEdges: [] };
       }
     }
@@ -1270,35 +1402,9 @@ export class DependencyResolverService {
       }
     }
 
-    // Repair broken variable injections:
-    // - Remove injections where no producer exists AND variable isn't a known user-provided pattern
-    // - Keep injections for auth_token, api_key etc. (user may provide via initialVariables)
-    const USER_PROVIDED_VARS = /^(auth_token|access_token|api_key|bearer_token|jwt|session_token|oauth_client_id|oauth_client_secret|base_url|token|authorization)$/i;
-    {
-      const producerVars = new Set<string>();
-      for (const n of nodes) {
-        for (const ext of n.variableExtractions) producerVars.add(ext.variableName);
-      }
-      let repairedCount = 0;
-      nodes = nodes.map(node => {
-        const validInjections = node.variableInjections.filter(inj => {
-          if (producerVars.has(inj.variableName)) return true;
-          if (USER_PROVIDED_VARS.test(inj.variableName)) return true; // user may provide
-          repairedCount++;
-          return false;
-        });
-        if (validInjections.length !== node.variableInjections.length) {
-          return { ...node, variableInjections: validInjections };
-        }
-        return node;
-      });
-      if (repairedCount > 0) {
-        logger.info('[DEPENDENCY_RESOLVER] Removed broken variable injections', { count: repairedCount });
-      }
-    }
-
-    // Validate variable chain
-    validateVariableChain(nodes, executionOrder);
+    // Validate-and-repair the variable chain: drops orphan injections (no producer
+    // and not user-provided) and injections whose producer runs after the consumer.
+    nodes = validateVariableChain(nodes, executionOrder);
 
     // Parallel groups + priority assignment
     const parallelGroups = buildParallelGroups(nodes, executionOrder);
@@ -1311,10 +1417,32 @@ export class DependencyResolverService {
       priority: levelMap.get(node.id) ?? node.priority,
     }));
 
-    emit('enriching', `Generating test data for ${nodes.filter(n => ['POST','PUT','PATCH'].includes(n.method)).length} endpoints...`, 80);
-    // ── Agent 3: Enricher ───────────────────────────────────────────────
-    checkTimeout();
-    nodes = await runEnricher(nodes, spec, analysisJson);
+    // Validate-and-repair GATE — score the finished DAG against the structural
+    // invariants (the same scorer the eval harness uses). Values supplied at run
+    // time (required inputs + user-provided auth vars) are NOT counted unresolved.
+    const producedVars = new Set(nodes.flatMap(n => n.variableExtractions.map(e => e.variableName)));
+    const providedVars = new Set<string>(Object.keys(referenceRequiredVars));
+    for (const n of nodes) {
+      for (const inj of n.variableInjections) {
+        if (!producedVars.has(inj.variableName)) providedVars.add(inj.variableName);
+      }
+    }
+    const qualityScore = scoreDag({
+      name: spec.title,
+      nodes,
+      executionOrder,
+      securityByEndpoint: securityMapFromSpec(spec),
+      providedVars: [...providedVars],
+    });
+
+    logger[qualityScore.passed ? 'info' : 'warn']('[DEPENDENCY_RESOLVER] DAG quality gate', {
+      passed: qualityScore.passed,
+      orderingViolations: qualityScore.orderingViolations,
+      unresolvedInjections: qualityScore.unresolvedInjections,
+      authCoverage: qualityScore.authCoverage,
+      hasCycle: qualityScore.hasCycle,
+      fabricatedReferenceIds: qualityScore.fabricatedReferenceIds,
+    });
 
     logger.info('[DEPENDENCY_RESOLVER] Pipeline completed', {
       nodes: nodes.length,
@@ -1327,10 +1455,24 @@ export class DependencyResolverService {
         nodes,
         executionOrder,
         parallelGroups,
-        summary: typeof rawDag.summary === 'string' ? rawDag.summary : `API flow with ${nodes.length} endpoints`,
+        summary: `API flow with ${nodes.length} endpoints`,
         totalEndpoints: endpoints.length + spec.unsupportedEndpoints.length,
         unsupportedEndpoints: spec.unsupportedEndpoints as UnsupportedEndpoint[],
       },
+      requiredVars: referenceRequiredVars,
+      qualityScore,
     };
   }
 }
+
+/** Internal helpers exposed for unit testing only. */
+export const __testables = {
+  autoWireRequiredAuth,
+  autoWireAuthDependencies,
+  autoWireVariableDependencies,
+  autoResolveReferenceIds,
+  autoWireCrudDependencies,
+  topologicalSort,
+  buildParallelGroups,
+  validateVariableChain,
+};

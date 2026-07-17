@@ -643,6 +643,9 @@ export interface ApiTestResponse {
   statusText?: string;
   durationMs: number;
   responseHeaders: Record<string, string>;
+  // Raw, un-folded Set-Cookie values (Headers.getSetCookie()) — one entry per
+  // cookie. Present when the response set cookies; used by the flow cookie jar.
+  setCookies?: string[];
   responseBody: any;
   error?: string;
   matchesExpected?: boolean; // true if status matches expectedStatus
