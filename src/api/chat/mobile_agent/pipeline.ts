@@ -136,6 +136,22 @@ export interface RunMobileAgentPipelineOpts {
    */
   openTestCaseBlock?: string | null;
   /**
+   * APP MAP — a formatted summary of the project's OTHER saved mobile tests
+   * (known flows/screens of the app under test). Injected as a system block so
+   * the agent grounds multi-screen authoring in real, already-tested screens
+   * instead of inventing steps for screens it never observed. Null when the
+   * project has no other mobile tests or the read failed (best-effort).
+   */
+  appKnowledgeBlock?: string | null;
+  /**
+   * The durable per-app SCREEN MAP from prior explorations (screens + flows +
+   * reachability), as a compact brief. Complements appKnowledgeBlock (saved
+   * tests): this is the learned app structure, so the agent can reason about
+   * screens it hasn't observed this turn without re-crawling. Null when the app
+   * hasn't been explored / no key / read failed (best-effort).
+   */
+  appSkeletonBlock?: string | null;
+  /**
    * Prior conversation turns (oldest→newest), already role-mapped for OpenAI
    * and secret-redacted by the handler. Threaded between the system blocks and
    * the current user goal so the agent has memory across turns ("now do the
@@ -170,6 +186,18 @@ export async function runMobileAgentPipeline(
     // not duplicate it. Stable across the turn (good for prompt cache).
     ...(opts?.openTestCaseBlock
       ? [{ role: 'system' as const, content: opts.openTestCaseBlock }]
+      : []),
+    // APP MAP (project's other saved mobile tests) — grounds authoring for
+    // screens the agent hasn't observed this turn. Stable across the turn
+    // (cache-local), before the per-turn snapshot.
+    ...(opts?.appKnowledgeBlock
+      ? [{ role: 'system' as const, content: opts.appKnowledgeBlock }]
+      : []),
+    // APP SKELETON (screen map from prior explorations) — lets the agent reason
+    // about the app's structure before crawling. Stable across the turn, so it
+    // sits with the other app-context blocks, before the per-turn snapshot.
+    ...(opts?.appSkeletonBlock
+      ? [{ role: 'system' as const, content: opts.appSkeletonBlock }]
       : []),
     ...(opts?.snapshot
       ? [{ role: 'system' as const, content: formatMobileSnapshotForChat(opts.snapshot) }]

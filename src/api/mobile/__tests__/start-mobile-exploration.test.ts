@@ -100,4 +100,45 @@ describe('startMobileExploration', () => {
     await startMobileExploration(mockReq(), res);
     expect(res.status).toHaveBeenCalledWith(500);
   });
+
+  it('enqueues a NORMALIZED briefing — strips credential-ish fields [Block D security]', async () => {
+    // The controller must run req.body.briefing through normalizeMobileBriefing
+    // before enqueue, so a smuggled credential can never reach the runner/LLM.
+    // Guards against a future refactor that spreads req.body into the job.
+    const res = mockRes();
+    await startMobileExploration(
+      mockReq({
+        body: {
+          platform: 'android', appId: 'com.demo.app', runnerSessionId: 'sess-1',
+          briefing: {
+            description: '  a shopping app  ',
+            region: 'KZ',
+            keyFlows: ['checkout'],
+            password: 'hunter2',
+            token: 'eyJ.abc.def',
+            testCredentials: { user: 'a', pass: 'b' },
+          },
+        },
+      }),
+      res,
+    );
+    expect(addMobileExplorationJob).toHaveBeenCalledWith(expect.objectContaining({
+      briefing: { description: 'a shopping app', region: 'KZ', keyFlows: ['checkout'] },
+    }));
+    // Belt: the enqueued payload contains none of the credential values.
+    const enqueued = JSON.stringify(addMobileExplorationJob.mock.calls[0][0]);
+    expect(enqueued).not.toContain('hunter2');
+    expect(enqueued).not.toContain('eyJ.abc.def');
+  });
+
+  it('enqueues briefing:undefined when none is provided', async () => {
+    const res = mockRes();
+    await startMobileExploration(
+      mockReq({ body: { platform: 'android', appId: 'a', runnerSessionId: 's' } }),
+      res,
+    );
+    expect(addMobileExplorationJob).toHaveBeenCalledWith(
+      expect.objectContaining({ briefing: undefined }),
+    );
+  });
 });

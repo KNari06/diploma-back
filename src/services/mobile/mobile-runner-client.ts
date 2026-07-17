@@ -27,6 +27,7 @@ import type {
   MobileExplorationStartResponse,
   MobileExplorationReadiness,
   MobileExplorationSnapshot,
+  MobileAppBriefing,
 } from './mobile-runner.types';
 import { MobileRunnerError } from './mobile-runner.types';
 import { mintRunnerUserToken } from './user-token';
@@ -307,7 +308,14 @@ export class MobileRunnerClient {
    */
   async startExploration(
     sessionId: string,
-    body: { appId: string; goal?: string; budget?: Record<string, number> },
+    body: {
+      appId: string;
+      goal?: string;
+      /** Structured pre-exploration context (see MobileAppBriefing). NO
+       *  credentials — those are handled via the runner's answer seam. */
+      briefing?: MobileAppBriefing;
+      budget?: Record<string, number>;
+    },
     opts?: { userId?: string },
   ): Promise<MobileExplorationStartResponse> {
     return this.request<MobileExplorationStartResponse>(

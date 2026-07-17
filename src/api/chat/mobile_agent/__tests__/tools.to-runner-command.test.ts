@@ -28,6 +28,7 @@ const RUNNER_COMMAND_TYPES = new Set([
   'get_logs', 'get_network_logs', 'get_app_info', 'get_app_cache',
   'check_package', 'tap_notification', 'dismiss_notification',
   'clear_all_notifications', 'assert_notification', 'switch_context',
+  'set_geolocation', 'clear_geolocation', 'set_orientation',
   'web_navigate', 'web_evaluate', 'web_click', 'web_type',
   'web_assert_element', 'web_assert_text', 'web_screenshot', 'web_get_url',
 ]);
@@ -55,6 +56,8 @@ describe('ACCEPTED_STEP_TYPES ↔ toRunnerCommand sync', () => {
     navigate: { value: 'https://example.com' },
     extract_text: { options: { extractVariable: 'price' } },
     drag: { options: { startX: 100, startY: 200, endX: 300, endY: 400 } },
+    // geolocation `set` requires coords or the converter throws — give it a fix.
+    geolocation: { options: { geolocationLatitude: 37.7749, geolocationLongitude: -122.4194 } },
   };
 
   it('every whitelisted type converts to a command type the runner schema declares', () => {
@@ -147,6 +150,93 @@ describe('toRunnerCommand — wait / wait_for', () => {
     expect(expectCommand(step({ type: 'wait_for' }))).toEqual({
       type: 'observe_page',
       params: {},
+    });
+  });
+});
+
+describe('toRunnerCommand — assert timeout plumbing', () => {
+  it('forwards options.timeout into assert_visible params (the ONE polled assert)', () => {
+    const cmd = expectCommand(
+      step({ type: 'assert', description: 'success toast', options: { timeout: 15000 } }),
+    );
+    expect(cmd.type).toBe('assert_visible');
+    expect((cmd.params as { timeout?: number }).timeout).toBe(15000);
+  });
+
+  it('omits timeout when unset so the runner keeps its 5s default', () => {
+    const cmd = expectCommand(step({ type: 'assert', description: 'success toast' }));
+    expect(cmd.type).toBe('assert_visible');
+    expect((cmd.params as { timeout?: number }).timeout).toBeUndefined();
+  });
+
+  it('does NOT put timeout on assert_text / ai_visual_check (single-shot, no poll)', () => {
+    const textCmd = expectCommand(
+      step({ type: 'assert_text', description: 'x', assertionText: 'Welcome', options: { timeout: 9000 } }),
+    );
+    expect(textCmd.type).toBe('assert_text');
+    expect((textCmd as { timeout?: number }).timeout).toBeUndefined();
+    expect((textCmd.params as { timeout?: number }).timeout).toBeUndefined();
+
+    const aiCmd = expectCommand(
+      // aiCheckSource is read via cast in the converter (not a typed option field), so cast here too.
+      step({ type: 'ai_check', description: 'looks logged in', options: { aiCheckSource: 'tree', timeout: 9000 } as unknown as MobileIntentStep['options'] }),
+    );
+    expect(aiCmd.type).toBe('ai_visual_check');
+    expect((aiCmd as { timeout?: number }).timeout).toBeUndefined();
+    expect((aiCmd.params as { timeout?: number }).timeout).toBeUndefined();
+  });
+});
+
+describe('toRunnerCommand — geolocation', () => {
+  it('maps a coordinate to set_geolocation', () => {
+    expect(
+      expectCommand(
+        step({
+          type: 'geolocation',
+          options: { geolocationLatitude: 37.7749, geolocationLongitude: -122.4194 },
+        }),
+      ),
+    ).toEqual({
+      type: 'set_geolocation',
+      params: { latitude: 37.7749, longitude: -122.4194 },
+    });
+  });
+
+  it('forwards altitude when provided', () => {
+    expect(
+      expectCommand(
+        step({
+          type: 'geolocation',
+          options: { geolocationLatitude: 1, geolocationLongitude: 2, geolocationAltitude: 50 },
+        }),
+      ).params,
+    ).toEqual({ latitude: 1, longitude: 2, altitude: 50 });
+  });
+
+  it('maps geolocationAction:"clear" to clear_geolocation', () => {
+    expect(expectCommand(step({ type: 'geolocation', options: { geolocationAction: 'clear' } }))).toEqual({
+      type: 'clear_geolocation',
+      params: {},
+    });
+  });
+
+  it('rejects a set without coordinates rather than silently clearing', () => {
+    const result = toRunnerCommand(step({ type: 'geolocation', options: { geolocationAction: 'set' } }));
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe('toRunnerCommand — rotate', () => {
+  it('maps rotateOrientation to set_orientation', () => {
+    expect(
+      expectCommand(step({ type: 'rotate', options: { rotateOrientation: 'landscape' } })),
+    ).toEqual({ type: 'set_orientation', params: { orientation: 'landscape' } });
+  });
+
+  it('defaults to portrait when orientation is unspecified', () => {
+    expect(expectCommand(step({ type: 'rotate' }))).toEqual({
+      type: 'set_orientation',
+      params: { orientation: 'portrait' },
     });
   });
 });

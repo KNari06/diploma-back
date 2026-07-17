@@ -157,6 +157,137 @@ async function buildOpenTestCaseBlock(
   }
 }
 
+/**
+ * Summarise the project's OTHER saved mobile test cases into an APP MAP block —
+ * the "known flows / screens" the app already has tests for. The agent authors
+ * draft steps seeing only the CURRENT device screen (blackboard.lastSnapshot),
+ * so a multi-screen flow (login → OTP → home) is otherwise authored blind for
+ * screens it never observed. Prior tests are ONE per-project source of "what
+ * screens/actions exist in this app". The other is the persisted exploration
+ * screen graph (`mobile_app_skeletons`, nodes=screens + edges=transitions),
+ * surfaced separately by buildAppSkeletonBlock — this block covers projects
+ * that have saved tests but were never explored, and grounds the agent in the
+ * exact step wording users authored. Feeding their step descriptions lets the
+ * agent ground later-screen steps in reality instead of inventing them.
+ *
+ * Best-effort + owner-scoped (listByProject enforces access); never blocks the
+ * turn. Excludes the currently-open test (buildOpenTestCaseBlock already
+ * covers it) and caps aggressively to protect the prompt budget.
+ */
+async function buildAppKnowledgeBlock(
+  projectId: string | undefined,
+  userId: string,
+  openTestCaseId: string | undefined,
+): Promise<string | null> {
+  if (!projectId) return null;
+  try {
+    // Lazy import — same reason as buildOpenTestCaseBlock (keep Supabase out of
+    // the module graph so handler.test.ts loads without env).
+    const { IntentTestCaseService } = await import(
+      '@/services/testing/ui/preview/intent-test-case.service'
+    );
+    const { items } = await IntentTestCaseService.listByProject({
+      projectId,
+      userId,
+      limit: 40,
+    });
+    const MAX_TESTS = 8; // prompt-budget cap
+    const MAX_STEPS_PER_TEST = 8;
+    const mobileTests = (items ?? [])
+      // Mobile only — a web test's steps don't map to this app's screens.
+      .filter((tc: any) => typeof tc?.platform === 'string' && tc.platform.startsWith('mobile_'))
+      // Not the test the editor is already scoped to (openTestCaseBlock has it).
+      .filter((tc: any) => !openTestCaseId || tc?.id !== openTestCaseId)
+      .filter((tc: any) => Array.isArray(tc?.stepsJson) && tc.stepsJson.length > 0)
+      .slice(0, MAX_TESTS);
+    if (mobileTests.length === 0) return null;
+
+    const sections = mobileTests.map((tc: any) => {
+      const steps = tc.stepsJson.slice(0, MAX_STEPS_PER_TEST);
+      const lines = steps.map((s: any) => {
+        const type = String(s?.type ?? 'step');
+        const desc = String(s?.description ?? '').slice(0, 80);
+        return `  - ${type}${desc ? `: ${desc}` : ''}`;
+      });
+      if (tc.stepsJson.length > MAX_STEPS_PER_TEST) {
+        lines.push(`  - … (+${tc.stepsJson.length - MAX_STEPS_PER_TEST} more)`);
+      }
+      return `• "${tc.name ?? tc.id}":\n${lines.join('\n')}`;
+    });
+    const body = sections.join('\n');
+    return (
+      '## APP MAP (flows/screens already tested in THIS app)\n' +
+      'These are existing saved tests for this app — use them to ground your ' +
+      'authoring in REAL screens and element names this app is known to have. ' +
+      'Reuse the same element descriptions where they apply. This is a hint, ' +
+      'NOT steps to copy — author for the user’s actual goal. If your flow ' +
+      'needs a screen NOT covered here and you have not observed it, navigate ' +
+      'to it and observe_mobile_page before authoring steps for it.\n' +
+      wrapUntrusted(body)
+    );
+  } catch (err) {
+    logger.debug('[MOBILE_AGENT] buildAppKnowledgeBlock skipped', {
+      projectId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
+ * APP SKELETON — the durable per-app screen map from prior explorations, as a
+ * compact brief. Complements buildAppKnowledgeBlock (which lists saved TESTS):
+ * this tells the agent what SCREENS exist, which flows are covered vs pending,
+ * and where the entry screen leads — so it can reason about the app without
+ * re-crawling. Best-effort; null when the app hasn't been explored yet or has
+ * no project/package key. `userId` gates the read (owner OR workspace member)
+ * inside getAppModel — a denial returns null, so this never surfaces another
+ * workspace's app map.
+ */
+async function buildAppSkeletonBlock(
+  projectId: string | undefined,
+  userId: string | undefined,
+  appPackage: string | undefined,
+  framework: string | undefined,
+): Promise<string | null> {
+  if (!projectId || !appPackage) return null;
+  const platform =
+    framework === 'ios'
+      ? 'mobile_ios'
+      : framework === 'flutter'
+      ? 'mobile_flutter'
+      : 'mobile_android';
+  try {
+    // Lazy import (keep Supabase out of the module graph for handler.test.ts).
+    const { AppSkeletonService } = await import(
+      '@/services/testing/exploration/app-skeleton.service'
+    );
+    const model = await AppSkeletonService.getAppModel(
+      {
+        projectId,
+        platform: platform as 'mobile_android' | 'mobile_ios' | 'mobile_flutter',
+        packageName: appPackage,
+      },
+      userId,
+    );
+    const brief = AppSkeletonService.summariseForPrompt(model);
+    if (!brief) return null;
+    return (
+      '## APP SKELETON (screens & flows learned from prior exploration)\n' +
+      'A map of this app from earlier autonomous runs — use it to know what ' +
+      'screens exist and how they connect BEFORE crawling. It is a prior, not ' +
+      'ground truth: if the live screen differs, trust what you observe.\n' +
+      wrapUntrusted(brief)
+    );
+  } catch (err) {
+    logger.debug('[MOBILE_AGENT] buildAppSkeletonBlock skipped', {
+      projectId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
 interface MobileAgentParams {
   message: string;
   parsedIntent?: any;
@@ -415,11 +546,32 @@ export async function handleMobileAgent(
     // turn on a read failure.
     const openTestCaseBlock = await buildOpenTestCaseBlock(params.testCaseId, userId);
 
+    // APP MAP — the project's OTHER saved mobile tests, so the agent grounds
+    // multi-screen authoring in this app's known screens instead of inventing
+    // steps for screens it hasn't observed. Uses the projectId resolved above
+    // (controller-threaded or eager context); best-effort, owner-scoped.
+    const resolvedProjectId =
+      blackboard.projectId ?? projectContext?.projectId ?? undefined;
+    const appKnowledgeBlock = await buildAppKnowledgeBlock(
+      resolvedProjectId,
+      userId,
+      params.testCaseId,
+    );
+
+    // APP SKELETON — the screen map from prior explorations (complements the
+    // saved-tests list above). Keyed by project + app package + framework.
+    const appSkeletonBlock = await buildAppSkeletonBlock(
+      resolvedProjectId,
+      userId,
+      projectContext?.appPackage,
+      projectContext?.detectedFramework,
+    );
+
     // Prior turns for cross-turn memory (best-effort). Read BEFORE this turn is
     // saved, so it contains only earlier turns — no dupe of the current goal.
     const history = await buildMobileHistory(chatSessionId, userId, chatStore);
 
-    const pipelineOpts = { abortSignal, snapshot, openTestCaseBlock, history };
+    const pipelineOpts = { abortSignal, snapshot, openTestCaseBlock, appKnowledgeBlock, appSkeletonBlock, history };
     const result = trackingSessionId && workspaceId
       ? await withAIContext(
           { workspaceId, userId, operationType: 'chat' },

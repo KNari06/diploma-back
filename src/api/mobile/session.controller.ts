@@ -26,6 +26,7 @@ import {
 import { resolveDedicatedDevice } from '@/services/mobile/dedicated-device.service';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { normalizeMobileBriefing } from '@/services/mobile/mobile-briefing.util';
 import { ProjectService } from '@/services/core/project.service';
 import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
 import { sendMobileRunnerError, isSessionGoneError } from './mobile-error-mapper';
@@ -2790,6 +2791,7 @@ export async function startMobileExploration(req: Request, res: Response): Promi
     appId,
     runnerSessionId,
     goal,
+    briefing: rawBriefing,
     budget,
     chatSessionId,
   } = req.body as {
@@ -2797,9 +2799,15 @@ export async function startMobileExploration(req: Request, res: Response): Promi
     appId?: string;
     runnerSessionId?: string;
     goal?: string;
+    briefing?: unknown;
     budget?: Record<string, number>;
     chatSessionId?: string;
   };
+
+  // Normalize the briefing to the safe shape: string fields + string arrays,
+  // capped, and CREDENTIAL-FREE (any credential-ish keys are dropped — creds
+  // ride the runner's answer/redaction seam, never this blob).
+  const briefing = normalizeMobileBriefing(rawBriefing);
 
   const VALID: Record<string, 'android' | 'ios' | 'flutter'> = {
     android: 'android', ios: 'ios', flutter: 'flutter',
@@ -2839,6 +2847,7 @@ export async function startMobileExploration(req: Request, res: Response): Promi
       chatSessionId: chatSessionId || undefined,
       budget,
       goal: goal?.trim() || undefined,
+      briefing,
     });
 
     logger.info('[MOBILE_SESSION] Mobile exploration queued', {
