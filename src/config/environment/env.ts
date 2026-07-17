@@ -286,6 +286,21 @@ const envSchema = z.object({
   // ──────────────────────────────────────────────────────────────────
   ENABLE_TEST_CASE_CHAT: z.string().transform(v => v === 'true').default('false'),
 
+  // ──────────────────────────────────────────────────────────────────
+  // Referrals by link. Feature-gated, OFF by default — dark in prod until set
+  // in the infra .env (see CLAUDE.md "Env vars: local vs prod"). When off:
+  // attribution is not written, the reward is not granted, and the /referrals
+  // routes return 404. Migration 20260713_referrals.sql is independent of the
+  // flag (safe to apply first; tables stay empty until the flag flips on).
+  // Reward is a time-windowed revenue share: the partner earns
+  // REFERRAL_REWARD_RATE (0.70 = 70%) of the REAL amount a referred user pays,
+  // for their first REFERRAL_REWARD_MONTHS (2) monthly payments, then 0%.
+  // Owed balance accrues in the paid invoice's currency (cents).
+  // ──────────────────────────────────────────────────────────────────
+  REFERRALS_ENABLED: z.string().transform(v => v === 'true').default('false'),
+  REFERRAL_REWARD_RATE: z.string().transform(Number).default('0.7'),
+  REFERRAL_REWARD_MONTHS: z.string().transform(Number).default('2'),
+
   // Mobile Runner (qait-mobile-runner microservice)
   MOBILE_RUNNER_URL: z.string().url().optional().default('http://localhost:4100'),
   MOBILE_RUNNER_ENABLED: z.string().transform(v => v === 'true').default('false'),

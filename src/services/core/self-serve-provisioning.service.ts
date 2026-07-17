@@ -9,6 +9,7 @@ import { UserCreditsService } from '@/services/core/user-credits.service';
 import { cache } from '@/utils/core/redis-cache';
 import {
   approvePendingUser,
+  fetchUserRole,
   fetchUserStatus,
   userHasAnyWorkspace,
 } from '@/services/core/db/self-serve.db';
@@ -41,6 +42,13 @@ export class SelfServeProvisioningService {
   static async provision(userId: string): Promise<boolean> {
     if (!env.AUTO_APPROVE_SIGNUP) return false;
     if (!userId) return false;
+
+    // Partner logins are dashboard accounts, not QAIT product users — they must
+    // never get a trial workspace, default project, or welcome credits.
+    if (await this.isPartnerRole(userId)) {
+      logger.info('[SELF_SERVE] Skipping product provisioning for partner login', { userId });
+      return false;
+    }
 
     let approved = false;
     try {
@@ -165,6 +173,20 @@ export class SelfServeProvisioningService {
     logger.info('[SELF_SERVE] Default project created', { userId, workspaceId });
   }
 
+  /**
+   * True when the user's account role is 'partner'. Best-effort: on a read
+   * error we return false (fail-open to normal provisioning) — a partner
+   * getting a stray workspace is a smaller harm than a real user being denied
+   * one because of a transient read failure.
+   */
+  private static async isPartnerRole(userId: string): Promise<boolean> {
+    try {
+      return (await fetchUserRole(userId)) === 'partner';
+    } catch {
+      return false;
+    }
+  }
+
   /** Redis key marking a user as recently self-heal-checked (skip the DB probe). */
   private static healCheckedKey(userId: string): string {
     return `qait:selfheal:checked:${userId}`;
@@ -196,6 +218,12 @@ export class SelfServeProvisioningService {
       // Only heal approved users. If status wasn't passed in, read it once.
       const effectiveStatus = status ?? (await fetchUserStatus(userId));
       if (effectiveStatus !== 'approved') return;
+
+      // Never provision a workspace/credits for a partner login.
+      if (await this.isPartnerRole(userId)) {
+        await cache.set(this.healCheckedKey(userId), true, this.HEAL_CHECK_TTL_SECONDS);
+        return;
+      }
 
       if (await userHasAnyWorkspace(userId)) {
         // Healthy — cache the verdict so we skip the probe for a while.

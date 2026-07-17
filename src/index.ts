@@ -67,6 +67,7 @@ import supportRoutes from '@/api/support/support.routes';
 import telegramTasksRoutes from '@/api/telegram-tasks/telegram-webhook.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
+import referralsRoutes from '@/api/referrals/referrals.route';
 import waitlistRoutes from '@/api/waitlist/waitlist.route';
 import investorRoutes from '@/api/investor/investor.route';
 import workspaceRoutes from '@/api/workspace/workspace.routes';
@@ -1370,6 +1371,7 @@ app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User n
 app.use(`/api/${env.API_VERSION}/ai-logs`, aiLogsRoutes); // User-viewable AI action logs (auth applied per-route; runner-event uses shared secret)
 app.use(`/api/${env.API_VERSION}/announcements`, announcementsRoutes); // What's New announcements
 app.use(`/api/${env.API_VERSION}/user`, userRoutes); // User profile (needed for pending users)
+app.use(`/api/${env.API_VERSION}/referrals`, referralsRoutes); // Referrals by link (per-route auth; feature-gated to 404 when off)
 app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // User issue reports
 
 // Client failure ingest — auth only (NOT requireApproved: a user hitting an
