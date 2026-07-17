@@ -27,6 +27,7 @@ import type {
   MobileExplorationStartResponse,
   MobileExplorationReadiness,
   MobileExplorationSnapshot,
+  MobileAppBriefing,
 } from './mobile-runner.types';
 import { MobileRunnerError } from './mobile-runner.types';
 import { mintRunnerUserToken } from './user-token';
@@ -307,7 +308,14 @@ export class MobileRunnerClient {
    */
   async startExploration(
     sessionId: string,
-    body: { appId: string; goal?: string; budget?: Record<string, number> },
+    body: {
+      appId: string;
+      goal?: string;
+      /** Structured pre-exploration context (see MobileAppBriefing). NO
+       *  credentials — those are handled via the runner's answer seam. */
+      briefing?: MobileAppBriefing;
+      budget?: Record<string, number>;
+    },
     opts?: { userId?: string },
   ): Promise<MobileExplorationStartResponse> {
     return this.request<MobileExplorationStartResponse>(
@@ -810,6 +818,12 @@ export class MobileRunnerClient {
     intentWords?: string[];
     /** Platform that produced the result — labels Flutter vs native in the trace. */
     framework?: 'android' | 'ios' | 'flutter';
+    /**
+     * USER-authored trigger that fired while resolving (a dialog was cleared
+     * mid-lint). Passthrough from the runner; the editor's live-run fast path
+     * reads it to badge which trigger fired. Absent otherwise.
+     */
+    triggerFired?: import('./mobile-runner.types').Trigger & { matchedText?: string };
   }> {
     return this.request('POST', `/api/commands/${sessionId}/lint`, {
       // Only attach bindingHints when we actually have some — keeps the wire

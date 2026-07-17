@@ -299,12 +299,20 @@ export async function executeApiTest(
       ? response.status === request.expectedStatus
       : undefined;
 
+    // Raw per-cookie Set-Cookie values (undici/Node fetch). The folded
+    // `responseHeaders['set-cookie']` string is lossy for multiple cookies, so
+    // expose the un-folded array for the flow cookie jar when available.
+    const setCookies = typeof (response.headers as any).getSetCookie === 'function'
+      ? ((response.headers as any).getSetCookie() as string[])
+      : undefined;
+
     const result: ApiTestResponse = {
       success: response.ok,
       status: response.status,
       statusText: response.statusText,
       durationMs,
       responseHeaders: sanitizeHeaders(responseHeaders),
+      setCookies: setCookies && setCookies.length > 0 ? setCookies : undefined,
       responseBody,
       matchesExpected,
     };

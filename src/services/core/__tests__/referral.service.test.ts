@@ -1,0 +1,296 @@
+import { ReferralService, maskEmail } from '@/services/core/referral.service';
+import * as referralDb from '@/services/core/db/referral.db';
+import { ReferralsFeature } from '@/config/features/referrals';
+import { cache } from '@/utils/core/redis-cache';
+
+jest.mock('@/services/core/db/referral.db');
+jest.mock('@/config/features/referrals', () => ({
+  ReferralsFeature: {
+    isEnabled: jest.fn(),
+    getRewardRate: jest.fn(),
+    getRewardWindowCount: jest.fn(),
+    // Real formula so tests assert the actual computed share.
+    computeReward: (paid: number) =>
+      !Number.isFinite(paid) || paid <= 0
+        ? 0
+        : Math.round(paid * (ReferralsFeature.getRewardRate() as unknown as number)),
+  },
+}));
+jest.mock('@/utils/core/redis-cache', () => ({
+  cache: { get: jest.fn(), set: jest.fn(), del: jest.fn() },
+}));
+jest.mock('@/utils/core/logger', () => ({
+  logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
+}));
+
+const db = referralDb as jest.Mocked<typeof referralDb>;
+const feature = ReferralsFeature as jest.Mocked<typeof ReferralsFeature>;
+const mockCache = cache as jest.Mocked<typeof cache>;
+
+const activePartner = {
+  id: 'p1',
+  code: 'acme',
+  name: 'Acme',
+  email: 'partner@acme.com',
+  auth_user_id: 'auth1',
+  status: 'active',
+  created_at: '2026-07-13T00:00:00Z',
+};
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  feature.isEnabled.mockReturnValue(true);
+  feature.getRewardRate.mockReturnValue(0.7);
+  feature.getRewardWindowCount.mockReturnValue(2);
+});
+
+describe('ReferralService.attributeUser', () => {
+  it('does nothing when the feature is disabled', async () => {
+    feature.isEnabled.mockReturnValue(false);
+    const result = await ReferralService.attributeUser('u1', 'acme');
+    expect(result).toBe(false);
+    expect(db.findPartnerByCode).not.toHaveBeenCalled();
+  });
+
+  it('does nothing for an empty code', async () => {
+    expect(await ReferralService.attributeUser('u1', '')).toBe(false);
+    expect(await ReferralService.attributeUser('u1', null)).toBe(false);
+    expect(db.findPartnerByCode).not.toHaveBeenCalled();
+  });
+
+  it('ignores an unknown code', async () => {
+    db.findPartnerByCode.mockResolvedValue(null);
+    expect(await ReferralService.attributeUser('u1', 'nope')).toBe(false);
+    expect(db.attributeUserIfUnset).not.toHaveBeenCalled();
+  });
+
+  it('ignores a disabled partner', async () => {
+    db.findPartnerByCode.mockResolvedValue({ ...activePartner, status: 'disabled' });
+    expect(await ReferralService.attributeUser('u1', 'acme')).toBe(false);
+    expect(db.attributeUserIfUnset).not.toHaveBeenCalled();
+  });
+
+  it('attributes to an active partner and reports the set-once result', async () => {
+    db.findPartnerByCode.mockResolvedValue(activePartner);
+    db.attributeUserIfUnset.mockResolvedValue(true);
+    expect(await ReferralService.attributeUser('u1', 'ACME')).toBe(true);
+    expect(db.attributeUserIfUnset).toHaveBeenCalledWith('u1', 'p1');
+  });
+
+  it('returns false when already attributed (set-once no-op), without throwing', async () => {
+    db.findPartnerByCode.mockResolvedValue(activePartner);
+    db.attributeUserIfUnset.mockResolvedValue(false);
+    expect(await ReferralService.attributeUser('u1', 'acme')).toBe(false);
+  });
+
+  it('never throws on a db error', async () => {
+    db.findPartnerByCode.mockRejectedValue(new Error('db down'));
+    await expect(ReferralService.attributeUser('u1', 'acme')).resolves.toBe(false);
+  });
+});
+
+describe('ReferralService.attributeAtAuth', () => {
+  it('prefers an explicit code over the pending store', async () => {
+    db.findPartnerByCode.mockResolvedValue(activePartner);
+    db.attributeUserIfUnset.mockResolvedValue(true);
+    await ReferralService.attributeAtAuth('u1', 'x@y.com', 'acme');
+    expect(mockCache.get).not.toHaveBeenCalled();
+    expect(db.findPartnerByCode).toHaveBeenCalledWith('acme');
+  });
+
+  it('falls back to the pending store keyed by email, then clears it', async () => {
+    mockCache.get.mockResolvedValue('acme');
+    db.findPartnerByCode.mockResolvedValue(activePartner);
+    db.attributeUserIfUnset.mockResolvedValue(true);
+    await ReferralService.attributeAtAuth('u1', 'x@y.com');
+    expect(db.findPartnerByCode).toHaveBeenCalledWith('acme');
+    expect(mockCache.del).toHaveBeenCalled();
+  });
+
+  it('is a no-op when no code is available anywhere', async () => {
+    mockCache.get.mockResolvedValue(null);
+    expect(await ReferralService.attributeAtAuth('u1', 'x@y.com')).toBe(false);
+    expect(db.findPartnerByCode).not.toHaveBeenCalled();
+  });
+});
+
+describe('ReferralService.rewardOnPayment', () => {
+  const payment = {
+    userId: 'u1',
+    invoiceId: 'in_1',
+    amountPaidMinorUnits: 3000, // $30.00
+    currency: 'usd',
+  };
+
+  it('no-ops when the feature is disabled', async () => {
+    feature.isEnabled.mockReturnValue(false);
+    expect(await ReferralService.rewardOnPayment(payment)).toBe(false);
+    expect(db.getUserReferralPartnerId).not.toHaveBeenCalled();
+  });
+
+  it('no-ops when the user has no referral partner', async () => {
+    db.getUserReferralPartnerId.mockResolvedValue(null);
+    expect(await ReferralService.rewardOnPayment(payment)).toBe(false);
+    expect(db.insertRewardIfAbsent).not.toHaveBeenCalled();
+  });
+
+  it('grants 70% of the real paid amount ($30 → $21) for the first payment', async () => {
+    db.getUserReferralPartnerId.mockResolvedValue('p1');
+    db.countRewardsForUser.mockResolvedValue(0);
+    db.insertRewardIfAbsent.mockResolvedValue(true);
+    expect(await ReferralService.rewardOnPayment(payment)).toBe(true);
+    expect(db.insertRewardIfAbsent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        partnerId: 'p1',
+        referredUserId: 'u1',
+        eventType: 'paid_conversion',
+        amount: 2100, // round(3000 * 0.70)
+        currency: 'usd',
+        stripeInvoiceId: 'in_1',
+      })
+    );
+  });
+
+  it('still rewards the SECOND payment (window = 2)', async () => {
+    db.getUserReferralPartnerId.mockResolvedValue('p1');
+    db.countRewardsForUser.mockResolvedValue(1); // one already rewarded
+    db.insertRewardIfAbsent.mockResolvedValue(true);
+    expect(await ReferralService.rewardOnPayment({ ...payment, invoiceId: 'in_2' })).toBe(true);
+  });
+
+  it('does NOT reward the third payment — window exhausted (100% ours)', async () => {
+    db.getUserReferralPartnerId.mockResolvedValue('p1');
+    db.countRewardsForUser.mockResolvedValue(2); // window already full
+    expect(await ReferralService.rewardOnPayment({ ...payment, invoiceId: 'in_3' })).toBe(false);
+    expect(db.insertRewardIfAbsent).not.toHaveBeenCalled();
+  });
+
+  it('reports false (no double-reward) when the per-invoice conflict skips the insert', async () => {
+    db.getUserReferralPartnerId.mockResolvedValue('p1');
+    db.countRewardsForUser.mockResolvedValue(0);
+    db.insertRewardIfAbsent.mockResolvedValue(false); // ON CONFLICT (stripe_invoice_id)
+    expect(await ReferralService.rewardOnPayment(payment)).toBe(false);
+  });
+
+  it('does not reward when the rate rounds the amount to zero', async () => {
+    feature.getRewardRate.mockReturnValue(0);
+    db.getUserReferralPartnerId.mockResolvedValue('p1');
+    db.countRewardsForUser.mockResolvedValue(0);
+    expect(await ReferralService.rewardOnPayment(payment)).toBe(false);
+    expect(db.insertRewardIfAbsent).not.toHaveBeenCalled();
+  });
+
+  it('no-ops without an invoice id (can\'t dedupe)', async () => {
+    expect(await ReferralService.rewardOnPayment({ ...payment, invoiceId: '' })).toBe(false);
+    expect(db.getUserReferralPartnerId).not.toHaveBeenCalled();
+  });
+
+  it('never throws on a db error (payment path must not fail)', async () => {
+    db.getUserReferralPartnerId.mockRejectedValue(new Error('db down'));
+    await expect(ReferralService.rewardOnPayment(payment)).resolves.toBe(false);
+  });
+});
+
+describe('ReferralService.getStatsForPartner', () => {
+  it('aggregates registrations, paid users, credits used, and owed balance', async () => {
+    db.getReferredUsers.mockResolvedValue([
+      { id: 'a', email: 'a@x.com', referred_at: '2026-07-01', plan_status: 'paid' },
+      { id: 'b', email: 'b@x.com', referred_at: '2026-07-02', plan_status: 'free' },
+      { id: 'c', email: 'c@x.com', referred_at: '2026-07-03', plan_status: null },
+    ]);
+    db.getCreditsUsedForUsers.mockResolvedValue(
+      new Map([
+        ['a', 500],
+        ['b', 250],
+        ['c', 0],
+      ])
+    );
+    db.getOwedBalance.mockResolvedValue(1000);
+
+    const stats = await ReferralService.getStatsForPartner('p1', 'acme');
+    expect(stats).toEqual({
+      partnerId: 'p1',
+      code: 'acme',
+      registrations: 3,
+      paidUsers: 1,
+      creditsUsedByReferred: 750,
+      owedBalance: 1000,
+    });
+  });
+});
+
+describe('ReferralService.getReferredUsersForPartner', () => {
+  it('masks referred-user emails (PII)', async () => {
+    db.getReferredUsers.mockResolvedValue([
+      { id: 'a', email: 'jane@acme.com', referred_at: '2026-07-01', plan_status: 'paid' },
+    ]);
+    db.getCreditsUsedForUsers.mockResolvedValue(new Map([['a', 42]]));
+    const [row] = await ReferralService.getReferredUsersForPartner('p1');
+    expect(row.email).toBe('j***@acme.com');
+    expect(row.isPaid).toBe(true);
+    expect(row.creditsUsed).toBe(42);
+  });
+});
+
+describe('ReferralService.createPartner', () => {
+  it('rejects a duplicate code before inserting', async () => {
+    db.findPartnerByCode.mockResolvedValue(activePartner);
+    await expect(ReferralService.createPartner({ code: 'acme', name: 'x' })).rejects.toThrow(
+      /already exists/
+    );
+    expect(db.insertPartner).not.toHaveBeenCalled();
+  });
+
+  it('inserts the partner row BEFORE provisioning a login (no orphaned login on insert failure)', async () => {
+    // Regression guard: if the login were provisioned first and the insert then
+    // failed, a role=partner login would exist with no partners row (a dead
+    // account). Insert must come first.
+    const calls: string[] = [];
+    db.findPartnerByCode.mockResolvedValue(null);
+    db.insertPartner.mockImplementation(async () => {
+      calls.push('insert');
+      return { ...activePartner, auth_user_id: null };
+    });
+    db.inviteAuthUser.mockImplementation(async () => {
+      calls.push('invite');
+      return 'auth-new';
+    });
+    db.markUserAsPartnerLogin.mockResolvedValue(undefined);
+    db.updatePartner.mockResolvedValue({ ...activePartner, auth_user_id: 'auth-new' });
+
+    await ReferralService.createPartner({
+      code: 'e2e_new',
+      name: 'New',
+      email: 'p@acme.com',
+      provisionLogin: true,
+    });
+
+    expect(calls[0]).toBe('insert');
+    expect(calls.indexOf('insert')).toBeLessThan(calls.indexOf('invite'));
+    expect(db.updatePartner).toHaveBeenCalledWith(activePartner.id, { authUserId: 'auth-new' });
+  });
+
+  it('still returns the partner when login provisioning fails', async () => {
+    db.findPartnerByCode.mockResolvedValue(null);
+    db.insertPartner.mockResolvedValue({ ...activePartner, auth_user_id: null });
+    db.inviteAuthUser.mockRejectedValue(new Error('invite failed'));
+
+    const partner = await ReferralService.createPartner({
+      code: 'e2e_new2',
+      name: 'New2',
+      email: 'p@acme.com',
+      provisionLogin: true,
+    });
+    expect(partner.id).toBe(activePartner.id); // partner created despite login failure
+  });
+});
+
+describe('maskEmail', () => {
+  it('masks the local part, keeps the domain', () => {
+    expect(maskEmail('jane@acme.com')).toBe('j***@acme.com');
+  });
+  it('handles null and malformed input', () => {
+    expect(maskEmail(null)).toBeNull();
+    expect(maskEmail('@nope.com')).toBe('***');
+  });
+});

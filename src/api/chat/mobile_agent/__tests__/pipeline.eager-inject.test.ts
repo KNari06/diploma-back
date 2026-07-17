@@ -118,6 +118,25 @@ describe('runMobileAgentPipeline — eager snapshot inject', () => {
     expect(messages[1].content).toMatch(/kz\.janapost/);
   });
 
+  it('injects the app-skeleton block as a system message when provided [app-skeleton]', async () => {
+    await runMobileAgentPipeline(bb(), {
+      appSkeletonBlock: '## APP SKELETON\nbanking app. 3 screens mapped.',
+    });
+    const messages = mockGetChatCompletion.mock.calls[0][0] as Array<{ role: string; content: string }>;
+    const skeleton = messages.find((m) => m.role === 'system' && m.content.includes('APP SKELETON'));
+    expect(skeleton).toBeDefined();
+    expect(skeleton?.content).toContain('3 screens mapped');
+    // Must precede the user message (cache-local app context).
+    const userIdx = messages.findIndex((m) => m.role === 'user');
+    expect(messages.indexOf(skeleton!)).toBeLessThan(userIdx);
+  });
+
+  it('SKIPS the app-skeleton block when null (app not explored yet)', async () => {
+    await runMobileAgentPipeline(bb(), { appSkeletonBlock: null });
+    const messages = mockGetChatCompletion.mock.calls[0][0] as Array<{ role: string; content: string }>;
+    expect(messages.some((m) => m.content.includes('APP SKELETON'))).toBe(false);
+  });
+
   it('does not change role order — system messages must precede user', async () => {
     // Defensive: a prior implementation might be tempted to put the
     // snapshot last (closer to the user message). Don't — OpenAI's

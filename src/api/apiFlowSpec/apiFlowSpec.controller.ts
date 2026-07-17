@@ -53,7 +53,7 @@ export const parseSpec = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const { source, url, content, fileName, projectId, environmentId, chatSessionId, analysisId, userAnswers } = req.body;
+    const { source, url, content, fileName, projectId, environmentId, chatSessionId, analysisId, userAnswers, probe } = req.body;
 
     if (!projectId) {
       res.status(400).json({ success: false, error: 'projectId is required' });
@@ -82,9 +82,10 @@ export const parseSpec = async (req: Request, res: Response): Promise<void> => {
       chatSessionId,
       analysisId,
       userAnswers,
+      probe: probe === true,
     };
 
-    logger.info('[FLOW_SPEC_CONTROLLER] Parsing spec', { source, url, projectId, userId });
+    logger.info('[FLOW_SPEC_CONTROLLER] Parsing spec', { source, url, projectId, userId, probe: probe === true });
 
     const result = await FlowBuilderService.buildFromSpec(parseRequest, userId);
 
@@ -211,9 +212,23 @@ export const updateSpec = async (req: Request, res: Response): Promise<void> => 
     const userId = getUserId(req);
     if (!userId) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
     const { id } = req.params;
-    const { executionDag, errorStrategy } = req.body;
+    const { executionDag, errorStrategy, variableChain } = req.body;
 
-    const updated = await FlowBuilderService.update(id, userId, { executionDag, errorStrategy });
+    // variableChain is persisted verbatim and seeded into the run context, so
+    // accept only a flat string→string map; drop anything else.
+    let safeVariableChain: Record<string, string> | undefined;
+    if (variableChain && typeof variableChain === 'object' && !Array.isArray(variableChain)) {
+      safeVariableChain = {};
+      for (const [k, v] of Object.entries(variableChain)) {
+        if (typeof v === 'string') safeVariableChain[k] = v;
+      }
+    }
+
+    const updated = await FlowBuilderService.update(id, userId, {
+      executionDag,
+      errorStrategy,
+      variableChain: safeVariableChain,
+    });
     if (!updated) {
       res.status(404).json({ success: false, error: 'Flow spec not found' });
       return;
@@ -259,7 +274,7 @@ export const runFlow = async (req: Request, res: Response): Promise<void> => {
     const userId = getUserId(req);
     if (!userId) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
     const { id } = req.params;
-    const { config, chatSessionId, nodeOverrides } = req.body as RunFlowRequest;
+    const { config, chatSessionId, nodeOverrides, initialVariables } = req.body as RunFlowRequest;
 
     const flowSpec = await FlowBuilderService.getById(id, userId);
     if (!flowSpec) {
@@ -304,7 +319,7 @@ export const runFlow = async (req: Request, res: Response): Promise<void> => {
       ...(config || {}),
     } as any, chatSessionId);
 
-    const runRequest: RunFlowRequest = { config, chatSessionId, nodeOverrides };
+    const runRequest: RunFlowRequest = { config, chatSessionId, nodeOverrides, initialVariables };
 
     // Start execution async — refund credits on catastrophic failure (not step failures)
     FlowExecutorService.execute(flowSpec, userId, runRequest, flowRunId).catch(async (error) => {

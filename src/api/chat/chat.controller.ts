@@ -79,29 +79,33 @@ import { debugChatData, getChatHistory, getChatSessions, getCurrentChatHistory }
  * Conditions for force-route (ALL must hold):
  *   - env.MOBILE_EDITOR_FORCE_ROUTE is on (default true)
  *   - context.mobileEditorMode === true
- *   - context.mobileSessionId is a non-empty string
  *
- * Missing mobileSessionId with mobileEditorMode=true is a frontend race
- * (session teardown overlap) — falls through to the classifier so
- * mobile_agent's own NO_SESSION_REPLY explains the situation instead of
- * a silent misroute.
+ * mobileSessionId is deliberately NOT a condition. mobileEditorMode=true
+ * with a missing/empty mobileSessionId means the mobile editor has no live
+ * runner session (never started, expired, or a teardown race). Falling
+ * through to the classifier here — the old behaviour — was a silent
+ * misroute: the classifier has no mobile signal left, sends the message to
+ * web general_chat, and the user gets a generic answer with no hint that
+ * the device session is the problem. Force-routing to mobile_agent instead
+ * guarantees the handler's own NO_SESSION_REPLY ("start a device in the
+ * editor") surfaces the real cause. `metadata.missingSession` marks the
+ * degraded case for logs/metrics.
  */
 export function decideForceRoute(
   context: unknown,
   flagEnabled: boolean,
-): { intent: 'mobile_agent'; intent_confidence: number; confidence: number; metadata: { routingSource: 'force_route' } } | null {
+): { intent: 'mobile_agent'; intent_confidence: number; confidence: number; metadata: { routingSource: 'force_route'; missingSession?: true } } | null {
   if (!flagEnabled) return null;
   const ctx = parseMobileContext(context);
   if (!ctx) return null;
   if (ctx.mobileEditorMode !== true) return null;
-  if (typeof ctx.mobileSessionId !== 'string' || ctx.mobileSessionId.length === 0) {
-    return null;
-  }
+  const hasSession =
+    typeof ctx.mobileSessionId === 'string' && ctx.mobileSessionId.length > 0;
   return {
     intent: 'mobile_agent',
     intent_confidence: 1.0,
     confidence: 1.0,
-    metadata: { routingSource: 'force_route' },
+    metadata: { routingSource: 'force_route', ...(hasSession ? {} : { missingSession: true as const }) },
   };
 }
 
@@ -551,28 +555,69 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // We trust the frontend signal here for the same reason web trusts
     // `mode === 'editor'` — both are set by the editor shell, not by the
     // user. A request with `mobileEditorMode=true` but no `mobileSessionId`
-    // is a frontend race (session teardown overlap); we fall through to
-    // the normal classifier so `mobile_agent` returns its own
-    // `NO_SESSION_REPLY` instead of a silent misroute.
+    // (session never started / expired / teardown race) ALSO force-routes:
+    // `mobile_agent` replies with its own `NO_SESSION_REPLY`, which tells
+    // the user to start a device — the classifier would have silently
+    // misrouted the message to web general_chat.
     //
     // Kill switch: env `MOBILE_EDITOR_FORCE_ROUTE=false` reverts to
     // classifier-only routing.
     const forceRouteIntent = decideForceRoute(context, env.MOBILE_EDITOR_FORCE_ROUTE);
 
+    // Backstop for the force-route: a chat scoped to a MOBILE test case whose
+    // request carries no mobileEditorMode flag at all. The current frontend
+    // always sends the flag from the mobile editor, so landing here means a
+    // stale/broken client build — the classifier will treat the message as
+    // web chat and no mobile tool can fire. We can't conjure a device
+    // session, but we must not degrade silently: log + count it, and tag the
+    // outgoing response with `metadata.mobileContextMissing` so the client /
+    // support can see WHY the reply came back generic.
+    if (
+      !forceRouteIntent &&
+      chatStore.kind === 'testcase' &&
+      testCaseAccess?.platform?.startsWith('mobile_')
+    ) {
+      incCounter('mobile_chat.force_route', 'missing_flags');
+      logger.warn('[CHAT] Mobile test-case chat without mobile context flags', {
+        chatSessionId,
+        userId,
+        testCaseId,
+        platform: testCaseAccess.platform,
+      });
+      const originalJson = res.json.bind(res);
+      res.json = (body: unknown) =>
+        originalJson(
+          body && typeof body === 'object' && !Array.isArray(body)
+            ? {
+                ...(body as Record<string, unknown>),
+                metadata: {
+                  ...((body as { metadata?: Record<string, unknown> }).metadata ?? {}),
+                  mobileContextMissing: true,
+                },
+              }
+            : body,
+        );
+    }
+
     let parsedIntent: Awaited<ReturnType<typeof parseIntent>>;
     if (forceRouteIntent) {
       parsedIntent = forceRouteIntent as Awaited<ReturnType<typeof parseIntent>>;
       // Phase B7: count force-route hits so ops can verify the path is
-      // actually firing on real Mobile-Editor traffic. Label = `applied`
-      // so future work can distinguish e.g. `disabled_by_env`.
-      incCounter('mobile_chat.force_route', 'applied');
+      // actually firing on real Mobile-Editor traffic. `applied_no_session`
+      // marks the degraded case (mobile editor sent no live session id, so
+      // mobile_agent will answer with NO_SESSION_REPLY).
+      incCounter(
+        'mobile_chat.force_route',
+        forceRouteIntent.metadata.missingSession ? 'applied_no_session' : 'applied',
+      );
       logger.info('[CHAT] mobileEditorMode force-route → mobile_agent', {
         chatSessionId,
         userId,
-        // Re-parse here just for the log field — the helper already
-        // validated mobileSessionId is a non-empty string, so this is
-        // safe to cast.
-        mobileSessionId: (parseMobileContext(context) as { mobileSessionId: string }).mobileSessionId,
+        // Re-parse just for the log fields. mobileSessionId may legitimately
+        // be absent (missingSession case) — mobile_agent handles that with
+        // NO_SESSION_REPLY.
+        mobileSessionId: parseMobileContext(context)?.mobileSessionId ?? null,
+        missingSession: forceRouteIntent.metadata.missingSession === true,
         messagePreview: message.slice(0, 60),
       });
       // Same abort guard the classifier path runs immediately after

@@ -20,6 +20,7 @@ import {
 import { notifyAdminsOfNewUser } from '@/services/auth/new-user-notification.service';
 import { EmailService } from '@/services/core/email.service';
 import { SelfServeProvisioningService } from '@/services/core/self-serve-provisioning.service';
+import { ReferralService } from '@/services/core/referral.service';
 import { INDIVIDUAL_PLANS } from '@/services/core/token-calculator.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -41,9 +42,15 @@ function getClientIp(req: Request): string {
  */
 export const signup = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email, password, name } = req.body;
+    const { email, password, name, referralCode } = req.body;
 
     const result = await signUpWithEmail(email, password, name);
+
+    // Stash a captured ?ref code (keyed by email) so it survives until the
+    // user's first auth. Best-effort; no-op unless REFERRALS_ENABLED. Guard the
+    // type here so a malformed body can't reject inside the fire-and-forget call.
+    const refCode = typeof referralCode === 'string' ? referralCode : null;
+    void ReferralService.stashPendingCode(email, refCode);
 
     // Welcome email — fire-and-forget so a mail failure never breaks signup.
     // Distinct from the Supabase verification email and the approval email.
@@ -118,6 +125,10 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     // off; idempotent; best-effort (never throws).
     const provisioned = await SelfServeProvisioningService.provision(result.user.id);
     const effectiveStatus = provisioned ? 'approved' : result.user.status;
+
+    // Referral attribution (first-touch): consume a pending ?ref code for this
+    // email. Idempotent + ungated by AUTO_APPROVE_SIGNUP; no-op unless enabled.
+    void ReferralService.attributeAtAuth(result.user.id, result.user.email);
 
     res.json({
       success: true,
@@ -333,6 +344,10 @@ export const completeOAuthHandler = async (req: Request, res: Response): Promise
     // never claims approval after a silent provisioning failure.
     const provisioned = await SelfServeProvisioningService.provision(result.user.id);
     const effectiveStatus = provisioned ? 'approved' : result.user.status;
+
+    // Referral attribution (first-touch): consume a pending ?ref code for this
+    // email. Idempotent + ungated by AUTO_APPROVE_SIGNUP; no-op unless enabled.
+    void ReferralService.attributeAtAuth(result.user.id, result.user.email);
 
     res.json({
       success: true,
@@ -989,6 +1004,9 @@ export const verifyEmail = async (req: Request, res: Response): Promise<void> =>
     // Returns true only when the user is genuinely approved, so the response
     // never claims approval after a silent provisioning failure.
     const provisioned = await SelfServeProvisioningService.provision(data.user.id);
+
+    // Referral attribution (first-touch) — the primary path for email signups.
+    void ReferralService.attributeAtAuth(data.user.id, data.user.email);
     const effectiveStatus = provisioned
       ? 'approved'
       : userData?.status || 'pending_approval';

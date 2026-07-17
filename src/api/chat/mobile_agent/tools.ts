@@ -562,10 +562,21 @@ const MOBILE_RUN_DRAFT_STEPS_TOOL: ChatCompletionTool = {
                   'dialogs), "biometric" (Face ID / Touch ID / fingerprint — ' +
                   'set options.biometricAction to "match"/"fail"), "otp" ' +
                   '(SMS code / TOTP — set options.otpAction to "read_sms"/' +
-                  '"generate_totp"/"type_otp"), "permission" (Android/iOS ' +
+                  '"generate_totp"/"type_otp"). To fill an OTP from an SMS, ' +
+                  'author TWO steps: first {type:"otp", options:{otpAction:' +
+                  '"read_sms"}} (auto-stores the code as otp_code), then ' +
+                  '{type:"otp", description:"OTP field", options:{otpAction:' +
+                  '"type_otp", otpCode:"{{otp_code}}"}} — the "{{otp_code}}" ' +
+                  'placeholder is substituted at run time from the read step. ' +
+                  'Same for read_clipboard→"{{clipboard}}". "permission" (Android/iOS ' +
                   'permission prompt — set options.permissionAction to ' +
-                  '"allow"/"deny"/"allow_always"). Runner aliases ("tap", ' +
-                  '"input_text", "press_key", "launch_app") also work.',
+                  '"allow"/"deny"/"allow_always"), "geolocation" (mock GPS — ' +
+                  'set options.geolocationLatitude + options.geolocationLongitude ' +
+                  'to a coordinate, or options.geolocationAction:"clear" to ' +
+                  'remove the mock fix; emulator only), "rotate" (device ' +
+                  'orientation — set options.rotateOrientation to "portrait"/' +
+                  '"landscape"/"reverse_portrait"/"reverse_landscape"). Runner ' +
+                  'aliases ("tap", "input_text", "press_key", "launch_app") also work.',
               },
               description: {
                 type: 'string',
@@ -1588,6 +1599,7 @@ export const ACCEPTED_STEP_TYPES = new Set<string>([
   'swipe', 'long_press', 'double_tap', 'drag', 'pinch',
   'go_back', 'go_home', 'dismiss',
   'biometric', 'otp', 'permission', 'clipboard', 'network',
+  'geolocation', 'rotate',
   // runner aliases that toRunnerCommand maps explicitly
   'tap', 'type_text', 'input_text', 'press_key', 'launch_app',
   'assert_visible', 'assert_text', 'permission_dialog',
@@ -2400,22 +2412,36 @@ function toRunnerCommandInner(step: MobileIntentStep): Record<string, unknown> {
       //      text assertion to assert_visible silently DROPS the value — a
       //      false-green. assert_text REQUIRES expectedText.
       //   3. neither                 -> assert_visible (pure visibility).
-      const opts = step.options as { aiCheckSource?: 'tree' | 'screenshot'; useVisualAi?: boolean } | undefined;
+      const opts = step.options as { aiCheckSource?: 'tree' | 'screenshot'; useVisualAi?: boolean; timeout?: number } | undefined;
       const assertText = step.assertionText ?? step.value;
       const aiSource = opts?.aiCheckSource ?? (opts?.useVisualAi ? 'screenshot' : undefined);
       if (type === 'ai_check' && aiSource) {
+        // NOTE: the runner's ai_visual_check is single-shot (no poll) and its
+        // params schema has no `timeout` field, so a longer wait is NOT
+        // honoured here — author a preceding `wait_for` step to settle first.
         return {
           type: 'ai_visual_check',
           params: { assertion: (assertText ?? step.description) ?? '', source: aiSource },
         };
       }
       if (assertText && assertText.trim()) {
+        // Same: assert_text is single-shot; no timeout field in its params.
         return {
           type: 'assert_text',
           params: { intent: assertText.trim(), expectedText: assertText },
         };
       }
-      return { type: 'assert_visible', params: { intent: step.description } };
+      // assert_visible is the ONE assert the runner POLLS (up to params.timeout,
+      // default 5s). Forward an explicit options.timeout so "wait up to 15s for
+      // X to appear" works — the field lives INSIDE params (assertVisibleParams),
+      // not top-level. Omitted when unset so the runner keeps its 5s default.
+      return {
+        type: 'assert_visible',
+        params: {
+          intent: step.description,
+          ...(typeof opts?.timeout === 'number' ? { timeout: opts.timeout } : {}),
+        },
+      };
     }
     case 'assert_text': {
       // assertTextParams REQUIRES expectedText — emitting without it 400s the
@@ -2608,6 +2634,53 @@ function toRunnerCommandInner(step: MobileIntentStep): Record<string, unknown> {
             ? { packetLossPercent: opts.networkPacketLossPercent }
             : {}),
         },
+      };
+    }
+
+    // ── geolocation: mock GPS. clear vs set decided by structure (runner
+    //    parity): explicit geolocationAction 'clear' OR no coords → clear;
+    //    otherwise set_geolocation with lat/lng (+ optional altitude). Mirrors
+    //    the runner's own intent-step-converter so live == replay.
+    case 'geolocation': {
+      const opts = step.options as
+        | {
+            geolocationAction?: 'set' | 'clear';
+            geolocationLatitude?: number;
+            geolocationLongitude?: number;
+            geolocationAltitude?: number;
+          }
+        | undefined;
+      const lat = opts?.geolocationLatitude;
+      const lon = opts?.geolocationLongitude;
+      if (opts?.geolocationAction === 'clear' || lat == null || lon == null) {
+        // A 'set' with missing coords is a bad author — surface it rather than
+        // silently clearing (which would be a confusing false-green).
+        if (opts?.geolocationAction !== 'clear' && (lat == null || lon == null)) {
+          throw new StepConversionError(
+            'geolocation set requires options.geolocationLatitude and options.geolocationLongitude (use geolocationAction:"clear" to remove the mock fix).',
+          );
+        }
+        return { type: 'clear_geolocation', params: {} };
+      }
+      return {
+        type: 'set_geolocation',
+        params: {
+          latitude: lat,
+          longitude: lon,
+          ...(opts?.geolocationAltitude != null ? { altitude: opts.geolocationAltitude } : {}),
+        },
+      };
+    }
+
+    // ── rotate: device orientation. Defaults to portrait when unspecified
+    //    (runner parity).
+    case 'rotate': {
+      const opts = step.options as
+        | { rotateOrientation?: 'portrait' | 'landscape' | 'reverse_portrait' | 'reverse_landscape' }
+        | undefined;
+      return {
+        type: 'set_orientation',
+        params: { orientation: opts?.rotateOrientation ?? 'portrait' },
       };
     }
 

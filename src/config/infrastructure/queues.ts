@@ -1,6 +1,6 @@
 import { AgentResponse, TestJobData } from '@/types';
 import type { ExplorationBudget, RateLimitingConfig } from '@/agent/core/lite/exploration/types';
-import type { MobileTestJobData } from '@/services/mobile/mobile-runner.types';
+import type { MobileTestJobData, MobileAppBriefing } from '@/services/mobile/mobile-runner.types';
 import type { AllureImportJobData } from '@/services/allure-import/allure-import.types';
 import { handleQueueError } from '@/utils/core/error-handler';
 import { logQueueEvent, logger } from '@/utils/core/logger';
@@ -61,6 +61,9 @@ export interface MobileExplorationJobData {
   workspaceId?: string;
   /** Plain-English focus, forwarded to the runner as the exploration goal. */
   goal?: string;
+  /** Structured pre-exploration briefing (description/region/keyFlows/avoid).
+   *  NO credentials. Read from the project at start; grounds the sub-agents. */
+  briefing?: MobileAppBriefing;
   budget?: Record<string, number>;
 }
 

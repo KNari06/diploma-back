@@ -75,4 +75,27 @@ describe('reduceRuntimeMeta', () => {
       expect(reduceRuntimeMeta({ scratchpadSnapshot: 'not-an-object' as any }).scratchpadSnapshot).toBeUndefined();
     });
   });
+
+  describe('triggerFired (mobile fired-trigger indicator)', () => {
+    const payload = {
+      triggerId: 'editor-trigger-7',
+      conditionKind: 'any_dialog' as const,
+      actionKind: 'tap' as const,
+      actionText: 'Allow',
+      matchedText: 'Allow access to your location?',
+      timestamp: '2026-07-13T00:00:00.000Z',
+    };
+
+    it('preserves triggerFired through the Redis → Postgres reduction', () => {
+      expect(reduceRuntimeMeta({ triggerFired: payload }).triggerFired).toEqual(payload);
+    });
+
+    it('returns undefined triggerFired when absent (so it never persists an empty badge)', () => {
+      expect(reduceRuntimeMeta({ runtimeStatus: 'executed' }).triggerFired).toBeUndefined();
+    });
+
+    it('ignores a non-object triggerFired instead of persisting garbage', () => {
+      expect(reduceRuntimeMeta({ triggerFired: 'nope' as any }).triggerFired).toBeUndefined();
+    });
+  });
 });

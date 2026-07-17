@@ -97,4 +97,30 @@ describe('parseAllurePdf — per-step expected results', () => {
     expect(testCases).toHaveLength(0);
     expect(errors.join(' ')).toMatch(/scanned|no text/i);
   });
+
+  it('does NOT strip a real step line shaped like "N of M" as page noise', async () => {
+    // Regression: the page-footer cleaner must keep action lines such as
+    // "Repeat step 3 of 5" / "Do 5 of 8" (they read like a counter but are
+    // real steps). We capture the text actually sent to the LLM and assert
+    // those lines survive the pre-clean, while a true footer is removed.
+    mockGetText.mockResolvedValue({
+      text: [
+        '#1002 Retry flow [Active]',
+        'Steps:',
+        'Repeat step 3 of 5',
+        'Do 5 of 8',
+        'Test Cases\t12 of 250',   // genuine footer → stripped
+        '12 of 250',                 // bare counter → stripped
+      ].join('\n'),
+    });
+    llmReturns([{ name: 'Retry flow', steps: [{ type: 'click', description: 'Repeat step 3 of 5' }] }]);
+
+    await parseAllurePdf(Buffer.from('pdf'));
+
+    const sentToLlm: string = mockGetChatCompletion.mock.calls[0][0]
+      .map((m: { content: string }) => m.content).join('\n');
+    expect(sentToLlm).toContain('Repeat step 3 of 5');   // real step kept
+    expect(sentToLlm).toContain('Do 5 of 8');            // real step kept
+    expect(sentToLlm).not.toContain('12 of 250');        // footer stripped
+  });
 });

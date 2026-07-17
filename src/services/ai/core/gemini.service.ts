@@ -109,7 +109,7 @@ export interface GeminiResponse {
  */
 export async function generateTextWithGemini(params: {
   prompt: string;
-  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.5-flash-lite';
+  model?: 'gemini-flash-latest' | 'gemini-flash-lite-latest' | 'gemini-pro-latest' | 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.5-flash-lite';
   temperature?: number;
   maxTokens?: number;
   timeout?: number;
@@ -249,7 +249,7 @@ export async function generateTextWithGemini(params: {
  */
 export async function getChatCompletionWithGemini(params: {
   messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
-  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.5-flash-lite';
+  model?: 'gemini-flash-latest' | 'gemini-flash-lite-latest' | 'gemini-pro-latest' | 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.5-flash-lite';
   temperature?: number;
   maxTokens?: number;
   timeout?: number;
@@ -464,9 +464,8 @@ export async function getChatCompletionWithGemini(params: {
 export async function generateTextWithGeminiVision(params: {
   prompt: string;
   imageBase64: string;
-  /** Gemini natively supports webp alongside png/jpeg. */
   mimeType?: 'image/png' | 'image/jpeg' | 'image/webp';
-  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.5-flash-lite';
+  model?: 'gemini-flash-latest' | 'gemini-flash-lite-latest' | 'gemini-pro-latest' | 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.5-flash-lite';
   temperature?: number;
   maxTokens?: number;
   timeout?: number;

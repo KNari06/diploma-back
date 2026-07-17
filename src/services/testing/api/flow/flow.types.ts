@@ -351,6 +351,9 @@ export interface ParseSpecRequest {
   // For resuming after user answers questions
   analysisId?: string; // ID of cached analysis to resume
   userAnswers?: Record<string, string>; // question ID → answer
+  // Opt-in probe phase: with consent, call SAFE endpoints (GET reads, login) during
+  // build to observe real response shapes and correct extraction jsonPaths.
+  probe?: boolean;
 }
 
 export interface RunFlowRequest {

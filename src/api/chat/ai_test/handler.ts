@@ -945,7 +945,11 @@ export async function handlePlatformTest(
           });
         }
       }
-      // Credits are now deducted per-step during execution — no upfront deduction needed
+      // Credits are deducted 1-per-executed-step DURING the run — no upfront
+      // deduction here. The soft check at STEP 0 only gates start; the actual
+      // per-step deduction happens in the executor: LiteEngine.chargeStepCredit
+      // for lite runs and test-executor.ts for replay/regression. The early
+      // `checkCreditsForTest` is grace-inclusive so grace-funded users still run.
       if (reusedExistingTest) {
         logger.info('[PLATFORM_TEST] Reused existing active test', {
           testId: actualTestId,

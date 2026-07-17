@@ -3,6 +3,11 @@
  * Type definitions for test hierarchy: Module → Flow → TestCase → Step
  */
 
+// Type-only import (compile-erased) of the flattened trigger-fired payload so
+// RunReportStep can surface which authored trigger cleared a dialog on a step,
+// matching the live editor. No runtime dependency is introduced.
+import type { TriggerFiredPayload } from '@/services/testing/ui/preview/web-trigger-engine';
+
 // ============================================================================
 // ENUMS AND BASIC TYPES
 // ============================================================================
@@ -1039,6 +1044,15 @@ export interface RunReportStep {
    * teardown failures.
    */
   phase?: 'setup' | 'main' | 'teardown';
+  /**
+   * The user-authored trigger that fired while this step ran (a dialog /
+   * permission prompt was auto-cleared). Flattened `TriggerFiredPayload`
+   * (condition + action target), forwarded from runtimeMeta.triggerFired by
+   * the report assembler. Drives the green "TRIGGER" badge in the saved-report
+   * timeline, matching the live editor. Absent on steps where no trigger fired
+   * and on legacy runs persisted before this was carried through.
+   */
+  triggerFired?: TriggerFiredPayload;
 }
 
 /**

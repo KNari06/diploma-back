@@ -14,8 +14,8 @@
 import AdmZip from 'adm-zip';
 import path from 'path';
 import { logger } from '@/utils/core/logger';
-import { classifyAllureFiles } from './allure-classifier';
-import type { ClassifierInput } from './allure-classifier';
+import { classifyAllureFiles, type ClassifierInput } from './allure-classifier';
+import { adaptReportTestCases, isReportTestCasePath } from './allure-report-adapter';
 import type {
   AllureParsedData,
   AllureTestResult,
@@ -347,6 +347,36 @@ export async function parseAllureZip(zipBuffer: Buffer): Promise<AllureParsedDat
     videosSkipped,
     filesSkipped,
   });
+
+  // ── 4b. Generated-report fallback ─────────────────────────────────────────
+  // The RAW `allure-results/` directory has `*-result.json` files, handled
+  // above. But many users upload the GENERATED report (`allure generate`
+  // output / the CI-published site) instead, which stores each test under
+  // `data/test-cases/<uid>.json` in a different schema. Those files were
+  // hard-skipped by the classifier. When we found NO raw results, adapt the
+  // report test cases so the import isn't a silent no-op. Guarded on
+  // `rawResults.length === 0` so a genuine results ZIP (which never contains
+  // `data/test-cases/`) is completely unaffected.
+  if (rawResults.length === 0) {
+    const reportEntries: Array<{ path: string; json: unknown }> = [];
+    for (const [entryPath, buf] of entryBufferMap) {
+      if (!isReportTestCasePath(entryPath)) continue;
+      const parsed = safeParseJSON(buf.toString('utf-8'));
+      if (parsed) reportEntries.push({ path: entryPath, json: parsed });
+    }
+
+    if (reportEntries.length > 0) {
+      logger.info('[AllureParser] No raw results — falling back to generated-report adapter', {
+        reportTestCaseFiles: reportEntries.length,
+      });
+      const adapted = adaptReportTestCases(reportEntries);
+      rawResults.push(...adapted.results);
+      rawContainers.push(...adapted.containers);
+      // These files were counted as skipped during classification; correct the
+      // tally so the stats reflect what actually became test cases.
+      filesSkipped = Math.max(0, filesSkipped - reportEntries.length);
+    }
+  }
 
   // ── 5. Deduplicate parameterised tests by testCaseId ──────────────────────
   const results = deduplicateResults(rawResults);
