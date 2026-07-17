@@ -129,19 +129,19 @@ export const AI_TASK_MODELS = {
    * Yes/no/other confirmation classification (e.g. "do you want to start
    * exploration?"). Gemini Flash for speed, native JSON, multilingual.
    */
-  confirmationClassification: 'gemini-2.5-flash' as const,
+  confirmationClassification: 'gemini-flash-latest' as const,
   // ── API Flow Testing ───────────────────────────────────────────────
   /** API Flow Analyst — domain analysis from spec (needs large context for 1000+ endpoints) */
-  apiFlowAnalyst: 'gemini-2.5-flash' as const,
+  apiFlowAnalyst: 'gemini-flash-latest' as const,
   /** API Flow Architect — DAG building from analysis + endpoints */
-  apiFlowArchitect: 'gemini-2.5-flash' as const,
+  apiFlowArchitect: 'gemini-flash-latest' as const,
   /** API Flow Enricher — realistic test data generation */
-  apiFlowEnricher: 'gemini-2.5-flash' as const,
+  apiFlowEnricher: 'gemini-flash-latest' as const,
 
   /** Vision-based element resolution (Gemini multimodal, screenshot + DOM) */
-  visionElementResolution: 'gemini-2.5-flash' as const,
+  visionElementResolution: 'gemini-flash-latest' as const,
   /** Post-healing visual verification (Gemini multimodal, confirm correct element) */
-  healingVerification: 'gemini-2.5-flash' as const,
+  healingVerification: 'gemini-flash-latest' as const,
 
   // ── Negative / Boundary Testing ────────────────────────────────────────
   /**
@@ -208,7 +208,7 @@ export const AI_TASK_MODELS = {
    * reruns that hide real bugs. Must be fast; 3s hard timeout.
    * Uses Gemini 2.5 Flash for speed + native JSON mode.
    */
-  retryClassification: 'gemini-2.5-flash' as const,
+  retryClassification: 'gemini-flash-latest' as const,
   /** Coverage analysis */
   coverageAnalysis: AI_MODELS.fast,
   /** Test recommendations */

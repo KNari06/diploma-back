@@ -364,18 +364,37 @@ The execution engine CANNOT do these things — user must provide:
 ═══ DECISION LOGIC ═══
 
 For AUTHENTICATION:
-  IF spec has a login/signin/token endpoint with clear request schema (email+password, username+password):
-    → DO NOT ask for a token. Mark this endpoint as isAuthEndpoint: true.
-    → The Enricher agent will generate test credentials for the login body.
-    → The executor will call login first, extract the token, and inject it everywhere.
-    → ONLY ask for credentials if the login endpoint requires REAL accounts that can't be auto-created
-      (e.g., no registration endpoint AND login body hints at existing accounts).
+  A login endpoint is AUTONOMOUS only if the system can obtain a WORKING account for it
+  without the user. Evaluate EACH login endpoint SEPARATELY — a spec often has more than one
+  auth realm (e.g. a public user login AND an /admin login). One realm can be autonomous while
+  another needs asked credentials; never assume a token from one realm works for another.
 
-  IF spec has a registration/signup endpoint:
-    → Include it BEFORE login in the execution order.
-    → Generate test data for registration. Extract user_id from response.
-    → Then login with the registered credentials. Extract auth_token.
-    → Fully autonomous — no questions needed.
+  IF a login takes email/username + PASSWORD:
+    Look for a PAIRED registration/signup endpoint that creates an account usable by THIS login —
+    same realm/role. A public user signup does NOT satisfy an /admin (or other privileged) login.
+    → IF such a registration endpoint EXISTS:
+        DO NOT ask. Mark the login isAuthEndpoint: true. Order: register → login → extract token.
+        The Enricher generates the registration + login body. Fully autonomous.
+    → IF NO paired registration endpoint EXISTS (the login needs a PRE-EXISTING real account):
+        You CANNOT invent a valid account — ASK for the credentials (prefix ids/vars by realm,
+        e.g. "admin_" for an /admin login, so multiple realms don't collide):
+        → id: "<realm>_email" (or "<realm>_username"), type: "text", variableName: "<realm>_email"
+        → id: "<realm>_password", type: "secret", variableName: "<realm>_password"
+        → context: "The <realm> login needs a real existing account — there is no registration
+          endpoint to create one automatically."
+        Mark the login isAuthEndpoint; the executor sends the provided creds in the login body.
+
+  IF a login is PASSWORDLESS (OTP / one-time code / magic link):
+    The code is delivered out-of-band (SMS/email) and CANNOT be auto-generated — ASK for the
+    delivery target AND the code:
+    → id: "otp_target", type: "text", variableName: "otp_target" (the email/phone that receives it)
+    → id: "otp_code", type: "secret", variableName: "otp_code"
+    → context: "This login sends a one-time code the system can't read; enter the target and the code."
+    (Do NOT ask for a password here — a passwordless login has none.)
+    ALWAYS ask these whenever an OTP send/verify endpoint appears in the flow and its verify step
+    yields the auth token — EVEN IF a separate registration/login path also exists. A hard-coded code
+    like "123456" WILL fail, so the token that verify produces would be empty. The verify body's code
+    and target fields must reference {{otp_code}} / {{otp_target}}, not invented values.
 
   IF spec has NO login/token endpoint but endpoints require bearerAuth:
     → ASK: id: "auth_token", type: "secret", variableName: "auth_token"
@@ -676,6 +695,8 @@ Using the domain analysis as your guide, produce this EXACT JSON:
 
 7. Public endpoints (auth_required: NONE) → NO auth variableInjections.
 
+7b. **COOKIE / SESSION AUTH**: if the login authenticates by SETTING A COOKIE (response Set-Cookie / a cookie-based security scheme) rather than returning a token in the JSON body, the runtime carries the session cookie automatically across steps. In that case DO NOT extract the cookie (no variableExtraction with headerSource "Set-Cookie") and DO NOT inject an "Authorization: Bearer" header for it — that sends the raw cookie string as a bogus token and breaks auth. Only model bearer/token auth (token returned in the response body, e.g. $.accessToken) with extraction + Authorization injection.
+
 8. canRunParallel = true for nodes at the same dependency level with no shared state.
 
 9. expectedStatusCodes: from the response schemas (200, 201, 204, etc.)
@@ -806,9 +827,26 @@ export function buildEnricherPrompt(
 
   // Extract domain info for context
   let domainHint = '';
+  let providedVarsStr = '';
   try {
     const analysis = JSON.parse(analysisJson);
     domainHint = `Domain: ${analysis.domain?.name || 'unknown'}\nDescription: ${analysis.domain?.description || ''}`;
+    // User-provided variables (names only — never the secret values). Let the
+    // Enricher wire these into request bodies as {{name}} instead of fabricating
+    // credentials the user already supplied (e.g. login email/password).
+    const providedVars = Array.isArray(analysis._providedVariables) ? analysis._providedVariables : [];
+    if (providedVars.length > 0) {
+      providedVarsStr = `\n═══ USER-PROVIDED VARIABLES (available as {{name}} at runtime) ═══\n`
+        + providedVars
+          .map((v: any) => `  {{${v.name}}}${v.type ? ` [${v.type}]` : ''}${v.context ? ` — ${v.context}` : ''}`)
+          .join('\n')
+        + `\n\nIf a request-body field corresponds to one of these (a login/credentials body`
+        + ` needing email/username/password, or an entity id the user supplied), use the`
+        + ` {{name}} placeholder as the field VALUE instead of inventing data. Match only`
+        + ` when the body field genuinely fits — auth tokens, API keys and base URLs are`
+        + ` injected elsewhere (headers/URL), so never place those in the body unless the`
+        + ` request schema explicitly defines that field.\n`;
+    }
   } catch {
     domainHint = 'Domain: infer from endpoint names';
   }
@@ -817,7 +855,7 @@ export function buildEnricherPrompt(
 
 ═══ DOMAIN CONTEXT ═══
 ${domainHint}
-
+${providedVarsStr}
 ═══ ENDPOINTS NEEDING REQUEST BODIES ═══
 
 ${nodeDescriptions}
@@ -844,6 +882,7 @@ Return EXACTLY this JSON:
 - Include a key in "samples" for EVERY endpoint listed above
 - Match the schema structure exactly (field names, nesting, types)
 - For injected variables: use the exact {{variable_name}} from the injected_variables line
+- For user-provided variables: when a body field matches one (see USER-PROVIDED VARIABLES), use its {{name}} placeholder instead of inventing a value
 - For required fields without schema: infer reasonable field names from the endpoint path and summary
 - For enum fields: pick the first valid option
 - Keep arrays short (1-2 items)
