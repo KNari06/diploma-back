@@ -8,8 +8,14 @@ jest.mock('@/config/environment/env', () => ({
   env: { AUTO_APPROVE_SIGNUP: false },
 }));
 
+// Mock the db sublayer (unit test must not touch a real Supabase client).
+const mockApprovePendingUser = jest.fn();
+jest.mock('@/services/core/db/self-serve.db', () => ({
+  approvePendingUser: (...args: unknown[]) => mockApprovePendingUser(...args),
+}));
+
 import { env } from '@/config/environment/env';
-import { resolveEffectiveStatus } from '../effective-status';
+import { resolveEffectiveStatus, healApprovalIfNeeded } from '../effective-status';
 
 const setFlag = (v: boolean) => {
   (env as { AUTO_APPROVE_SIGNUP: boolean }).AUTO_APPROVE_SIGNUP = v;
@@ -56,5 +62,42 @@ describe('resolveEffectiveStatus', () => {
     it('leaves an approved user approved', () => {
       expect(resolveEffectiveStatus('approved')).toBe('approved');
     });
+  });
+});
+
+describe('healApprovalIfNeeded', () => {
+  beforeEach(() => {
+    mockApprovePendingUser.mockReset();
+    mockApprovePendingUser.mockResolvedValue({ id: 'u1', email: 'x@y.com', name: 'X' });
+  });
+
+  it('reconciles a pending user to approved when self-serve is on', async () => {
+    (env as { AUTO_APPROVE_SIGNUP: boolean }).AUTO_APPROVE_SIGNUP = true;
+    await healApprovalIfNeeded('u1', 'pending_approval');
+    expect(mockApprovePendingUser).toHaveBeenCalledWith('u1');
+  });
+
+  it('does nothing when the flag is off (B2B manual approval)', async () => {
+    (env as { AUTO_APPROVE_SIGNUP: boolean }).AUTO_APPROVE_SIGNUP = false;
+    await healApprovalIfNeeded('u1', 'pending_approval');
+    expect(mockApprovePendingUser).not.toHaveBeenCalled();
+  });
+
+  it('does not touch an already-approved user', async () => {
+    (env as { AUTO_APPROVE_SIGNUP: boolean }).AUTO_APPROVE_SIGNUP = true;
+    await healApprovalIfNeeded('u1', 'approved');
+    expect(mockApprovePendingUser).not.toHaveBeenCalled();
+  });
+
+  it('never un-rejects a rejected user', async () => {
+    (env as { AUTO_APPROVE_SIGNUP: boolean }).AUTO_APPROVE_SIGNUP = true;
+    await healApprovalIfNeeded('u1', 'rejected');
+    expect(mockApprovePendingUser).not.toHaveBeenCalled();
+  });
+
+  it('swallows DB errors — never throws into the auth path', async () => {
+    (env as { AUTO_APPROVE_SIGNUP: boolean }).AUTO_APPROVE_SIGNUP = true;
+    mockApprovePendingUser.mockRejectedValue(new Error('db down'));
+    await expect(healApprovalIfNeeded('u1', 'pending_approval')).resolves.toBeUndefined();
   });
 });

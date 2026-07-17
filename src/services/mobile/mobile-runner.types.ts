@@ -128,6 +128,9 @@ export type MobileIntentActionType =
   | 'biometric' | 'otp' | 'permission' | 'clipboard'
   // Network simulation
   | 'network'
+  // Device conditions (runner: set_geolocation/clear_geolocation, set_orientation)
+  | 'geolocation'       // mock GPS location (set lat/lng, or clear)
+  | 'rotate'            // device orientation (portrait / landscape / reverse_*)
   // V-cross-app: run another saved test case at this point in the sequence,
   // possibly on a different platform. Informational only — the backend
   // orchestrator resolves this step before dispatch; the runner never
@@ -217,6 +220,15 @@ export interface MobileIntentStepOptions {
   networkLatencyMs?: number;
   networkBandwidthKbps?: number;
   networkPacketLossPercent?: number;
+  // Geolocation (mock GPS). Field names mirror the runner's own
+  // intent-step-converter so a saved step replays identically. `set` needs
+  // latitude+longitude; `clear` removes the mock fix.
+  geolocationAction?: 'set' | 'clear';
+  geolocationLatitude?: number;
+  geolocationLongitude?: number;
+  geolocationAltitude?: number;
+  // Rotate / device orientation.
+  rotateOrientation?: 'portrait' | 'landscape' | 'reverse_portrait' | 'reverse_landscape';
   // Dismiss
   /** Free-text hint for `dismiss` steps ("Reading settings sheet"). Advisory
    *  only — the runner always closes the top-most active layer it sees. */
@@ -841,6 +853,22 @@ export interface MobileTestJobData {
 export interface MobileExplorationStartResponse {
   runId: string;
   status: string; // ExplorationStatus on the runner: 'running' | 'awaiting_user' | …
+}
+
+/**
+ * Structured pre-exploration context forwarded to the runner. Mirrors the
+ * runner's AppBriefing. Carries NO credentials by design — test credentials
+ * are handled through the runner's answer/redaction seam, never this blob.
+ */
+export interface MobileAppBriefing {
+  description?: string;
+  region?: string;
+  keyFlows?: string[];
+  avoid?: string[];
+  /** Field-format rules for the FormFiller (e.g. "promo code = 8 uppercase"). */
+  dataHints?: string;
+  /** Per-flow success conditions the agent asserts ("an order number appears"). */
+  successCriteria?: string[];
 }
 
 /** Runner readiness probe — GET /api/explorer/readiness. */

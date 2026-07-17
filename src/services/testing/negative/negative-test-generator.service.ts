@@ -331,6 +331,16 @@ export class NegativeTestGeneratorService {
     // Deep copy steps
     const steps = JSON.parse(JSON.stringify(originalSteps));
 
+    // Strip any trailing ai_check the SOURCE case carried (exploration-sourced
+    // cases now end with a positive expectedOutcome:'success' oracle). Left in
+    // place, that positive check asserts the happy-path state on a flow we
+    // deliberately BROKE — it can never pass, so the negative becomes
+    // structurally unable to succeed. The negative's own error-oracle is
+    // appended below; the source's happy oracle is meaningless here.
+    while (steps.length > 0 && steps[steps.length - 1]?.type === 'ai_check') {
+      steps.pop();
+    }
+
     if (mutation.mutationType === 'skip_step') {
       // Remove the step entirely
       steps.splice(mutation.stepIndex, 1);

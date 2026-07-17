@@ -188,6 +188,31 @@ describe('NegativeTestGeneratorService.generateForTestCase', () => {
     expect(negativeDb.insertNegativeTestCase).not.toHaveBeenCalled();
   });
 
+  it('strips a source positive ai_check so the negative can actually fail-then-pass [#6]', async () => {
+    // Exploration-sourced case ends with a positive expectedOutcome:success
+    // oracle. If inherited, it asserts the happy state on a broken flow → the
+    // negative can never pass. The generator must drop it and keep only its own
+    // error oracle.
+    (negativeDb.getSourceTestCase as jest.Mock).mockResolvedValue({
+      ...SOURCE,
+      steps_json: [
+        ...SOURCE.steps_json,
+        { id: 'expl_check_0', type: 'ai_check', assertionText: 'dashboard visible', value: 'dashboard visible', expectedOutcome: 'success', options: { aiCheckSource: 'tree' } },
+      ],
+    });
+    const inserts = captureInserts();
+    aiReturns([
+      { mutationType: 'empty_field', stepIndex: 1, originalValue: 'user@example.com', mutatedValue: '', expectedBehavior: 'validation error' },
+    ]);
+
+    await NegativeTestGeneratorService.generateForTestCase('src-1', 'user-1');
+    const steps = inserts[0].stepsJson;
+    const checks = steps.filter((s: any) => s.type === 'ai_check');
+    expect(checks).toHaveLength(1); // only the negative's own, not the inherited positive
+    expect(checks[0].expectedOutcome).toBe('error');
+    expect(steps.some((s: any) => s.expectedOutcome === 'success')).toBe(false);
+  });
+
   it('throws when the source test case is missing', async () => {
     (negativeDb.getSourceTestCase as jest.Mock).mockResolvedValue(null);
     await expect(

@@ -25,6 +25,7 @@ import type { MobileExplorationJobData } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileExplorationRelay } from '@/services/mobile/mobile-exploration-relay';
 import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
+import { AppSkeletonService } from '@/services/testing/exploration/app-skeleton.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
@@ -44,6 +45,7 @@ export class MobileExplorationRunJobHandler {
       userId,
       chatSessionId,
       goal,
+      briefing,
       budget,
     } = job.data;
 
@@ -70,7 +72,7 @@ export class MobileExplorationRunJobHandler {
       // 2. Start the run on the runner (key injected server-side).
       const started = await client.startExploration(
         runnerSessionId,
-        { appId, goal, budget },
+        { appId, goal, briefing, budget },
         { userId },
       );
       // The runner mints its own runId; the relay subscribes to THAT, but
@@ -111,8 +113,50 @@ export class MobileExplorationRunJobHandler {
             flows, projectId, userId, platform,
           );
           savedCount = savedIds.length;
+
+          // Persist the screen graph into the per-app skeleton — the map a later
+          // "test X in this app" / chat request consults instead of re-crawling.
+          // The graph already rides in this same snapshot under `mobile`; we used
+          // to discard it. Best-effort inside the service (never throws).
+          const mobile = (snapshot as { mobile?: {
+            graph?: { nodes?: unknown[]; edges?: unknown[] };
+            rootFingerprint?: string; fingerprintVersion?: number;
+            domainGuess?: string; coverageScore?: number;
+          } }).mobile;
+          if (mobile?.graph) {
+            await AppSkeletonService.mergeRunIntoSkeleton({
+              projectId,
+              platform: toSkeletonPlatform(platform),
+              packageName: appId,
+              // Pass through as-is (may be undefined on an older runner). The
+              // service treats undefined as "same version" so it MERGES rather
+              // than rebuilding — a `?? 0` here would make every run look like a
+              // version change and never accumulate.
+              fingerprintVersion: mobile.fingerprintVersion,
+              graph: mobile.graph,
+              rootFingerprint: mobile.rootFingerprint,
+              domainGuess: mobile.domainGuess,
+              // coverageScore rides on the mobile header (the snapshot has no
+              // top-level `summary`), so read it there — reading summary.* here
+              // was always undefined → bestCoverageScore stuck at 0.
+              coverageScore: mobile.coverageScore,
+              runId: runnerRunId,
+            });
+          }
+
           // Prefer the snapshot's richer summary over the envelope's.
-          summary = (snapshot as { summary?: Record<string, unknown> }).summary ?? snapshot ?? outcome.summary;
+          const rawSummary = (snapshot as { summary?: Record<string, unknown> }).summary ?? snapshot ?? outcome.summary;
+          // Hoist coverageScore to the TOP level: the runner puts it at
+          // summary.mobile.coverageScore, but the frontend history view reads
+          // summary.coverageScore → it was always null for mobile. Prefer the
+          // authoritative mobile value; fall back to any existing top-level one.
+          const mobileHdr = (snapshot as { mobile?: { coverageScore?: number } }).mobile;
+          summary = {
+            ...rawSummary,
+            coverageScore: mobileHdr?.coverageScore
+              ?? (rawSummary as { coverageScore?: number }).coverageScore
+              ?? null,
+          };
         } catch (err) {
           // Non-fatal: the run DID complete; we just couldn't fetch/persist
           // cases. Record the run as completed with 0 saved rather than
@@ -205,4 +249,12 @@ export class MobileExplorationRunJobHandler {
       relay?.stop('job-cleanup');
     }
   }
+}
+
+/** Normalize the job's bare platform ('android'|'ios'|'flutter') to the
+ *  intent_test_cases enum form the skeleton table keys on. */
+function toSkeletonPlatform(
+  platform: 'android' | 'ios' | 'flutter',
+): 'mobile_android' | 'mobile_ios' | 'mobile_flutter' {
+  return platform === 'ios' ? 'mobile_ios' : platform === 'flutter' ? 'mobile_flutter' : 'mobile_android';
 }

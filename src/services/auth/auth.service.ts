@@ -10,7 +10,7 @@ import {
 } from '@/utils/validation/businessEmail';
 import * as crypto from 'crypto';
 import { notifyAdminsOfNewUser } from './new-user-notification.service';
-import { resolveEffectiveStatus } from './effective-status';
+import { resolveEffectiveStatus, healApprovalIfNeeded } from './effective-status';
 
 // Thrown when signup is rejected because the email domain is a free/consumer
 // or disposable provider. The controller catches this and returns a 400
@@ -900,6 +900,12 @@ export async function verifyToken(accessToken: string): Promise<AuthUser | null>
       status: resolveEffectiveStatus(userData?.status),
       avatar: userData?.avatar_url || data.user.user_metadata?.avatar_url,
     };
+
+    // Self-heal: if this user is effectively approved but the DB still says
+    // pending (a stuck provision), reconcile the row in the background so the
+    // admin approvals list and other DB readers see the truth. Fire-and-forget
+    // — never blocks or fails /auth/me.
+    void healApprovalIfNeeded(data.user.id, userData?.status);
 
     // Cache result (fire-and-forget; cache is fail-safe)
     cache.set(cKey, authUser, AUTH_CACHE_TTL);
