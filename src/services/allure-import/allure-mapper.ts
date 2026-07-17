@@ -93,6 +93,63 @@ function flattenRawSteps(allureSteps: AllureStep[], parentName?: string): Flatte
   return result;
 }
 
+/**
+ * Turn a before-fixture (a `StepResult`-shaped object) into precondition lines.
+ *
+ * A fixture can be either a single named setup ("Seed test user") or a wrapper
+ * whose real work is in nested `steps[]` ("Login" → open page / enter creds /
+ * submit). We surface:
+ *   - the fixture's own name (if it reads as a real precondition, not a generic
+ *     hook name like "beforeEach"/"setUp"), and
+ *   - each nested leaf step's name.
+ * De-duplicated, order-preserving. Recurses to any depth (fixture step trees
+ * can nest) with a defensive cap so a pathological file can't blow the stack.
+ */
+export function flattenFixtureToPreconditions(fixture: AllureStep, depth = 0): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw?: string): void => {
+    const name = raw?.trim();
+    if (!name) return;
+    // Skip generic framework hook names — they're noise as a "precondition"
+    // (beforeEach/afterAll/setUp/tearDown/@BeforeMethod…). Case-insensitive so
+    // camelCase (`beforeEach`) and other casings all match.
+    if (/^(?:before|after)\s*(?:each|all|class|method|suite|scenario|feature)?$|^set\s*up$|^tear\s*down$/i.test(name)) return;
+    if (seen.has(name)) return;
+    seen.add(name);
+    out.push(name);
+  };
+
+  const walk = (step: AllureStep, d: number): void => {
+    const children = step.steps ?? [];
+    if (children.length === 0) {
+      // True leaf — its name is a real action.
+      push(step.name);
+    } else if (d < 8) {
+      // Grouping fixture — descend to its leaf actions (they carry the detail).
+      for (const child of children) walk(child, d + 1);
+    } else {
+      // At the depth cap a node still has children. Do NOT substitute the
+      // grouping node's own name for the real leaf (LOW-1 in the audit) —
+      // instead flatten its remaining descendants' leaf names in one shallow
+      // pass so the actual actions survive rather than a wrapper label.
+      const flattenLeaves = (s: AllureStep): void => {
+        const kids = s.steps ?? [];
+        if (kids.length === 0) push(s.name);
+        else for (const k of kids) push(k.name); // one level only — bounded
+      };
+      flattenLeaves(step);
+    }
+  };
+
+  // Include the fixture's own name first (unless it's just a hook name), then
+  // its nested leaf steps — so "Login" AND its sub-actions both appear.
+  push(fixture.name);
+  for (const child of fixture.steps ?? []) walk(child, depth + 1);
+
+  return out;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AI step conversion
 // ─────────────────────────────────────────────────────────────────────────────
@@ -487,7 +544,24 @@ export async function convertImportedStepsWithAI(
   testName: string,
   rawSteps: Array<{ type: string; description: string; value?: string; expected?: string[] }>,
   platform: ImportPlatform = 'web',
+  rawScenario?: string,
 ): Promise<AIStepConversionResult> {
+  // When the deterministic CSV split was degenerate (its step / expected labels
+  // were in a language our registry doesn't cover), `rawScenario` carries the
+  // ORIGINAL text. Ask the LLM to re-segment it into steps + expected by
+  // MEANING first — no word-list, so any language works — then convert. Falls
+  // back to the pre-split steps if re-segmentation yields nothing usable.
+  if (rawScenario && rawScenario.trim()) {
+    const resegmented = await resegmentScenarioWithAI(testName, rawScenario);
+    if (resegmented.length > 0) {
+      return convertNormalizedStepsWithAI(
+        testName,
+        resegmented.map((s) => ({ text: s.description, expected: s.expected })),
+        platform,
+      );
+    }
+  }
+
   return convertNormalizedStepsWithAI(
     testName,
     rawSteps.map((s) => ({
@@ -497,6 +571,65 @@ export async function convertImportedStepsWithAI(
     })),
     platform,
   );
+}
+
+/**
+ * Re-segment a raw, unlabelled scenario blob into steps + per-step expected
+ * results using the LLM, identifying the step/expected structure SEMANTICALLY
+ * (by meaning, in any language) rather than by matching label words. Used only
+ * as a fallback when the deterministic marker-based split failed. Returns [] on
+ * any failure so the caller keeps its original split.
+ */
+async function resegmentScenarioWithAI(
+  testName: string,
+  rawScenario: string,
+): Promise<Array<{ description: string; expected?: string[] }>> {
+  const systemPrompt = `You segment a raw test-case scenario (in ANY human language) into ordered STEPS and their EXPECTED RESULTS.
+
+The text has no reliable markers. Decide structure by MEANING, not by matching words:
+- A STEP is an action the tester performs (open, tap, enter, select, compare, repeat…).
+- An EXPECTED RESULT describes what should be true AFTER a step (a state, a value, a visible message). It belongs to the step it follows.
+- A line that introduces expectations (its own short label, or a phrase meaning "expected result" in the source language) is a delimiter — the lines after it are expected results of the step above, not new steps.
+- Preserve the ORIGINAL language and order. Never drop, merge, or translate content.
+
+Return JSON:
+{ "steps": [ { "description": "<step text>", "expected": ["<expectation>", …] }, … ] }
+Omit "expected" when a step has none. If the text has no discernible steps, return { "steps": [] }.`;
+
+  try {
+    const response = await getChatCompletionWithMessages(
+      [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: `Test: "${testName}"\n\nScenario:\n${rawScenario}` },
+      ],
+      {
+        model: AI_TASK_MODELS.allureStepConvert,
+        temperature: 0,
+        max_tokens: 4096,
+        response_format: { type: 'json_object' },
+        reasoning_effort: 'low',
+      },
+    );
+    const parsed = JSON.parse(response.content?.trim() || '{}');
+    const steps = Array.isArray(parsed.steps) ? parsed.steps : [];
+    return steps
+      .filter((s: unknown): s is { description: string; expected?: unknown } =>
+        !!s && typeof s === 'object' && typeof (s as { description?: unknown }).description === 'string')
+      .map((s: { description: string; expected?: unknown }) => {
+        const desc = s.description.trim();
+        const expected = Array.isArray(s.expected)
+          ? s.expected.map((e) => String(e).trim()).filter(Boolean)
+          : undefined;
+        return expected && expected.length > 0 ? { description: desc, expected } : { description: desc };
+      })
+      .filter((s: { description: string }) => s.description.length > 0);
+  } catch (err) {
+    logger.warn('[AllureMapper] Scenario re-segmentation failed, using deterministic split', {
+      testName,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
 }
 
 /**
@@ -573,9 +706,70 @@ interface ExtractedLabels {
  * JUnit/NUnit-style (parentSuite/suite/subSuite) both produce meaningful
  * hierarchy instead of everything landing in "Unassigned".
  */
-function extractLabels(labels: AllureLabel[]): ExtractedLabels {
+/**
+ * Split raw `tag` label values into plain tags + parsed BDD composites.
+ *
+ * Cucumber-JVM encodes metadata as `KEY=value`; behave / Cucumber.js use
+ * `key:value`. A leading `@` may or may not survive into the label value. We
+ * recognise the well-known keys (severity / owner / issue / tms / link) and
+ * route them; everything else stays a plain tag (with a leading `@` stripped
+ * for cleanliness). Unknown `key=value` / `key:value` composites are kept as
+ * plain tags verbatim so nothing is silently dropped.
+ */
+function parseBddTags(rawTags: string[]): {
+  plainTags: string[];
+  bddSeverities: string[];
+  bddOwners: string[];
+  bddLinks: string[];
+} {
+  const plainTags: string[] = [];
+  const bddSeverities: string[] = [];
+  const bddOwners: string[] = [];
+  const bddLinks: string[] = [];
+
+  for (const raw of rawTags) {
+    const tag = raw.trim().replace(/^@/, '');
+    if (!tag) continue;
+
+    // Match `KEY=value` OR `KEY:value` (only the FIRST separator splits, so a
+    // URL value with its own `:`/`=` stays intact).
+    const m = tag.match(/^([A-Za-z_]+)\s*[=:]\s*(.+)$/);
+    if (!m) {
+      plainTags.push(tag);
+      continue;
+    }
+    const key = m[1].toLowerCase();
+    const value = m[2].trim();
+    if (!value) { plainTags.push(tag); continue; }
+
+    switch (key) {
+      case 'severity':
+        bddSeverities.push(value);
+        break;
+      case 'owner':
+        bddOwners.push(value);
+        break;
+      case 'issue':
+      case 'tmslink':
+      case 'tms':
+      case 'link':
+        bddLinks.push(value);
+        break;
+      default:
+        // Unknown composite — keep verbatim rather than drop it.
+        plainTags.push(tag);
+    }
+  }
+
+  return { plainTags, bddSeverities, bddOwners, bddLinks };
+}
+
+export function extractLabels(labels: AllureLabel[]): ExtractedLabels {
   const byName = (name: string) =>
     labels.filter((l) => l.name === name).map((l) => l.value);
+  // Case-insensitive variant — some adapters vary label-name casing.
+  const byNameCI = (name: string) =>
+    labels.filter((l) => l.name?.toLowerCase() === name.toLowerCase()).map((l) => l.value);
 
   // ── BDD hierarchy labels ────────────────────────────────────────────────
   const epicNames      = byName('epic');
@@ -588,10 +782,31 @@ function extractLabels(labels: AllureLabel[]): ExtractedLabels {
   const subSuites      = byName('subSuite');
 
   // ── Metadata labels ─────────────────────────────────────────────────────
-  const severities     = byName('severity');
-  const tagValues      = byName('tag');
+  const severities     = [...byName('severity')];
+  const rawTagValues   = byName('tag');
   const layers         = byName('layer');
-  const owners         = byName('owner');
+  const owners         = [...byName('owner')];
+
+  // ── Allure ID (AS_ID) ────────────────────────────────────────────────────
+  // The Allure ID label is literally named `AS_ID` in adapter output (constant
+  // ALLURE_ID_LABEL_NAME), NOT `allure_id`. Accept both plus `ALLURE_ID` for
+  // older/other adapters. Surfaced as a tag so it's searchable and links back
+  // to the TestOps/Allure test id.
+  const allureIds = [
+    ...byNameCI('AS_ID'),
+    ...byNameCI('ALLURE_ID'),
+    ...byNameCI('allure_id'),
+  ];
+
+  // ── BDD composite tags ───────────────────────────────────────────────────
+  // Cucumber/behave carry metadata inside `tag` values as composites. JVM uses
+  // `KEY=value` (SEVERITY=critical, ISSUE=…, OWNER=…, TMSLINK=…, LINK=…);
+  // behave/JS use `key:value`. Parse both so severity/owner/links aren't lost
+  // as opaque tags; plain tags stay as-is.
+  const { plainTags, bddSeverities, bddOwners, bddLinks } = parseBddTags(rawTagValues);
+  severities.push(...bddSeverities);
+  owners.push(...bddOwners);
+  const tagValues = plainTags;
 
   // ── Resolve Module name (fallback chain) ────────────────────────────────
   let moduleName: string | undefined;
@@ -638,6 +853,8 @@ function extractLabels(labels: AllureLabel[]): ExtractedLabels {
     ...stories.map((s) => `story:${s}`),
     ...layers.map((l) => `layer:${l}`),
     ...owners.map((o) => `owner:${o}`),
+    ...allureIds.map((id) => `allure_id:${id}`),
+    ...bddLinks.map((l) => `link:${l}`),
   ];
 
   // ── Description suffix from story labels ────────────────────────────────
@@ -1122,12 +1339,18 @@ export async function mapAllureResult(
     extractLabels(result.labels);
 
   // ── 3. Extract preconditions from container (needed before buildDescription) ──
+  // A before-fixture is a StepResult-shaped object with its own nested `steps[]`
+  // (allure-java `FixtureResult`). The old code took only `fixture.name` and
+  // dropped every nested sub-step — so a "Login" fixture with sub-steps
+  // "open page / enter creds / submit" imported as the single line "Login".
+  // `flattenFixtureToPreconditions` keeps the fixture's leaf actions. `afters`
+  // (teardown) stay intentionally unmapped — preconditions are setup only.
   const container = containerByUuid.get(result.uuid);
   const preconditions: string[] = [];
 
   if (container?.befores?.length) {
     for (const fixture of container.befores) {
-      if (fixture.name) preconditions.push(fixture.name);
+      preconditions.push(...flattenFixtureToPreconditions(fixture));
     }
   }
 

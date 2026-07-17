@@ -2127,6 +2127,28 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Build screenshots array from graphData (source of truth for URLs + screenshot URLs)
       const screenshots: Array<{ url: string; screenshot: string }> = [];
       const seenScreenshotUrls = new Set<string>();
+
+      const pushIfNew = (url: string | undefined, screenshotUrl: string | undefined) => {
+        if (!screenshotUrl) return;
+        if (seenScreenshotUrls.has(screenshotUrl)) return;
+        seenScreenshotUrls.add(screenshotUrl);
+        screenshots.push({ url: url || testData.url, screenshot: screenshotUrl });
+      };
+
+      // Final-state screenshot FIRST. LiteEngine captures + uploads it AFTER the
+      // end node is built (lite-engine.ts), so it never lands in graphData — the
+      // end node's meta.screenshot is always undefined. `formatTestResult`
+      // persists `screenshots[0]` into `test_results.screenshot`, so without this
+      // a failed lite run persisted an early/mid-run graph node (or nothing),
+      // never the shot showing where it actually got stuck. Prepend it so it
+      // wins index 0 for both pass and fail. The lite `execute()` return always
+      // uses the {url, screenshot} URL shape (Buffers only appear mid-run), so
+      // narrow the union before reading.
+      const finalShot = liteResult.screenshots?.[0];
+      if (finalShot && 'screenshot' in finalShot && finalShot.screenshot) {
+        pushIfNew(finalShot.url, finalShot.screenshot);
+      }
+
       if (liteResult.graphData?.nodes) {
         for (const node of liteResult.graphData.nodes as any[]) {
           if (!node?.meta) continue;
@@ -2136,13 +2158,6 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           const screenshotAfter: string | undefined = node.meta.screenshotAfter;
           const screenshotBefore: string | undefined = node.meta.screenshotBefore;
           const pageScreenshot: string | undefined = node.meta.screenshot; // page nodes
-
-          const pushIfNew = (url: string | undefined, screenshotUrl: string | undefined) => {
-            if (!screenshotUrl) return;
-            if (seenScreenshotUrls.has(screenshotUrl)) return;
-            seenScreenshotUrls.add(screenshotUrl);
-            screenshots.push({ url: url || testData.url, screenshot: screenshotUrl });
-          };
 
           pushIfNew(urlBefore, screenshotBefore);
           pushIfNew(urlAfter, screenshotAfter);
@@ -2185,6 +2200,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         // ✅ NEW: Full graph data like Pro
         graphData: liteResult.graphData,
 
+        // V16 billing parity: propagate lite's per-step credits-exhausted flag
+        // so the job/report surface the same "credits exhausted" banner the
+        // replay path does.
+        creditsExhausted: liteResult.creditsExhausted || false,
+
         // Internal flags
         _liteMode: true, // Flag to skip uploadIntelligentTestScreenshots
       };
@@ -2197,6 +2217,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             browser: testData.browser || 'chrome',
             step: step.data.step,
             stepDescription: step.data.description,
+            // Preserve the action type so the run report can show a per-step
+            // action badge (reduceStepCompletedPayload allowlists `action`).
+            action: step.data.action,
             success: step.data.success,
             timestamp: step.ts,
           });

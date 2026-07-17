@@ -158,4 +158,38 @@ describe('parseAllureCsv', () => {
 
     expect(testCases.map((t) => t.name)).toEqual(['Short', 'Full']);
   });
+
+  it('does NOT treat prose like "Windows 10:" or "Chapter 3." as a step marker', async () => {
+    // Regression: the non-bracketed step patterns must fire ONLY on leading
+    // numbering (1. / 1)), not a generic "Word N:/." prefix — otherwise a
+    // continuation line with a version string or heading is severed into a
+    // phantom step, losing its leading text.
+    const scenario = [
+      '[step 1] Open the settings page',
+      '\tWindows 10: verify the layout renders',   // continuation, NOT a new step
+      '[step 2] Save',
+    ].join('\n');
+    const csv = ['name;scenario', `Layout;"${scenario.replace(/"/g, '""')}"`].join('\n');
+
+    const { testCases } = await parseAllureCsv(csv);
+
+    // Exactly two real steps — "Windows 10:" did not spawn a third.
+    expect(testCases[0].steps).toHaveLength(2);
+    expect(testCases[0].steps.map((s) => s.description)).not.toContain('verify the layout renders');
+  });
+
+  it('does NOT read a bare "Expected number…" continuation as an expected-result delimiter', async () => {
+    // Regression: only "expected result(s)" is a delimiter, not the bare word
+    // "Expected" — otherwise "Expected number of rows is 50" is mis-bucketed.
+    const scenario = [
+      '[step 1] Load the transactions page',
+      '\tExpected number of rows is 50',   // this is step context, NOT the delimiter
+    ].join('\n');
+    const csv = ['name;scenario', `Rows;"${scenario.replace(/"/g, '""')}"`].join('\n');
+
+    const { testCases } = await parseAllureCsv(csv);
+
+    // The word "Expected" is preserved (not stripped as a delimiter label).
+    expect(testCases[0].steps[0].expected).toBeUndefined();
+  });
 });

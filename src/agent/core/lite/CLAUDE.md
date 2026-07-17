@@ -106,3 +106,22 @@ console errors ⇒ visible JS break · progress%+rounds ⇒ "stuck, change strat
    must never fail the flow (CLAUDE.md hard invariant #11).
 5. **Login/auth URL detection lives only in [auth-url-patterns.ts](exploration/auth-url-patterns.ts).**
    Never inline a second login-URL regex — import `isLoginUrl`.
+6. **LiteEngine bills 1 credit per successful executed step; Exploration does NOT.**
+   Lite chat runs are UI tests (product decision 2026-07-17: 1cr/executed step, same
+   as replay; NO refund on failure). **Billing ACCRUES then SETTLES once — it is NOT
+   eager.** `chargeStepCredit(action)` (legacy loop: prefilled-replay, credential
+   auto-fill, main AI action, recovery-retry) and `chargeForPipelineRound`
+   (hybrid/pipeline-v2 via TestPipeline's `onRoundComplete`) only INCREMENT
+   `billableStepCount`; the actual per-step deductions happen once in
+   `settleStepCharges()`, called from `buildResult()`. **Bill-the-winner:** the paths
+   fall through on failure (hybrid → pipeline v2 → legacy loop), so each fall-through
+   boundary calls `resetPathCharges()` to discard the abandoned path's tally — only the
+   path that reaches `buildResult` is billed (a run that ran 5 hybrid steps then finished
+   in 8 pipeline steps bills 8, not 13). Eager charging double-billed those retries.
+   Charge lives in LiteEngine, NOT in the shared [ActionExecutor](execution/action-executor.ts)
+   or [pipeline/command-executor.ts](pipeline/command-executor.ts) — Exploration reuses
+   both and bills flat 10cr, so a charge there would double-bill exploration. When you
+   add a NEW `executor.execute` site in LiteEngine, call `chargeStepCredit` on its
+   success path; when you add a NEW fall-through boundary, call `resetPathCharges()`
+   before the next path runs. `settleStepCharges` latches `creditsExhausted` (surfaced on
+   `LiteTestResult`) and never throws — mirrors the replay path.
