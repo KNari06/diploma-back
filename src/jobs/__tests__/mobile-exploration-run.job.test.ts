@@ -33,6 +33,16 @@ jest.mock('@/services/testing/exploration/exploration-storage.service', () => ({
   ExplorationStorageService: { createRun, completeMobileRun, failRun, saveMobileTestCasesFromSnapshot },
 }));
 
+const mergeRunIntoSkeleton = jest.fn();
+jest.mock('@/services/testing/exploration/app-skeleton.service', () => ({
+  AppSkeletonService: { mergeRunIntoSkeleton },
+}));
+
+const deductCreditsForTest = jest.fn();
+jest.mock('@/services/core/credit-cost-tracker.service', () => ({
+  CreditCostTrackerService: { deductCreditsForTest },
+}));
+
 const emitExplorationCompleted = jest.fn();
 jest.mock('@/websocket/core/websocket.service', () => ({
   webSocketService: { emitExplorationCompleted },
@@ -66,8 +76,12 @@ beforeEach(() => {
   jest.clearAllMocks();
   createRun.mockResolvedValue({ id: 'row-1' });
   startExploration.mockResolvedValue({ runId: 'runner-run-9', status: 'running' });
-  getExplorationResult.mockResolvedValue({ flows: [], summary: { coverageScore: 70 } });
+  // The runner's result snapshot has NO top-level `summary` — the graph + its
+  // rollups (fingerprintVersion, coverageScore) ride on the `mobile` header.
+  getExplorationResult.mockResolvedValue({ flows: [] });
   saveMobileTestCasesFromSnapshot.mockResolvedValue([]);
+  mergeRunIntoSkeleton.mockResolvedValue(undefined);
+  deductCreditsForTest.mockResolvedValue(undefined);
 });
 
 describe('MobileExplorationRunJobHandler', () => {
@@ -97,7 +111,6 @@ describe('MobileExplorationRunJobHandler', () => {
     waitUntilDone.mockResolvedValue({ status: 'completed', testCasesCount: 0, summary: {}, reason: 'completed' });
     getExplorationResult.mockResolvedValue({
       flows: [{ name: 'login', mobile: { cases: [{ name: 'happy', intentSteps: [{ a: 1 }] }] } }],
-      summary: { coverageScore: 88 },
     });
     saveMobileTestCasesFromSnapshot.mockResolvedValue(['tc-1', 'tc-2', 'tc-3']);
 
@@ -113,6 +126,71 @@ describe('MobileExplorationRunJobHandler', () => {
     expect(saveChatMessages).toHaveBeenCalled();
     expect(failRun).not.toHaveBeenCalled();
     expect(relayStop).toHaveBeenCalled();
+  });
+
+  it('merges the screen graph into the app skeleton, reading coverage from the mobile header', async () => {
+    // Regression for BUG-A/BUG-B: the graph + rollups live on `mobile`, NOT a
+    // top-level `summary`. The job must forward graph, rootFingerprint,
+    // fingerprintVersion, domainGuess and coverageScore (from the header) and
+    // map the bare platform → the skeleton enum form.
+    waitUntilDone.mockResolvedValue({ status: 'completed', testCasesCount: 0, summary: {}, reason: 'completed' });
+    getExplorationResult.mockResolvedValue({
+      flows: [],
+      mobile: {
+        graph: { nodes: [{ mobile: { fingerprint: 'fp1' } }], edges: [] },
+        rootFingerprint: 'fp1',
+        fingerprintVersion: 1,
+        domainGuess: 'shopping',
+        coverageScore: 63,
+      },
+    });
+
+    await MobileExplorationRunJobHandler.process(makeJob());
+
+    expect(mergeRunIntoSkeleton).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'p-1',
+      platform: 'mobile_android', // bare 'android' → enum form
+      packageName: 'com.demo.app',
+      fingerprintVersion: 1,
+      rootFingerprint: 'fp1',
+      domainGuess: 'shopping',
+      coverageScore: 63, // from mobile header, not summary
+      runId: 'runner-run-9',
+      graph: expect.objectContaining({ nodes: expect.any(Array) }),
+    }));
+  });
+
+  it('hoists mobile.coverageScore to summary.coverageScore for completeMobileRun (C3)', async () => {
+    // The frontend history view reads summary.coverageScore, but the runner
+    // only puts it at summary.mobile.coverageScore → it was always null for
+    // mobile. The job must lift it to the top level.
+    waitUntilDone.mockResolvedValue({ status: 'completed', testCasesCount: 0, summary: {}, reason: 'completed' });
+    getExplorationResult.mockResolvedValue({
+      flows: [],
+      mobile: { graph: { nodes: [{ mobile: { fingerprint: 'fp1' } }], edges: [] }, rootFingerprint: 'fp1', coverageScore: 63 },
+    });
+
+    await MobileExplorationRunJobHandler.process(makeJob());
+
+    expect(completeMobileRun).toHaveBeenCalledWith('expl-1', expect.objectContaining({
+      summary: expect.objectContaining({ coverageScore: 63 }),
+    }));
+  });
+
+  it('sets summary.coverageScore null when the snapshot has no coverage (C3)', async () => {
+    waitUntilDone.mockResolvedValue({ status: 'completed', testCasesCount: 0, summary: {}, reason: 'completed' });
+    getExplorationResult.mockResolvedValue({ flows: [] }); // no mobile header
+    await MobileExplorationRunJobHandler.process(makeJob());
+    expect(completeMobileRun).toHaveBeenCalledWith('expl-1', expect.objectContaining({
+      summary: expect.objectContaining({ coverageScore: null }),
+    }));
+  });
+
+  it('skips the skeleton merge when the snapshot carries no graph', async () => {
+    waitUntilDone.mockResolvedValue({ status: 'completed', testCasesCount: 0, summary: {}, reason: 'completed' });
+    getExplorationResult.mockResolvedValue({ flows: [] }); // no `mobile`
+    await MobileExplorationRunJobHandler.process(makeJob());
+    expect(mergeRunIntoSkeleton).not.toHaveBeenCalled();
   });
 
   it('still completes the run (count 0) if fetching the result throws', async () => {

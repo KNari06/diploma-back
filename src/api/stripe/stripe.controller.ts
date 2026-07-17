@@ -3,6 +3,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { EmailService } from '@/services/core/email.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { PlanService } from '@/services/core/plan.service';
+import { ReferralService } from '@/services/core/referral.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import Stripe from 'stripe';
@@ -902,6 +903,23 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
   // Stripe still sends its own receipt for every charge.
   const isFirstOrOneOff =
     !billingReason || billingReason === 'subscription_create' || billingReason === 'manual' || billingReason === 'subscription_update';
+
+  // Referral reward — revenue share: the referring partner earns a % (default
+  // 70%) of the REAL amount paid, for the referred user's first N monthly
+  // payments (default 2), then 0%. Fires on EVERY paid invoice (first charge AND
+  // renewals — personal OR B2B, all reach here); the window is enforced inside
+  // the service by COUNTING prior reward rows, not by the billing reason, and
+  // per-invoice idempotency is the ledger's ON CONFLICT on stripe_invoice_id.
+  // Best-effort: never fails the webhook (service swallows). No-op unless enabled.
+  if (invoice.id && (invoice.amount_paid ?? 0) > 0) {
+    void ReferralService.rewardOnPayment({
+      userId: user.id,
+      invoiceId: invoice.id,
+      amountPaidMinorUnits: invoice.amount_paid ?? 0,
+      currency: invoice.currency || 'usd',
+    });
+  }
+
   if (user.email && isFirstOrOneOff) {
     EmailService.sendPlanPurchasedEmail({
       recipientEmail: user.email,

@@ -192,6 +192,9 @@ export class RegressionReportAssemblerService {
           status,
           durationMs: typeof s.data?.durationMs === 'number' ? s.data.durationMs : undefined,
           screenshot: screenshotUrl,
+          // Same trigger-fired badge parity as the main assembly loop, for
+          // mobile chain-segment steps that cleared a dialog/permission prompt.
+          ...(meta?.triggerFired ? { triggerFired: meta.triggerFired } : {}),
         };
       });
 
@@ -610,6 +613,11 @@ export class RegressionReportAssemblerService {
             ...(meta?.healWhatChanged ? { healWhatChanged: meta.healWhatChanged } : {}),
             ...(meta?.flaky ? { flaky: true } : {}),
             ...(phase ? { phase } : {}),
+            // Which user-authored trigger cleared a dialog/permission prompt on
+            // this step (mobile). Flattened TriggerFiredPayload — drives the
+            // green "TRIGGER" badge in the reopened-report timeline, matching
+            // the live editor. Absent when no trigger fired / on legacy runs.
+            ...(meta?.triggerFired ? { triggerFired: meta.triggerFired } : {}),
           });
         }
 

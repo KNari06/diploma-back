@@ -19,6 +19,7 @@
     "build-kb": "ts-node -r tsconfig-paths/register src/scripts/build-global-kb.ts",
     "eval-kb": "ts-node -r tsconfig-paths/register src/scripts/eval-kb.ts",
     "eval-intent": "ts-node -r tsconfig-paths/register src/scripts/eval-intent-understanding.ts",
+    "eval-api-flow-baseline": "ts-node -r tsconfig-paths/register src/scripts/api-flow-baseline.ts",
     "lite:analyze": "ts-node -r tsconfig-paths/register src/scripts/lite-analyze/cli.ts",
     "create-test-users": "ts-node -r tsconfig-paths/register scripts/create-test-users.ts",
     "create-admin-user": "ts-node -r tsconfig-paths/register scripts/create-admin-user.ts",

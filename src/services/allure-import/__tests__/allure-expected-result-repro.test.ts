@@ -92,4 +92,37 @@ describe('REPRO: nested Expected result under a step (TestOps case #13)', () => 
     expect(steps[0].description).toBe('Do the thing');
     expect(steps[0].expected).toEqual(['The thing is done', 'No error appears']);
   });
+
+  it('MULTILINGUAL: German [Schritt N] + "Erwartetes Ergebnis" parses like EN', async () => {
+    // Previously the hardcoded EN/RU/KZ regexes would treat the German
+    // expected-result line as another step, collapsing the split. Now the
+    // multilingual label registry recognises it.
+    const scenario = [
+      '[Schritt 1] Anmeldeseite öffnen',
+      '[Schritt 2] Zugangsdaten eingeben und absenden',
+      '\tErwartetes Ergebnis: Das Dashboard wird angezeigt',
+      '\tErwartetes Ergebnis: Kein Fehler erscheint',
+    ].join('\n');
+    const { testCases } = await parseAllureCsv(buildCsv(scenario));
+    const steps = testCases[0].steps;
+
+    expect(steps).toHaveLength(2);
+    expect(steps[1].description).toBe('Zugangsdaten eingeben und absenden');
+    expect(steps[1].description).not.toMatch(/Erwartetes/);
+    expect(steps[1].expected).toEqual([
+      'Das Dashboard wird angezeigt',
+      'Kein Fehler erscheint',
+    ]);
+  });
+
+  it('MULTILINGUAL: [attachment N] in another language is NOT read as a step', async () => {
+    const scenario = [
+      '[Schritt 1] Etwas tun',
+      '\t[Anhang 1.1] screenshot.png',
+      '[Schritt 2] Etwas anderes tun',
+    ].join('\n');
+    const { testCases } = await parseAllureCsv(buildCsv(scenario));
+    // Two steps — the [Anhang 1.1] line is an attachment, not a third step.
+    expect(testCases[0].steps).toHaveLength(2);
+  });
 });

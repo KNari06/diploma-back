@@ -156,7 +156,7 @@ export class TestCompletionHandlerService {
       // V11: Include executed_steps so formatter can show step-level failure reasons
       const { data: test, error: testError } = await supabaseAdmin
         .from('tests')
-        .select('id, url, status, browsers, user_id, project_id, created_at, completed_at, executed_steps')
+        .select('id, url, status, browsers, user_id, project_id, created_at, completed_at, executed_steps, intelligent_mode')
         .eq('id', testId)
         .single();
 
@@ -172,8 +172,8 @@ export class TestCompletionHandlerService {
       const { data: results, error: resultsError } = await supabaseAdmin
         .from('test_results')
         .select(
-          'id, test_id, browser, status, errors, created_at, completed_at'
-        ) // ✅ Select only needed fields
+          'id, test_id, browser, status, errors, logs, created_at, completed_at'
+        ) // ✅ Select only needed fields; `logs` carries the lite failure reason
         .eq('test_id', testId); // ✅ Correct field name: test_id (not testId)
 
       if (resultsError) {

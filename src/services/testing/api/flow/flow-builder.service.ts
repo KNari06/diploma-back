@@ -15,6 +15,8 @@ import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { SpecParserService } from './spec-parser.service';
 import { DependencyResolverService, type ResolveResult } from './dependency-resolver.service';
+import { detectRequiredInputs } from './required-inputs';
+import { runProbe } from './probe-runner.service';
 import { callAiWithRetry, extractJson } from './ai-json.util';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import {
@@ -775,6 +777,14 @@ export class FlowBuilderService {
     }
 
     const dag = resolveResult.dag!;
+
+    // Deterministic net for un-fakeable inputs (OTP/verification codes, their
+    // delivery target, external secrets): rewrite the Enricher's fabricated
+    // values to {{placeholders}} and collect them as required run-time variables
+    // so the run dialog asks the user instead of sending data the API rejects.
+    const { nodes: inputNodes, requiredVars } = detectRequiredInputs(dag.nodes);
+    dag.nodes = inputNodes;
+
     emit('building_dag', 80, `Built execution DAG with ${dag.nodes.length} nodes`);
 
     // Step 3: Build visualization
@@ -795,6 +805,32 @@ export class FlowBuilderService {
         Object.assign(userProvidedVariables, request.userAnswers);
       } catch {
         // Non-critical
+      }
+    }
+
+    // Surface deterministically-detected required inputs (empty → the run dialog
+    // marks them required). Never clobber a real answer the user already gave.
+    // `requiredVars` covers OTP/verification/secret fields; `resolveResult.requiredVars`
+    // covers reference ids on auth-bootstrap nodes (e.g. register's country/city id).
+    for (const [key, value] of Object.entries({ ...requiredVars, ...(resolveResult.requiredVars || {}) })) {
+      if (!(key in userProvidedVariables)) userProvidedVariables[key] = value;
+    }
+
+    // Probe phase (opt-in, best-effort): with consent, call SAFE endpoints (GET
+    // reads + login) to observe real response shapes and correct extraction
+    // jsonPaths before persisting. Seeds only the non-empty credentials the user
+    // already provided; patches dag.nodes in place. Never fails the build.
+    if (request.probe) {
+      const probeCtx: Record<string, string> = {};
+      for (const [k, v] of Object.entries(userProvidedVariables)) if (v) probeCtx[k] = v;
+      try {
+        emit('building_dag', 88, 'Probing safe endpoints to verify response shapes...');
+        const { corrections, endpointsProbed } = await runProbe(dag, spec, probeCtx);
+        logger.info('[FLOW_BUILDER] Probe phase done', { endpointsProbed, corrections: corrections.length });
+      } catch (err) {
+        logger.warn('[FLOW_BUILDER] Probe phase failed (non-fatal)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
 
@@ -890,6 +926,7 @@ export class FlowBuilderService {
     updates: {
       executionDag?: ExecutionDAG;
       errorStrategy?: string;
+      variableChain?: Record<string, string>;
     },
   ): Promise<ApiFlowSpec | null> {
     const existing = await FlowBuilderService.getById(id, userId);
@@ -898,6 +935,7 @@ export class FlowBuilderService {
     await updateFlowSpec(id, {
       executionDag: updates.executionDag,
       errorStrategy: updates.errorStrategy,
+      variableChain: updates.variableChain,
     });
 
     return FlowBuilderService.getById(id, userId);

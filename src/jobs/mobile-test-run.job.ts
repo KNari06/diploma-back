@@ -44,6 +44,7 @@ import { uploadMobileStepScreenshots, processAndUploadStepScreenshot, decodeBase
 import { sumStepDurations } from './helpers/telemetry';
 import { classifyStepResults } from '@/utils/testing/step-result-classifier';
 import { CompiledPlanPersistenceService } from '@/services/testing/ui/preview/compiled-plan-persistence.service';
+import { buildTriggerFiredPayload } from '@/services/testing/ui/preview/web-trigger-engine';
 import { MobileSessionAcquisitionService } from '@/services/mobile/session-acquisition.service';
 import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import type { TestStepCompletedPayload } from '@/websocket/types/types';
@@ -1080,6 +1081,27 @@ export class MobileTestRunJobHandler {
                 : stepResult.scratchpadSnapshot
                   ? { scratchpadSnapshot: stepResult.scratchpadSnapshot }
                   : {}),
+              // Which USER trigger fired on this step, flattened to the web
+              // payload shape. Persisted into `tests.executed_steps[].runtimeMeta`
+              // (see reduceRuntimeMeta allowlist) as an audit trail — the value
+              // survives the run, ready for a saved-report indicator (the report
+              // assembler / StepsTimeline UI don't render it yet; that's a
+              // follow-up). Also broadcast live on `test:step:completed` (the
+              // live editor + single-step Apply surface it today). `matchedText`
+              // is runtime on-screen dialog
+              // text — redact it against the run's secrets (invariant #10), same
+              // as `error`/`scratchpadSnapshot` above, in case the app echoes a
+              // secret into a confirmation dialog.
+              ...(stepResult.triggerFired
+                ? {
+                    triggerFired: buildTriggerFiredPayload(
+                      stepResult.triggerFired,
+                      stepResult.triggerFired.matchedText
+                        ? redactWithValues(stepResult.triggerFired.matchedText, mobileSecretValues)
+                        : undefined,
+                    ),
+                  }
+                : {}),
             },
           };
           await TestExecutedStepsRedisService.appendStepCompleted(testId, mobileStepEvent);

@@ -132,6 +132,8 @@ export class ExplorationStorageService {
           description?: string;
           status?: string;
           intentSteps?: unknown[];
+          assertions?: Array<{ type?: string; expect?: string; afterStep?: number }>;
+          preconditions?: string[];
         }>;
       };
     }>,
@@ -148,6 +150,14 @@ export class ExplorationStorageService {
         const steps = Array.isArray(c.intentSteps) ? c.intentSteps : [];
         // Skip empty cases — nothing replayable to save.
         if (steps.length === 0) continue;
+        // Turn the case's observation assertions into runnable ai_check steps,
+        // INSERTED at the step they were observed after (not blindly appended) —
+        // a mid-flow check ("cart badge shows 1" after step 1 of 2) must replay
+        // against that screen, not the final one. Non-observation assertions
+        // (network/url/console) can't run on the mobile tree; they're preserved
+        // as `assert:` tags (mirroring the web path) rather than silently dropped.
+        const stepsWithChecks = insertMobileAssertionSteps(steps, c.assertions);
+        const assertionTags = buildAssertionTags(c.assertions);
         const priority = ['high', 'medium', 'low'].includes(flow.priority || '')
           ? (flow.priority as string)
           : 'medium';
@@ -157,11 +167,21 @@ export class ExplorationStorageService {
           name: c.name || flow.name || 'Mobile flow',
           description: c.description || null,
           start_url: null, // mobile has no URL
-          steps_json: steps,
-          tags: [browserTag, ...(flow.category ? [flow.category] : [])],
+          steps_json: stepsWithChecks,
+          // Set the platform column (not just the tag) so mobile exploration
+          // cases are queryable by platform like every other mobile test — the
+          // tag alone left `platform` defaulting to 'web'. browserTag already
+          // holds the enum form (mobile_android|mobile_ios|mobile_flutter).
+          platform: browserTag,
+          tags: [browserTag, ...(flow.category ? [flow.category] : []), ...assertionTags],
           priority,
           expected_result: null,
-          preconditions: null,
+          // B5: entry precondition derived by the runner from the flow's
+          // first screen ("App is on the X screen"). Column is TEXT[]; keep
+          // only non-empty strings, else leave the column at its default.
+          preconditions: Array.isArray(c.preconditions)
+            ? c.preconditions.filter((p): p is string => typeof p === 'string' && p.trim().length > 0)
+            : null,
           status: 'draft',
           kind: 'standalone',
           source: 'exploration',
@@ -472,4 +492,69 @@ export class ExplorationStorageService {
       // Non-critical, ignore errors
     }
   }
+}
+
+type MobileAssertion = { type?: string; expect?: string; afterStep?: number };
+
+/** Build one runnable ai_check step from an observation assertion. Shape mirrors
+ *  the negative-generator's mobile ai_check (aiCheckSource:'tree' → the runner
+ *  maps it to an `ai_visual_check`; assertionText is REQUIRED). expectedOutcome
+ *  :'success' — exploration flows are happy paths (inverse of a negative). */
+function makeAiCheckStep(expect: string, seq: number): Record<string, unknown> {
+  return {
+    id: `expl_check_${seq}_${Date.now().toString(36)}`,
+    type: 'ai_check',
+    description: expect,
+    assertionText: expect,
+    value: expect,
+    expectedOutcome: 'success' as const,
+    options: { aiCheckSource: 'tree' as const },
+  };
+}
+
+/**
+ * Insert observation-assertion ai_check steps into steps_json AT the position
+ * each was observed (assertion.afterStep, 1-based; 0/undefined/out-of-range =
+ * end-of-flow). A mid-flow check must replay against the screen it was seen on,
+ * not the final screen. Non-observation assertions (network/url/console) can't
+ * run on the a11y tree — handled by buildAssertionTags, not here.
+ *
+ * Insertion is done back-to-front by target index so earlier splices don't shift
+ * later ones. Steps with no positioned checks are untouched.
+ */
+function insertMobileAssertionSteps(
+  steps: unknown[],
+  assertions: MobileAssertion[] | undefined,
+): unknown[] {
+  const result = [...steps];
+  if (!Array.isArray(assertions)) return result;
+  // Collect observation checks with a resolved insert index (after the Nth step).
+  const positioned = assertions
+    .filter((a) => a?.type === 'observation' && (a.expect || '').trim())
+    .map((a, i) => {
+      const raw = typeof a.afterStep === 'number' ? a.afterStep : steps.length;
+      // Clamp 1..steps.length; 0 or out-of-range → append at end.
+      const idx = raw >= 1 && raw <= steps.length ? raw : steps.length;
+      return { idx, seq: i, expect: (a.expect as string).trim() };
+    })
+    // Descending by insert index so splices don't invalidate earlier indices;
+    // ties keep authoring order (stable via seq).
+    .sort((x, y) => y.idx - x.idx || y.seq - x.seq);
+  for (const p of positioned) {
+    result.splice(p.idx, 0, makeAiCheckStep(p.expect, p.seq));
+  }
+  return result;
+}
+
+/**
+ * Preserve non-runnable assertions (network/url/console) as compact `assert:`
+ * tags — the same breadcrumb the web path (saveTestCases) keeps — instead of
+ * dropping them silently. Capped so a chatty flow can't bloat the tags array.
+ */
+function buildAssertionTags(assertions: MobileAssertion[] | undefined): string[] {
+  if (!Array.isArray(assertions)) return [];
+  return assertions
+    .filter((a) => a?.type && a.type !== 'observation' && (a.expect || '').trim())
+    .slice(0, 8)
+    .map((a) => `assert:${a.type}:${(a.expect as string).trim().slice(0, 40)}`);
 }

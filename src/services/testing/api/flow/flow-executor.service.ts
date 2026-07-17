@@ -23,6 +23,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { executeApiTest } from '../apiTest.service';
 import { ApiTestStorageService } from '../api-test-storage.service';
 import { FlowBuilderService } from './flow-builder.service';
+import { CookieJar } from './cookie-jar';
 import type {
   ApiFlowSpec,
   DAGNode,
@@ -85,7 +86,7 @@ const SENSITIVE_PATTERNS = /token|secret|password|key|auth|jwt|bearer/i;
 // VARIABLE INTERPOLATION
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VAR_REGEX = /\{\{([\w.\-]+)\}\}/g;
+const VAR_REGEX = /\{\{([\w.-]+)\}\}/g;
 
 function interpolate(template: string, ctx: VariableContext): string {
   if (!template.includes('{{')) return template;
@@ -98,7 +99,18 @@ function interpolate(template: string, ctx: VariableContext): string {
 
 function interpolateObject(obj: any, ctx: VariableContext): any {
   if (obj === null || obj === undefined) return obj;
-  if (typeof obj === 'string') return interpolate(obj, ctx);
+  if (typeof obj === 'string') {
+    // Whole-value placeholder (the field IS exactly "{{var}}"): substitute the
+    // ctx value with its ORIGINAL type — a JSON API may reject "5"/"false"
+    // where a number/boolean is expected. Embedded placeholders (e.g.
+    // "Bearer {{token}}") still string-interpolate.
+    const whole = obj.match(/^\{\{([\w.-]+)\}\}$/);
+    if (whole) {
+      const v = ctx[whole[1]];
+      return v === undefined || v === null ? obj : v;
+    }
+    return interpolate(obj, ctx);
+  }
   if (typeof obj === 'number' || typeof obj === 'boolean') return obj;
   if (Array.isArray(obj)) return obj.map(item => interpolateObject(item, ctx));
   if (typeof obj === 'object') {
@@ -244,7 +256,13 @@ function buildResolvedRequest(
     const rawValue = ctx[injection.variableName];
     if (rawValue === undefined) continue;
 
-    if (injection.injectAs === 'body_field' && resolvedBody && typeof resolvedBody === 'object') {
+    if (injection.injectAs === 'body_field') {
+      // Ensure a plain-object container exists — otherwise the injection is
+      // silently lost: a missing body no-ops, and a named prop on an array body
+      // is dropped by JSON.stringify.
+      if (resolvedBody === undefined || resolvedBody === null || typeof resolvedBody !== 'object' || Array.isArray(resolvedBody)) {
+        resolvedBody = {};
+      }
       resolvedBody[injection.targetKey] = rawValue;
     } else if (injection.injectAs === 'body_json_path') {
       // targetKey is a JSON path (e.g. "$.user.id" or "data.token"). Ensure a
@@ -274,19 +292,24 @@ function setByJsonPath(target: Record<string, any>, path: string, value: any): v
 
   if (segments.length === 0) return;
 
-  let cursor: Record<string, any> = target;
+  const isIndex = (s: string) => /^\d+$/.test(s);
+  const keyFor = (cursor: any, seg: string) => (Array.isArray(cursor) && isIndex(seg) ? Number(seg) : seg);
+
+  let cursor: any = target;
   for (let i = 0; i < segments.length - 1; i++) {
-    const seg = segments[i];
-    if (cursor[seg] === undefined || cursor[seg] === null || typeof cursor[seg] !== 'object') {
-      cursor[seg] = {};
+    const key = keyFor(cursor, segments[i]);
+    if (cursor[key] === undefined || cursor[key] === null || typeof cursor[key] !== 'object') {
+      // A numeric NEXT segment means this level is an array (`items[0]` → array),
+      // not an object with a "0" key.
+      cursor[key] = isIndex(segments[i + 1]) ? [] : {};
     }
-    cursor = cursor[seg];
+    cursor = cursor[key];
   }
-  cursor[segments[segments.length - 1]] = value;
+  cursor[keyFor(cursor, segments[segments.length - 1])] = value;
 }
 
 // Test-only surface for the otherwise-private request builder.
-export const __testables = { buildResolvedRequest, setByJsonPath };
+export const __testables = { buildResolvedRequest, setByJsonPath, extractVariable };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RATE LIMIT HANDLING
@@ -406,6 +429,9 @@ export class FlowExecutorService {
 
     // Initialize variable context (pre-load from linked environment if available)
     const ctx: VariableContext = {};
+    // Per-run cookie jar: carries Set-Cookie sessions (e.g. cookie-based login)
+    // across steps so authenticated follow-up requests aren't rejected with 401.
+    const cookieJar = new CookieJar();
     if (flowSpec.environmentId) {
       try {
         const { data: env } = await supabaseAdmin
@@ -428,10 +454,13 @@ export class FlowExecutorService {
       }
     }
 
-    // Load saved variable chain from flow spec (user-provided during setup)
+    // Load saved variable chain from flow spec (user-provided during setup).
+    // Skip EMPTY values: an empty variableChain entry is an unfilled "required"
+    // input (surfaced by the run dialog) — seeding '' would silently resolve
+    // {{var}} to nothing; leaving it out keeps the placeholder visibly unresolved.
     if (flowSpec.variableChain && typeof flowSpec.variableChain === 'object') {
       for (const [key, value] of Object.entries(flowSpec.variableChain)) {
-        if (key && value !== undefined && value !== null) {
+        if (key && value !== undefined && value !== null && value !== '') {
           ctx[key] = value;
         }
       }
@@ -551,7 +580,7 @@ export class FlowExecutorService {
 
         const result = await FlowExecutorService.executeStep(
           node, resolvedUrl, resolvedHeaders, resolvedBody, stepIndex, flowRunId,
-          config, abortController.signal, c.expectedStatusCodes,
+          config, abortController.signal, c.expectedStatusCodes, cookieJar,
         );
         result.caseId = c.id;
         result.caseName = c.name;
@@ -634,7 +663,10 @@ export class FlowExecutorService {
 
       const nodeId = node.id;
       const override = request.nodeOverrides?.[nodeId];
-      const { resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected } = buildResolvedRequest(
+      // `let` so the request can be REBUILT after a 401 auth-refresh updates ctx
+      // — otherwise the retry re-sends the stale headers and the new bearer token
+      // never lands.
+      let { resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected } = buildResolvedRequest(
         node, baseUrl, ctx, override,
       );
 
@@ -657,7 +689,7 @@ export class FlowExecutorService {
 
       while (retryCount < maxRetries) {
         const result = await FlowExecutorService.executeStep(
-          node, resolvedUrl, resolvedHeaders, resolvedBody, stepIndex, flowRunId, config, abortController.signal,
+          node, resolvedUrl, resolvedHeaders, resolvedBody, stepIndex, flowRunId, config, abortController.signal, undefined, cookieJar,
         );
 
         // 429 rate limit
@@ -685,7 +717,7 @@ export class FlowExecutorService {
             authNode, baseUrl, ctx, authOverride,
           );
           const authResult = await FlowExecutorService.executeStep(
-            authNode, authUrl, authHeaders, authBody, -1, flowRunId, config, abortController.signal,
+            authNode, authUrl, authHeaders, authBody, -1, flowRunId, config, abortController.signal, undefined, cookieJar,
           );
           if (authResult.status === 'passed') {
             for (const ext of authNode.variableExtractions) {
@@ -695,6 +727,11 @@ export class FlowExecutorService {
                 variablesResolved++;
               }
             }
+            // Rebuild the request so the refreshed token (and any cookie) lands
+            // on the retry instead of re-sending the stale headers.
+            ({ resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected } = buildResolvedRequest(
+              node, baseUrl, ctx, override,
+            ));
             retryCount++;
             if (retryCount < maxRetries) {
               emit('emitApiFlowStepRetrying', {
@@ -993,20 +1030,38 @@ export class FlowExecutorService {
     // Case-matrix override: a case judges pass/fail against ITS own expected
     // codes, not the node's. Falls back to the node's when not provided.
     expectedStatusOverride?: number[],
+    // Per-run cookie jar: replays stored session cookies and captures Set-Cookie.
+    cookieJar?: CookieJar,
   ): Promise<FlowStepResult> {
     const startTime = Date.now();
     const expected = expectedStatusOverride?.length ? expectedStatusOverride : node.expectedStatusCodes;
+
+    // Attach stored cookies for this URL, unless the request already sets Cookie.
+    let requestHeaders = headers;
+    if (cookieJar) {
+      const hasExplicitCookie = Object.keys(headers).some(k => k.toLowerCase() === 'cookie');
+      if (!hasExplicitCookie) {
+        const cookieHeader = cookieJar.cookieHeaderFor(resolvedUrl);
+        if (cookieHeader) requestHeaders = { ...headers, Cookie: cookieHeader };
+      }
+    }
 
     try {
       const response = await executeApiTest({
         method: node.method,
         url: resolvedUrl,
-        headers,
+        headers: requestHeaders,
         body: ['POST', 'PUT', 'PATCH'].includes(node.method) ? body : undefined,
         timeout: config.stepTimeoutMs,
         expectedStatus: expected?.[0] ?? 200,
         signal: abortSignal,
       });
+
+      // Capture any Set-Cookie so later steps in this run stay authenticated.
+      // Use ONLY the un-folded array (Headers.getSetCookie); the folded
+      // responseHeaders string can't be split reliably (a value with ", token="
+      // would fracture into a bogus cookie).
+      if (response.setCookies?.length) cookieJar?.storeFromSetCookie(resolvedUrl, response.setCookies);
 
       const durationMs = Date.now() - startTime;
       const expectedCodes = expected?.length ? expected : [200, 201];
@@ -1019,7 +1074,7 @@ export class FlowExecutorService {
         method: node.method,
         path: node.path,
         resolvedUrl,
-        requestHeaders: headers,
+        requestHeaders,
         requestBody: body,
         responseStatus: response.status,
         responseBody: response.responseBody,
@@ -1038,7 +1093,7 @@ export class FlowExecutorService {
         method: node.method,
         path: node.path,
         resolvedUrl,
-        requestHeaders: headers,
+        requestHeaders,
         requestBody: body,
         durationMs: Date.now() - startTime,
         variablesInjected: [],

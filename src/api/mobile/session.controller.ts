@@ -26,6 +26,7 @@ import {
 import { resolveDedicatedDevice } from '@/services/mobile/dedicated-device.service';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { normalizeMobileBriefing } from '@/services/mobile/mobile-briefing.util';
 import { ProjectService } from '@/services/core/project.service';
 import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
 import { sendMobileRunnerError, isSessionGoneError } from './mobile-error-mapper';
@@ -204,6 +205,16 @@ export interface WarmupData {
   runnerSocketUrl: string | null;
   runnerApiKey?: string;
   platform: MobilePlatform;
+  /**
+   * For a Flutter session, the HOST the session was booted on ('android' /
+   * 'ios'). `platform` is always 'flutter' for both hosts, so it can't tell an
+   * Android-emulator session from an iOS-simulator one — a later warmup that
+   * switched the host toggle would otherwise reuse the wrong-host session (the
+   * reuse path skips re-prep for Flutter). Compared in the reuse gate to force
+   * a recreate on host switch. Optional: legacy/non-flutter entries omit it and
+   * default to 'android' in the comparison.
+   */
+  hostPlatform?: 'android' | 'ios';
   createdAt: string;
   /** Package name currently installed on the emulator */
   installedPackage?: string;
@@ -296,6 +307,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   const {
     projectId,
     platform: rawPlatform,
+    hostPlatform: rawHostPlatform,
     appPackage,
     deviceSelector: rawDeviceSelector,
     prelaunch: rawPrelaunch,
@@ -303,6 +315,13 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   } = req.body as {
     projectId?: string;
     platform?: string;
+    /**
+     * HOST platform for a `flutter` warmup — `android` (default) or `ios`. Picks
+     * whether the runner acquires an Android emulator or an iOS simulator, and
+     * which artifact slot (`android` .apk vs `ios` .app) prepApp installs.
+     * Ignored for non-Flutter platforms (they already ARE their host).
+     */
+    hostPlatform?: string;
     appPackage?: string;
     deviceSelector?: unknown;
     /**
@@ -387,7 +406,12 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   // 'android' and keep `platform` ('flutter') only as the logical label
   // stored in Redis + returned to the frontend.
   const isFlutter = platform === 'flutter';
-  const sessionCreatePlatform: MobilePlatform = isFlutter ? 'android' : platform;
+  // HOST lane for a Flutter test: android (default) or ios. A Flutter app is a
+  // NATIVE session under the hood (upgraded via attach-flutter), so we acquire
+  // the host platform, not 'flutter'. Only 'ios' opts into the new simulator
+  // path; anything else keeps the legacy android host (zero behaviour change).
+  const flutterHostPlatform: 'android' | 'ios' = rawHostPlatform === 'ios' ? 'ios' : 'android';
+  const sessionCreatePlatform: MobilePlatform = isFlutter ? flutterHostPlatform : platform;
 
   // Phase 2.6: validate `deviceSelector` if present. Inline validator to
   // match this file's existing style (no zod). Rejects malformed selectors
@@ -455,7 +479,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   // session". Android is left alone (the Android default already lands on
   // an emulator). Physical-iOS callers must pin `source: 'local-physical'`
   // explicitly; this default never overrides that.
-  if (platform === 'ios' && deviceSelector === undefined) {
+  if (sessionCreatePlatform === 'ios' && deviceSelector === undefined) {
     deviceSelector = { source: 'local-emulator' };
     logger.debug('[MOBILE_SESSION] defaulting iOS deviceSelector to local-emulator', {
       userId,
@@ -803,24 +827,34 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           }
           try { cancelIdle(userId); } catch { /* non-fatal */ }
           // Fall through to create a new session below
-        } else if (existing.platform !== platform) {
-          // Platform mismatch — the cached session's platform must match the
-          // requested one, in BOTH directions:
+        } else if (
+          existing.platform !== platform
+          // Flutter HOST switch (android↔ios): both hosts report
+          // platform='flutter', so the check above can't tell them apart. A
+          // session warmed on the iOS simulator must NOT be reused for an
+          // android-host request (or vice versa) — the reuse path skips re-prep
+          // for Flutter, so nothing would correct the host. Legacy entries with
+          // no recorded host default to 'android'.
+          || (isFlutter && (existing.hostPlatform ?? 'android') !== flutterHostPlatform)
+        ) {
+          // Platform mismatch — the cached session's platform (and, for Flutter,
+          // its host) must match the requested one, in BOTH directions:
           //   - Flutter request, non-flutter cached: a plain android/ios
           //     session has no Dart VM Service connection.
           //   - Non-flutter request, flutter cached: a flutter session
-          //     (android host upgraded via attachFlutter) reports
-          //     platform='flutter' and must NOT be handed to an android/ios
-          //     run. (The earlier one-directional check missed this case and
-          //     reused a flutter session for an android request.)
+          //     (host upgraded via attachFlutter) reports platform='flutter'
+          //     and must NOT be handed to an android/ios run.
+          //   - Flutter request, flutter cached on the OTHER host: wrong device.
           // Invalidate and fall through to a fresh create. For flutter the
-          // create path does android → install → attachFlutter.
-          logger.info('[MOBILE_SESSION] Cached session platform mismatch — recreating', {
+          // create path does host-native → install → attachFlutter.
+          logger.info('[MOBILE_SESSION] Cached session platform/host mismatch — recreating', {
             projectId,
             userId,
             staleSessionId: existing.sessionId,
             cachedPlatform: existing.platform,
             requestedPlatform: platform,
+            cachedHost: existing.hostPlatform ?? null,
+            requestedHost: isFlutter ? flutterHostPlatform : null,
           });
           await redisConnection.del(redisKey);
           clearSessionRunnerBinding(existing.sessionId).catch(() => {});
@@ -858,6 +892,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
                 userId,
                 appPackage,
                 platform,
+                hostPlatform: flutterHostPlatform,
                 variantLabel,
                 skipLaunch: !prelaunch,
                 onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
@@ -1062,6 +1097,9 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       runnerSocketUrl: effectiveRunnerSocketUrl,
       runnerApiKey: dedicatedRunnerApiKey ?? undefined,
       platform,
+      // Record the Flutter host so a later warmup that flipped the host toggle
+      // recreates instead of reusing the wrong-host session (reuse gate above).
+      ...(isFlutter ? { hostPlatform: flutterHostPlatform } : {}),
       createdAt: new Date().toISOString(),
       // Audit BUG-1 fix: persist the selector so the next warmup can
       // detect "user wants a different device" and invalidate the
@@ -1121,6 +1159,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         userId,
         appPackage,
         platform,
+        hostPlatform: flutterHostPlatform,
         variantLabel,
         skipLaunch: isFlutter ? true : !prelaunch,
         onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
@@ -2790,6 +2829,7 @@ export async function startMobileExploration(req: Request, res: Response): Promi
     appId,
     runnerSessionId,
     goal,
+    briefing: rawBriefing,
     budget,
     chatSessionId,
   } = req.body as {
@@ -2797,9 +2837,15 @@ export async function startMobileExploration(req: Request, res: Response): Promi
     appId?: string;
     runnerSessionId?: string;
     goal?: string;
+    briefing?: unknown;
     budget?: Record<string, number>;
     chatSessionId?: string;
   };
+
+  // Normalize the briefing to the safe shape: string fields + string arrays,
+  // capped, and CREDENTIAL-FREE (any credential-ish keys are dropped — creds
+  // ride the runner's answer/redaction seam, never this blob).
+  const briefing = normalizeMobileBriefing(rawBriefing);
 
   const VALID: Record<string, 'android' | 'ios' | 'flutter'> = {
     android: 'android', ios: 'ios', flutter: 'flutter',
@@ -2839,6 +2885,7 @@ export async function startMobileExploration(req: Request, res: Response): Promi
       chatSessionId: chatSessionId || undefined,
       budget,
       goal: goal?.trim() || undefined,
+      briefing,
     });
 
     logger.info('[MOBILE_SESSION] Mobile exploration queued', {

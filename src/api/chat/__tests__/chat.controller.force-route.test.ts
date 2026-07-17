@@ -5,13 +5,13 @@
  * isolates the force-route decision so we can confirm the contract:
  *
  *   - Force-route fires when MOBILE_EDITOR_FORCE_ROUTE is on AND
- *     context.mobileEditorMode === true AND mobileSessionId is set.
+ *     context.mobileEditorMode === true — with or without a
+ *     mobileSessionId. A missing/invalid session id still force-routes
+ *     (tagged `metadata.missingSession`) so mobile_agent replies with
+ *     its own `NO_SESSION_REPLY` instead of the classifier silently
+ *     misrouting the message to web general_chat.
  *   - Anything else returns null (the caller then runs the normal
  *     intent classifier).
- *
- * Critical edge: `mobileEditorMode=true` WITHOUT `mobileSessionId` is
- * a frontend race; we MUST fall through so mobile_agent can reply with
- * its own `NO_SESSION_REPLY`.
  */
 
 import { decideForceRoute } from '../chat.controller';
@@ -49,21 +49,28 @@ describe('decideForceRoute', () => {
     expect(decideForceRoute({ mobileEditorMode: false, mobileSessionId: 's1' }, true)).toBeNull();
   });
 
-  it('returns null when mobileSessionId is missing (frontend race → let classifier handle)', () => {
-    expect(decideForceRoute({ mobileEditorMode: true }, true)).toBeNull();
+  it('force-routes with missingSession when mobileSessionId is absent (no silent misroute)', () => {
+    expect(decideForceRoute({ mobileEditorMode: true }, true)).toEqual({
+      intent: 'mobile_agent',
+      intent_confidence: 1.0,
+      confidence: 1.0,
+      metadata: { routingSource: 'force_route', missingSession: true },
+    });
   });
 
-  it('returns null when mobileSessionId is empty string', () => {
-    expect(decideForceRoute({ mobileEditorMode: true, mobileSessionId: '' }, true)).toBeNull();
+  it('treats an empty-string mobileSessionId as missing (still force-routes)', () => {
+    expect(
+      decideForceRoute({ mobileEditorMode: true, mobileSessionId: '' }, true)?.metadata,
+    ).toEqual({ routingSource: 'force_route', missingSession: true });
   });
 
-  it('returns null when mobileSessionId is not a string (defensive)', () => {
+  it('treats a non-string mobileSessionId as missing (defensive)', () => {
     expect(
-      decideForceRoute({ mobileEditorMode: true, mobileSessionId: 12345 }, true),
-    ).toBeNull();
+      decideForceRoute({ mobileEditorMode: true, mobileSessionId: 12345 }, true)?.metadata,
+    ).toEqual({ routingSource: 'force_route', missingSession: true });
     expect(
-      decideForceRoute({ mobileEditorMode: true, mobileSessionId: null }, true),
-    ).toBeNull();
+      decideForceRoute({ mobileEditorMode: true, mobileSessionId: null }, true)?.metadata,
+    ).toEqual({ routingSource: 'force_route', missingSession: true });
   });
 
   it('accepts a JSON-string context (matches frontend serialization)', () => {

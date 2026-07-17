@@ -18,6 +18,7 @@
 
 import { getMobileRunnerClientForSession } from './session-runner-routing';
 import type { MobileCompiledPlan } from './mobile-runner.types';
+import { buildTriggerFiredPayload, type TriggerFiredPayload } from '@/services/testing/ui/preview/web-trigger-engine';
 import { logger } from '@/utils/core/logger';
 
 // ── Constants ─────────────────────────────────────────────────────────────
@@ -218,6 +219,12 @@ export interface MobileApplyOutput {
     aiCheckConfidence?: number;
     /** ai_check steps only, pass or fail: 1-2 sentence LLM explanation. */
     aiCheckExplanation?: string;
+    /**
+     * The USER-authored trigger that fired while this step ran, flattened to the
+     * web `TriggerFiredPayload` shape so the mobile editor renders the same
+     * "TRIGGER" step badge + "FIRED" panel highlight as web. Absent otherwise.
+     */
+    triggerFired?: TriggerFiredPayload;
   };
   appliedStep?: {
     id: string;
@@ -406,7 +413,16 @@ export class MobileStepApplyService {
 
           return {
             success: true,
-            stepResult: { success: true, resolvedVia: lintResult.resolvedVia || 'lint', durationMs },
+            stepResult: {
+              success: true,
+              resolvedVia: lintResult.resolvedVia || 'lint',
+              durationMs,
+              // A user trigger cleared a dialog during resolve — flatten to the
+              // web payload so the editor badges which trigger fired.
+              ...(lintResult.triggerFired
+                ? { triggerFired: buildTriggerFiredPayload(lintResult.triggerFired, lintResult.triggerFired.matchedText) }
+                : {}),
+            },
             appliedStep,
             status: 'passed',
           };
@@ -531,6 +547,11 @@ export class MobileStepApplyService {
           : {}),
         ...(stepResult?.aiCheckExplanation !== undefined
           ? { aiCheckExplanation: stepResult.aiCheckExplanation }
+          : {}),
+        // A user trigger fired during this step — flatten to the web payload so
+        // the mobile editor renders the same "TRIGGER"/"FIRED" indicators.
+        ...(stepResult?.triggerFired
+          ? { triggerFired: buildTriggerFiredPayload(stepResult.triggerFired, stepResult.triggerFired.matchedText) }
           : {}),
       },
       appliedStep,
