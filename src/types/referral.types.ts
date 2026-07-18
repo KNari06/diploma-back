@@ -12,6 +12,10 @@ export interface Partner {
   email: string | null;
   authUserId: string | null;
   status: PartnerStatus;
+  /** Per-partner reward share 0..1; null = use the global REFERRAL_REWARD_RATE default. */
+  rewardRate: number | null;
+  /** Per-partner rewarded-payment count; null = use the global REFERRAL_REWARD_MONTHS default. */
+  rewardWindowCount: number | null;
   createdAt: string;
 }
 
