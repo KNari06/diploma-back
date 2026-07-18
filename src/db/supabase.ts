@@ -469,6 +469,16 @@ export class SupabaseService {
     return data;
   }
 
+  // A test result id lives in EITHER the shared web table (test_results) or the
+  // forked mobile table (mobile_test_results). ids are unique UUIDs, so try web
+  // first, then fall back to mobile — mirroring the read fallback in
+  // AIAnalysisJobHandler.getTestResult. Without the mobile branch, an ai_summary
+  // written for a mobile run matched 0 rows in test_results and was silently
+  // dropped, so the report assembler surfaced no bugs for mobile runs.
+  //
+  // CONSTRAINT: `updates` must reference only columns common to BOTH tables (the
+  // sole caller sets `ai_summary`). A web-only column would throw on the mobile
+  // fallback when the id isn't in test_results.
   async updateTestResult(id: string, updates: any) {
     // Validate inputs
     if (!id || typeof id !== 'string') {
@@ -480,27 +490,42 @@ export class SupabaseService {
 
     logger.info('[DB] Updating test result', { resultId: id });
 
-    const { data, error } = await (this.client as any)
-      .from('test_results')
+    const web = await this.updateResultInTable('test_results', id, updates);
+    if (web) {
+      return web as any;
+    }
+
+    // Not found in test_results — the id belongs to a mobile run.
+    const mobile = await this.updateResultInTable('mobile_test_results', id, updates);
+    if (!mobile) {
+      logger.warn('[DB] Test result update matched no row in either table', { resultId: id });
+    }
+    return mobile as any;
+  }
+
+  // Update one result table by id; returns the updated row, or null on a 0-row
+  // match. Throws (after logging table + code) on a real DB error.
+  private async updateResultInTable(
+    table: 'test_results' | 'mobile_test_results',
+    id: string,
+    updates: any,
+  ) {
+    const res = await (this.client as any)
+      .from(table)
       .update(updates) // Don't add updated_at - column doesn't exist in test_results
       .eq('id', id)
       .select()
       .maybeSingle(); // Use maybeSingle() for safety
 
-    if (error) {
-      logger.error('[DB] Failed to update test result', {
+    if (res.error) {
+      logger.error(`[DB] Failed to update test result (${table})`, {
         resultId: id,
-        error: error.message,
-        code: error.code,
+        error: res.error.message,
+        code: res.error.code,
       });
-      throw error;
+      throw res.error;
     }
-
-    if (!data) {
-      logger.warn('[DB] Test result update returned no data', { resultId: id });
-    }
-
-    return data as any;
+    return res.data ?? null;
   }
 
   async getTestResults(testId: string) {

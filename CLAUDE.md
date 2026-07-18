@@ -130,9 +130,9 @@ POST `/api/v1/regression/run` or `/run-plan`
 → runner returns `RunStepsResult` per-step with screenshot + evidence
 → `CompiledPlanPersistenceService.persistFromRun` writes compiled plans back to `intent_test_cases.steps_json`
 → per-step screenshots uploaded base64→URL (`uploadMobileStepScreenshots` in [step-screenshot.service.ts](src/services/storage/step-screenshot.service.ts), gated by `SCREENSHOT_EACH_STEP_ENABLED`) → `runtimeMeta.stepScreenshotUrl` + `metadata.steps[].screenshot`
-→ `createTestResult()` inserts into `test_results` with aggregated stats
+→ `MobileTestRunJobHandler.createTestResult()` (private wrapper) → `dbAdminService.createMobileTestResult()` inserts into the FORKED `mobile_test_results` table (NOT `test_results`; `browser` is CHECK-constrained to `mobile-android`/`mobile-ios`) with aggregated stats
 → **Phase 2 telemetry** ([20260516_mobile_telemetry.sql](supabase-migrations/20260516_mobile_telemetry.sql)): per-test wallclock (`app_setup_ms`, `scenario_steps_ms`, `test_steps_ms`, `session_claim_ms`, `cold_start_used`) written into `test_executions` in `mobile-test-run.job.ts` finally block; aggregated into `regression_runs.total_*` by `TestCompletionHandlerService.recomputeRunStatus()` at run finalisation. Best-effort, NEVER fails the test path.
-→ post-run [ai-analysis.job.ts](src/jobs/ai-analysis.job.ts) → bug detection.
+→ post-run [ai-analysis.job.ts](src/jobs/ai-analysis.job.ts) → bug detection → writes `ai_summary` back via `dbAdminService.updateTestResult` (which tries `test_results` then falls back to `mobile_test_results`, mirroring the read fallback in `getTestResult` — so a mobile run's `ai_summary` lands on its `mobile_test_results` row).
 
 **Mobile regression diverges from web in five ways:** (1) batch RPC (`runSteps`)
 not per-step apply; (2) hardcoded `screenshotEachStep: true`; (3) NO heal layer
