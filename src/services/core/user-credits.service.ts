@@ -128,8 +128,19 @@ export class UserCreditsService {
       return await this.grantInitialBonusIfEligible(existingCredits);
     }
 
-    // Create new credits record with 0 balance
-    // Use upsert to avoid race condition if user is created concurrently
+    // Create new credits record with 0 balance.
+    // Use upsert to avoid a race if the user is created concurrently — but it
+    // MUST be insert-only (ON CONFLICT DO NOTHING), never a merge.
+    //
+    // We reach this branch whenever `existingCredits` is falsy, and getUserCredits
+    // returns null on a TRANSIENT read error too — not only when the row is truly
+    // absent. Without `ignoreDuplicates`, `onConflict` degrades to DO UPDATE, so a
+    // spurious null here would overwrite a funded, paid row back to the free
+    // defaults (credits_balance -> 0, plan -> free/inactive, grace -> 0) with no
+    // credit_transactions entry. That is a real data-loss path — it wiped an
+    // active user's ~8.3k balance on 2026-07-10. `ignoreDuplicates: true` makes
+    // the conflict a no-op; the `if (!data)` refetch below returns the untouched
+    // existing row.
     const { data, error } = await supabaseAdmin
       .from('user_credits')
       .upsert(
@@ -142,6 +153,7 @@ export class UserCreditsService {
         },
         {
           onConflict: 'user_id',
+          ignoreDuplicates: true,
         }
       )
       .select()
