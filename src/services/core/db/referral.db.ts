@@ -15,14 +15,8 @@ export interface PartnerRow {
   email: string | null;
   auth_user_id: string | null;
   status: string;
-  reward_rate: number | null;
-  reward_window_count: number | null;
   created_at: string;
 }
-
-/** Columns selected for every partner read. Keep in one place so all reads match. */
-const PARTNER_COLUMNS =
-  'id, code, name, email, auth_user_id, status, reward_rate, reward_window_count, created_at';
 
 // ── partner lookups ────────────────────────────────────────────────────────
 
@@ -30,7 +24,7 @@ const PARTNER_COLUMNS =
 export async function findPartnerByCode(code: string): Promise<PartnerRow | null> {
   const { data, error } = await supabaseAdmin
     .from('partners')
-    .select(PARTNER_COLUMNS)
+    .select('id, code, name, email, auth_user_id, status, created_at')
     .ilike('code', code)
     .maybeSingle();
 
@@ -42,7 +36,7 @@ export async function findPartnerByCode(code: string): Promise<PartnerRow | null
 export async function findPartnerByAuthUserId(authUserId: string): Promise<PartnerRow | null> {
   const { data, error } = await supabaseAdmin
     .from('partners')
-    .select(PARTNER_COLUMNS)
+    .select('id, code, name, email, auth_user_id, status, created_at')
     .eq('auth_user_id', authUserId)
     .maybeSingle();
 
@@ -54,7 +48,7 @@ export async function findPartnerByAuthUserId(authUserId: string): Promise<Partn
 export async function listPartners(): Promise<PartnerRow[]> {
   const { data, error } = await supabaseAdmin
     .from('partners')
-    .select(PARTNER_COLUMNS)
+    .select('id, code, name, email, auth_user_id, status, created_at')
     .order('created_at', { ascending: false });
 
   if (error) throw error;
@@ -77,7 +71,7 @@ export async function insertPartner(input: {
       email: input.email,
       auth_user_id: input.authUserId,
     })
-    .select(PARTNER_COLUMNS)
+    .select('id, code, name, email, auth_user_id, status, created_at')
     .single();
 
   if (error) throw error;
@@ -86,67 +80,33 @@ export async function insertPartner(input: {
 
 export async function updatePartner(
   id: string,
-  patch: {
-    name?: string;
-    email?: string | null;
-    status?: string;
-    authUserId?: string | null;
-    rewardRate?: number | null;
-    rewardWindowCount?: number | null;
-  }
+  patch: { name?: string; email?: string | null; status?: string; authUserId?: string | null }
 ): Promise<PartnerRow | null> {
   const update: Record<string, unknown> = {};
   if (patch.name !== undefined) update.name = patch.name;
   if (patch.email !== undefined) update.email = patch.email;
   if (patch.status !== undefined) update.status = patch.status;
   if (patch.authUserId !== undefined) update.auth_user_id = patch.authUserId;
-  if (patch.rewardRate !== undefined) update.reward_rate = patch.rewardRate;
-  if (patch.rewardWindowCount !== undefined) update.reward_window_count = patch.rewardWindowCount;
 
   const { data, error } = await supabaseAdmin
     .from('partners')
     .update(update)
     .eq('id', id)
-    .select(PARTNER_COLUMNS);
+    .select('id, code, name, email, auth_user_id, status, created_at');
 
   if (error) throw error;
   return (data?.[0] as PartnerRow | undefined) ?? null;
-}
-
-/** Supabase Auth returns this code when the email is already registered. */
-function isEmailExists(error: unknown): boolean {
-  const code = (error as { code?: string } | null)?.code;
-  const status = (error as { status?: number } | null)?.status;
-  return code === 'email_exists' || status === 422;
 }
 
 /**
  * Invite an email via Supabase Auth (creates the auth user + sends the invite).
  * Returns the new auth user id, or null when Supabase returned no user. Throws
  * on a hard Supabase error; the service treats login provisioning as best-effort.
- * When the email is already registered, resolves the existing synced users row
- * instead (no invite email — the account already exists) so an existing user can
- * still be promoted to a partner login.
  */
 export async function inviteAuthUser(email: string): Promise<string | null> {
   const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email);
-  if (error) {
-    if (isEmailExists(error)) return findUserIdByEmail(email);
-    throw error;
-  }
-  return data?.user?.id ?? null;
-}
-
-/** Resolve the synced public.users row id for an email (case-insensitive). Null if none. */
-export async function findUserIdByEmail(email: string): Promise<string | null> {
-  const { data, error } = await supabaseAdmin
-    .from('users')
-    .select('id')
-    .eq('email', email.trim().toLowerCase())
-    .maybeSingle();
-
   if (error) throw error;
-  return (data as { id: string } | null)?.id ?? null;
+  return data?.user?.id ?? null;
 }
 
 /**
@@ -197,49 +157,6 @@ export async function getUserReferralPartnerId(userId: string): Promise<string |
 
   if (error) throw error;
   return (data?.referred_by_partner_id as string | null | undefined) ?? null;
-}
-
-/** A referred user's partner id + that partner's per-partner reward overrides (null = use global default). */
-export interface UserRewardConfig {
-  partnerId: string;
-  rewardRate: number | null;
-  rewardWindowCount: number | null;
-}
-
-/**
- * Resolve the partner a referred user is attributed to, together with the
- * partner's reward overrides, in a single query. Returns null when the user has
- * no partner. Reward path uses this instead of getUserReferralPartnerId so a
- * custom per-partner rate/window is applied without a second round-trip.
- */
-export async function getUserRewardConfig(userId: string): Promise<UserRewardConfig | null> {
-  const { data, error } = await supabaseAdmin
-    .from('users')
-    .select('referred_by_partner_id, partners:referred_by_partner_id (reward_rate, reward_window_count)')
-    .eq('id', userId)
-    .maybeSingle();
-
-  if (error) throw error;
-  const row = data as {
-    referred_by_partner_id: string | null;
-    partners?: PartnerRewardCols | PartnerRewardCols[] | null;
-  } | null;
-  const partnerId = row?.referred_by_partner_id ?? null;
-  if (!partnerId) return null;
-
-  // Supabase types an embedded relation as an array; a to-one FK yields 0..1 rows.
-  const rel = row?.partners;
-  const partner = Array.isArray(rel) ? rel[0] ?? null : rel ?? null;
-  return {
-    partnerId,
-    rewardRate: partner?.reward_rate ?? null,
-    rewardWindowCount: partner?.reward_window_count ?? null,
-  };
-}
-
-interface PartnerRewardCols {
-  reward_rate: number | null;
-  reward_window_count: number | null;
 }
 
 // ── reward ledger ────────────────────────────────────────────────────────────

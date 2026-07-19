@@ -30,33 +30,9 @@ export const ReferralsFeature = {
     return Math.max(0, Math.floor(n));
   },
 
-  /**
-   * Effective rate for a partner: the per-partner override when set, else the
-   * global default. Clamped 0..1. `override` is null when the partner uses the default.
-   */
-  resolveRewardRate(override: number | null | undefined): number {
-    if (override === null || override === undefined) return this.getRewardRate();
-    const r = Number.isFinite(override) ? (override as number) : 0;
-    return Math.max(0, Math.min(1, r));
-  },
-
-  /**
-   * Effective window for a partner: the per-partner override when set, else the
-   * global default. Floored, >= 0. `override` is null when the partner uses the default.
-   */
-  resolveRewardWindowCount(override: number | null | undefined): number {
-    if (override === null || override === undefined) return this.getRewardWindowCount();
-    const n = Number.isFinite(override) ? (override as number) : 0;
-    return Math.max(0, Math.floor(n));
-  },
-
-  /**
-   * Reward owed for one paid invoice: round(paidAmount * rate), 0 if rate is 0.
-   * `rate` defaults to the global rate when omitted.
-   */
-  computeReward(paidAmountMinorUnits: number, rate?: number): number {
+  /** Reward owed for one paid invoice: round(paidAmount * rate), 0 if rate is 0. */
+  computeReward(paidAmountMinorUnits: number): number {
     if (!Number.isFinite(paidAmountMinorUnits) || paidAmountMinorUnits <= 0) return 0;
-    const effectiveRate = rate === undefined ? this.getRewardRate() : rate;
-    return Math.round(paidAmountMinorUnits * effectiveRate);
+    return Math.round(paidAmountMinorUnits * this.getRewardRate());
   },
 };
