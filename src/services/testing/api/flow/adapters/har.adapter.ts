@@ -6,6 +6,7 @@
 
 import { logger } from '@/utils/core/logger';
 import type { HttpMethod, ParsedApiSpec, ParsedEndpoint, ParsedParameter } from '../flow.types';
+import { ensureUniqueOperationIds } from './adapter-utils';
 
 // Static asset extensions to filter out
 const STATIC_EXTENSIONS = [
@@ -249,6 +250,8 @@ export function parseHarFile(content: string): ParsedApiSpec {
       baseUrl = '';
     }
   }
+
+  ensureUniqueOperationIds(endpoints);
 
   logger.info('[HAR_ADAPTER] Parsed HAR file', {
     totalEntries: har.log.entries.length,

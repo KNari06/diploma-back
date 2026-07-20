@@ -7,6 +7,7 @@
 import SwaggerParser from '@apidevtools/swagger-parser';
 import type { OpenAPI, OpenAPIV2, OpenAPIV3, OpenAPIV3_1 } from 'openapi-types';
 import { logger } from '@/utils/core/logger';
+import { ensureUniqueOperationIds } from './adapter-utils';
 import type {
   ApiSpecSourceType,
   AuthScheme,
@@ -321,16 +322,11 @@ export async function parseOpenApiSpec(
         ? dedupedParams.filter((p: any) => p.in !== 'body')
         : dedupedParams;
 
-      // Generate unique operationId: use spec's operationId if available,
-      // otherwise method_path (sanitized). Append _N suffix if collision detected.
-      let operationId = operation.operationId
+      // operationId: spec's own if present, otherwise method_path (sanitized).
+      // Uniqueness across the spec is enforced once by ensureUniqueOperationIds
+      // below (shared with every other adapter), so no per-endpoint dedup here.
+      const operationId = operation.operationId
         || `${method.toLowerCase()}_${path.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '')}`;
-      const seenOpIds = new Set(endpoints.map(e => e.operationId));
-      if (seenOpIds.has(operationId)) {
-        let suffix = 2;
-        while (seenOpIds.has(`${operationId}_${suffix}`)) suffix++;
-        operationId = `${operationId}_${suffix}`;
-      }
 
       endpoints.push({
         operationId,
@@ -349,6 +345,8 @@ export async function parseOpenApiSpec(
       });
     }
   }
+
+  ensureUniqueOperationIds(endpoints);
 
   // Derive a meaningful title — generic defaults like "OpenAPI definition" are useless
   const rawTitle = anyDoc.info?.title || '';

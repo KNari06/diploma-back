@@ -5,6 +5,7 @@
 
 import { logger } from '@/utils/core/logger';
 import type { HttpMethod, ParsedApiSpec, ParsedEndpoint, ParsedParameter } from '../flow.types';
+import { ensureUniqueOperationIds } from './adapter-utils';
 
 const VALID_HTTP_METHODS: HttpMethod[] = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'];
 
@@ -136,6 +137,8 @@ export function parseInsomniaExport(content: string): ParsedApiSpec {
       hasFileUpload,
     });
   }
+
+  ensureUniqueOperationIds(endpoints);
 
   logger.info('[INSOMNIA_ADAPTER] Parsed export', {
     totalResources: exported.resources.length,

@@ -24,6 +24,7 @@ import { executeApiTest } from '../apiTest.service';
 import { ApiTestStorageService } from '../api-test-storage.service';
 import { FlowBuilderService } from './flow-builder.service';
 import { CookieJar } from './cookie-jar';
+import { redactWithValues } from '@/utils/interpolation/redact-secrets';
 import type {
   ApiFlowSpec,
   DAGNode,
@@ -31,6 +32,7 @@ import type {
   FlowExecutionConfig,
   FlowRunSummary,
   FlowRunStatus,
+  FlowStepBlockedReason,
   FlowStepResult,
   FlowStepStatus,
   NodeCase,
@@ -123,6 +125,28 @@ function interpolateObject(obj: any, ctx: VariableContext): any {
   return obj;
 }
 
+/**
+ * Value for one injection, binding-by-reference aware.
+ *
+ * When the injection names a specific producer (`sourceNodeId`), read that node's
+ * OWN extracted output — so a consumer bound to the admin-realm login gets the
+ * admin token even if a user-realm login later overwrote the shared `auth_token`
+ * slot in the flat context. Falls back to the name-keyed context when there's no
+ * binding (user-provided vars, env vars, older DAGs) or the producer hasn't
+ * emitted that name.
+ */
+function resolveInjectionValue(
+  injection: VariableInjection,
+  ctx: VariableContext,
+  nodeOutputs?: Map<string, Record<string, any>>,
+): any {
+  if (injection.sourceNodeId && nodeOutputs) {
+    const out = nodeOutputs.get(injection.sourceNodeId);
+    if (out && injection.variableName in out) return out[injection.variableName];
+  }
+  return ctx[injection.variableName];
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // VARIABLE EXTRACTION (JSONPath)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -164,22 +188,92 @@ function maskValue(name: string, value: string): string {
   return value;
 }
 
+/**
+ * Every credential value currently in the run context, longest first.
+ *
+ * A flow's secrets don't live under the `secrets.*` namespace that
+ * `collectSecretValues` keys off — they arrive as `auth_token` / `api_key` from the
+ * run dialog, or get extracted from a login response mid-run. So we collect by
+ * NAME here and hand the values to the shared `redactWithValues`, rather than
+ * writing a second redactor.
+ */
+function collectFlowSecretValues(ctx: VariableContext): string[] {
+  const values: string[] = [];
+  for (const [name, raw] of Object.entries(ctx)) {
+    if (!SENSITIVE_PATTERNS.test(name)) continue;
+    const str = raw == null ? '' : String(raw);
+    if (str.length >= 4) values.push(str);
+  }
+  return values.sort((a, b) => b.length - a.length);
+}
+
+/**
+ * Strip credential values from a step result before it leaves the process.
+ *
+ * Hard invariant #10: anything that emits, logs or PERSISTS an interpolated body
+ * redacts first. A flow step carries live credentials in four places at once —
+ * `Authorization: Bearer <jwt>` and `Cookie` headers, a login's request body, the
+ * login response that minted the token, and `variablesExtracted[].value` — and all
+ * four land in `api_flow_runs.summary` and `api_test_executions`.
+ *
+ * Value-based, not name-based: a token pasted into a query string or echoed inside
+ * an unrelated response field gets caught too. Over-masking is never worse than a
+ * leak.
+ */
+function redactStepResult(step: FlowStepResult, secretValues: readonly string[]): FlowStepResult {
+  if (secretValues.length === 0) return step;
+  const scrub = <T,>(v: T): T => {
+    if (typeof v === 'string') return redactWithValues(v, secretValues) as unknown as T;
+    if (Array.isArray(v)) return v.map(scrub) as unknown as T;
+    if (v && typeof v === 'object') {
+      return Object.fromEntries(Object.entries(v).map(([k, val]) => [k, scrub(val)])) as unknown as T;
+    }
+    return v;
+  };
+  return {
+    ...step,
+    resolvedUrl: scrub(step.resolvedUrl),
+    requestHeaders: scrub(step.requestHeaders),
+    requestBody: scrub(step.requestBody),
+    responseBody: scrub(step.responseBody),
+    responseHeaders: scrub(step.responseHeaders),
+    variablesExtracted: step.variablesExtracted.map(e => ({ name: e.name, value: maskValue(e.name, e.value) })),
+  };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // REQUEST BUILDING
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Methods that destroy or overwrite data we did not create.
+ *
+ * POST is excluded on purpose: creating a resource is how a smoke run gets the ids
+ * every later step needs, and it leaves what it made behind rather than removing
+ * something that was already there.
+ */
+const DESTRUCTIVE_METHODS: ReadonlySet<string> = new Set(['DELETE', 'PUT', 'PATCH']);
+
+export const isDestructiveMethod = (method: string): boolean => DESTRUCTIVE_METHODS.has(method.toUpperCase());
 
 function buildResolvedRequest(
   node: DAGNode,
   baseUrl: string,
   ctx: VariableContext,
   nodeOverride?: { requestBody?: any; queryParams?: Record<string, string>; headers?: Record<string, string> },
+  // Per-producer outputs for binding-by-reference injection resolution. Optional:
+  // omitted (or an injection with no sourceNodeId) → name-keyed ctx lookup.
+  nodeOutputs?: Map<string, Record<string, any>>,
 ): {
   resolvedUrl: string;
   resolvedHeaders: Record<string, string>;
   resolvedBody: any;
   variablesInjected: string[];
+  unboundVariables: string[];
+  unresolvedPathParams: string[];
 } {
   const variablesInjected: string[] = [];
+  const unboundVariables: string[] = [];
   const resolvedHeaders: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(nodeOverride?.headers || {}),
@@ -191,11 +285,13 @@ function buildResolvedRequest(
 
   // Apply injections
   for (const injection of node.variableInjections) {
-    const rawValue = ctx[injection.variableName];
+    const rawValue = resolveInjectionValue(injection, ctx, nodeOutputs);
     if (rawValue === undefined) {
+      unboundVariables.push(injection.variableName);
       logger.warn('[FLOW_EXECUTOR] Unresolved injection variable', {
         nodeId: node.id,
         variableName: injection.variableName,
+        injectAs: injection.injectAs,
       });
       continue;
     }
@@ -230,6 +326,12 @@ function buildResolvedRequest(
   // Also resolve any {{var}} in path
   path = interpolate(path, ctx);
 
+  // Anything still braced is a parameter we could not bind — `{id}` from an
+  // unsatisfied path_param, or a `{{var}}` interpolate left alone. Sending it
+  // would put a literal brace on the wire and score the resulting 404 against the
+  // endpoint. The caller blocks the step instead.
+  const unresolvedPathParams = (path.match(/\{{1,2}[^{}]+\}{1,2}/g) || []).map(m => m.replace(/[{}]/g, ''));
+
   // Build query string
   const qsEntries = Object.entries(queryParams);
   if (node.sampleQueryParams) {
@@ -253,7 +355,7 @@ function buildResolvedRequest(
 
   // Apply body field injections
   for (const injection of node.variableInjections) {
-    const rawValue = ctx[injection.variableName];
+    const rawValue = resolveInjectionValue(injection, ctx, nodeOutputs);
     if (rawValue === undefined) continue;
 
     if (injection.injectAs === 'body_field') {
@@ -275,7 +377,7 @@ function buildResolvedRequest(
     }
   }
 
-  return { resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected };
+  return { resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected, unboundVariables, unresolvedPathParams };
 }
 
 /**
@@ -432,6 +534,17 @@ export class FlowExecutorService {
     // Per-run cookie jar: carries Set-Cookie sessions (e.g. cookie-based login)
     // across steps so authenticated follow-up requests aren't rejected with 401.
     const cookieJar = new CookieJar();
+    // Per-producer extracted values, keyed by node id. Powers binding-by-reference
+    // injection: a consumer bound to a specific producer reads THAT node's output
+    // here, so realm-shared names (two logins → `auth_token`) don't clobber.
+    // Written alongside `ctx` at every extraction; `ctx` stays the name-keyed
+    // fallback for `{{var}}` interpolation, user vars, and unbound injections.
+    const nodeOutputs = new Map<string, Record<string, any>>();
+    const recordOutput = (nodeId: string, name: string, value: any): void => {
+      const out = nodeOutputs.get(nodeId) || {};
+      out[name] = value;
+      nodeOutputs.set(nodeId, out);
+    };
     if (flowSpec.environmentId) {
       try {
         const { data: env } = await supabaseAdmin
@@ -515,8 +628,8 @@ export class FlowExecutorService {
     const skippedRow = (
       node: DAGNode,
       stepIndex: number,
-      status: 'skipped' | 'cancelled',
-      reason: 'unsupported' | 'dependency_failed' | 'cancelled',
+      status: 'skipped' | 'cancelled' | 'blocked',
+      reason: 'unsupported' | 'dependency_failed' | 'cancelled' | FlowStepBlockedReason,
       message: string,
     ): void => {
       skippedNodes.add(node.id);
@@ -568,7 +681,7 @@ export class FlowExecutorService {
 
       const runOneCase = async (c: NodeCase): Promise<void> => {
         const { resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected } = buildResolvedRequest(
-          node, baseUrl, ctx, { requestBody: c.requestBody, queryParams: c.queryParams, headers: c.headers },
+          node, baseUrl, ctx, { requestBody: c.requestBody, queryParams: c.queryParams, headers: c.headers }, nodeOutputs,
         );
 
         emit('emitApiFlowStepStart', {
@@ -603,17 +716,18 @@ export class FlowExecutorService {
 
         if (result.responseStatus !== undefined) {
           try {
+            const persisted = redactStepResult(result, collectFlowSecretValues(ctx));
             await ApiTestStorageService.saveApiTestExecution({
               userId,
               testId: randomUUID(),
               chatSessionId,
-              request: { method: node.method, url: result.resolvedUrl, headers: result.requestHeaders, body: result.requestBody },
+              request: { method: node.method, url: persisted.resolvedUrl, headers: persisted.requestHeaders, body: persisted.requestBody },
               response: {
-                status: result.responseStatus || 0,
-                statusText: String(result.responseStatus || 0),
-                headers: result.responseHeaders,
-                body: result.responseBody,
-                durationMs: result.durationMs,
+                status: persisted.responseStatus || 0,
+                statusText: String(persisted.responseStatus || 0),
+                headers: persisted.responseHeaders,
+                body: persisted.responseBody,
+                durationMs: persisted.durationMs,
               },
               success: result.status === 'passed',
               errorMessage: result.error,
@@ -666,9 +780,21 @@ export class FlowExecutorService {
       // `let` so the request can be REBUILT after a 401 auth-refresh updates ctx
       // — otherwise the retry re-sends the stale headers and the new bearer token
       // never lands.
-      let { resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected } = buildResolvedRequest(
-        node, baseUrl, ctx, override,
-      );
+      const built = buildResolvedRequest(node, baseUrl, ctx, override, nodeOutputs);
+      let { resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected } = built;
+      const { unboundVariables, unresolvedPathParams } = built;
+
+      // INVARIANT: never send a request we could not finish addressing. The URL
+      // would carry a literal `{id}`, and the 404 it earns would be reported as
+      // this endpoint's failure instead of our unbound variable.
+      if (unresolvedPathParams.length > 0) {
+        const missing = unboundVariables.length ? unboundVariables.join(', ') : unresolvedPathParams.join(', ');
+        skippedRow(
+          node, stepIndex, 'blocked', 'unbound_variable',
+          `Not attempted: no value for ${missing}. Nothing in this flow produces it — provide it as a run variable, or check the endpoint that should.`,
+        );
+        return;
+      }
 
       emit('emitApiFlowStepStart', {
         flowSpecId: flowSpec.id,
@@ -714,7 +840,7 @@ export class FlowExecutorService {
           const authNode = nodeMap.get(authNodeId)!;
           const authOverride = request.nodeOverrides?.[authNodeId];
           const { resolvedUrl: authUrl, resolvedHeaders: authHeaders, resolvedBody: authBody } = buildResolvedRequest(
-            authNode, baseUrl, ctx, authOverride,
+            authNode, baseUrl, ctx, authOverride, nodeOutputs,
           );
           const authResult = await FlowExecutorService.executeStep(
             authNode, authUrl, authHeaders, authBody, -1, flowRunId, config, abortController.signal, undefined, cookieJar,
@@ -724,13 +850,14 @@ export class FlowExecutorService {
               const value = extractVariable(authResult.responseBody, authResult.responseHeaders || {}, ext);
               if (value !== undefined) {
                 ctx[ext.variableName] = value;
+                recordOutput(authNodeId, ext.variableName, value);
                 variablesResolved++;
               }
             }
             // Rebuild the request so the refreshed token (and any cookie) lands
             // on the retry instead of re-sending the stale headers.
             ({ resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected } = buildResolvedRequest(
-              node, baseUrl, ctx, override,
+              node, baseUrl, ctx, override, nodeOutputs,
             ));
             retryCount++;
             if (retryCount < maxRetries) {
@@ -772,6 +899,7 @@ export class FlowExecutorService {
           const value = extractVariable(finalStepResult.responseBody, finalStepResult.responseHeaders || {}, ext);
           if (value !== undefined) {
             ctx[ext.variableName] = value;
+            recordOutput(nodeId, ext.variableName, value);
             variablesResolved++;
             extractedThisStep.push({ name: ext.variableName, value });
             // Safe across groups: a hard barrier separates groups, so an auth
@@ -809,22 +937,23 @@ export class FlowExecutorService {
 
       if (finalStepResult.responseStatus !== undefined) {
         try {
+          const persisted = redactStepResult(finalStepResult, collectFlowSecretValues(ctx));
           await ApiTestStorageService.saveApiTestExecution({
             userId,
             testId: randomUUID(),
             chatSessionId,
             request: {
               method: node.method,
-              url: finalStepResult.resolvedUrl,
-              headers: finalStepResult.requestHeaders,
-              body: finalStepResult.requestBody,
+              url: persisted.resolvedUrl,
+              headers: persisted.requestHeaders,
+              body: persisted.requestBody,
             },
             response: {
-              status: finalStepResult.responseStatus || 0,
-              statusText: String(finalStepResult.responseStatus || 0),
-              headers: finalStepResult.responseHeaders,
-              body: finalStepResult.responseBody,
-              durationMs: finalStepResult.durationMs,
+              status: persisted.responseStatus || 0,
+              statusText: String(persisted.responseStatus || 0),
+              headers: persisted.responseHeaders,
+              body: persisted.responseBody,
+              durationMs: persisted.durationMs,
             },
             success: finalStepResult.status === 'passed',
             errorMessage: finalStepResult.error,
@@ -899,6 +1028,13 @@ export class FlowExecutorService {
             skippedRow(node, stepIndex, 'skipped', 'unsupported', `Unsupported: ${node.unsupportedReason}`);
             continue;
           }
+          if (!request.allowDestructive && isDestructiveMethod(node.method)) {
+            skippedRow(
+              node, stepIndex, 'blocked', 'destructive_not_consented',
+              `Not attempted: ${node.method} can destroy data on this host. Enable destructive operations for this run to include it.`,
+            );
+            continue;
+          }
           const depFailed = node.dependsOn.some(dep => failedNodes.has(dep) || skippedNodes.has(dep));
           if (depFailed && config.errorStrategy !== 'continue_on_failure') {
             skippedRow(node, stepIndex, 'skipped', 'dependency_failed', 'Skipped: dependency failed');
@@ -938,6 +1074,10 @@ export class FlowExecutorService {
     const nodeRows = stepResults.filter(r => !r.caseId);
     const passed = nodeRows.filter(r => r.status === 'passed').length;
     const failed = nodeRows.filter(r => r.status === 'failed').length;
+    // 'blocked' is counted apart from both: it is our own gap, not an API verdict,
+    // so it must never inflate `failed` (a false bug report) nor hide in `skipped`
+    // (which means "a dependency already failed"). It is the coverage debt.
+    const blocked = nodeRows.filter(r => r.status === 'blocked').length;
     const skipped = nodeRows.filter(r => r.status === 'skipped' || r.status === 'cancelled').length;
     // Sum over node rows only: a parent aggregate row's durationMs is already the
     // sum of its case rows, so summing all rows would double-count case durations.
@@ -953,10 +1093,14 @@ export class FlowExecutorService {
       total: nodeRows.length,
       passed,
       failed,
+      blocked,
       skipped,
       totalDurationMs,
       variablesResolved,
-      stepResults,
+      // Redact ONCE, here: this array is the sole feed for the persisted
+      // `api_flow_runs.summary`, the returned summary and the completion emit. The
+      // live values stay in `ctx`, which never leaves the process.
+      stepResults: stepResults.map(s => redactStepResult(s, collectFlowSecretValues(ctx))),
       startedAt,
       completedAt: new Date().toISOString(),
     };

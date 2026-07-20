@@ -52,14 +52,13 @@ describe('buildResolvedRequest — variable interpolation', () => {
     expect(r.resolvedBody).toEqual({ code: '' });
   });
 
-  it('🐛 numeric 0 / boolean false interpolate to the STRINGS "0" / "false"', () => {
-    // {{n}} with ctx.n === 0 becomes "0"; {{b}} with false becomes "false".
-    // For a JSON body field expected to be a number/bool this is a type change
-    // the API may reject. (Whole-value injection preserves type; string
-    // interpolation does not.)
+  it('✅ a whole-value {{var}} preserves numeric 0 / boolean false types', () => {
+    // A field that IS exactly "{{c}}" substitutes the ctx value with its original
+    // type, so 0 stays 0 and false stays false — a JSON body the API won't reject
+    // on a type mismatch.
     const n = node({ path: '/x', method: 'POST', sampleRequestBody: { count: '{{c}}', flag: '{{f}}' } });
     const r = buildResolvedRequest(n, BASE, { c: 0 as any, f: false as any });
-    expect(r.resolvedBody).toEqual({ count: '0', flag: 'false' });
+    expect(r.resolvedBody).toEqual({ count: 0, flag: false });
   });
 });
 
@@ -71,26 +70,25 @@ describe('buildResolvedRequest — variable injection', () => {
     expect(r.resolvedHeaders.Authorization).toBe('Bearer T1');
   });
 
-  it('🐛 body_field injection on an ARRAY body sets a named prop that JSON.stringify silently drops', () => {
-    // typeof [] === 'object', so `resolvedBody[targetKey] = value` sets a NAMED
-    // property on the array object (arr.userId). It is present on the JS value
-    // but NOT serialized by JSON.stringify — so the injected userId never
-    // reaches the wire. CORRECT: inject into each element, or warn.
+  it('✅ body_field injection on an ARRAY body materializes an object so the field is not silently dropped', () => {
+    // A named prop on an array is present in JS but dropped by JSON.stringify. To
+    // avoid that silent loss, a non-plain-object body is replaced by an object
+    // container the field lands on. Injecting a scalar field into an array body is
+    // itself ill-formed; the array payload yields to the visible field.
     const n = node({ path: '/x', method: 'POST', sampleRequestBody: [{ a: 1 }],
       variableInjections: [{ variableName: 'uid', injectAs: 'body_field', targetKey: 'userId' }] });
     const r = buildResolvedRequest(n, BASE, { uid: 'U1' });
-    expect((r.resolvedBody as any).userId).toBe('U1');            // set on the array object
-    expect(JSON.stringify(r.resolvedBody)).toBe('[{"a":1}]');     // but lost on serialize
-    expect(JSON.stringify(r.resolvedBody)).not.toContain('userId');
+    expect(r.resolvedBody).toEqual({ userId: 'U1' });
+    expect(JSON.stringify(r.resolvedBody)).toContain('userId');
   });
 
-  it('🐛 body_field injection is silently dropped when there is NO body', () => {
-    // Unlike body_json_path (which creates {}), body_field no-ops on an absent
-    // body. An injection meant to BE the body is lost.
+  it('✅ body_field injection materializes a container when there is NO body', () => {
+    // Like body_json_path, body_field now creates an object container for an absent
+    // body, so an injection meant to BE the body lands instead of being lost.
     const n = node({ path: '/x', method: 'POST',
       variableInjections: [{ variableName: 'uid', injectAs: 'body_field', targetKey: 'userId' }] });
     const r = buildResolvedRequest(n, BASE, { uid: 'U1' });
-    expect(r.resolvedBody).toBeUndefined();
+    expect(r.resolvedBody).toEqual({ userId: 'U1' });
   });
 
   it('🐛 a path_param whose {token} is absent from the path silently no-ops but is still reported injected', () => {
@@ -119,13 +117,13 @@ describe('setByJsonPath', () => {
     expect(t).toEqual({ user: { profile: { id: 'X' } } });
   });
 
-  it('🐛 an array-index segment becomes an OBJECT key, not an array element', () => {
-    // items[0] → { items: { "0": {...} } } instead of { items: [ {...} ] }.
-    // An API expecting a JSON array receives an object.
+  it('✅ an array-index segment becomes an array element, not an object key', () => {
+    // items[0] → { items: [ {...} ] }: a numeric next-segment makes the level an
+    // array, so an API expecting a JSON array receives one.
     const t: any = {};
     setByJsonPath(t, '$.items[0].id', 'X');
-    expect(t).toEqual({ items: { '0': { id: 'X' } } });
-    expect(Array.isArray(t.items)).toBe(false);
+    expect(t).toEqual({ items: [{ id: 'X' }] });
+    expect(Array.isArray(t.items)).toBe(true);
   });
 
   it('🐛 an intermediate primitive is clobbered into an object', () => {
