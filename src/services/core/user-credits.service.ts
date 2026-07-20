@@ -14,16 +14,26 @@ import { logger } from '@/utils/core/logger';
  * Single source of truth — used by the UserCredits row type, updateSubscription,
  * and grantBusinessPlan so the three can never drift out of sync again.
  */
-export type SubscriptionPlanSlug =
-  | 'free'
-  | 'basic'
-  | 'pro'
-  | 'ultra'
-  | 'pilot'
-  | 'small_business'
-  | 'middle_business'
-  | 'enterprise'
-  | 'business';
+/**
+ * Single source of truth for every plan slug `user_credits.subscription_plan`
+ * understands. Runtime array so it can back `.includes()` checks; the type below
+ * is derived from it, so a new tier is added in ONE place and every consumer
+ * (validation, grace map, plan.service credit mirror) stays in sync — no second
+ * hand-maintained allowlist that can silently coerce an unknown slug to 'free'.
+ */
+export const SUBSCRIPTION_PLAN_SLUGS = [
+  'free',
+  'basic',
+  'pro',
+  'ultra',
+  'pilot',
+  'small_business',
+  'middle_business',
+  'enterprise',
+  'business',
+] as const;
+
+export type SubscriptionPlanSlug = (typeof SUBSCRIPTION_PLAN_SLUGS)[number];
 
 export interface UserCredits {
   id: string;
@@ -881,11 +891,7 @@ export class UserCreditsService {
         return false;
       }
 
-      const validPlans: SubscriptionPlanSlug[] = [
-        'free', 'basic', 'pro', 'ultra',
-        'pilot', 'small_business', 'middle_business', 'enterprise', 'business',
-      ];
-      if (!validPlans.includes(plan)) {
+      if (!(SUBSCRIPTION_PLAN_SLUGS as readonly string[]).includes(plan)) {
         logger.error('[USER_CREDITS] Invalid plan in updateSubscription', { userId, plan });
         return false;
       }

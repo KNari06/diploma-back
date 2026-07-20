@@ -1,5 +1,9 @@
 import { logger } from '@/utils/core/logger';
-import { UserCreditsService } from '@/services/core/user-credits.service';
+import {
+  UserCreditsService,
+  SUBSCRIPTION_PLAN_SLUGS,
+  type SubscriptionPlanSlug,
+} from '@/services/core/user-credits.service';
 import {
   clearUserPlanToFree,
   getCurrentPlanSlug,
@@ -8,9 +12,13 @@ import {
 } from '@/services/core/db/plan.db';
 import { isFreeSlug } from '@/services/core/db/plan-access.db';
 
-/** Subscription plans understood by user_credits.subscription_plan. */
-type CreditPlan = 'free' | 'basic' | 'pro' | 'ultra' | 'enterprise' | 'business';
-const CREDIT_PLANS: readonly CreditPlan[] = ['free', 'basic', 'pro', 'ultra', 'enterprise', 'business'];
+/**
+ * Plans the credit-side mirror understands. Reuses the single source of truth
+ * in user-credits.service (do NOT hand-maintain a second copy — a slug missing
+ * here would silently coerce a real paid plan to 'free' on the credit side).
+ */
+type CreditPlan = SubscriptionPlanSlug;
+const CREDIT_PLANS: readonly CreditPlan[] = SUBSCRIPTION_PLAN_SLUGS;
 
 export interface SetUserPlanOptions {
   /**
