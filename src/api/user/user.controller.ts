@@ -1,12 +1,21 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
+import {
+  AdminPlanGrantService,
+  ALL_ADMIN_GRANT_SLUGS,
+  isAdminGrantSlug,
+} from '@/services/core/admin-plan-grant.service';
 import { logger } from '@/utils/core/logger';
 import { isValidUUID } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
 
 // Maximum credit amount to prevent DoS/integer overflow
 const MAX_CREDIT_AMOUNT = 1000000;
+
+// Upper bound for an admin-entered plan price (USD), to catch fat-finger typos
+// that would corrupt revenue reporting. Fits NUMERIC(10,2).
+const MAX_PLAN_PRICE_USD = 1000000;
 
 // Maximum limit for history query
 const MAX_HISTORY_LIMIT = 500;
@@ -571,7 +580,7 @@ export const assignUserPlan = async (req: Request, res: Response): Promise<void>
     // header. The route is guarded by requireAdmin; this is a defense-in-depth
     // recheck against the same trusted identity.
     const adminUserId = req.user?.id;
-    const { user_id, plan_slug } = req.body;
+    const { user_id, plan_slug, credits, price_usd } = req.body;
 
     if (!adminUserId || !(await isAdmin(adminUserId))) {
       res.status(403).json({
@@ -596,12 +605,47 @@ export const assignUserPlan = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    if (!plan_slug || !['free', 'pro', 'team'].includes(plan_slug)) {
+    // Assignable plans: individual (free/pro) + B2B tiers (pilot / small_business
+    // / middle_business / enterprise). B2B tiers accept optional credits/price
+    // overrides (discount) — presets fill in when omitted.
+    if (!plan_slug || !isAdminGrantSlug(plan_slug)) {
       res.status(400).json({
         success: false,
         error: 'Invalid plan slug',
         code: 'INVALID_PLAN_SLUG',
-        message: 'Plan slug must be one of: free, pro, team',
+        message: `Plan slug must be one of: ${ALL_ADMIN_GRANT_SLUGS.join(', ')}`,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Optional numeric overrides — reject malformed OR out-of-range values rather
+    // than silently coercing (a bad credits value would mis-grant a paying
+    // customer; an uncapped price corrupts revenue reporting). Cap credits at the
+    // same MAX_CREDIT_AMOUNT as purchaseCredits for consistency; cap price to a
+    // generous bound to catch fat-finger typos.
+    if (
+      credits !== undefined &&
+      (typeof credits !== 'number' || !Number.isFinite(credits) || credits < 0 || credits > MAX_CREDIT_AMOUNT)
+    ) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid credits',
+        code: 'INVALID_CREDITS',
+        message: `credits must be a number between 0 and ${MAX_CREDIT_AMOUNT}`,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+    if (
+      price_usd !== undefined &&
+      (typeof price_usd !== 'number' || !Number.isFinite(price_usd) || price_usd < 0 || price_usd > MAX_PLAN_PRICE_USD)
+    ) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid price',
+        code: 'INVALID_PRICE',
+        message: `price_usd must be a number between 0 and ${MAX_PLAN_PRICE_USD}`,
         timestamp: new Date().toISOString(),
       });
       return;
@@ -611,16 +655,24 @@ export const assignUserPlan = async (req: Request, res: Response): Promise<void>
       adminUserId: adminUserId.substring(0, 8) + '...',
       userId: user_id.substring(0, 8) + '...',
       planSlug: plan_slug,
+      credits,
+      priceUsd: price_usd,
     });
 
-    const success = await PricingPlansService.assignPlanToUser(user_id, plan_slug);
+    const result = await AdminPlanGrantService.grant({
+      userId: user_id,
+      planSlug: plan_slug,
+      creditsOverride: credits,
+      priceUsd: price_usd,
+      grantedByAdminId: adminUserId,
+    });
 
-    if (!success) {
+    if (!result.success) {
       res.status(400).json({
         success: false,
         error: 'Failed to assign plan',
         code: 'PLAN_ASSIGNMENT_FAILED',
-        message: 'Could not assign plan to user',
+        message: result.error || 'Could not assign plan to user',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -631,6 +683,8 @@ export const assignUserPlan = async (req: Request, res: Response): Promise<void>
       message: 'Plan assigned successfully',
       user_id,
       plan_slug,
+      credits_granted: result.creditsGranted,
+      price_usd: result.priceUsd,
       timestamp: new Date().toISOString(),
     });
 

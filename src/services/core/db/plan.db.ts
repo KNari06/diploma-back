@@ -93,6 +93,50 @@ export async function writeUserPlan(params: {
 }
 
 /**
+ * Write the `users` plan mirror for a B2B tier that has NO `pricing_plans` row
+ * (pilot / small_business / middle_business / enterprise). Sets `plan_id = null`
+ * (there is no pricing row to point at — the paid-gate still passes via the
+ * secondary `userHasPaidBusinessPlan` check on `user_credits.subscription_plan`)
+ * and mirrors the slug + status text so `users.plan` stops drifting from
+ * `user_credits.subscription_plan` (the split-brain where a B2B user showed
+ * `users.plan='pro'`). Optionally resets per-period usage counters for a real
+ * grant. Credits themselves are written separately by grantBusinessPlan.
+ */
+export async function writeUserBusinessPlanMirror(params: {
+  userId: string;
+  planSlug: string;
+  resetUsageCounters: boolean;
+}): Promise<boolean> {
+  const update: Record<string, unknown> = {
+    plan_id: null,
+    plan: params.planSlug,
+    plan_status: 'paid',
+  };
+
+  if (params.resetUsageCounters) {
+    const now = new Date();
+    const today = now.toISOString().split('T')[0];
+    update.plan_started_at = now.toISOString();
+    update.credits_used_today = 0;
+    update.credits_used_this_month = 0;
+    update.last_credit_reset_date = today;
+    update.monthly_reset_date = today;
+  }
+
+  const { error } = await supabaseAdmin.from('users').update(update).eq('id', params.userId);
+
+  if (error) {
+    logger.error('[PLAN_DB] Error writing user business-plan mirror', {
+      error: error.message,
+      userId: params.userId,
+      planSlug: params.planSlug,
+    });
+    return false;
+  }
+  return true;
+}
+
+/**
  * Clear the user's plan to free WITHOUT depending on a pricing_plans 'free'
  * row: writes `plan_id = null` (which getUserPlanSlug treats as free) + the
  * text/status mirrors. Fallback for a terminal downgrade (Stripe cancellation)

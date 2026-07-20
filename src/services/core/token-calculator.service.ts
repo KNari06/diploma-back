@@ -4,12 +4,10 @@ import { logger } from '@/utils/core/logger';
  * Token Calculator Service
  * Converts between tokens and credits for accurate billing
  *
- * PRICING MODEL (as of 2024):
- * - Pro Plan: $28.9/month = 1000 credits
- * - Ultra Plan: $43.9/month = 1000 credits
- * - Business Plan: $590/month = 30,000 credits (up to 5 QA engineers)
- * - 1 credit = 562.5 tokens
- * - Margin: 83-89%
+ * PRICING MODEL: individual self-serve = Free (50) / Pro ($28.9, 1000 credits).
+ * Team/Enterprise = the B2B tiers in WORKSPACE_PLANS below (granted by admin or
+ * Stripe, credits belong to the USER's user_credits, not a workspace). The old
+ * individual "ultra"/"Team" plan is retired. 1 credit = 562.5 tokens.
  */
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -72,12 +70,14 @@ export const TEST_CREDITS = {
 export const MOBILE_STEP_CREDIT_MULTIPLIER = 4;
 
 /**
- * Individual subscription plans (user_credits)
+ * Individual subscription plans (user_credits). Self-serve individual tiers only
+ * — Free + Pro. The former 'ultra' ("Team") individual plan was retired (0 users,
+ * = Pro credits, not self-serve purchasable); the real Team/Enterprise offering
+ * is the B2B WORKSPACE_PLANS below.
  */
 export const INDIVIDUAL_PLANS = {
   free: { price: 0, credits: 50 },
   pro: { price: 28.9, credits: 1000 },
-  ultra: { price: 43.9, credits: 1000 },
 } as const;
 
 /**
