@@ -56,7 +56,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
       success: false,
       error: 'Upgrade required',
       code: 'UPGRADE_REQUIRED',
-      message: `${PAID_FEATURE_LABELS.MOBILE_TESTING} is available on the Pro plan. Upgrade to run mobile tests via CI.`,
+      message: `${PAID_FEATURE_LABELS.MOBILE_TESTING} is available on paid plans. Upgrade to run mobile tests via CI.`,
     });
     return;
   }

@@ -13,7 +13,7 @@
 
 import type { Request, Response } from 'express';
 import { assignUserPlan } from '../user.controller';
-import { PricingPlansService } from '@/services/core/pricing-plans.service';
+import { AdminPlanGrantService } from '@/services/core/admin-plan-grant.service';
 
 const ADMIN_ID = '11111111-1111-4111-8111-111111111111';
 const ATTACKER_ID = '22222222-2222-4222-8222-222222222222';
@@ -43,7 +43,15 @@ jest.mock('@/db/supabase', () => ({
   },
 }));
 
-jest.spyOn(PricingPlansService, 'assignPlanToUser').mockResolvedValue(true);
+// The controller now routes plan grants through AdminPlanGrantService (the single
+// entry that keeps users + user_credits in sync). Stub it so these tests focus on
+// the security/validation gate, not the grant internals.
+jest.spyOn(AdminPlanGrantService, 'grant').mockResolvedValue({
+  success: true,
+  planSlug: 'pro',
+  creditsGranted: null,
+  priceUsd: null,
+});
 
 function mockRes() {
   const res: Partial<Response> & { statusCode?: number; body?: any } = {};
@@ -70,7 +78,12 @@ function mockReq(overrides: Partial<Request>): Request {
 describe('assignUserPlan — admin identity from JWT, not header', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    (PricingPlansService.assignPlanToUser as jest.Mock).mockResolvedValue(true);
+    (AdminPlanGrantService.grant as jest.Mock).mockResolvedValue({
+      success: true,
+      planSlug: 'pro',
+      creditsGranted: null,
+      priceUsd: null,
+    });
   });
 
   it('rejects a non-admin caller even when a spoofed admin x-user-id header is sent', async () => {
@@ -85,7 +98,7 @@ describe('assignUserPlan — admin identity from JWT, not header', () => {
     expect(res.statusCode).toBe(403);
     expect(res.body?.code).toBe('ACCESS_DENIED');
     // The header must never grant access, and no plan is written.
-    expect(PricingPlansService.assignPlanToUser).not.toHaveBeenCalled();
+    expect(AdminPlanGrantService.grant).not.toHaveBeenCalled();
   });
 
   it('rejects when there is no authenticated user (req.user absent)', async () => {
@@ -95,7 +108,7 @@ describe('assignUserPlan — admin identity from JWT, not header', () => {
     await assignUserPlan(req, res);
 
     expect(res.statusCode).toBe(403);
-    expect(PricingPlansService.assignPlanToUser).not.toHaveBeenCalled();
+    expect(AdminPlanGrantService.grant).not.toHaveBeenCalled();
   });
 
   it('allows a genuine admin (JWT identity) and assigns the plan', async () => {
@@ -105,13 +118,31 @@ describe('assignUserPlan — admin identity from JWT, not header', () => {
     await assignUserPlan(req, res);
 
     expect(res.body?.success).toBe(true);
-    expect(PricingPlansService.assignPlanToUser).toHaveBeenCalledWith(TARGET_ID, 'pro');
+    expect(AdminPlanGrantService.grant).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: TARGET_ID, planSlug: 'pro', grantedByAdminId: ADMIN_ID }),
+    );
+  });
+
+  it('accepts a B2B tier slug (enterprise) for an admin caller', async () => {
+    const req = mockReq({
+      user: { id: ADMIN_ID, role: 'admin' } as any,
+      body: { user_id: TARGET_ID, plan_slug: 'enterprise' },
+    });
+    const res = mockRes();
+
+    await assignUserPlan(req, res);
+
+    // enterprise is now a valid assignable B2B tier — the grant is attempted.
+    expect(res.body?.success).toBe(true);
+    expect(AdminPlanGrantService.grant).toHaveBeenCalledWith(
+      expect.objectContaining({ planSlug: 'enterprise' }),
+    );
   });
 
   it('validates the plan slug for an admin caller (rejects unknown slug)', async () => {
     const req = mockReq({
       user: { id: ADMIN_ID, role: 'admin' } as any,
-      body: { user_id: TARGET_ID, plan_slug: 'enterprise' }, // not in [free, pro, team]
+      body: { user_id: TARGET_ID, plan_slug: 'bogus_plan' }, // not an assignable slug
     });
     const res = mockRes();
 
@@ -119,6 +150,20 @@ describe('assignUserPlan — admin identity from JWT, not header', () => {
 
     expect(res.statusCode).toBe(400);
     expect(res.body?.code).toBe('INVALID_PLAN_SLUG');
-    expect(PricingPlansService.assignPlanToUser).not.toHaveBeenCalled();
+    expect(AdminPlanGrantService.grant).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed credits override (not a number)', async () => {
+    const req = mockReq({
+      user: { id: ADMIN_ID, role: 'admin' } as any,
+      body: { user_id: TARGET_ID, plan_slug: 'enterprise', credits: 'lots' },
+    });
+    const res = mockRes();
+
+    await assignUserPlan(req, res);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.code).toBe('INVALID_CREDITS');
+    expect(AdminPlanGrantService.grant).not.toHaveBeenCalled();
   });
 });
