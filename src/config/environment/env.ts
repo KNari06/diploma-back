@@ -375,6 +375,28 @@ const envSchema = z.object({
   // ON by default; pair with the artifact-retention job (prunes old
   // screenshots) so storage doesn't grow unbounded.
   // ──────────────────────────────────────────────────────────────────
+  // ──────────────────────────────────────────────────────────────────
+  // Import credit charging (Allure ZIP / PDF / CSV → intent_test_cases).
+  // AI-powered imports run multiple LLM calls; historically they charged 0
+  // credits and logged 0 usage. When ON, a completed import deducts
+  // IMPORT_CREDITS_PER_TEST × testsImported and logs AI usage. Default OFF so
+  // it can dark-launch (usage logging fills first) before deduction flips on.
+  // ──────────────────────────────────────────────────────────────────
+  IMPORT_CREDITS_ENABLED: z.string().transform(v => v === 'true').default('false'),
+  // Credits charged per successfully imported test case. Decimal-safe.
+  IMPORT_CREDITS_PER_TEST: z.string().transform(Number).default('1'),
+  // ──────────────────────────────────────────────────────────────────
+  // Authoring credit charging (step-editor Apply that needed the LLM).
+  // Element resolution is a 5-stage waterfall; identity/evidence/compiled
+  // resolve for free, only the LLM/vision stages (resolverPath 'llm'/'vision')
+  // spend money. When ON, a successful Apply that used the LLM deducts
+  // AUTHORING_CREDITS_PER_RESOLVE, deduped once per (session, step). Lint and
+  // the background observer are NOT charged (too frequent / background).
+  // Default OFF — independent of import's flag so each ships on its own.
+  // ──────────────────────────────────────────────────────────────────
+  AUTHORING_CREDITS_ENABLED: z.string().transform(v => v === 'true').default('false'),
+  // Credits charged per AI-assisted (llm/vision) Apply. Decimal-safe.
+  AUTHORING_CREDITS_PER_RESOLVE: z.string().transform(Number).default('1'),
   SCREENSHOT_EACH_STEP_ENABLED: z.string().transform(v => v === 'true').default('true'),
   // Encoding format: 'webp' (smaller, via sharp) or 'jpeg' (Playwright-native).
   SCREENSHOT_FORMAT: z.enum(['webp', 'jpeg']).default('webp'),
