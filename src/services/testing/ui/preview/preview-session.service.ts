@@ -1745,6 +1745,15 @@ export class PreviewSessionService {
         clearAuthDetectorSession(sessionId);
       } catch { /* best effort */ }
 
+      // Release the authoring-credits dedup entries for this session. This is
+      // the teardown path taken by TTL eviction and explicit stops (the common
+      // case), so without it the in-memory dedup Set accumulates for the whole
+      // process lifetime. Mirrors the clear in stopSessionInternal.
+      try {
+        const { AuthoringCreditsService } = await import('@/services/core/authoring-credits.service');
+        AuthoringCreditsService.clearSession(sessionId);
+      } catch { /* non-critical */ }
+
       // Remove from maps
       this.sessions.delete(sessionId);
       this.userToSession.delete(session.userId);
@@ -1773,6 +1782,13 @@ export class PreviewSessionService {
     }
 
     logger.info('[PREVIEW_SESSION] Stopping session (internal)', { sessionId, userId: session.userId });
+
+    // Release the authoring-credits dedup entries for this session so the
+    // in-memory guard doesn't accumulate across the process lifetime.
+    try {
+      const { AuthoringCreditsService } = await import('@/services/core/authoring-credits.service');
+      AuthoringCreditsService.clearSession(sessionId);
+    } catch { /* non-critical — dedup set is bounded per session anyway */ }
 
     // Safety-net: close and upload editor trace (idempotent — no-op if already closed)
     try {

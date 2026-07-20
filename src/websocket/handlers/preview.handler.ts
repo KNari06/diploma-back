@@ -2161,6 +2161,29 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         confirmedSelections.delete(selectionKey);
       }
 
+      // Charge credits for an AI-assisted apply. Only fires when the element
+      // needed the LLM (resolverPath 'llm'/'vision') — identity/evidence/
+      // compiled resolves are free. Feature-gated + deduped per (session, step).
+      // Fire-and-forget: billing must never delay or fail the apply result.
+      if (result.success) {
+        void import('@/services/core/authoring-credits.service')
+          .then(({ AuthoringCreditsService }) =>
+            AuthoringCreditsService.chargeForApply({
+              userId: ensuredUserId,
+              previewSessionId,
+              stepId: stepDraft.id,
+              resolverPath: result.resolverPath,
+            }),
+          )
+          .catch((err) => {
+            logger.warn('[WebSocket] Authoring credit charge failed (non-fatal)', {
+              previewSessionId,
+              stepId: stepDraft.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+      }
+
       // Phase 2.5: redact `secrets.*` values from the WS payload before
       // sending to the browser. After `applyStep` finished, `appliedStep`
       // carries the post-interpolation `value` / `assertionText` — that's

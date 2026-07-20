@@ -24,7 +24,7 @@ export interface TokenUsage {
 
 export interface CreditDeduction {
   userId: string;
-  testType: 'intelligent' | 'standard' | 'api' | 'chat';
+  testType: 'intelligent' | 'standard' | 'api' | 'chat' | 'import';
   tokens?: TokenUsage;
   credits: number;
   costUSD: number;
@@ -237,7 +237,7 @@ export class CreditCostTrackerService {
         throw new Error('Invalid userId');
       }
 
-      if (!deduction.testType || !['intelligent', 'standard', 'api', 'chat'].includes(deduction.testType)) {
+      if (!deduction.testType || !['intelligent', 'standard', 'api', 'chat', 'import'].includes(deduction.testType)) {
         throw new Error('Invalid testType');
       }
 
