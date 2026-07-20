@@ -274,7 +274,7 @@ export const runFlow = async (req: Request, res: Response): Promise<void> => {
     const userId = getUserId(req);
     if (!userId) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
     const { id } = req.params;
-    const { config, chatSessionId, nodeOverrides, initialVariables } = req.body as RunFlowRequest;
+    const { config, chatSessionId, nodeOverrides, initialVariables, allowDestructive } = req.body as RunFlowRequest;
 
     const flowSpec = await FlowBuilderService.getById(id, userId);
     if (!flowSpec) {
@@ -319,7 +319,11 @@ export const runFlow = async (req: Request, res: Response): Promise<void> => {
       ...(config || {}),
     } as any, chatSessionId);
 
-    const runRequest: RunFlowRequest = { config, chatSessionId, nodeOverrides, initialVariables };
+    // Consent must be an explicit `true` from the caller — never a truthy string.
+    const runRequest: RunFlowRequest = {
+      config, chatSessionId, nodeOverrides, initialVariables,
+      allowDestructive: allowDestructive === true,
+    };
 
     // Start execution async — refund credits on catastrophic failure (not step failures)
     FlowExecutorService.execute(flowSpec, userId, runRequest, flowRunId).catch(async (error) => {

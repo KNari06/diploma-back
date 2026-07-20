@@ -24,6 +24,7 @@ import type {
   ParsedResponse,
 } from '../flow.types';
 import { callAiWithRetry, extractJson } from '../ai-json.util';
+import { ensureUniqueOperationIds } from './adapter-utils';
 
 const VALID_HTTP_METHODS: HttpMethod[] = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'];
 const VALID_PARAM_LOCATIONS = new Set(['path', 'query', 'header', 'cookie']);
@@ -213,6 +214,8 @@ export async function parsePythonScript(content: string): Promise<ParsedApiSpec>
         'Supported styles: requests, httpx, aiohttp, urllib, and pytest test files.',
     );
   }
+
+  ensureUniqueOperationIds(endpoints);
 
   const authSchemes = normalizeAuthSchemes(parsed.authSchemes);
   const baseUrl = deriveBaseUrl(parsed.baseUrl);

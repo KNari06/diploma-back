@@ -2962,10 +2962,12 @@ export interface ApiFlowStepSkippedPayload {
   sessionId: string;
   stepIndex: number;
   nodeId: string;
-  // 'unsupported' | dependency failure | user cancelled — drives node visual state
-  reason: 'unsupported' | 'dependency_failed' | 'cancelled';
-  // when reason === 'cancelled' the frontend renders the node as 'cancelled', else 'skipped'
-  status: 'skipped' | 'cancelled';
+  // Drives the node's visual state. The `blocked` reasons mean we never sent a
+  // valid request (unbound variable / destructive call without consent) — that is
+  // OUR gap, not an API failure, and must not render as one.
+  reason: 'unsupported' | 'dependency_failed' | 'cancelled' | 'unbound_variable' | 'destructive_not_consented';
+  // frontend renders the node as this status verbatim
+  status: 'skipped' | 'cancelled' | 'blocked';
   message?: string;
   timestamp: string;
 }
