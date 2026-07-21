@@ -132,7 +132,7 @@ export class ExplorationStorageService {
           description?: string;
           status?: string;
           intentSteps?: unknown[];
-          assertions?: Array<{ type?: string; expect?: string; afterStep?: number }>;
+          assertions?: Array<{ type?: string; expect?: string; afterStep?: number; source?: 'tree' | 'screenshot' }>;
           preconditions?: string[];
         }>;
       };
@@ -494,13 +494,23 @@ export class ExplorationStorageService {
   }
 }
 
-type MobileAssertion = { type?: string; expect?: string; afterStep?: number };
+type MobileAssertion = { type?: string; expect?: string; afterStep?: number; source?: 'tree' | 'screenshot' };
 
 /** Build one runnable ai_check step from an observation assertion. Shape mirrors
- *  the negative-generator's mobile ai_check (aiCheckSource:'tree' → the runner
- *  maps it to an `ai_visual_check`; assertionText is REQUIRED). expectedOutcome
- *  :'success' — exploration flows are happy paths (inverse of a negative). */
-function makeAiCheckStep(expect: string, seq: number): Record<string, unknown> {
+ *  the negative-generator's mobile ai_check (aiCheckSource → the runner maps it
+ *  to an `ai_visual_check`; assertionText is REQUIRED). expectedOutcome:'success'
+ *  — exploration flows are happy paths (inverse of a negative).
+ *
+ *  `source` comes from the explorer's assert_observation tool: 'screenshot' for
+ *  visual / which-screen facts the single-frame a11y tree can't prove (a bare
+ *  'tree' check of those fails as Inconclusive even when the app is correct),
+ *  else 'tree'. Defaults to 'tree' when the explorer didn't flag it — the safe,
+ *  cheaper path for text/state assertions, which are the majority. */
+function makeAiCheckStep(
+  expect: string,
+  seq: number,
+  source: 'tree' | 'screenshot' = 'tree',
+): Record<string, unknown> {
   return {
     id: `expl_check_${seq}_${Date.now().toString(36)}`,
     type: 'ai_check',
@@ -508,7 +518,7 @@ function makeAiCheckStep(expect: string, seq: number): Record<string, unknown> {
     assertionText: expect,
     value: expect,
     expectedOutcome: 'success' as const,
-    options: { aiCheckSource: 'tree' as const },
+    options: { aiCheckSource: source },
   };
 }
 
@@ -535,13 +545,14 @@ function insertMobileAssertionSteps(
       const raw = typeof a.afterStep === 'number' ? a.afterStep : steps.length;
       // Clamp 1..steps.length; 0 or out-of-range → append at end.
       const idx = raw >= 1 && raw <= steps.length ? raw : steps.length;
-      return { idx, seq: i, expect: (a.expect as string).trim() };
+      const source = a.source === 'screenshot' ? 'screenshot' as const : 'tree' as const;
+      return { idx, seq: i, expect: (a.expect as string).trim(), source };
     })
     // Descending by insert index so splices don't invalidate earlier indices;
     // ties keep authoring order (stable via seq).
     .sort((x, y) => y.idx - x.idx || y.seq - x.seq);
   for (const p of positioned) {
-    result.splice(p.idx, 0, makeAiCheckStep(p.expect, p.seq));
+    result.splice(p.idx, 0, makeAiCheckStep(p.expect, p.seq, p.source));
   }
   return result;
 }
