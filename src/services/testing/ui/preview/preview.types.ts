@@ -1941,6 +1941,8 @@ export interface IntentTestCase {
   // Organization
   flowId?: string;
   flowName?: string;
+  moduleId?: string;
+  moduleName?: string;
   dependsOn?: string[];
   resolvedDependencies?: Array<{ id: string; name: string }>;
 

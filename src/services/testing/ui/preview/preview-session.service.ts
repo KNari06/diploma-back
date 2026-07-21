@@ -253,7 +253,20 @@ async function navigateWithProgress(
   }, PROGRESS_EMIT_INTERVAL_MS);
 
   try {
-    await page.goto(url, opts as any);
+    // Retry ONCE on a timeout — the first navigation to a cold site (DNS/TLS/CDN
+    // warm-up + a transient network blip) can miss the deadline while a second
+    // attempt succeeds in ~2s. Only timeouts retry; hard failures (DNS/refused/
+    // cert) are deterministic, so we fail fast on those instead of waiting again.
+    try {
+      await page.goto(url, opts as any);
+    } catch (firstError) {
+      const firstMsg = (firstError instanceof Error ? firstError.message : String(firstError)).toLowerCase();
+      if (!firstMsg.includes('timeout')) throw firstError;
+      logger.warn('[PREVIEW_SESSION] Navigation timed out, retrying once', {
+        url, elapsed: Date.now() - start,
+      });
+      await page.goto(url, opts as any);
+    }
     phase = 'complete';
   } catch (error) {
     phase = 'error';
