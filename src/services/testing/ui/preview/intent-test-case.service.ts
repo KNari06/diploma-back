@@ -979,6 +979,8 @@ export class IntentTestCaseService {
       // Organization
       flowId: row.flow_id || undefined,
       flowName: row.test_flows?.name || undefined,
+      moduleId: row.test_flows?.module_id || undefined,
+      moduleName: row.test_flows?.test_modules?.name || undefined,
       dependsOn: row.depends_on || undefined,
 
       // Metadata

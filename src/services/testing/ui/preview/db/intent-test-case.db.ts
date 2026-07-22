@@ -34,11 +34,11 @@ export function insertTestCaseRow(insert: Record<string, unknown>) {
     .single();
 }
 
-/** Owner-scoped single fetch (joins flow name). */
+/** Owner-scoped single fetch (joins flow + parent-module name). */
 export function getTestCaseRowByIdForUser(id: string, userId: string) {
   return supabaseAdmin
     .from('intent_test_cases')
-    .select('*, test_flows(name)')
+    .select('*, test_flows(name, module_id, test_modules(name))')
     .eq('id', id)
     .eq('user_id', userId)
     .single();
@@ -150,7 +150,7 @@ export function listTestCaseDataForProject(
 ) {
   let q = supabaseAdmin
     .from('intent_test_cases')
-    .select('*, test_flows(name)')
+    .select('*, test_flows(name, module_id, test_modules(name))')
     .eq('project_id', projectId)
     .eq('user_id', userId);
   if (flowId) q = q.eq('flow_id', flowId);

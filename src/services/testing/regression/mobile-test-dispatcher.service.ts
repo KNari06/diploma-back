@@ -92,7 +92,7 @@ export class MobileTestDispatcherService {
     // point for every mobile dispatch path (single-case run, plan/module
     // orchestrator, CI), so free users can't queue mobile jobs from any route.
     if (!(await isPaidUser(userId))) {
-      throw new ValidationError(`${PAID_FEATURE_LABELS.MOBILE_TESTING} is available on the Pro plan. Upgrade to run mobile tests.`);
+      throw new ValidationError(`${PAID_FEATURE_LABELS.MOBILE_TESTING} is available on paid plans. Upgrade to run mobile tests.`);
     }
 
     // 1. Resolve platform and browser

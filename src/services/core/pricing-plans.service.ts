@@ -1,11 +1,44 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { PlanService } from '@/services/core/plan.service';
+import { WORKSPACE_PLANS } from '@/services/core/token-calculator.service';
+
+type B2bPlanSlug = keyof typeof WORKSPACE_PLANS;
+
+/**
+ * Build a synthetic PricingPlan for a B2B tier (which has no pricing_plans row).
+ * Credits reflect the user's actual granted allotment (from user_credits) so an
+ * admin discount is honored, falling back to the tier's config credits.
+ */
+function syntheticB2bPlan(slug: B2bPlanSlug, grantedCredits: number | null): PricingPlan {
+  const cfg = WORKSPACE_PLANS[slug];
+  const name = slug
+    .split('_')
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+  return {
+    id: `b2b:${slug}`,
+    name,
+    slug,
+    description: `${name} plan`,
+    price: cfg.price,
+    credits_per_month: grantedCredits != null && Number.isFinite(grantedCredits) ? grantedCredits : cfg.credits,
+    credits_per_day: null,
+    features: [],
+    limitations: [],
+    is_active: true,
+    created_at: '',
+    updated_at: '',
+  };
+}
 
 export interface PricingPlan {
   id: string;
   name: string;
-  slug: 'free' | 'pro' | 'ultra';
+  // Individual pricing_plans slugs, plus the B2B tiers which have NO
+  // pricing_plans row — for those, getUserPlanInfo returns a synthetic plan
+  // built from WORKSPACE_PLANS so paid B2B users aren't reported as "no plan".
+  slug: 'free' | 'pro' | 'ultra' | 'pilot' | 'small_business' | 'middle_business' | 'enterprise';
   description: string;
   price: number | null; // NULL for free plan
   credits_per_month: number; // -1 for unlimited
@@ -130,7 +163,42 @@ export class PricingPlansService {
         return null;
       }
 
+      // No pricing_plans row. This is either a genuine free/no-plan user OR a
+      // paid B2B user (pilot/small_business/middle_business/enterprise have no
+      // pricing_plans row and their users.plan_id is null). Check the credit-side
+      // tier before concluding "no plan", so a paying B2B customer gets real plan
+      // info instead of a 404.
       if (!data || !data.pricing_plans) {
+        const { data: credits } = await supabaseAdmin
+          .from('user_credits')
+          .select('subscription_plan, subscription_status, credits_balance')
+          .eq('user_id', userId)
+          .maybeSingle();
+
+        const slug = credits?.subscription_plan as string | undefined;
+        if (
+          slug &&
+          credits?.subscription_status === 'active' &&
+          (slug in WORKSPACE_PLANS)
+        ) {
+          const plan = syntheticB2bPlan(slug as B2bPlanSlug, Number(credits?.credits_balance));
+          const monthlyRemaining =
+            plan.credits_per_month === -1
+              ? -1
+              : Math.max(0, plan.credits_per_month - (data?.credits_used_this_month || 0));
+          return {
+            user_id: userId,
+            plan,
+            plan_started_at: data?.plan_started_at,
+            credits_used_today: data?.credits_used_today || 0,
+            credits_used_this_month: data?.credits_used_this_month || 0,
+            last_credit_reset_date: data?.last_credit_reset_date,
+            monthly_reset_date: data?.monthly_reset_date,
+            daily_remaining: -1,
+            monthly_remaining: monthlyRemaining,
+          };
+        }
+
         logger.debug('[PRICING_PLANS] User has no plan assigned (free tier)', {
           userId: userId.substring(0, 8) + '...',
         });

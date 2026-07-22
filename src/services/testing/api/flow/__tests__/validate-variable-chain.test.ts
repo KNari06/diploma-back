@@ -43,4 +43,29 @@ describe('validateVariableChain (repair, not warn-only)', () => {
     const out = validateVariableChain(nodes, ['c', 'p']); // consumer before producer
     expect(out.find(n => n.id === 'c')!.variableInjections).toHaveLength(0);
   });
+
+  it('grades a bound injection on ITS producer, keeping it when the same name has a later producer too', () => {
+    // Two producers of `tok`: p_early (before c) and p_late (after c). The
+    // injection is bound to p_early → satisfiable → kept, even though the flat
+    // name-map might pick a different one.
+    const nodes = [
+      node({ id: 'p_early', method: 'POST', path: '/pe', variableExtractions: [{ variableName: 'tok', jsonPath: '$.t' }] }),
+      node({ id: 'c', method: 'GET', path: '/c', variableInjections: [{ variableName: 'tok', injectAs: 'header', targetKey: 'X', sourceNodeId: 'p_early' }] }),
+      node({ id: 'p_late', method: 'POST', path: '/pl', variableExtractions: [{ variableName: 'tok', jsonPath: '$.t' }] }),
+    ];
+    const out = validateVariableChain(nodes, ['p_early', 'c', 'p_late']);
+    expect(out.find(n => n.id === 'c')!.variableInjections).toHaveLength(1);
+  });
+
+  it('drops a bound injection when ITS producer runs after, despite an earlier same-name producer', () => {
+    // p_early (before c) also produces `tok`, but the injection is bound to
+    // p_late (after c) → unsatisfiable for THAT binding → dropped.
+    const nodes = [
+      node({ id: 'p_early', method: 'POST', path: '/pe', variableExtractions: [{ variableName: 'tok', jsonPath: '$.t' }] }),
+      node({ id: 'c', method: 'GET', path: '/c', variableInjections: [{ variableName: 'tok', injectAs: 'header', targetKey: 'X', sourceNodeId: 'p_late' }] }),
+      node({ id: 'p_late', method: 'POST', path: '/pl', variableExtractions: [{ variableName: 'tok', jsonPath: '$.t' }] }),
+    ];
+    const out = validateVariableChain(nodes, ['p_early', 'c', 'p_late']);
+    expect(out.find(n => n.id === 'c')!.variableInjections).toHaveLength(0);
+  });
 });

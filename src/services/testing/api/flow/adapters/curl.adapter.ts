@@ -6,6 +6,7 @@
 
 import { logger } from '@/utils/core/logger';
 import type { HttpMethod, ParsedApiSpec, ParsedEndpoint, ParsedParameter } from '../flow.types';
+import { ensureUniqueOperationIds } from './adapter-utils';
 
 const VALID_HTTP_METHODS: HttpMethod[] = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'];
 
@@ -231,6 +232,8 @@ export function parseCurlCommands(content: string): ParsedApiSpec {
   if (endpoints.length === 0) {
     throw new Error('Could not parse any valid API endpoints from curl commands');
   }
+
+  ensureUniqueOperationIds(endpoints);
 
   logger.info('[CURL_ADAPTER] Parsed curl commands', {
     total: rawCommands.length,

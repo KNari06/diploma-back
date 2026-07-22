@@ -57,6 +57,41 @@ describe('saveMobileTestCasesFromSnapshot — assertion → ai_check', () => {
     expect(check.options).toEqual({ aiCheckSource: 'tree' });
   });
 
+  it("carries source:'screenshot' through to aiCheckSource (visual/which-screen assertions)", async () => {
+    const flows = [{
+      name: 'Login',
+      mobile: {
+        cases: [{
+          name: 'happy',
+          intentSteps: [{ id: 's1', type: 'click', description: 'Login' }],
+          // A which-screen fact the single-frame a11y tree can't prove — must
+          // replay as a screenshot check, not tree (else Inconclusive).
+          assertions: [{ type: 'observation', expect: 'the confirmation code screen is shown', source: 'screenshot' }],
+        }],
+      },
+    }];
+    await ExplorationStorageService.saveMobileTestCasesFromSnapshot(flows, 'proj', 'user', 'android');
+    const steps = insertedRecords()[0].steps_json as Array<Record<string, any>>;
+    expect(steps[1].type).toBe('ai_check');
+    expect(steps[1].options).toEqual({ aiCheckSource: 'screenshot' });
+  });
+
+  it("defaults to aiCheckSource:'tree' when the assertion carries no source", async () => {
+    const flows = [{
+      name: 'Login',
+      mobile: {
+        cases: [{
+          name: 'happy',
+          intentSteps: [{ id: 's1', type: 'click', description: 'Login' }],
+          assertions: [{ type: 'observation', expect: 'welcome text visible' }], // no source
+        }],
+      },
+    }];
+    await ExplorationStorageService.saveMobileTestCasesFromSnapshot(flows, 'proj', 'user', 'android');
+    const steps = insertedRecords()[0].steps_json as Array<Record<string, any>>;
+    expect(steps[1].options).toEqual({ aiCheckSource: 'tree' });
+  });
+
   it('does not make non-observation assertions into steps, but PRESERVES them as tags [#9]', async () => {
     const flows = [{
       name: 'Api',
