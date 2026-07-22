@@ -164,6 +164,25 @@ export interface NodeCase {
   enabled?: boolean; // default true; false → skipped at run time
 }
 
+/**
+ * A variable link the builder could not statically verify. Surfaced to the user
+ * so a flow that LOOKS connected doesn't silently fail at run time.
+ *  - 'no_producer'      : a node injects a variable no in-flow call produces —
+ *                         the user must supply it (auth_token, api_key, base_url…).
+ *  - 'producer_after'   : the producing call is ordered AFTER the consumer.
+ *  - 'name_collision'   : two calls extract the same variable name (last wins).
+ * NOTE: this is STRUCTURAL only. It cannot catch a wrong jsonPath that points at
+ * a field absent from the real response — that is knowable only at run time.
+ */
+export interface UnverifiedLink {
+  kind: 'no_producer' | 'producer_after' | 'name_collision';
+  variableName: string;
+  consumerNodeId?: string;
+  producerNodeId?: string;
+  injectAs?: string;
+  targetKey?: string;
+}
+
 export interface ExecutionDAG {
   nodes: DAGNode[];
   executionOrder: string[]; // node IDs in topological sort order
@@ -171,6 +190,8 @@ export interface ExecutionDAG {
   summary: string; // human-readable description of the flow
   totalEndpoints: number;
   unsupportedEndpoints: UnsupportedEndpoint[];
+  /** Variable links that could not be statically verified (see UnverifiedLink). */
+  unverifiedLinks?: UnverifiedLink[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
