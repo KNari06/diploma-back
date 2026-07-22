@@ -1,13 +1,47 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 
+/**
+ * Every slug that can land in `user_credits.subscription_plan`.
+ *
+ * - Individual (INDIVIDUAL_PLANS): free / pro. ('basic' is legacy, 'ultra' is
+ *   the retired individual "Team" plan — kept here to type historical rows.)
+ * - B2B (WORKSPACE_PLANS, granted to the user's own row via grantBusinessPlan):
+ *   pilot / small_business / middle_business / enterprise.
+ * - 'business' is a legacy Stripe plan-code alias that always resolves to
+ *   small_business before persistence; kept for historical rows.
+ *
+ * Single source of truth — used by the UserCredits row type, updateSubscription,
+ * and grantBusinessPlan so the three can never drift out of sync again.
+ */
+/**
+ * Single source of truth for every plan slug `user_credits.subscription_plan`
+ * understands. Runtime array so it can back `.includes()` checks; the type below
+ * is derived from it, so a new tier is added in ONE place and every consumer
+ * (validation, grace map, plan.service credit mirror) stays in sync — no second
+ * hand-maintained allowlist that can silently coerce an unknown slug to 'free'.
+ */
+export const SUBSCRIPTION_PLAN_SLUGS = [
+  'free',
+  'basic',
+  'pro',
+  'ultra',
+  'pilot',
+  'small_business',
+  'middle_business',
+  'enterprise',
+  'business',
+] as const;
+
+export type SubscriptionPlanSlug = (typeof SUBSCRIPTION_PLAN_SLUGS)[number];
+
 export interface UserCredits {
   id: string;
   user_id: string;
   credits_balance: number;
   total_purchased: number;
   total_used: number;
-  subscription_plan: 'free' | 'basic' | 'pro' | 'ultra' | 'enterprise' | 'business';
+  subscription_plan: SubscriptionPlanSlug;
   subscription_status: 'active' | 'inactive' | 'expired';
   subscription_expires_at: string | null;
   /** V16: Grace period — max negative balance allowed (plan-dependent) */
@@ -644,6 +678,10 @@ export class UserCreditsService {
    * @param mode         'upgrade' (add) or 'renew' (set)
    * @param description  transaction description
    * @param metadata     extra transaction metadata (e.g. invoice id)
+   * @param priceUsd     price actually charged for this grant (USD). Persisted
+   *                     to credit_transactions.cost_usd for revenue reporting;
+   *                     lets an admin record a discounted price. Omit to leave
+   *                     cost_usd null (e.g. a free/comp grant).
    */
   static async grantBusinessPlan(
     userId: string,
@@ -652,7 +690,8 @@ export class UserCreditsService {
     graceLimit: number,
     mode: 'upgrade' | 'renew',
     description: string,
-    metadata: Record<string, any> = {}
+    metadata: Record<string, any> = {},
+    priceUsd?: number
   ): Promise<{ success: boolean; newBalance: number }> {
     try {
       if (!userId || typeof userId !== 'string') {
@@ -700,6 +739,12 @@ export class UserCreditsService {
         ...metadata,
         b2b_plan: planSlug,
         renewal_reset: mode === 'renew',
+        // Persist the charged price to credit_transactions.cost_usd for revenue
+        // reporting (recordTransaction copies metadata.cost_usd → the column).
+        // Only when provided, so a comp/free grant leaves cost_usd null.
+        ...(typeof priceUsd === 'number' && Number.isFinite(priceUsd)
+          ? { cost_usd: Math.round(priceUsd * 100) / 100 }
+          : {}),
       });
 
       logger.info('[USER_CREDITS] Business plan granted to user', {
@@ -835,7 +880,7 @@ export class UserCreditsService {
    */
   static async updateSubscription(
     userId: string,
-    plan: 'free' | 'basic' | 'pro' | 'ultra' | 'enterprise' | 'business',
+    plan: SubscriptionPlanSlug,
     status: 'active' | 'inactive' | 'expired',
     expiresAt: string | null = null
   ): Promise<boolean> {
@@ -846,8 +891,7 @@ export class UserCreditsService {
         return false;
       }
 
-      const validPlans = ['free', 'basic', 'pro', 'ultra', 'enterprise', 'business'];
-      if (!validPlans.includes(plan)) {
+      if (!(SUBSCRIPTION_PLAN_SLUGS as readonly string[]).includes(plan)) {
         logger.error('[USER_CREDITS] Invalid plan in updateSubscription', { userId, plan });
         return false;
       }
@@ -858,12 +902,19 @@ export class UserCreditsService {
         return false;
       }
 
-      // V16: Grace limit per plan tier
-      const GRACE_LIMITS: Record<string, number> = {
+      // V16: Grace limit per plan tier. The individual path (PlanService →
+      // setUserPlan) uses this; B2B grants go through grantBusinessPlan which
+      // passes grace directly and never calls this. enterprise/business keep
+      // their existing individual-path values (unchanged); the B2B-only slugs
+      // are added so a defensive call here can't silently 0 out their grace.
+      const GRACE_LIMITS: Record<SubscriptionPlanSlug, number> = {
         free: 0,
         basic: 100,
         pro: 100,
         ultra: 200,
+        pilot: 1000,
+        small_business: 3000,
+        middle_business: 8000,
         enterprise: 1000,
         business: 1000,
       };

@@ -33,10 +33,9 @@ describe('autoWireVariableDependencies', () => {
     expect(out.find(n => n.id === 'delete')!.dependsOn).toContain('upload');
   });
 
-  it('🐛 creates a 3-node cycle A→B→C→A (only a direct 2-cycle is guarded)', () => {
-    // Each node injects a var the next produces. The guard only blocks a direct
-    // reverse edge, so a longer ring slips through and is left for the downstream
-    // breakCycles to (over-)break. CORRECT: detect the transitive cycle here.
+  it('✅ does not create a 3-node cycle A→B→C→A (transitive guard)', () => {
+    // Each node injects a var the next produces. wouldCreateCycle walks the live
+    // dependency map, so the ring-closing edge C→A is refused — no cycle forms.
     const A = node({ id: 'A', variableExtractions: [{ variableName: 'vA', jsonPath: '$.a' }],
       variableInjections: [{ variableName: 'vB', injectAs: 'body_field', targetKey: 'b' }] });
     const B = node({ id: 'B', variableExtractions: [{ variableName: 'vB', jsonPath: '$.b' }],
@@ -47,16 +46,16 @@ describe('autoWireVariableDependencies', () => {
     const deps = Object.fromEntries(out.map(n => [n.id, n.dependsOn]));
     expect(deps.A).toContain('B');
     expect(deps.B).toContain('C');
-    expect(deps.C).toContain('A'); // ← the ring is closed
+    expect(deps.C).not.toContain('A'); // ring-closing edge refused
   });
 });
 
 describe('autoWireRequiredAuth — multi-realm', () => {
-  it('🐛 an admin endpoint is wired to the USER login and injected with the shared token', () => {
-    // Two independent auth realms both extracting `auth_token`. The pass picks a
-    // single global primaryProducer and applies it to EVERY protected endpoint,
-    // so GET /admin/users depends on userLogin and carries the user token → 403
-    // in reality. CORRECT: partition by realm/scope.
+  it('✅ an admin endpoint is wired to the ADMIN login and bound to its token', () => {
+    // Two independent auth realms both extracting `auth_token`. autoWireRequiredAuth
+    // partitions producers by realm prefix, so GET /admin/users depends on adminLogin
+    // and its Authorization injection is bound (sourceNodeId) to adminLogin — the
+    // admin token, not the user's.
     const userLogin = node({ id: 'userLogin', method: 'POST', path: '/auth/login', isAuthEndpoint: true,
       variableExtractions: [{ variableName: 'auth_token', jsonPath: '$.token' }] });
     const adminLogin = node({ id: 'adminLogin', method: 'POST', path: '/admin/login', isAuthEndpoint: true,
@@ -69,8 +68,10 @@ describe('autoWireRequiredAuth — multi-realm', () => {
     ] };
     const out = autoWireRequiredAuth([userLogin, adminLogin, adminEp], spec);
     const ae = out.find(n => n.id === 'adminEp')!;
-    expect(ae.dependsOn).toEqual(['userLogin']); // wired to the WRONG realm's producer
-    expect(ae.variableInjections.some(i => i.targetKey === 'Authorization')).toBe(true);
+    expect(ae.dependsOn).toEqual(['adminLogin']);
+    const authInj = ae.variableInjections.find(i => i.targetKey === 'Authorization')!;
+    expect(authInj).toBeDefined();
+    expect(authInj.sourceNodeId).toBe('adminLogin');
   });
 });
 

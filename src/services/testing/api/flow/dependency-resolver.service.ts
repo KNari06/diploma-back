@@ -26,6 +26,7 @@ import {
   lastPathSegment,
   isReferenceIdField,
   isSnakeIdVar,
+  isItemPath,
 } from './wiring/wiring-policy';
 import { seedNodesFromSpec } from './wiring/spec-seed';
 import { coerceBodyToSchema, missingRequiredFields } from './wiring/body-validator';
@@ -382,13 +383,28 @@ function autoWireAuthDependencies(nodes: DAGNode[]): DAGNode[] {
  * - COOKIE / session (token extracted from a Set-Cookie header): add ORDERING
  *   only. The runtime cookie jar carries the session; a raw cookie replayed as
  *   `Authorization: Bearer` breaks auth, so any such bogus injection the
- *   Architect added is STRIPPED here.
+ *   Architect added is STRIPPED here. The session dependency is IMPLICIT (nothing
+ *   injects the cookie) and `security` is unreliable for it — captured HAR/curl/
+ *   Insomnia specs set `security` only from a Bearer header, so a cookie API
+ *   yields empty security on EVERY endpoint. So when the spec declares NO security
+ *   anywhere (`specHasAnySecurity` false) we order every cookie-realm member after
+ *   the establisher; when security IS annotated we trust it (only `isProtected`
+ *   endpoints get ordered). Independently of that, refresh endpoints are ALWAYS
+ *   ordered after the establisher in cookie mode — they sit on a session-
+ *   establishing PATH (so they're seeded as producers) but CONSUME the session
+ *   they rotate, so they must run after login, not alongside it.
  * - BEARER (token extracted from the response body): add ordering AND a missing
- *   `Authorization: Bearer {{auth_token}}` injection.
+ *   `Authorization: Bearer {{auth_token}}` injection, gated on the spec's
+ *   `security` field (meaningful when a token header is actually present).
  */
 function autoWireRequiredAuth(nodes: DAGNode[], spec: ParsedApiSpec): DAGNode[] {
   const secByKey = new Map<string, string[]>();
   for (const e of spec.endpoints) secByKey.set(`${e.method}:${e.path}`, e.security || []);
+  // `security` is only trustworthy when the spec declares it SOMEWHERE. Captured
+  // HAR/curl/Insomnia cookie specs (and un-annotated OpenAPI) carry none, so we
+  // can't distinguish protected from public — that's when cookie mode falls back
+  // to ordering every realm member. If any endpoint declares security, trust it.
+  const specHasAnySecurity = spec.endpoints.some(e => (e.security || []).length > 0);
 
   const nodeById = new Map(nodes.map(n => [n.id, n]));
   const AUTH_ENDPOINT_PRODUCERS = nodes.filter(
@@ -430,13 +446,27 @@ function autoWireRequiredAuth(nodes: DAGNode[], spec: ParsedApiSpec): DAGNode[] 
     if (!byPrefix.has(prefix)) byPrefix.set(prefix, []);
     byPrefix.get(prefix)!.push(p);
   }
+  const authTokenExt = (n: DAGNode) => n.variableExtractions.find(e => isAuthTokenVar(e.variableName));
+  // A producer whose auth token comes from a Set-Cookie header (a guessed session)
+  // rather than the response body (a ground-truth bearer token like `$.token`).
+  const isCookieProducer = (n: DAGNode) => {
+    const e = authTokenExt(n);
+    return !!e?.headerSource && /cookie/i.test(e.headerSource);
+  };
   const buildRealm = (prefix: string, group: DAGNode[]): AuthRealm => {
     const rankable = group.filter(n => !isRefreshEndpoint(n));
-    const pool = rankable.length ? rankable : group;
+    const base = rankable.length ? rankable : group;
+    // Prefer a BEARER producer (token from the response BODY — ground truth) over
+    // one whose token is only a GUESSED Set-Cookie session. A `/register` that
+    // returns no body token but sits on an establish-path is seeded as a cookie
+    // producer; without this, a register+login realm tie-breaks to register and
+    // flips the whole realm to cookie mode, suppressing the Bearer injection the
+    // real login needs. Fall back to cookie only when no bearer producer exists.
+    const bearer = base.filter(n => !isCookieProducer(n));
+    const pool = bearer.length ? bearer : base;
     const producer = pool.reduce((best, n) => (countAuthAncestors(n) > countAuthAncestors(best) ? n : best), pool[0]);
-    const authVar = producer.variableExtractions.find(e => isAuthTokenVar(e.variableName))!.variableName;
-    const ext = producer.variableExtractions.find(e => e.variableName === authVar);
-    return { prefix, producer, authVar, cookieMode: !!ext?.headerSource && /cookie/i.test(ext.headerSource) };
+    const ext = authTokenExt(producer);
+    return { prefix, producer, authVar: ext!.variableName, cookieMode: !!ext?.headerSource && /cookie/i.test(ext.headerSource) };
   };
   const realms = [...byPrefix.entries()]
     .map(([prefix, group]) => buildRealm(prefix, group))
@@ -473,11 +503,30 @@ function autoWireRequiredAuth(nodes: DAGNode[], spec: ParsedApiSpec): DAGNode[] 
   let injectedCount = 0;
   let strippedCount = 0;
 
-  const result = nodes.map(node => {
-    if (authBootstrap.has(node.id)) return node;
+  // Does `path` sit under this realm's prefix? An empty prefix = the whole spec.
+  const isUnderRealm = (path: string, realm: AuthRealm): boolean =>
+    !realm.prefix || path === realm.prefix || path.startsWith(`${realm.prefix}/`);
 
+  const result = nodes.map(node => {
     const realm = resolveRealm(node.path);
+    const isRefresh = isRefreshEndpoint(node);
+    // Establishers and their pre-session ancestors run BEFORE a session exists —
+    // never order/inject them. A COOKIE-mode refresh is the exception: it sits on
+    // a session-establishing path (so it's seeded as a producer and lands in
+    // authBootstrap) but CONSUMES the session it rotates, so it must run AFTER the
+    // realm's login — let it fall through to the ordering logic below. In bearer
+    // mode a refresh stays exempt (unchanged behaviour).
+    if (authBootstrap.has(node.id) && !(isRefresh && realm.cookieMode)) return node;
+
     const isProtected = (secByKey.get(`${node.method}:${node.path}`) || []).length > 0;
+    // Cookie-mode refresh is a session CONSUMER → always after the establisher,
+    // independent of `security` (a semantic truth the spec may not annotate).
+    const refreshOrder = realm.cookieMode && isRefresh;
+    // Cookie session is an implicit dependency; when the spec carries NO security
+    // info at all, order every realm member after the establisher (see header +
+    // specHasAnySecurity). If security is declared anywhere, trust it (isProtected).
+    const cookieBlindOrder = realm.cookieMode && !specHasAnySecurity && isUnderRealm(node.path, realm);
+    const shouldOrder = isProtected || refreshOrder || cookieBlindOrder;
     let dependsOn = node.dependsOn;
     let variableInjections = node.variableInjections;
     let changed = false;
@@ -492,25 +541,41 @@ function autoWireRequiredAuth(nodes: DAGNode[], spec: ParsedApiSpec): DAGNode[] 
       }
     }
 
-    if (isProtected) {
-      // Ordering: run after this realm's auth producer. Skip if it would reverse
+    if (shouldOrder) {
+      // Ordering: run after this realm's auth producer. Skip a self-edge (a
+      // refresh that is its realm's only producer) and any edge that would reverse
       // an existing dependency (the producer already depends on this node).
-      if (!dependsOn.includes(realm.producer.id) && !realm.producer.dependsOn.includes(node.id)) {
+      if (
+        node.id !== realm.producer.id &&
+        !dependsOn.includes(realm.producer.id) &&
+        !realm.producer.dependsOn.includes(node.id)
+      ) {
         dependsOn = [...dependsOn, realm.producer.id];
         orderedCount += 1;
         changed = true;
       }
-      // Bearer mode: ensure the token is actually injected.
-      if (!realm.cookieMode) {
-        const hasAuthInjection = variableInjections.some(
+      // Bearer mode: ensure the token is actually injected. Only for genuinely
+      // protected endpoints — a cookie-order-only node needs no header token.
+      if (!realm.cookieMode && isProtected) {
+        // Bind to THIS realm's producer (binding-by-reference): with multiple
+        // realms all extracting `auth_token`, the executor must read the value
+        // from the admin login for `/admin/*` and the user login for the rest —
+        // not whichever wrote the shared name last.
+        const authInjIdx = variableInjections.findIndex(
           i => i.variableName === realm.authVar || (i.injectAs === 'header' && String(i.targetKey).toLowerCase() === 'authorization'),
         );
-        if (!hasAuthInjection) {
+        if (authInjIdx === -1) {
           variableInjections = [
             ...variableInjections,
-            { variableName: realm.authVar, injectAs: 'header', targetKey: 'Authorization', prefix: 'Bearer ' },
+            { variableName: realm.authVar, injectAs: 'header', targetKey: 'Authorization', prefix: 'Bearer ', sourceNodeId: realm.producer.id },
           ];
           injectedCount += 1;
+          changed = true;
+        } else if (variableInjections[authInjIdx].sourceNodeId !== realm.producer.id) {
+          // Stamp an existing (seed-added) auth injection with its realm producer.
+          variableInjections = variableInjections.map((inj, i) =>
+            i === authInjIdx ? { ...inj, sourceNodeId: realm.producer.id } : inj,
+          );
           changed = true;
         }
       }
@@ -562,18 +627,34 @@ function autoWireVariableDependencies(nodes: DAGNode[]): DAGNode[] {
   const result = nodes.map(node => {
     const deps = liveDeps.get(node.id)!;
     const before = deps.size;
-    for (const inj of node.variableInjections) {
-      if (isAuthOrAuthorizationVar(inj.variableName)) continue;
+    let injections = node.variableInjections;
+    let injChanged = false;
+    node.variableInjections.forEach((inj, i) => {
+      if (isAuthOrAuthorizationVar(inj.variableName)) return;
       const producers = producersByVar.get(inj.variableName);
-      if (!producers) continue;
+      if (!producers) return;
       const producerId = producers.find(pid => pid !== node.id);
-      if (!producerId || deps.has(producerId)) continue;
-      if (wouldCreateCycle(node.id, producerId, depsOf)) continue; // transitive cycle guard
-      deps.add(producerId);
-    }
-    if (deps.size === before) return node;
+      if (!producerId) return;
+      // Ordering: the consumer must run after the producer. Skip if the edge
+      // already exists or would cycle — in the cycle case leave the injection
+      // name-bound (no sourceNodeId) so it keeps today's best-effort behaviour.
+      if (!deps.has(producerId)) {
+        if (wouldCreateCycle(node.id, producerId, depsOf)) return; // transitive cycle guard
+        deps.add(producerId);
+      }
+      // Binding-by-reference: bind this injection to the specific producer chosen
+      // above, so two producers sharing a variable name (e.g. `POST /users` and
+      // `GET /users` both yielding `user_id`) can't feed the consumer the wrong
+      // one. Respect an existing binding (e.g. a realm-aware auth stamp).
+      if (!inj.sourceNodeId) {
+        if (!injChanged) { injections = [...injections]; injChanged = true; }
+        injections[i] = { ...inj, sourceNodeId: producerId };
+      }
+    });
+    const depsChanged = deps.size !== before;
+    if (!depsChanged && !injChanged) return node;
     edgesAdded += deps.size - before;
-    return { ...node, dependsOn: [...deps] };
+    return { ...node, dependsOn: depsChanged ? [...deps] : node.dependsOn, variableInjections: injections };
   });
 
   if (edgesAdded > 0) {
@@ -613,8 +694,7 @@ function autoResolveReferenceIds(nodes: DAGNode[]): { nodes: DAGNode[]; required
   const listByEntity = new Map<string, string>();
   for (const n of nodes) {
     if (n.method !== 'GET') continue;
-    const rawParts = n.path.split('/').filter(Boolean);
-    if (rawParts[rawParts.length - 1]?.startsWith('{')) continue; // item GET, not a list
+    if (isItemPath(n.path)) continue; // item GET, not a list
     const entity = singularize(lastPathSegment(n.path)).toLowerCase();
     if (entity && !listByEntity.has(entity)) listByEntity.set(entity, n.id);
   }
@@ -1146,7 +1226,13 @@ function validateVariableChain(nodes: DAGNode[], executionOrder: string[]): DAGN
   const repaired = nodes.map(node => {
     const consumerIdx = orderIdx.get(node.id) ?? Infinity;
     const kept = node.variableInjections.filter(inj => {
-      const producerId = producerMap.get(inj.variableName);
+      // Binding-by-reference: validate against the SPECIFIC bound producer when
+      // one is named (and still in the graph), else fall back to the earliest
+      // by-name producer. This lets a consumer bound to a later-realm producer be
+      // graded on ITS producer's order, not a coincidentally-earlier same-name one.
+      const producerId = inj.sourceNodeId && orderIdx.has(inj.sourceNodeId)
+        ? inj.sourceNodeId
+        : producerMap.get(inj.variableName);
       if (producerId === undefined) {
         if (isUserProvidedVar(inj.variableName)) return true; // user supplies it at run time
         droppedOrphan++;
@@ -1169,6 +1255,27 @@ function validateVariableChain(nodes: DAGNode[], executionOrder: string[]): DAGN
     });
   }
   return repaired;
+}
+
+/**
+ * The variables the USER supplies at run time — the scorer's `providedVars`.
+ *
+ * Only two things qualify: vars we decided to ask for (`requiredVars`), and the
+ * credential/environment vars a user always supplies (`isUserProvidedVar`).
+ *
+ * It must NEVER be derived from the injections being scored. Deriving it that way
+ * ("every injection with no producer is user-provided") makes the set exactly equal
+ * to the unresolved set, so `countUnresolvedInjections` returns 0 by construction —
+ * the gate cannot fail, and it launders the very orphans it exists to surface.
+ */
+function runtimeProvidedVars(nodes: DAGNode[], requiredVars: Record<string, string>): string[] {
+  const provided = new Set(Object.keys(requiredVars));
+  for (const node of nodes) {
+    for (const inj of node.variableInjections) {
+      if (isUserProvidedVar(inj.variableName)) provided.add(inj.variableName);
+    }
+  }
+  return [...provided];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1402,8 +1509,30 @@ export class DependencyResolverService {
       }
     }
 
-    // Validate-and-repair the variable chain: drops orphan injections (no producer
-    // and not user-provided) and injections whose producer runs after the consumer.
+    // QUALITY GATE — score the graph the wiring passes actually produced, BEFORE
+    // the repair below rewrites it. `validateVariableChain` drops every injection it
+    // cannot satisfy, so scoring after it grades the cover-up: unresolved injections
+    // are gone by construction. What the repair drops does not vanish — it resurfaces
+    // at run time as a `blocked` step.
+    const qualityScore = scoreDag({
+      name: spec.title,
+      nodes,
+      executionOrder,
+      securityByEndpoint: securityMapFromSpec(spec),
+      providedVars: runtimeProvidedVars(nodes, referenceRequiredVars),
+    });
+
+    logger[qualityScore.passed ? 'info' : 'warn']('[DEPENDENCY_RESOLVER] DAG quality gate', {
+      passed: qualityScore.passed,
+      orderingViolations: qualityScore.orderingViolations,
+      unresolvedInjections: qualityScore.unresolvedInjections,
+      authCoverage: qualityScore.authCoverage,
+      hasCycle: qualityScore.hasCycle,
+      fabricatedReferenceIds: qualityScore.fabricatedReferenceIds,
+    });
+
+    // Repair the variable chain: drops orphan injections (no producer and not
+    // user-provided) and injections whose producer runs after the consumer.
     nodes = validateVariableChain(nodes, executionOrder);
 
     // Parallel groups + priority assignment
@@ -1416,33 +1545,6 @@ export class DependencyResolverService {
       ...node,
       priority: levelMap.get(node.id) ?? node.priority,
     }));
-
-    // Validate-and-repair GATE — score the finished DAG against the structural
-    // invariants (the same scorer the eval harness uses). Values supplied at run
-    // time (required inputs + user-provided auth vars) are NOT counted unresolved.
-    const producedVars = new Set(nodes.flatMap(n => n.variableExtractions.map(e => e.variableName)));
-    const providedVars = new Set<string>(Object.keys(referenceRequiredVars));
-    for (const n of nodes) {
-      for (const inj of n.variableInjections) {
-        if (!producedVars.has(inj.variableName)) providedVars.add(inj.variableName);
-      }
-    }
-    const qualityScore = scoreDag({
-      name: spec.title,
-      nodes,
-      executionOrder,
-      securityByEndpoint: securityMapFromSpec(spec),
-      providedVars: [...providedVars],
-    });
-
-    logger[qualityScore.passed ? 'info' : 'warn']('[DEPENDENCY_RESOLVER] DAG quality gate', {
-      passed: qualityScore.passed,
-      orderingViolations: qualityScore.orderingViolations,
-      unresolvedInjections: qualityScore.unresolvedInjections,
-      authCoverage: qualityScore.authCoverage,
-      hasCycle: qualityScore.hasCycle,
-      fabricatedReferenceIds: qualityScore.fabricatedReferenceIds,
-    });
 
     logger.info('[DEPENDENCY_RESOLVER] Pipeline completed', {
       nodes: nodes.length,
@@ -1475,4 +1577,5 @@ export const __testables = {
   topologicalSort,
   buildParallelGroups,
   validateVariableChain,
+  runtimeProvidedVars,
 };

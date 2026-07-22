@@ -80,4 +80,32 @@ describe('autoWireVariableDependencies', () => {
     const result = autoWireVariableDependencies([self]);
     expect(result.find(n => n.id === 'self')!.dependsOn).toHaveLength(0);
   });
+
+  it('stamps sourceNodeId on the wired injection (binding-by-reference)', () => {
+    const upload = node({ id: 'upload', variableExtractions: [ext('file_id')] });
+    const del = node({ id: 'del', variableInjections: [inj('file_id')] });
+    const result = autoWireVariableDependencies([del, upload]);
+    expect(result.find(n => n.id === 'del')!.variableInjections[0]).toMatchObject({
+      variableName: 'file_id', sourceNodeId: 'upload',
+    });
+  });
+
+  it('binds a same-named injection to the chosen producer, not the flat name', () => {
+    // Two nodes produce `user_id`; the deleter is wired+bound to the creator.
+    const create = node({ id: 'create_user', variableExtractions: [ext('user_id')] });
+    const list = node({ id: 'list_users', variableExtractions: [ext('user_id')] });
+    const del = node({ id: 'del_user', variableInjections: [inj('user_id')] });
+    const result = autoWireVariableDependencies([del, create, list]);
+    const bound = result.find(n => n.id === 'del_user')!.variableInjections[0];
+    expect(bound.sourceNodeId).toBeDefined();
+    expect(['create_user', 'list_users']).toContain(bound.sourceNodeId);
+    expect(result.find(n => n.id === 'del_user')!.dependsOn).toContain(bound.sourceNodeId);
+  });
+
+  it('leaves an injection name-bound (no sourceNodeId) when the edge would cycle', () => {
+    const producer = node({ id: 'producer', dependsOn: ['consumer'], variableExtractions: [ext('x')] });
+    const consumer = node({ id: 'consumer', variableInjections: [inj('x')] });
+    const result = autoWireVariableDependencies([producer, consumer]);
+    expect(result.find(n => n.id === 'consumer')!.variableInjections[0].sourceNodeId).toBeUndefined();
+  });
 });

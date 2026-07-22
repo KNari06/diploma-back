@@ -96,6 +96,30 @@ export const lastPathSegment = (p: string): string => {
   return parts[parts.length - 1] || '';
 };
 
+/** A path ending in a `{param}` — an item fetch (`/users/{id}`), not a collection. */
+export const isItemPath = (p: string): boolean => {
+  const parts = p.split('/').filter(Boolean);
+  return !!parts[parts.length - 1]?.startsWith('{');
+};
+
+/** A path param naming no entity of its own (`{id}`, `{_id}`) — only its path says what it identifies. */
+export const isGenericIdParam = (name: string): boolean => /^_?id$/.test(toSnakeCase(name));
+
+/**
+ * The entity a path param identifies — the last literal segment before it.
+ * `/users/{id}` → "user"; `/users/{userId}/posts/{id}` → "post".
+ * Empty when the param is preceded by no literal segment (`/{id}`).
+ */
+export const pathEntityFor = (path: string, paramName: string): string => {
+  const parts = path.split('/').filter(Boolean);
+  const at = parts.indexOf(`{${paramName}}`);
+  const before = at === -1 ? parts : parts.slice(0, at);
+  for (let i = before.length - 1; i >= 0; i--) {
+    if (!before[i].startsWith('{')) return singularize(before[i]).toLowerCase();
+  }
+  return '';
+};
+
 /** A request field that names a reference id (`userId`, `country_id`, …). */
 export const isReferenceIdField = (field: string): boolean => /id$/i.test(field);
 

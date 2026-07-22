@@ -48,6 +48,12 @@ jest.mock('@/services/core/db/plan.db', () => ({
 }));
 
 jest.mock('@/services/core/user-credits.service', () => ({
+  // Single source of truth for credit-side plan slugs — plan.service reads this
+  // to decide the credit mirror slug, so the mock must expose it too.
+  SUBSCRIPTION_PLAN_SLUGS: [
+    'free', 'basic', 'pro', 'ultra',
+    'pilot', 'small_business', 'middle_business', 'enterprise', 'business',
+  ] as const,
   UserCreditsService: {
     updateSubscription: jest.fn((userId: string, plan: string, status: string) =>
       updateSubscriptionMock(userId, plan, status)

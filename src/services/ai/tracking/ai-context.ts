@@ -32,7 +32,7 @@ export interface AITrackingContext {
   /** User who initiated the operation */
   userId?: string;
   /** High-level operation category */
-  operationType?: 'lite-test' | 'pro-test' | 'chat' | 'test-plan' | 'api-test' | 'analysis' | 'regression';
+  operationType?: 'lite-test' | 'pro-test' | 'chat' | 'test-plan' | 'api-test' | 'analysis' | 'regression' | 'import';
 
   // ── AI action log fields (one row per LLM call) ─────────────────────────
   /** Logical source of the AI call. Defaults derived from operationType. */
@@ -108,6 +108,9 @@ export function deriveLogSource(ctx: AITrackingContext | undefined): AILogSource
     case 'api-test':
     case 'test-plan':
     case 'regression': return 'analysis';
+    // Import (Allure/PDF/CSV) parses documents into test structure — closest
+    // existing action-log source is 'analysis'.
+    case 'import':     return 'analysis';
     default:           return 'chat';
   }
 }

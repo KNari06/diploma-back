@@ -5,6 +5,7 @@
 
 import { logger } from '@/utils/core/logger';
 import type { AuthScheme, HttpMethod, ParsedApiSpec, ParsedEndpoint, ParsedParameter } from '../flow.types';
+import { ensureUniqueOperationIds } from './adapter-utils';
 
 interface PostmanVariable {
   key: string;
@@ -302,6 +303,8 @@ export function parsePostmanCollection(content: string): ParsedApiSpec {
       }
     }
   }
+
+  ensureUniqueOperationIds(endpoints);
 
   logger.info('[POSTMAN_ADAPTER] Parsed collection', {
     title,

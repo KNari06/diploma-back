@@ -110,6 +110,14 @@ export interface VariableInjection {
   injectAs: 'header' | 'path_param' | 'query_param' | 'body_field' | 'body_json_path';
   targetKey: string; // e.g. "Authorization" for header, "userId" for body field
   prefix?: string; // e.g. "Bearer " for auth tokens
+  // Binding-by-reference: the SPECIFIC producer node whose extraction feeds this
+  // injection. When set, the executor reads the value from that node's own output
+  // instead of the flat, name-keyed run context — so two producers that share a
+  // variable name (e.g. a user-realm and an admin-realm login both extracting
+  // `auth_token`) no longer overwrite each other, and a consumer always gets its
+  // intended realm's value. Optional + fallback-to-name keeps older persisted DAGs
+  // (and injections no pass could attribute to one producer) working unchanged.
+  sourceNodeId?: string;
 }
 
 export interface DAGNode {
@@ -169,7 +177,7 @@ export interface ExecutionDAG {
 // REACT FLOW VISUALIZATION
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type FlowNodeStatus = 'pending' | 'running' | 'passed' | 'failed' | 'skipped' | 'unsupported';
+export type FlowNodeStatus = 'pending' | 'running' | 'passed' | 'failed' | 'blocked' | 'skipped' | 'unsupported';
 
 export interface ApiFlowNodeData {
   label: string;
@@ -237,7 +245,17 @@ export interface VariableContext {
 
 export type FlowErrorStrategy = 'stop_on_failure' | 'continue_on_failure' | 'retry_then_skip';
 export type FlowRunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
-export type FlowStepStatus = 'pending' | 'running' | 'passed' | 'failed' | 'skipped' | 'retrying' | 'cancelled';
+/**
+ * `blocked` is NOT `failed`, and the distinction is the point of the whole feature:
+ * `failed` means the API answered and the answer was wrong — a finding about THEIR
+ * system. `blocked` means we never asked a valid question (an unbound path param, a
+ * destructive call without consent) — a finding about OURS. Conflating them reports
+ * our own gaps as their bugs and makes coverage unmeasurable.
+ */
+export type FlowStepStatus = 'pending' | 'running' | 'passed' | 'failed' | 'blocked' | 'skipped' | 'retrying' | 'cancelled';
+
+/** Why a step could not be attempted. Mirrors `ApiFlowStepSkippedPayload.reason`. */
+export type FlowStepBlockedReason = 'unbound_variable' | 'destructive_not_consented';
 
 export interface FlowExecutionConfig {
   errorStrategy: FlowErrorStrategy;
@@ -279,6 +297,7 @@ export interface FlowRunSummary {
   total: number;
   passed: number;
   failed: number;
+  blocked: number; // never attempted — see FlowStepStatus
   skipped: number;
   totalDurationMs: number;
   variablesResolved: number;
@@ -362,6 +381,10 @@ export interface RunFlowRequest {
   // User-provided variables injected into variable context before execution
   // Typically: auth tokens, API keys, base URLs, test credentials
   initialVariables?: Record<string, string>;
+  // Consent to run DELETE/PUT/PATCH against the target. Default OFF: a spec says
+  // nothing about whose data is behind it, and a smoke run is one click from a
+  // production host. Without it those endpoints are reported `blocked`, not run.
+  allowDestructive?: boolean;
   // optional: override sample data per node
   nodeOverrides?: Record<string, {
     requestBody?: any;

@@ -88,6 +88,135 @@ describe('autoWireRequiredAuth — cookie/session mode', () => {
   });
 });
 
+describe('autoWireRequiredAuth — cookie mode implicit session ordering', () => {
+  // Regression guard: a cookie/session API yields EMPTY `security` on every
+  // endpoint (captured HAR/curl set it only from a Bearer header), and a refresh
+  // endpoint is seeded as a producer (its path matches an establish segment).
+  // Both used to leave endpoints running before/alongside login → 401.
+  const adminLogin = node({
+    id: 'adminLogin', method: 'POST', path: '/api/v1/admin/auth/login',
+    isAuthEndpoint: true, variableExtractions: [cookieExtraction],
+  });
+
+  it('orders a refresh endpoint AFTER login (does not treat it as a co-equal producer)', () => {
+    const refresh = node({
+      id: 'refresh', method: 'POST', path: '/api/v1/admin/auth/refresh',
+      isAuthEndpoint: true, variableExtractions: [cookieExtraction],
+    });
+    const result = autoWireRequiredAuth(
+      [adminLogin, refresh],
+      spec([
+        { method: 'POST', path: '/api/v1/admin/auth/login', security: [] },
+        { method: 'POST', path: '/api/v1/admin/auth/refresh', security: [] },
+      ]),
+    );
+    expect(result.find(n => n.id === 'refresh')!.dependsOn).toEqual(['adminLogin']);
+    expect(result.find(n => n.id === 'adminLogin')!.dependsOn).toHaveLength(0);
+  });
+
+  it('orders a realm member with EMPTY security after login (cookie session is implicit)', () => {
+    const companies = node({ id: 'companies', method: 'GET', path: '/api/v1/admin/companies' });
+    const result = autoWireRequiredAuth(
+      [adminLogin, companies],
+      spec([
+        { method: 'POST', path: '/api/v1/admin/auth/login', security: [] },
+        { method: 'GET', path: '/api/v1/admin/companies', security: [] },
+      ]),
+    );
+    expect(result.find(n => n.id === 'companies')!.dependsOn).toContain('adminLogin');
+  });
+
+  it('does NOT order an endpoint outside the realm prefix (no over-chaining)', () => {
+    const health = node({ id: 'health', method: 'GET', path: '/api/v1/public/health' });
+    const result = autoWireRequiredAuth(
+      [adminLogin, health],
+      spec([
+        { method: 'POST', path: '/api/v1/admin/auth/login', security: [] },
+        { method: 'GET', path: '/api/v1/public/health', security: [] },
+      ]),
+    );
+    expect(result.find(n => n.id === 'health')!.dependsOn).toHaveLength(0);
+  });
+
+  it('never makes a refresh-only realm producer depend on itself', () => {
+    const refreshOnly = node({
+      id: 'refreshOnly', method: 'POST', path: '/auth/refresh',
+      isAuthEndpoint: true, variableExtractions: [cookieExtraction],
+    });
+    const result = autoWireRequiredAuth(
+      [refreshOnly],
+      spec([{ method: 'POST', path: '/auth/refresh', security: [] }]),
+    );
+    expect(result.find(n => n.id === 'refreshOnly')!.dependsOn).toHaveLength(0);
+  });
+
+  it('trusts declared security in cookie mode: a public endpoint stays free while a protected one is ordered', () => {
+    // Annotated cookie OpenAPI — security IS declared somewhere, so we do NOT
+    // blindly chain every realm member. `health` (security: []) stays free.
+    const companies = node({ id: 'companies', method: 'GET', path: '/api/v1/admin/companies' });
+    const health = node({ id: 'health', method: 'GET', path: '/api/v1/admin/health' });
+    const result = autoWireRequiredAuth(
+      [adminLogin, companies, health],
+      spec([
+        { method: 'POST', path: '/api/v1/admin/auth/login', security: [] },
+        { method: 'GET', path: '/api/v1/admin/companies', security: ['cookieAuth'] },
+        { method: 'GET', path: '/api/v1/admin/health', security: [] },
+      ]),
+    );
+    expect(result.find(n => n.id === 'companies')!.dependsOn).toContain('adminLogin');
+    expect(result.find(n => n.id === 'health')!.dependsOn).toHaveLength(0);
+  });
+
+  it('prefers a bearer (body-token) producer over a guessed cookie producer in the same realm', () => {
+    // A /register that returns no body token is seeded as a Set-Cookie producer;
+    // /login returns a real body token. In one realm the realm producer must be
+    // login (bearer) — else the realm flips to cookie mode and protected endpoints
+    // get NO Authorization token and run unauthenticated.
+    const register = node({
+      id: 'register', method: 'POST', path: '/auth/register',
+      isAuthEndpoint: true, variableExtractions: [{ variableName: 'session_token', headerSource: 'Set-Cookie' }],
+    });
+    const login = node({
+      id: 'login', method: 'POST', path: '/auth/login',
+      isAuthEndpoint: true, variableExtractions: [{ variableName: 'auth_token', jsonPath: '$.token' }],
+    });
+    const authors = node({ id: 'authors', method: 'GET', path: '/authors' });
+    const result = autoWireRequiredAuth(
+      [register, login, authors],
+      spec([
+        { method: 'POST', path: '/auth/register', security: [] },
+        { method: 'POST', path: '/auth/login', security: [] },
+        { method: 'GET', path: '/authors', security: ['bearerAuth'] },
+      ]),
+    );
+    const a = result.find(n => n.id === 'authors')!;
+    expect(a.dependsOn).toContain('login');
+    expect(a.dependsOn).not.toContain('register');
+    expect(a.variableInjections).toEqual([
+      { variableName: 'auth_token', injectAs: 'header', targetKey: 'Authorization', prefix: 'Bearer ', sourceNodeId: 'login' },
+    ]);
+  });
+
+  it('still orders refresh after login even when the spec declares security elsewhere', () => {
+    // refresh ordering is semantic, not `security`-gated: it must run after login
+    // regardless of annotations.
+    const refresh = node({
+      id: 'refresh', method: 'POST', path: '/api/v1/admin/auth/refresh',
+      isAuthEndpoint: true, variableExtractions: [cookieExtraction],
+    });
+    const companies = node({ id: 'companies', method: 'GET', path: '/api/v1/admin/companies' });
+    const result = autoWireRequiredAuth(
+      [adminLogin, refresh, companies],
+      spec([
+        { method: 'POST', path: '/api/v1/admin/auth/login', security: [] },
+        { method: 'POST', path: '/api/v1/admin/auth/refresh', security: [] },
+        { method: 'GET', path: '/api/v1/admin/companies', security: ['cookieAuth'] },
+      ]),
+    );
+    expect(result.find(n => n.id === 'refresh')!.dependsOn).toEqual(['adminLogin']);
+  });
+});
+
 describe('autoWireRequiredAuth — bearer mode', () => {
   const login = node({ id: 'login', method: 'POST', path: '/login', isAuthEndpoint: true, variableExtractions: [bodyExtraction] });
 
@@ -100,7 +229,7 @@ describe('autoWireRequiredAuth — bearer mode', () => {
     const wired = result.find(n => n.id === 'users')!;
     expect(wired.dependsOn).toContain('login');
     expect(wired.variableInjections).toEqual([
-      { variableName: 'auth_token', injectAs: 'header', targetKey: 'Authorization', prefix: 'Bearer ' },
+      { variableName: 'auth_token', injectAs: 'header', targetKey: 'Authorization', prefix: 'Bearer ', sourceNodeId: 'login' },
     ]);
   });
 
@@ -206,5 +335,39 @@ describe('autoWireRequiredAuth — invariants', () => {
     const s = result.find(n => n.id === 'sendOtp')!;
     expect(s.variableInjections).toHaveLength(0);
     expect(s.dependsOn).toHaveLength(0);
+  });
+});
+
+describe('autoWireRequiredAuth — binding-by-reference (multi-realm)', () => {
+  it('binds each protected endpoint to ITS realm producer via sourceNodeId', () => {
+    const userLogin = node({
+      id: 'user_login', method: 'POST', path: '/api/v1/auth/login',
+      isAuthEndpoint: true, variableExtractions: [bodyExtraction],
+    });
+    const adminLogin = node({
+      id: 'admin_login', method: 'POST', path: '/api/v1/admin/auth/login',
+      isAuthEndpoint: true, variableExtractions: [bodyExtraction],
+    });
+    const userThing = node({ id: 'user_thing', method: 'GET', path: '/api/v1/things' });
+    const adminThing = node({ id: 'admin_thing', method: 'GET', path: '/api/v1/admin/things' });
+
+    const result = autoWireRequiredAuth(
+      [userLogin, adminLogin, userThing, adminThing],
+      spec([
+        { method: 'POST', path: '/api/v1/auth/login', security: [] },
+        { method: 'POST', path: '/api/v1/admin/auth/login', security: [] },
+        { method: 'GET', path: '/api/v1/things', security: ['bearerAuth'] },
+        { method: 'GET', path: '/api/v1/admin/things', security: ['bearerAuth'] },
+      ]),
+    );
+
+    const ut = result.find(n => n.id === 'user_thing')!;
+    const at = result.find(n => n.id === 'admin_thing')!;
+    // Admin endpoint binds to the admin login; user endpoint to the user login —
+    // so the flat `auth_token` slot last-write-wins can no longer cross realms.
+    expect(at.variableInjections[0]).toMatchObject({ targetKey: 'Authorization', sourceNodeId: 'admin_login' });
+    expect(at.dependsOn).toContain('admin_login');
+    expect(ut.variableInjections[0]).toMatchObject({ targetKey: 'Authorization', sourceNodeId: 'user_login' });
+    expect(ut.dependsOn).toContain('user_login');
   });
 });

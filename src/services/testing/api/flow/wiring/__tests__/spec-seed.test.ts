@@ -79,7 +79,25 @@ describe('seedNodesFromSpec', () => {
     expect(n.variableExtractions).toEqual([{ variableName: 'auth_token', jsonPath: '$.token' }]);
   });
 
-  it('seeds a create producer with $.id and a list producer with $[0].id', () => {
+  it('seeds a create producer with $.id', () => {
+    const nodes = seedNodesFromSpec(spec([
+      ep({ method: 'POST', path: '/cities', operationId: 'createCity',
+           responses: { '201': { description: 'created', schema: { type: 'object', properties: { id: {}, name: {} } } } } }),
+    ]));
+    expect(byId(nodes, 'createCity').variableExtractions).toEqual([{ variableName: 'city_id', jsonPath: '$.id' }]);
+  });
+
+  it('seeds a list producer with $[0].id when nothing creates the entity', () => {
+    const nodes = seedNodesFromSpec(spec([
+      ep({ method: 'GET', path: '/cities', operationId: 'listCities',
+           responses: { '200': { description: 'ok', schema: { type: 'array', items: { properties: { id: {}, name: {} } } } } } }),
+    ]));
+    expect(byId(nodes, 'listCities').variableExtractions).toEqual([{ variableName: 'city_id', jsonPath: '$[0].id' }]);
+  });
+
+  it('lets the create win the entity id when a list would produce it too', () => {
+    // Both at level 0 with no edge between them: two producers of `city_id` race for
+    // the run context, and a downstream DELETE would hit a pre-existing city.
     const nodes = seedNodesFromSpec(spec([
       ep({ method: 'POST', path: '/cities', operationId: 'createCity',
            responses: { '201': { description: 'created', schema: { type: 'object', properties: { id: {}, name: {} } } } } }),
@@ -87,7 +105,57 @@ describe('seedNodesFromSpec', () => {
            responses: { '200': { description: 'ok', schema: { type: 'array', items: { properties: { id: {}, name: {} } } } } } }),
     ]));
     expect(byId(nodes, 'createCity').variableExtractions).toEqual([{ variableName: 'city_id', jsonPath: '$.id' }]);
-    expect(byId(nodes, 'listCities').variableExtractions).toEqual([{ variableName: 'city_id', jsonPath: '$[0].id' }]);
+    expect(byId(nodes, 'listCities').variableExtractions).toEqual([]);
+  });
+
+  it('does NOT make an item GET a list producer', () => {
+    // `$[0].id` against a single-object response reads nothing, and the id it
+    // echoes had to come from a producer upstream anyway.
+    const nodes = seedNodesFromSpec(spec([
+      ep({ method: 'GET', path: '/cities/{cityId}', operationId: 'getCity',
+           parameters: [{ name: 'cityId', in: 'path', required: true }],
+           responses: { '200': { description: 'ok', schema: { type: 'object', properties: { id: {}, name: {} } } } } }),
+    ]));
+    expect(byId(nodes, 'getCity').variableExtractions).toEqual([]);
+  });
+
+  it('binds a generic {id} path param to the entity its path names', () => {
+    // `{id}` carries no entity of its own — read it from the path, or it resolves
+    // to the nonexistent `id_id`, gets dropped as an orphan, and `/users/{id}`
+    // goes on the wire with the brace intact.
+    const nodes = seedNodesFromSpec(spec([
+      ep({ method: 'POST', path: '/users', operationId: 'createUser',
+           responses: { '201': { description: 'created', schema: { type: 'object', properties: { id: {} } } } } }),
+      ep({ method: 'GET', path: '/users/{id}', operationId: 'getUser',
+           parameters: [{ name: 'id', in: 'path', required: true }] }),
+    ]));
+    expect(byId(nodes, 'getUser').variableInjections).toEqual([
+      { variableName: 'user_id', injectAs: 'path_param', targetKey: 'id' },
+    ]);
+    // …and it resolves against what the create produces.
+    expect(byId(nodes, 'createUser').variableExtractions).toEqual([{ variableName: 'user_id', jsonPath: '$.id' }]);
+  });
+
+  it('binds {id} to the nearest entity in a nested path', () => {
+    const nodes = seedNodesFromSpec(spec([
+      ep({ method: 'GET', path: '/users/{userId}/posts/{id}', operationId: 'getPost',
+           parameters: [{ name: 'userId', in: 'path', required: true }, { name: 'id', in: 'path', required: true }] }),
+    ]));
+    expect(byId(nodes, 'getPost').variableInjections).toEqual([
+      { variableName: 'user_id', injectAs: 'path_param', targetKey: 'userId' },
+      { variableName: 'post_id', injectAs: 'path_param', targetKey: 'id' },
+    ]);
+  });
+
+  it('lets a self-naming path param override its path context', () => {
+    // `{workspaceId}` under `/projects/` means workspace, not project.
+    const nodes = seedNodesFromSpec(spec([
+      ep({ method: 'GET', path: '/projects/{workspaceId}', operationId: 'getByWorkspace',
+           parameters: [{ name: 'workspaceId', in: 'path', required: true }] }),
+    ]));
+    expect(byId(nodes, 'getByWorkspace').variableInjections).toEqual([
+      { variableName: 'workspace_id', injectAs: 'path_param', targetKey: 'workspaceId' },
+    ]);
   });
 
   it('seeds path-param and body reference-id injections', () => {

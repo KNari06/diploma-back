@@ -56,27 +56,26 @@ describe('detectRequiredInputs — OTP context matching', () => {
     expect(requiredVars).toEqual({});
   });
 
-  it('🐛 a knowable `email` on an /otp/ path is hijacked into a required {{otp_target}}', () => {
-    // On /auth/otp/send the delivery email is often a fixed, knowable address,
-    // but any email/phone/to field on an OTP path is forced to a required var —
-    // prompting the user for something enrichment could have supplied.
+  it('✅ a knowable `email` on an /otp/ path is NOT hijacked into a required var', () => {
+    // A delivery email is a knowable address enrichment can supply. OTP_TARGET_FIELD
+    // deliberately excludes email/to, so it is left as-is (only target/recipient/
+    // phone-style fields become {{otp_target}}).
     const send = node({ id: 'sendOtp', path: '/auth/otp/send', sampleRequestBody: { email: 'ops@known.com' } });
     const { nodes, requiredVars } = detectRequiredInputs([send]);
-    expect(nodes[0].sampleRequestBody.email).toBe('{{otp_target}}');
-    expect(requiredVars).toHaveProperty('otp_target');
+    expect(nodes[0].sampleRequestBody.email).toBe('ops@known.com');
+    expect(requiredVars).not.toHaveProperty('otp_target');
   });
 
-  it('🐛 a 2FA/MFA code on /2fa or /mfa paths is NOT detected (fake data sails through)', () => {
-    // OTP_CONTEXT only matches the literal "otp" token. A fabricated code on
-    // /auth/2fa/verify or /mfa/challenge stays fake → OTP_INVALID at run time,
-    // the exact failure this pass exists to prevent. CORRECT: also match
-    // 2fa/mfa/twoFactor/one-time-code path segments.
+  it('✅ a 2FA/MFA code on /2fa or /mfa paths IS detected and made required', () => {
+    // OTP_CONTEXT matches otp/2fa/mfa/tfa path segments, so a fabricated code on
+    // /auth/2fa/verify or /mfa/challenge is rewritten to {{otp_code}} and surfaced
+    // as a required input instead of sailing through as fake data.
     const twofa = node({ id: 'x', path: '/auth/2fa/verify', sampleRequestBody: { code: '000000' } });
     const mfa = node({ id: 'y', path: '/mfa/challenge', sampleRequestBody: { code: '000000' } });
     const { nodes, requiredVars } = detectRequiredInputs([twofa, mfa]);
-    expect(nodes[0].sampleRequestBody.code).toBe('000000'); // not rewritten
-    expect(nodes[1].sampleRequestBody.code).toBe('000000');
-    expect(requiredVars).toEqual({});
+    expect(nodes[0].sampleRequestBody.code).toBe('{{otp_code}}');
+    expect(nodes[1].sampleRequestBody.code).toBe('{{otp_code}}');
+    expect(requiredVars).toEqual({ otp_code: '' });
   });
 
   it('🐛 query-param OTP detection has no dedicated coverage — verify it at least fires', () => {

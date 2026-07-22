@@ -8,24 +8,53 @@
  * CONSUMES) — so the candidate-graph builder (increment 1b) can wire edges
  * without asking the LLM to hallucinate them.
  *
- * Scope of this module: per-node seeding only (no cross-node edges, no ordering).
+ * Scope of this module: seeding only (no cross-node edges, no ordering).
  * It produces bare `DAGNode`s with:
  *  - auth producers: login/register/verify endpoints get an auth-token extraction
  *    (Bearer when the 2xx body carries a token field, else cookie via Set-Cookie)
  *    and `isAuthEndpoint = true`.
  *  - reference producers: create (`$.id`) and list (`$[0].id`) endpoints get an
- *    `<entity>_id` extraction so downstream consumers can inject it.
+ *    `<entity>_id` extraction so downstream consumers can inject it. Arbitrated so
+ *    each `<entity>_id` has exactly ONE producer (see `arbitrateReferenceProducers`).
  *  - consumers: path params, required `*Id` query params and `*Id` body fields
  *    become injections named in canonical `<field>_id` snake form.
+ *
+ * Producer and consumer names must AGREE for a value to flow, so both derive the
+ * entity from the same place — the path — whenever the field name doesn't carry
+ * one itself (`{id}` → `user_id` under `/users`, never the nonexistent `id_id`).
  */
 
 import type { DAGNode, HttpMethod, ParsedApiSpec, ParsedEndpoint } from '../flow.types';
-import { isAuthEstablishPath, isReferenceIdField, isTokenField, lastPathSegment, singularize, toSnakeCase } from './wiring-policy';
+import {
+  isAuthEstablishPath,
+  isGenericIdParam,
+  isItemPath,
+  isReferenceIdField,
+  isSnakeIdVar,
+  isTokenField,
+  lastPathSegment,
+  pathEntityFor,
+  singularize,
+  toSnakeCase,
+} from './wiring-policy';
 
 /** camelCase / snake `*Id` → canonical `<name>_id` variable name (cityId → city_id). */
 export function refVarName(field: string): string {
   const snake = toSnakeCase(field);
   return /_id$/.test(snake) ? snake : `${snake}_id`;
+}
+
+/**
+ * The variable a path param consumes. A param that names its own entity is
+ * authoritative (`{userId}` → `user_id`, even under `/projects/`); a generic
+ * `{id}` means whatever its path says it means (`/users/{id}` → `user_id`).
+ */
+export function pathParamVarName(path: string, paramName: string): string {
+  if (isGenericIdParam(paramName)) {
+    const entity = pathEntityFor(path, paramName);
+    if (entity) return `${entity}_id`;
+  }
+  return refVarName(paramName);
 }
 
 function twoxxResponse(ep: ParsedEndpoint): { status: string; schema?: any } | null {
@@ -101,11 +130,15 @@ function seedReferenceProducer(node: DAGNode, ep: ParsedEndpoint): void {
   if (node.isAuthEndpoint) return; // auth endpoints aren't reference producers
   const twoxx = twoxxResponse(ep);
   if (!twoxx?.schema) return;
+  // An item fetch (`GET /users/{id}`) produces nothing reusable: its response is a
+  // single object, so `$[0].id` reads nothing, and the id it echoes had to come
+  // from a producer upstream anyway.
+  if (node.method === 'GET' && isItemPath(ep.path)) return;
   const props = topLevelProps(twoxx.schema);
   const entity = singularize(lastPathSegment(ep.path)).toLowerCase();
   if (!entity) return;
 
-  const isList = isArraySchema(twoxx.schema) || node.method === 'GET';
+  const isList = isArraySchema(twoxx.schema);
   // Prefer a plain `id`, else an `<entity>Id`-style field in the response.
   const idField = props.find(p => /^id$/i.test(p)) || props.find(p => isReferenceIdField(p));
   if (!idField) return;
@@ -114,6 +147,39 @@ function seedReferenceProducer(node: DAGNode, ep: ParsedEndpoint): void {
   const jsonPath = isList ? `$[0].${idField}` : `$.${idField}`;
   if (!node.variableExtractions.some(e => e.variableName === varName)) {
     node.variableExtractions.push({ variableName: varName, jsonPath });
+  }
+}
+
+/**
+ * Leave exactly ONE producer per `<entity>_id` — a create beats a list.
+ *
+ * `POST /users` and `GET /users` both produce `user_id` and have no data edge
+ * between them, so they land in the same parallel group and both write the run
+ * context: whichever responds last wins. A downstream `DELETE /users/{userId}`
+ * would then delete a PRE-EXISTING user roughly half the time. Prefer the entity
+ * this run created; keep a list producer only when nothing creates that entity
+ * (`autoResolveReferenceIds` still promotes one on demand if a gap remains).
+ *
+ * Auth vars are out of scope — realms legitimately share `auth_token` today, and
+ * separating them needs per-realm names, not arbitration.
+ */
+function arbitrateReferenceProducers(nodes: DAGNode[]): void {
+  const byVar = new Map<string, DAGNode[]>();
+  for (const node of nodes) {
+    for (const e of node.variableExtractions) {
+      if (!isSnakeIdVar(e.variableName)) continue;
+      byVar.set(e.variableName, [...(byVar.get(e.variableName) || []), node]);
+    }
+  }
+
+  for (const [varName, producers] of byVar) {
+    if (producers.length < 2) continue;
+    const creates = producers.filter(n => n.method === 'POST');
+    const [keep] = creates.length ? creates : producers; // spec order — deterministic
+    for (const node of producers) {
+      if (node === keep) continue;
+      node.variableExtractions = node.variableExtractions.filter(e => e.variableName !== varName);
+    }
   }
 }
 
@@ -126,7 +192,7 @@ function seedConsumers(node: DAGNode, ep: ParsedEndpoint): void {
   };
 
   for (const p of ep.parameters || []) {
-    if (p.in === 'path') add(refVarName(p.name), 'path_param', p.name);
+    if (p.in === 'path') add(pathParamVarName(ep.path, p.name), 'path_param', p.name);
     else if (p.in === 'query' && p.required && isReferenceIdField(p.name)) add(refVarName(p.name), 'query_param', p.name);
   }
 
@@ -137,11 +203,13 @@ function seedConsumers(node: DAGNode, ep: ParsedEndpoint): void {
 
 /** Build bare, deterministically-seeded nodes — one per spec endpoint. */
 export function seedNodesFromSpec(spec: ParsedApiSpec): DAGNode[] {
-  return spec.endpoints.map(ep => {
+  const nodes = spec.endpoints.map(ep => {
     const node = bareNode(ep);
     seedAuthProducer(node, ep);
     seedReferenceProducer(node, ep);
     seedConsumers(node, ep);
     return node;
   });
+  arbitrateReferenceProducers(nodes);
+  return nodes;
 }

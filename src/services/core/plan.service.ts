@@ -1,5 +1,9 @@
 import { logger } from '@/utils/core/logger';
-import { UserCreditsService } from '@/services/core/user-credits.service';
+import {
+  UserCreditsService,
+  SUBSCRIPTION_PLAN_SLUGS,
+  type SubscriptionPlanSlug,
+} from '@/services/core/user-credits.service';
 import {
   clearUserPlanToFree,
   getCurrentPlanSlug,
@@ -8,9 +12,13 @@ import {
 } from '@/services/core/db/plan.db';
 import { isFreeSlug } from '@/services/core/db/plan-access.db';
 
-/** Subscription plans understood by user_credits.subscription_plan. */
-type CreditPlan = 'free' | 'basic' | 'pro' | 'ultra' | 'enterprise' | 'business';
-const CREDIT_PLANS: readonly CreditPlan[] = ['free', 'basic', 'pro', 'ultra', 'enterprise', 'business'];
+/**
+ * Plans the credit-side mirror understands. Reuses the single source of truth
+ * in user-credits.service (do NOT hand-maintain a second copy — a slug missing
+ * here would silently coerce a real paid plan to 'free' on the credit side).
+ */
+type CreditPlan = SubscriptionPlanSlug;
+const CREDIT_PLANS: readonly CreditPlan[] = SUBSCRIPTION_PLAN_SLUGS;
 
 export interface SetUserPlanOptions {
   /**
@@ -144,9 +152,20 @@ export class PlanService {
       //    grace_limit). Delegated to the credits primitive so the per-tier
       //    grace_limit mapping has a single owner. Best-effort: a failure here
       //    is logged but does not undo the committed users mirror.
-      const creditPlan: CreditPlan = (CREDIT_PLANS as readonly string[]).includes(planSlug)
-        ? (planSlug as CreditPlan)
-        : 'free';
+      const isKnownCreditPlan = (CREDIT_PLANS as readonly string[]).includes(planSlug);
+      // A non-free slug that isn't a known credit plan (e.g. a mis-mapped
+      // 'team') would coerce to 'free' on the credit side while users.plan keeps
+      // the real slug — a silent paid→free desync that then blocks paid features
+      // (isPaidUser reads user_credits). Loudly flag it instead of hiding it.
+      if (!isKnownCreditPlan && !isFreeTarget) {
+        logger.error('[PLAN_SERVICE] Unmapped non-free plan slug coerced to free on credit side — plan desync', {
+          userId: userId.substring(0, 8) + '...',
+          planSlug,
+          knownCreditPlans: CREDIT_PLANS,
+          source: opts.source,
+        });
+      }
+      const creditPlan: CreditPlan = isKnownCreditPlan ? (planSlug as CreditPlan) : 'free';
       const creditStatus = isFreeTarget ? 'inactive' : 'active';
 
       const creditOk = await UserCreditsService.updateSubscription(userId, creditPlan, creditStatus);

@@ -458,7 +458,7 @@ export const requirePaidPlan = (featureLabel: string = 'This feature') => {
           success: false,
           error: 'Upgrade required',
           code: 'UPGRADE_REQUIRED',
-          message: `${featureLabel} is available on the Pro plan. Upgrade to unlock it.`,
+          message: `${featureLabel} is available on paid plans. Upgrade to unlock it.`,
         });
         return;
       }
