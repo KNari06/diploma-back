@@ -22,6 +22,8 @@ import {
   type RequestKey,
 } from './shared/request-key';
 import { routeToHandler } from './shared/routing';
+import { isApiFlowRequest } from './api_flow/handler';
+import type { ChatAttachment } from './chat.types';
 import { parseMobileContext } from './mobile_agent/shared';
 import { incCounter } from '@/utils/core/mobile-chat-metrics';
 import { checkWorkspace, manageChatSession, validateInput } from './shared/validation';
@@ -106,6 +108,38 @@ export function decideForceRoute(
     intent_confidence: 1.0,
     confidence: 1.0,
     metadata: { routingSource: 'force_route', ...(hasSession ? {} : { missingSession: true as const }) },
+  };
+}
+
+/**
+ * Force-route an API-spec upload/paste to the api_flow_test handler.
+ *
+ * The intent classifier (`parseUserIntent`) sees only the typed message text —
+ * it has NO attachment/filename context. So a user who drops a Python project
+ * zip (or a .py / OpenAPI / Postman / HAR file) with a message like "here's my
+ * project" gets classified as general_chat, the extracted code is fed to the
+ * chat LLM as context, and NO flow is ever built — a silent drop the user reads
+ * as success. `isApiFlowRequest` already encodes the detection (spec URL, cURL,
+ * pasted Python, or a spec/archive attachment by extension); it was exported
+ * but never called. Wire it here so the deterministic signal wins over the
+ * blind classifier.
+ *
+ * Returns a minimal parsed-intent-shaped object (matching the mobile
+ * force-route contract) or null to fall through to the classifier. Kill switch:
+ * env `API_FLOW_FORCE_ROUTE=false`.
+ */
+export function decideApiFlowRoute(
+  message: string,
+  attachments: ChatAttachment[] | undefined,
+  flagEnabled: boolean,
+): { intent: 'api_flow_test'; intent_confidence: number; confidence: number; metadata: { routingSource: 'force_route' } } | null {
+  if (!flagEnabled) return null;
+  if (!isApiFlowRequest(message, attachments)) return null;
+  return {
+    intent: 'api_flow_test',
+    intent_confidence: 1.0,
+    confidence: 1.0,
+    metadata: { routingSource: 'force_route' },
   };
 }
 
@@ -562,7 +596,20 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     //
     // Kill switch: env `MOBILE_EDITOR_FORCE_ROUTE=false` reverts to
     // classifier-only routing.
-    const forceRouteIntent = decideForceRoute(context, env.MOBILE_EDITOR_FORCE_ROUTE);
+    const mobileForceRoute = decideForceRoute(context, env.MOBILE_EDITOR_FORCE_ROUTE);
+
+    // API-flow force-route: an uploaded spec/archive/.py (or pasted cURL /
+    // Python / Swagger URL) deterministically routes to api_flow_test — the
+    // classifier is blind to attachments and would silently drop a files-only
+    // upload into general_chat. Global scope only: a per-test-case chat is the
+    // editor surface (see Hard invariant #16) and must keep its own flow.
+    // Mobile force-route wins if both match. Kill switch: `API_FLOW_FORCE_ROUTE=false`.
+    const apiFlowForceRoute =
+      !mobileForceRoute && chatStore.kind === 'global'
+        ? decideApiFlowRoute(effectiveMessage, attachments, env.API_FLOW_FORCE_ROUTE)
+        : null;
+
+    const forceRouteIntent = mobileForceRoute ?? apiFlowForceRoute;
 
     // Backstop for the force-route: a chat scoped to a MOBILE test case whose
     // request carries no mobileEditorMode flag at all. The current frontend
@@ -600,15 +647,15 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     }
 
     let parsedIntent: Awaited<ReturnType<typeof parseIntent>>;
-    if (forceRouteIntent) {
-      parsedIntent = forceRouteIntent as Awaited<ReturnType<typeof parseIntent>>;
+    if (mobileForceRoute) {
+      parsedIntent = mobileForceRoute as Awaited<ReturnType<typeof parseIntent>>;
       // Phase B7: count force-route hits so ops can verify the path is
       // actually firing on real Mobile-Editor traffic. `applied_no_session`
       // marks the degraded case (mobile editor sent no live session id, so
       // mobile_agent will answer with NO_SESSION_REPLY).
       incCounter(
         'mobile_chat.force_route',
-        forceRouteIntent.metadata.missingSession ? 'applied_no_session' : 'applied',
+        mobileForceRoute.metadata.missingSession ? 'applied_no_session' : 'applied',
       );
       logger.info('[CHAT] mobileEditorMode force-route → mobile_agent', {
         chatSessionId,
@@ -617,11 +664,22 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         // be absent (missingSession case) — mobile_agent handles that with
         // NO_SESSION_REPLY.
         mobileSessionId: parseMobileContext(context)?.mobileSessionId ?? null,
-        missingSession: forceRouteIntent.metadata.missingSession === true,
+        missingSession: mobileForceRoute.metadata.missingSession === true,
         messagePreview: message.slice(0, 60),
       });
       // Same abort guard the classifier path runs immediately after
       // its LLM call — preserves the existing cancellation contract.
+      checkRequestAbortedWithLogging(abortSignal);
+    } else if (apiFlowForceRoute) {
+      parsedIntent = apiFlowForceRoute as Awaited<ReturnType<typeof parseIntent>>;
+      incCounter('api_flow.force_route', 'applied');
+      logger.info('[CHAT] api_flow force-route → api_flow_test', {
+        chatSessionId,
+        userId,
+        attachmentNames: attachments?.map(a => a.name).slice(0, 5),
+        messagePreview: message.slice(0, 60),
+      });
+      // Same abort guard the classifier path runs immediately after its LLM call.
       checkRequestAbortedWithLogging(abortSignal);
     } else {
       // ═══════════════════════════════════════════════════════════════════════

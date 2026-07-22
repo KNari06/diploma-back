@@ -2860,6 +2860,24 @@ export async function startMobileExploration(req: Request, res: Response): Promi
     return;
   }
 
+  // IDOR guard: projectId comes from req.params, so a caller could pass any
+  // project's id. The discovered cases + app-skeleton merge in the worker
+  // write to THIS projectId (mobile-exploration-run.job.ts), so without this
+  // check an authenticated paid user could pollute another tenant's project
+  // with their own crawl output. Mirrors the guard in warmupSession above.
+  const accessibleProject = await ProjectService.getProject(projectId, userId);
+  if (!accessibleProject) {
+    logger.warn('[MOBILE_SESSION] exploration start rejected: project not found or no access', {
+      userId,
+      projectId,
+      platform: rawPlatform,
+      reason: 'project_not_found_or_forbidden',
+      status: 404,
+    });
+    res.status(404).json({ success: false, error: 'Project not found' });
+    return;
+  }
+
   // Server-config ONLY — never accept a client-supplied runner URL (it
   // would let a caller redirect the server-held key to an arbitrary host).
   const runnerSocketUrl = currentRunnerSocketUrl();

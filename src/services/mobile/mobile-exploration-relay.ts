@@ -2,6 +2,7 @@ import { io, type Socket } from 'socket.io-client';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
+import { storeMobileClarificationRoute } from '@/services/mobile/mobile-clarification-route.service';
 import type {
   ExplorationProgressPayload,
   ExplorationCompletedPayload,
@@ -46,6 +47,38 @@ export interface MobileExplorationRelayParams {
 }
 
 const DEFAULT_MAX_LIFETIME_MS = 20 * 60 * 1000;
+const DEFAULT_CLARIFICATION_TIMEOUT_MS = 2 * 60 * 1000;
+
+/** The runner's UserQuestion, as it rides inside a flow_blocked envelope. */
+interface MobileClarificationQuestion {
+  id: string;
+  kind: 'credential' | 'choice' | 'free_text' | 'confirmation' | 'permission';
+  prompt: string;
+  options?: string[];
+  timeoutMs?: number;
+}
+
+/**
+ * Map a runner question kind → a frontend clarification `type`. Credential
+ * prompts are intentionally NOT routed here (they need a secure form, not the
+ * reused captcha/2FA modal); returning null leaves them as a passive block.
+ */
+function mapQuestionType(
+  kind: MobileClarificationQuestion['kind'],
+): 'confirmation' | 'choice' | 'test_data' | null {
+  switch (kind) {
+    case 'confirmation':
+    case 'permission':
+      return 'confirmation';
+    case 'choice':
+      return 'choice';
+    case 'free_text':
+      return 'test_data';
+    case 'credential':
+    default:
+      return null;
+  }
+}
 
 /** Terminal outcome resolved by waitUntilDone(). */
 export interface MobileExplorationRelayOutcome {
@@ -208,6 +241,64 @@ export class MobileExplorationRelay {
       userId: this.params.userId,
     };
     webSocketService.emitExplorationProgress(payload);
+
+    // Human-in-the-loop: an `awaiting_user` question rides in as a `flow_blocked`
+    // envelope carrying `data.mobile.question`. The progress event alone only
+    // paints a "blocked" badge — the browser can't answer it. Additionally
+    // surface it as a clarification request (the channel the answer modal
+    // listens on) and register the runner route so the answer can travel back.
+    if (envelope.event === 'flow_blocked') {
+      void this.surfaceClarification(payload);
+    }
+  }
+
+  /**
+   * Turn a `flow_blocked`-with-question progress event into an answerable
+   * clarification request + a runner route entry. Best-effort — never throws
+   * into the socket callback (a failure just leaves the run to time out on the
+   * runner, the pre-existing fail-closed behaviour).
+   */
+  private async surfaceClarification(payload: ExplorationProgressPayload): Promise<void> {
+    try {
+      const question = (payload.data as { mobile?: { question?: MobileClarificationQuestion } })
+        ?.mobile?.question;
+      if (!question?.id || !question.prompt) return;
+
+      // Map the runner question kind → the frontend clarification type. Only
+      // non-credential kinds are routed here; a credential prompt needs the
+      // secure form (out of scope for this reuse) and stays a passive block.
+      const type = mapQuestionType(question.kind);
+      if (!type) return;
+
+      const timeoutMs = typeof question.timeoutMs === 'number' && question.timeoutMs > 0
+        ? question.timeoutMs
+        : DEFAULT_CLARIFICATION_TIMEOUT_MS;
+
+      // Register the route BEFORE emitting, so an instant answer can't race a
+      // missing mapping.
+      await storeMobileClarificationRoute(
+        question.id,
+        { runId: this.params.runId, userId: this.params.userId },
+        Math.ceil(timeoutMs / 1000) + 30,
+      );
+
+      webSocketService.emitExplorationClarification({
+        explorationId: payload.explorationId,
+        questionId: question.id,
+        question: question.prompt,
+        type,
+        options: Array.isArray(question.options) ? question.options : undefined,
+        timeout: timeoutMs,
+        chatSessionId: this.params.chatSessionId ?? '',
+        userId: this.params.userId,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      logger.warn('[mobile-exploration-relay] failed to surface clarification', {
+        runId: this.params.runId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   private forwardCompleted(envelope: Partial<ExplorationCompletedPayload>): void {

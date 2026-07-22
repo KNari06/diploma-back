@@ -9,6 +9,18 @@ export interface ChatAttachment {
   base64?: string;
   /** For documents: extracted text content */
   extractedText?: string;
+  /**
+   * For archive uploads: structured extraction result so downstream handlers
+   * can tell the user their project was only partially read. Without this the
+   * truncation signal survives only as a comment buried in `extractedText`,
+   * which the user never sees.
+   */
+  archiveMeta?: {
+    fileCount: number;
+    truncated: boolean;
+    skipped: string[];
+    includedFiles: string[];
+  };
 }
 
 export interface ApiTestContext {

@@ -169,6 +169,7 @@ async function processUploadedFiles(req: Request): Promise<ChatAttachment[]> {
         const { extractPythonFromArchive } = await import('@/utils/parsing/archive-extractor');
         let extractedText: string;
         let archiveName = file.originalname;
+        let archiveMeta: ChatAttachment['archiveMeta'];
         try {
           const result = await extractPythonFromArchive(file.buffer, file.originalname);
           const note =
@@ -178,6 +179,14 @@ async function processUploadedFiles(req: Request): Promise<ChatAttachment[]> {
           extractedText = note + result.combined;
           // Keep a .py signal so api_flow detection routes to the Python adapter.
           archiveName = `${file.originalname}.py`;
+          // Preserve the extraction result as structured data so the api_flow
+          // handler can WARN the user when only part of their project was read.
+          archiveMeta = {
+            fileCount: result.fileCount,
+            truncated: result.truncated,
+            skipped: result.skipped,
+            includedFiles: result.includedFiles,
+          };
         } catch (archiveError) {
           logger.warn('[CHAT] Failed to extract Python from archive', {
             fileName: file.originalname,
@@ -192,6 +201,7 @@ async function processUploadedFiles(req: Request): Promise<ChatAttachment[]> {
           mimeType: file.mimetype,
           size: file.size,
           extractedText,
+          archiveMeta,
         });
       } else {
         // Document: extract text via fileParser

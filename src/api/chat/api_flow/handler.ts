@@ -84,6 +84,8 @@ export async function handleApiFlowTest(
     answers?: Record<string, any>;
     abortSignal?: AbortSignal;
     attachments?: ChatAttachment[];
+    /** Controller-resolved project (test-case scope). Global scope falls back to the session binding. */
+    projectId?: string;
   }
 ): Promise<void> {
   const { message, userId, workspace_id, chatSessionId, abortSignal, attachments } = params;
@@ -146,13 +148,22 @@ export async function handleApiFlowTest(
       source = 'url';
     }
 
-    // Get or detect project
-    const projectId = params.parsedIntent?.projectId || params.answers?.projectId;
+    // Get or detect project. Priority: intent → answers → the chat session's
+    // bound project (the controller syncs the UI-selected project into
+    // chat_sessions.project_id on every global turn). Without the session
+    // fallback a force-routed upload would dead-end here, since the classifier
+    // never populates parsedIntent.projectId for a files-only message.
+    let projectId: string | undefined =
+      params.parsedIntent?.projectId || params.answers?.projectId || params.projectId;
+    if (!projectId && chatSessionId) {
+      const session = await ChatService.getSessionWithProject(chatSessionId, userId);
+      projectId = session?.project_id;
+    }
     if (!projectId) {
       if (chatSessionId) {
         await ChatService.saveChatMessages(chatSessionId, [{
           role: 'ai',
-          content: 'Please provide a project ID to associate this flow spec with.',
+          content: 'Please select a project first, then upload your API spec / project again so I can attach the flow to it.',
         }]);
       }
       res.json({ success: true, timestamp: new Date().toISOString() });
@@ -208,15 +219,56 @@ export async function handleApiFlowTest(
     const authNode = dag.nodes.find(n => n.isAuthEndpoint);
     const authNote = authNode ? `\n🔐 Auth endpoint: \`${authNode.method} ${authNode.path}\`` : '';
 
+    // Truncation transparency: an uploaded project archive is read only up to a
+    // size cap, and lower-relevance files (tests first) are dropped silently in
+    // the extractor. Surface that here so the user knows the flow may be partial
+    // rather than assuming their whole project was understood.
+    const archiveMeta = specAttachment?.archiveMeta;
+    const truncationNote = archiveMeta?.truncated
+      ? `\n\n⚠️ Only part of your project was read (size limit): ${archiveMeta.fileCount} file(s) used, ${archiveMeta.skipped.length} skipped. The flow may be incomplete — upload a smaller subset or the specific API client/spec files for full coverage.`
+      : '';
+
+    // Unverified variable links: the builder statically checked which values flow
+    // between calls. Surface what it could NOT verify so a flow that LOOKS
+    // connected doesn't silently 401/400 at run time. `no_producer` = a value no
+    // call in the flow produces (you supply it before running); the others are
+    // ordering/collision anomalies worth a look.
+    const unverified = dag.unverifiedLinks ?? [];
+    const needProvided = [...new Set(unverified.filter(l => l.kind === 'no_producer').map(l => l.variableName))];
+    const anomalies = unverified.filter(l => l.kind !== 'no_producer');
+    const unverifiedNote =
+      needProvided.length > 0 || anomalies.length > 0
+        ? `\n\n🔗 **Some variable links couldn't be verified:**` +
+          (needProvided.length
+            ? `\n• ${needProvided.length} value(s) no call produces — you'll set them before running: ${needProvided.map(v => `\`${v}\``).join(', ')}.`
+            : '') +
+          (anomalies.length
+            ? `\n• ${anomalies.length} ordering/naming anomaly(ies) — the chain may not pass data as intended; check the flow view.`
+            : '') +
+          `\n(Static check only — a wrong response-field path can still fail at run time.)`
+        : '';
+
     const successMessage = `✅ **API Flow built for "${spec.title}"**
 
 📊 **${spec.endpoints.length} endpoints** analyzed and organized into an execution chain.
 🔗 **${dag.nodes.filter(n => n.dependsOn.length > 0).length} dependencies** detected.
-🔑 **${dag.nodes.filter(n => n.variableExtractions.length > 0).length} variable extractions** configured.${authNote}${unsupportedNote}${parallelNote}
+🔑 **${dag.nodes.filter(n => n.variableExtractions.length > 0).length} variable extractions** configured.${authNote}${unsupportedNote}${parallelNote}${truncationNote}${unverifiedNote}
 
 You can see the flow visualization in the sidebar. When ready, click **Run** to execute the chain.
 
 > Flow ID: \`${flowSpec.id}\``;
+
+    const flowMetadata = {
+      type: 'api_flow_built' as const,
+      flowSpecId: flowSpec.id,
+      totalEndpoints: spec.endpoints.length,
+      ...(archiveMeta?.truncated
+        ? { archiveTruncated: true, archiveFilesUsed: archiveMeta.fileCount, archiveFilesSkipped: archiveMeta.skipped.length }
+        : {}),
+      ...(unverified.length
+        ? { unverifiedLinkCount: unverified.length, unverifiedVarsNeeded: needProvided, unverifiedAnomalies: anomalies.length }
+        : {}),
+    };
 
     if (chatSessionId) {
       await ChatService.saveChatMessages(chatSessionId, [
@@ -224,11 +276,7 @@ You can see the flow visualization in the sidebar. When ready, click **Run** to 
         {
           role: 'ai',
           content: successMessage,
-          metadata: {
-            type: 'api_flow_built',
-            flowSpecId: flowSpec.id,
-            totalEndpoints: spec.endpoints.length,
-          },
+          metadata: flowMetadata,
         },
       ]);
     }
@@ -237,11 +285,7 @@ You can see the flow visualization in the sidebar. When ready, click **Run** to 
       success: true,
       reply: successMessage,
       timestamp: new Date().toISOString(),
-      metadata: {
-        type: 'api_flow_built',
-        flowSpecId: flowSpec.id,
-        totalEndpoints: spec.endpoints.length,
-      },
+      metadata: flowMetadata,
     });
   } catch (error: any) {
     logger.error('[API_FLOW_HANDLER] Failed to build flow', {
