@@ -711,17 +711,18 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
             names: candidates.map((c) => c.name),
           });
 
-          const reply = await storePendingRunExisting(chatSessionId, candidates);
+          const { reply, actions } = await storePendingRunExisting(chatSessionId, candidates);
 
           ChatService.saveChatMessages(chatSessionId, [
             { role: 'user', content: message },
-            { role: 'ai', content: reply, metadata: { mode: 'run_existing_confirmation' } },
+            { role: 'ai', content: reply, metadata: { mode: 'run_existing_confirmation', actions } },
           ]).catch(() => {});
 
           res.json({
             success: true,
             reply,
             mode: 'run_existing_confirmation',
+            metadata: { actions },
             timestamp: new Date().toISOString(),
             sessionId: chatSessionId,
           });
@@ -740,15 +741,29 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
           ? `I couldn't find a saved test matching that. To create new tests, open the **Explore** section (Execution menu) and add your URL or mobile app build — I'll discover test cases automatically.`
           : `You don't have any saved tests yet. Open the **Explore** section (Execution menu) and add your URL (web) or upload an APK/IPA/AAB (mobile) — I'll explore the app and generate test cases for you to run.`;
 
+        // Make "Explore" a one-click deep link instead of prose the user has to
+        // hunt for in the Execution menu.
+        const exploreActions = [
+          {
+            id: 'open-explore',
+            label: 'Open Explore',
+            kind: 'navigate' as const,
+            url: '/explorations',
+            variant: 'primary' as const,
+            icon: 'play',
+          },
+        ];
+
         ChatService.saveChatMessages(chatSessionId, [
           { role: 'user', content: message },
-          { role: 'ai', content: exploreReply, metadata: { mode: 'suggest_exploration' } },
+          { role: 'ai', content: exploreReply, metadata: { mode: 'suggest_exploration', actions: exploreActions } },
         ]).catch(() => {});
 
         res.json({
           success: true,
           reply: exploreReply,
           mode: 'suggest_exploration',
+          metadata: { actions: exploreActions },
           timestamp: new Date().toISOString(),
           sessionId: chatSessionId,
         });
