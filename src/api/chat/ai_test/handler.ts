@@ -15,39 +15,11 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { ChatTestUpdatePayload } from '@/websocket/types/types';
 import { Request, Response } from 'express';
 import { checkRequestAborted } from '../shared/request-cancellation';
+import { acquireChatTestLock, releaseChatTestLock } from '../shared/chat-test-lock';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
 import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
 import { QueueManager } from '@/config/infrastructure/queues';
-
-// ═══════════════════════════════════════════════════════════════════════════
-// REDIS LOCK HELPER: Prevents concurrent test starts for the same chat session
-// ═══════════════════════════════════════════════════════════════════════════
-const CHAT_TEST_LOCK_PREFIX = 'lock:chat_test_start:';
-const CHAT_TEST_LOCK_TTL_SECONDS = 10; // Short TTL to prevent stuck locks
-
-async function acquireChatTestLock(chatSessionId: string): Promise<boolean> {
-  try {
-    const lockKey = `${CHAT_TEST_LOCK_PREFIX}${chatSessionId}`;
-    const result = await redisConnection.set(lockKey, '1', 'EX', CHAT_TEST_LOCK_TTL_SECONDS, 'NX');
-    return result === 'OK';
-  } catch {
-    // If Redis is unavailable, fail-closed (reject the request to prevent concurrent execution)
-    logger.warn('[CHAT_LOCK] Redis unavailable, denying lock to prevent concurrent test execution', {
-      chatSessionId,
-    });
-    return false;
-  }
-}
-
-async function releaseChatTestLock(chatSessionId: string): Promise<void> {
-  try {
-    const lockKey = `${CHAT_TEST_LOCK_PREFIX}${chatSessionId}`;
-    await redisConnection.del(lockKey);
-  } catch {
-    // Best-effort release
-  }
-}
 
 /**
  * Run an async operation with timeout and optional cancellation support.

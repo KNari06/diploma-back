@@ -43,6 +43,7 @@ import { getProjectForAccess, getTestBrowsersAndOptions } from './db/regression.
 import { isPendingSegmentsStale } from '@/services/testing/results/test-completion-handler.service';
 import { priorityRank } from './resolve-test-case-priority.util';
 import { TestExecutionOrchestratorService } from './test-execution-orchestrator.service';
+import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -276,6 +277,29 @@ export class RegressionRunService {
           error: updateError,
           runId: run.id,
           testId,
+        });
+      }
+
+      // 6. When launched from chat, link this test to the chat session so the
+      // completion handler streams the final pass/fail back into the chat panel
+      // (same surface as a Lite run). Without this row `getChatSessionsForTest`
+      // returns [] and `handleTestCompletion` falls through to a bell
+      // notification — the chat's "I'll report the result" promise is never
+      // kept. `test:progress` already reaches chat:<sessionId>, but the
+      // terminal events do not, so this mapping is what closes the loop.
+      // Fire-and-forget + best-effort: never fail the run over a mapping write.
+      if (chatSessionId) {
+        TestChatMappingService.saveTestChatMapping({
+          testId,
+          chatSessionId,
+          userId,
+          metadata: { trigger: 'chat' },
+        }).catch((mappingError) => {
+          logger.warn('[REGRESSION_RUN] Failed to save test-chat mapping', {
+            error: formatError(mappingError),
+            testId,
+            chatSessionId,
+          });
         });
       }
 
