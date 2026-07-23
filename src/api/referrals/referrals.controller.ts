@@ -120,12 +120,38 @@ export const createPartner = async (req: Request, res: Response): Promise<void> 
 export const updatePartner = async (req: Request, res: Response): Promise<void> => {
   if (featureOff(res)) return;
   const { id } = req.params;
-  const { name, email, status } = req.body ?? {};
+  const { name, email, status, rewardRate, rewardWindowCount } = req.body ?? {};
   if (status !== undefined && status !== 'active' && status !== 'disabled') {
     res.status(400).json({ success: false, error: 'status must be active or disabled' });
     return;
   }
-  const partner = await ReferralService.updatePartner(id, { name, email, status });
+  // Reward overrides: null clears the override (back to the global default); a
+  // number must be in range. Anything else is rejected.
+  if (rewardRate !== undefined && rewardRate !== null) {
+    if (typeof rewardRate !== 'number' || !Number.isFinite(rewardRate) || rewardRate < 0 || rewardRate > 1) {
+      res.status(400).json({ success: false, error: 'rewardRate must be a number between 0 and 1, or null' });
+      return;
+    }
+  }
+  if (rewardWindowCount !== undefined && rewardWindowCount !== null) {
+    if (
+      typeof rewardWindowCount !== 'number' ||
+      !Number.isInteger(rewardWindowCount) ||
+      rewardWindowCount < 0
+    ) {
+      res
+        .status(400)
+        .json({ success: false, error: 'rewardWindowCount must be a non-negative integer, or null' });
+      return;
+    }
+  }
+  const partner = await ReferralService.updatePartner(id, {
+    name,
+    email,
+    status,
+    rewardRate,
+    rewardWindowCount,
+  });
   if (!partner) {
     res.status(404).json({ success: false, error: 'Partner not found' });
     return;
