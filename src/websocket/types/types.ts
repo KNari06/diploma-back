@@ -1479,7 +1479,13 @@ export interface ExplorationClarificationPayload {
   // 'test_data' = the flow needs a real value it couldn't invent (promo code,
   // account number, non-2FA one-time code). Frontend renders it with the same
   // text-input modal as '2fa_code'. NOT credentials (those need a secure form).
-  type: 'captcha_solve' | '2fa_code' | 'test_data';
+  // 'confirmation' / 'choice' = mobile human-in-the-loop `ask_user` pauses
+  // (e.g. confirming a destructive action the crawl's guard blocked). The answer
+  // routes back to the RUNNER (see mobile-clarification-route.service), not the
+  // web ClarificationService.
+  type: 'captcha_solve' | '2fa_code' | 'test_data' | 'confirmation' | 'choice';
+  /** For 'choice' — selectable options the user picks from. */
+  options?: string[];
   timeout: number;
   chatSessionId: string;
   userId?: string;
@@ -2920,6 +2926,15 @@ export interface ApiFlowDagReadyPayload {
   totalEndpoints: number;
   unsupportedEndpoints: Array<{ method: string; path: string; reason: string }>;
   variableChain: Record<string, any>;
+  /** Variable links the builder could not statically verify (see UnverifiedLink). */
+  unverifiedLinks?: Array<{
+    kind: 'no_producer' | 'producer_after' | 'name_collision';
+    variableName: string;
+    consumerNodeId?: string;
+    producerNodeId?: string;
+    injectAs?: string;
+    targetKey?: string;
+  }>;
   timestamp: string;
 }
 

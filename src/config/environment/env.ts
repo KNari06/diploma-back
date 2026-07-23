@@ -460,6 +460,14 @@ const envSchema = z.object({
   // `resolveEditorPageContext` in general/handler.ts.
   MOBILE_EDITOR_FORCE_ROUTE: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
 
+  // When `true` (default), an uploaded API spec / archive / Python source
+  // (or a pasted cURL / Python script / Swagger URL) force-routes to the
+  // api_flow_test handler instead of relying on the LLM intent classifier —
+  // which is blind to attachments and silently sends a files-only upload to
+  // general_chat (no flow ever built). Set to `false` to revert to
+  // classifier-only routing.
+  API_FLOW_FORCE_ROUTE: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
+
   // Phase B2-B4: mobile-editor eager snapshot inject. When `true`
   // (default), the mobile_agent handler eagerly fetches the runner's
   // `/ui-state` snapshot BEFORE the first LLM call and injects it as a

@@ -144,10 +144,14 @@ export class ReferralService {
     if (!userId || !invoiceId) return false;
 
     try {
-      const partnerId = await referralDb.getUserReferralPartnerId(userId);
-      if (!partnerId) return false;
+      const config = await referralDb.getUserRewardConfig(userId);
+      if (!config) return false;
+      const { partnerId } = config;
 
-      const windowCount = ReferralsFeature.getRewardWindowCount();
+      // Per-partner overrides win over the global env default (forward-only: the
+      // rate is captured in the ledger row below, so past rewards are unaffected).
+      const rate = ReferralsFeature.resolveRewardRate(config.rewardRate);
+      const windowCount = ReferralsFeature.resolveRewardWindowCount(config.rewardWindowCount);
       if (windowCount <= 0) return false;
 
       // Window gate: already rewarded for this user's first `windowCount`
@@ -155,7 +159,7 @@ export class ReferralService {
       const alreadyRewarded = await referralDb.countRewardsForUser(userId);
       if (alreadyRewarded >= windowCount) return false;
 
-      const amount = ReferralsFeature.computeReward(amountPaidMinorUnits);
+      const amount = ReferralsFeature.computeReward(amountPaidMinorUnits, rate);
       if (amount <= 0) return false;
 
       const rewarded = await referralDb.insertRewardIfAbsent({
@@ -168,7 +172,7 @@ export class ReferralService {
         metadata: {
           source: 'stripe:invoice',
           paidAmount: amountPaidMinorUnits,
-          rate: ReferralsFeature.getRewardRate(),
+          rate,
           paymentNumber: alreadyRewarded + 1,
         },
       });
@@ -292,19 +296,27 @@ export class ReferralService {
     return this.mapPartner(row);
   }
 
-  /** Update a partner (name / email / status / linked login). */
+  /** Update a partner (name / email / status / reward overrides / linked login). */
   static async updatePartner(
     id: string,
-    patch: { name?: string; email?: string | null; status?: 'active' | 'disabled' }
+    patch: {
+      name?: string;
+      email?: string | null;
+      status?: 'active' | 'disabled';
+      rewardRate?: number | null;
+      rewardWindowCount?: number | null;
+    }
   ): Promise<Partner | null> {
     const row = await referralDb.updatePartner(id, patch);
     return row ? this.mapPartner(row) : null;
   }
 
   /**
-   * Invite a partner's email via Supabase Auth and promote the synced users row
-   * to a partner login. Returns the auth user id, or null on failure (caller
-   * treats login provisioning as best-effort).
+   * Provision a partner login for an email. New email → Supabase invite (creates
+   * the auth user + sends the invite); already-registered email → resolve the
+   * existing user (no email) so they can still be promoted. Either way the synced
+   * users row is promoted to a partner login (role='partner', approved). Returns
+   * the auth user id, or null on failure (caller treats this as best-effort).
    */
   private static async provisionPartnerLogin(email: string): Promise<string | null> {
     try {
@@ -333,6 +345,8 @@ export class ReferralService {
       email: row.email,
       authUserId: row.auth_user_id,
       status: row.status === 'disabled' ? 'disabled' : 'active',
+      rewardRate: row.reward_rate,
+      rewardWindowCount: row.reward_window_count,
       createdAt: row.created_at,
     };
   }

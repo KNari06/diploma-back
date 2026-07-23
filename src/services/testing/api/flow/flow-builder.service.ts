@@ -861,6 +861,7 @@ export class FlowBuilderService {
         totalEndpoints: dag.totalEndpoints,
         unsupportedEndpoints: dag.unsupportedEndpoints,
         variableChain: flowSpec.variableChain,
+        unverifiedLinks: dag.unverifiedLinks,
         timestamp: new Date().toISOString(),
       });
     }

@@ -1078,15 +1078,43 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
       return;
     }
 
-    try {
-      const { ClarificationService } = require('@/agent/utils/context/clarification.service');
-      ClarificationService.handleExplorationClarificationResponse(questionId, answer);
-    } catch (error) {
-      logger.error('[SubscriptionHandler] Failed to handle exploration clarification response', {
-        error: error instanceof Error ? error.message : String(error),
-        questionId,
-      });
-    }
+    // Two clarification worlds share this event. A MOBILE question (the
+    // human-in-the-loop `ask_user` pause — e.g. confirming a destructive
+    // action) was registered with a runner route when it was surfaced; route
+    // its answer to the runner. Anything without a route is a WEB captcha/2FA
+    // question, handled in-process by the ClarificationService as before.
+    void (async () => {
+      try {
+        const { takeMobileClarificationRoute } = await import(
+          '@/services/mobile/mobile-clarification-route.service'
+        );
+        // Pass the ANSWERING socket's own userId — the service refuses to route
+        // (and leaves the entry intact) unless it matches the run's owner, so a
+        // leaked questionId can't be used to answer another tenant's run.
+        const route = await takeMobileClarificationRoute(questionId, userId);
+        if (route) {
+          const { getMobileRunnerClient } = await import('@/services/mobile/mobile-runner-client');
+          const skipped = answer === '__skip__';
+          await getMobileRunnerClient().submitExplorationAnswer(
+            route.runId,
+            { questionId, value: skipped ? undefined : answer, skipped },
+            { userId: route.userId },
+          );
+          logger.info('[SubscriptionHandler] Routed mobile clarification answer to runner', {
+            questionId, runId: route.runId, skipped,
+          });
+          return;
+        }
+
+        const { ClarificationService } = require('@/agent/utils/context/clarification.service');
+        ClarificationService.handleExplorationClarificationResponse(questionId, answer);
+      } catch (error) {
+        logger.error('[SubscriptionHandler] Failed to handle exploration clarification response', {
+          error: error instanceof Error ? error.message : String(error),
+          questionId,
+        });
+      }
+    })();
   });
 
   // Cleanup on disconnect

@@ -40,11 +40,18 @@ jest.mock('socket.io-client', () => ({
 
 const emitProgress = jest.fn();
 const emitCompleted = jest.fn();
+const emitClarification = jest.fn();
 jest.mock('@/websocket/core/websocket.service', () => ({
   webSocketService: {
     emitExplorationProgress: (p: unknown) => emitProgress(p),
     emitExplorationCompleted: (p: unknown) => emitCompleted(p),
+    emitExplorationClarification: (p: unknown) => emitClarification(p),
   },
+}));
+
+const storeRoute = jest.fn();
+jest.mock('@/services/mobile/mobile-clarification-route.service', () => ({
+  storeMobileClarificationRoute: (...args: unknown[]) => storeRoute(...args),
 }));
 
 jest.mock('@/config/environment/env', () => ({
@@ -200,5 +207,64 @@ describe('MobileExplorationRelay', () => {
     expect(lastSocket.disconnect).toHaveBeenCalledTimes(1);
     const outcome = await relay.waitUntilDone();
     expect(outcome.status).toBe('failed');
+  });
+
+  describe('human-in-the-loop clarification (flow_blocked with a question)', () => {
+    // surfaceClarification awaits storeMobileClarificationRoute before emitting,
+    // so flush the microtask queue after firing the event.
+    const flush = () => Promise.resolve().then(() => Promise.resolve());
+
+    it('surfaces a confirmation question as a clarification request + registers the runner route', async () => {
+      makeRelay().start();
+      lastSocket.fire('exploration:progress', {
+        explorationId: 'expl-1', phase: 'executing', event: 'flow_blocked', progressPercent: 50,
+        data: {
+          blockerType: 'other', canUserHelp: true,
+          mobile: { question: { id: 'q-del', kind: 'confirmation', prompt: 'Confirm delete account?', timeoutMs: 90000 } },
+        },
+      });
+      await flush();
+      // Route registered so the answer can travel back to THIS run.
+      expect(storeRoute).toHaveBeenCalledWith('q-del', { runId: 'expl-1', userId: 'user-1' }, expect.any(Number));
+      // Emitted on the channel the answer modal listens on.
+      expect(emitClarification).toHaveBeenCalledWith(expect.objectContaining({
+        explorationId: 'expl-1', questionId: 'q-del', type: 'confirmation',
+        question: 'Confirm delete account?', chatSessionId: 'chat-1', userId: 'user-1',
+      }));
+    });
+
+    it('maps a choice question (with options) to type choice', async () => {
+      makeRelay().start();
+      lastSocket.fire('exploration:progress', {
+        explorationId: 'expl-1', event: 'flow_blocked', data: {
+          mobile: { question: { id: 'q-c', kind: 'choice', prompt: 'Which account?', options: ['A', 'B'] } },
+        },
+      });
+      await flush();
+      expect(emitClarification).toHaveBeenCalledWith(expect.objectContaining({
+        questionId: 'q-c', type: 'choice', options: ['A', 'B'],
+      }));
+    });
+
+    it('does NOT surface a credential question (needs a secure form, stays a passive block)', async () => {
+      makeRelay().start();
+      lastSocket.fire('exploration:progress', {
+        explorationId: 'expl-1', event: 'flow_blocked', data: {
+          mobile: { question: { id: 'q-cred', kind: 'credential', prompt: 'password' } },
+        },
+      });
+      await flush();
+      expect(emitClarification).not.toHaveBeenCalled();
+      expect(storeRoute).not.toHaveBeenCalled();
+    });
+
+    it('ignores a flow_blocked with no embedded question', async () => {
+      makeRelay().start();
+      lastSocket.fire('exploration:progress', {
+        explorationId: 'expl-1', event: 'flow_blocked', data: { blockerType: 'other' },
+      });
+      await flush();
+      expect(emitClarification).not.toHaveBeenCalled();
+    });
   });
 });
