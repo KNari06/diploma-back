@@ -13,14 +13,14 @@
 #
 # Required CI/CD Variables (Group: qait.dev):
 #   AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
-#   RESOURCE_GROUP=qai-prod-rg  ACR_NAME=qaiprodacr24d6d7
-#   ACR_LOGIN_SERVER=qaiprodacr24d6d7.azurecr.io
+#   RESOURCE_GROUP=qai-prod-rg  ACR_NAME=qaiprodacrc3f4ef
+#   ACR_LOGIN_SERVER=qaiprodacrc3f4ef.azurecr.io
 #   CONTAINER_APP_API=qai-api-prod  CONTAINER_APP_WORKER=qai-worker-prod
 # ─────────────────────────────────────────────────────────────────
 
 default:
   tags:
-    - dev-runner            # все джобы → наш self-hosted runner
+    - dev-runner-appex      # все джобы → наш self-hosted runner
 
 workflow:
   rules:
