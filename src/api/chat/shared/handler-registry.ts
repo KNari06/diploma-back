@@ -187,6 +187,9 @@ const handleApiFlowTest: IntentHandler = async (req, res, params) => {
     answers: params.answers,
     abortSignal: params.abortSignal,
     attachments: params.attachments,
+    // Controller-resolved project (test-case scope). Global uploads fall back
+    // to the chat session's bound project inside the handler.
+    projectId: params.projectId,
   });
 };
 

@@ -177,7 +177,10 @@ export class MobileExplorationRunJobHandler {
         // multiplier (emulator COGS is higher). Charged once on success, best-
         // effort — a failed deduction must never fail the run the user got.
         // Mirrors mobile-test-run.job and the web exploration discovery charge.
-        if (userId) {
+        // Only charge when the run actually produced test cases — a completed
+        // crawl that saved nothing (or whose result fetch failed above, leaving
+        // savedCount = 0) is not a billable discovery.
+        if (userId && savedCount > 0) {
           const mobileExplorationCredits =
             EXPLORATION_DISCOVERY_CREDITS * MOBILE_STEP_CREDIT_MULTIPLIER;
           try {

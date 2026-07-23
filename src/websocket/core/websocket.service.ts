@@ -482,8 +482,19 @@ class WebSocketService {
         logger.info('[WebSocketService] Emitting test started', {
           testId,
           timestamp: payload.timestamp,
+          sessionId: payload.sessionId,
         });
+        // Emit to test room (always)
         this.emitToTest(testId, 'test:started', payload);
+        // When launched from chat, also emit to chat:<sessionId> so the chat
+        // panel can seed its progress card — mirrors emitTestProgress. Without
+        // this the panel (subscribed only to chat:<sessionId>, not test:<id>)
+        // never seeds a card and the "watch the progress below" reply is
+        // followed by dead air until the final result. Global-chat room only;
+        // test-case chat (chat:tc:<id>) is unaffected (Hard invariant #16).
+        if (payload.sessionId) {
+          this.emitToChat(payload.sessionId, 'test:started', payload);
+        }
       },
       { testId }
     );

@@ -18,9 +18,10 @@ import { Request, Response } from 'express';
 import { redisConnection } from '@/config/infrastructure/queues';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { ChatService } from '@/services/utils/chat.service';
-import { NotFoundError } from '@/types';
+import { NotFoundError, InsufficientCreditsError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { classifyConfirmation } from './confirmation-classifier';
+import { QuickAction } from './quick-action.types';
 
 const PENDING_RUN_EXISTING_PREFIX = 'pending_run_existing:';
 const PENDING_TTL_SECONDS = 300; // 5 min, matches manage-confirmation
@@ -49,13 +50,42 @@ function platformLabel(platform: string): string {
 }
 
 /**
- * Persist the pending candidate list and return the confirmation message the
- * caller should reply with. The caller (chat.controller) sends the response.
+ * Build clickable confirmation chips for the pending candidates. Each chip is a
+ * `kind:'chat'` quick action whose `prompt` is re-sent as a chat message on the
+ * user's behalf — landing back in `handlePendingRunExistingConfirmation` on the
+ * next turn exactly as if the user typed it. So the copy still tells the user
+ * they can type; the chips are a shortcut, not a replacement.
+ */
+function buildConfirmationChips(candidates: PendingRunExistingCandidate[]): QuickAction[] {
+  if (candidates.length === 1) {
+    return [
+      { id: 'run-existing-yes', label: 'Yes, run it', kind: 'chat', prompt: 'yes', variant: 'primary', icon: 'play', oneShot: true },
+      { id: 'run-existing-no', label: 'No', kind: 'chat', prompt: 'no', variant: 'ghost', icon: 'x', oneShot: true },
+    ];
+  }
+  const pickChips: QuickAction[] = candidates.map((_, i) => ({
+    id: `run-existing-pick-${i + 1}`,
+    label: `${i + 1}`,
+    kind: 'chat',
+    prompt: `${i + 1}`,
+    variant: 'secondary',
+    oneShot: true,
+  }));
+  return [
+    ...pickChips,
+    { id: 'run-existing-no', label: 'No', kind: 'chat', prompt: 'no', variant: 'ghost', icon: 'x', oneShot: true },
+  ];
+}
+
+/**
+ * Persist the pending candidate list and return the confirmation message + the
+ * clickable chips the caller should attach. The caller (chat.controller) sends
+ * the response.
  */
 export async function storePendingRunExisting(
   chatSessionId: string,
   candidates: PendingRunExistingCandidate[],
-): Promise<string> {
+): Promise<{ reply: string; actions: QuickAction[] }> {
   const payload: PendingRunExistingData = { candidates };
   try {
     await redisConnection.set(
@@ -70,21 +100,27 @@ export async function storePendingRunExisting(
     });
   }
 
+  const actions = buildConfirmationChips(candidates);
+
   if (candidates.length === 1) {
     const c = candidates[0];
-    return (
-      `I found a saved test that matches: **${c.name}** (${platformLabel(c.platform)}).\n\n` +
-      `Want me to run it?`
-    );
+    return {
+      reply:
+        `I found a saved test that matches: **${c.name}** (${platformLabel(c.platform)}).\n\n` +
+        `Want me to run it?`,
+      actions,
+    };
   }
 
   const list = candidates
     .map((c, i) => `${i + 1}. **${c.name}** (${platformLabel(c.platform)})`)
     .join('\n');
-  return (
-    `I found ${candidates.length} saved tests that match your request:\n\n${list}\n\n` +
-    `Reply with the **number** (e.g. "1") of the test to run, or **no** to skip.`
-  );
+  return {
+    reply:
+      `I found ${candidates.length} saved tests that match your request:\n\n${list}\n\n` +
+      `Reply with the **number** (e.g. "1") of the test to run, or **no** to skip.`,
+    actions,
+  };
 }
 
 /**
@@ -136,6 +172,10 @@ async function runCandidate(
   userId: string,
   candidate: PendingRunExistingCandidate,
 ): Promise<void> {
+  // Double-run protection lives at the caller: the pending payload is claimed
+  // atomically (GETDEL), so two near-simultaneous confirms can't both reach
+  // here for the same chat. No per-run Redis lock is needed (a valueless
+  // SET NX/DEL lock had a wrong-owner-delete footgun and only masked the race).
   try {
     const result = await RegressionRunService.runSavedTestCase({
       savedTestCaseId: candidate.id,
@@ -179,23 +219,42 @@ async function runCandidate(
     // A deleted/unpublished test between ask and confirm → NotFound. Surface a
     // clean message rather than a 500.
     const isNotFound = error instanceof NotFoundError;
+    // Out of credits: the pre-flight check throws InsufficientCreditsError,
+    // which carries a stable `code`/`details`. Pass the code through in the
+    // body so apiClient flips the global credits banner (it keys off
+    // `data.code === 'INSUFFICIENT_CREDITS'`, HTTP-status-independent), and
+    // show the human-readable reason instead of the generic retry copy.
+    const isInsufficientCredits = error instanceof InsufficientCreditsError;
     logger.error('[RUN_EXISTING_CONFIRM] Failed to run saved test case', {
       error: error instanceof Error ? error.message : String(error),
       savedTestCaseId: candidate.id,
     });
 
-    const errorReply = isNotFound
-      ? `That saved test is no longer available. Try again or open the **Explore** section to create new tests.`
-      : `Failed to start the test. Please try again.`;
+    let errorReply: string;
+    if (isInsufficientCredits) {
+      errorReply = `⚠️ ${error.message}`;
+    } else if (isNotFound) {
+      errorReply = `⚠️ That saved test is no longer available. Try again or open the **Explore** section to create new tests.`;
+    } else {
+      errorReply = `⚠️ Failed to start the test. Please try again.`;
+    }
 
     ChatService.saveChatMessages(chatSessionId, [
       { role: 'user', content: message },
-      { role: 'ai', content: errorReply },
+      { role: 'ai', content: errorReply, metadata: { error: true } },
     ]).catch(() => {});
 
     res.json({
       success: false,
       reply: errorReply,
+      // Machine-readable credit sentinel so the frontend can trigger the
+      // global banner; other errors carry only the ⚠️-prefixed reply.
+      ...(isInsufficientCredits && {
+        code: (error as InsufficientCreditsError & { code?: string }).code,
+        message: error.message,
+        details: (error as InsufficientCreditsError & { details?: unknown }).details,
+      }),
+      metadata: { error: true },
       timestamp: new Date().toISOString(),
       sessionId: chatSessionId,
     });
@@ -215,9 +274,23 @@ export async function handlePendingRunExistingConfirmation(
 ): Promise<boolean> {
   const key = keyFor(chatSessionId);
 
+  // Atomically CLAIM the pending payload: GETDEL reads-and-deletes in one op so
+  // two near-simultaneous confirms (double-click / network retry) can't both
+  // pass — only the first sees the payload; the second gets null and falls
+  // through. This closes the get→del race at the root (a plain get let both
+  // requests through, and the downstream run lock only masked it). The one case
+  // that must KEEP the pending list — a bare "yes" on a multi-match, where we
+  // re-ask for the number — writes it back below.
   let pendingRaw: string | null;
   try {
-    pendingRaw = await redisConnection.get(key);
+    // getdel needs Redis 6.2+. Fall back to get+del if the command is refused
+    // on an older server (still non-atomic there, but correct behaviour).
+    if (typeof (redisConnection as { getdel?: unknown }).getdel === 'function') {
+      pendingRaw = await (redisConnection as unknown as { getdel(k: string): Promise<string | null> }).getdel(key);
+    } else {
+      pendingRaw = await redisConnection.get(key);
+      if (pendingRaw) await redisConnection.del(key).catch(() => {});
+    }
   } catch {
     return false;
   }
@@ -227,21 +300,18 @@ export async function handlePendingRunExistingConfirmation(
   try {
     pending = JSON.parse(pendingRaw);
   } catch {
-    await redisConnection.del(key).catch(() => {});
-    return false;
+    return false; // already deleted by the claim above
   }
 
   const candidates = pending.candidates || [];
   if (candidates.length === 0) {
-    await redisConnection.del(key).catch(() => {});
-    return false;
+    return false; // already deleted by the claim above
   }
 
   // For a multi-match list, a direct numeric/name pick wins over yes/no.
   if (candidates.length > 1) {
     const picked = parsePick(message, candidates);
     if (picked) {
-      await redisConnection.del(key).catch(() => {});
       await runCandidate(res, message, chatSessionId, userId, picked);
       return true;
     }
@@ -253,11 +323,15 @@ export async function handlePendingRunExistingConfirmation(
   // ambiguous, so re-ask for the number rather than guessing.
   if (intent === 'confirm') {
     if (candidates.length === 1) {
-      await redisConnection.del(key).catch(() => {});
       await runCandidate(res, message, chatSessionId, userId, candidates[0]);
       return true;
     }
-    // Keep the pending list; ask the user to disambiguate.
+    // Bare "yes" on a multi list is ambiguous — re-ask for the number. The
+    // atomic claim already consumed the key, so write the pending list BACK
+    // (same TTL) so the user's next numeric reply still finds it.
+    try {
+      await redisConnection.set(key, pendingRaw, 'EX', PENDING_TTL_SECONDS);
+    } catch { /* best-effort — a lost list just falls through to a re-ask */ }
     const list = candidates
       .map((c, i) => `${i + 1}. **${c.name}** (${platformLabel(c.platform)})`)
       .join('\n');
@@ -275,10 +349,9 @@ export async function handlePendingRunExistingConfirmation(
     return true;
   }
 
-  // Decline — clear and steer toward exploration (consistent with the
-  // "no saved match" path).
+  // Decline — steer toward exploration (consistent with the "no saved match"
+  // path). The pending key was already consumed by the atomic claim above.
   if (intent === 'decline') {
-    await redisConnection.del(key).catch(() => {});
     const reply =
       `Okay, I won't run a saved test. To create new tests, open the **Explore** ` +
       `section (Execution menu) and add your URL or mobile app build.`;
@@ -295,7 +368,7 @@ export async function handlePendingRunExistingConfirmation(
     return true;
   }
 
-  // Ambiguous → clear pending and let the normal flow handle this message.
-  await redisConnection.del(key).catch(() => {});
+  // Ambiguous → let the normal flow handle this message. The pending key was
+  // already consumed by the atomic claim above, so nothing to clear.
   return false;
 }
