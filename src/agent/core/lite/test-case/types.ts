@@ -52,6 +52,7 @@ export type TestAction =
   | 'clear' // Clear an input field
   | 'selectDate' // Set date/time input value
   | 'verify' // Run assertions only (no action)
+  | 'assert' // Deterministic assertion authored by the agent (text-contains on an element)
   | 'custom'; // AI-driven "do X" action
 
 /**

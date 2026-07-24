@@ -9,6 +9,7 @@
 const KNOWN_FLAGS = [
   // silent-functional (DOM stays intact; only an assertion catches the wrong number)
   'shop.sf2-discount', // omit the 10% discount at checkout → total is wrong-high
+  'shop.sf-search-count', // search result count is off-by-one (list still filters correctly)
   'shop.sf4-qty-increment', // reserved: qty +2 instead of +1 (not wired in v1)
 ];
 

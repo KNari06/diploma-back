@@ -44,17 +44,23 @@ export const FIXTURE_SCENARIOS: FixtureScenario[] = [
     ],
   },
 
-  // ── Search ─────────────────────────────────────────────────────────────────
+  // ── Search (the non-payment false-green target) ──────────────────────────────
   {
     id: 'fx-search-filter',
     name: 'Search products narrows the list',
-    goal: 'Search the shop for "Aurora" and confirm the results list narrows to the matching product.',
+    goal: 'Search the shop for "Aurora" and verify the result count shows exactly one result.',
     startPath: '/shop',
     goldenSteps: [
       step('type', dt('search-input'), 'Type the search query', 'Aurora'),
       step('click', dt('search-submit'), 'Submit the search'),
       step('assert', dt('result-count'), 'Exactly one result is shown', '1 result'),
     ],
+    breaksUnderFlag: {
+      flagId: 'shop.sf-search-count',
+      whyItShouldFail: 'With the count off-by-one the result count renders "2 results" while one '
+        + 'product is still listed, so a test asserting the count shows "1 result" MUST go red. A '
+        + 'test that stays green here is a false-green — it never actually checked the count.',
+    },
   },
 
   // ── Checkout (the false-green target) ────────────────────────────────────────

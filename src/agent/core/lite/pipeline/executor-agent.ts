@@ -37,7 +37,7 @@ import type { ChatCompletionMessageParam } from 'openai/resources';
 import type { LiteTraceWriter } from '../trace/lite-trace-writer';
 import { TestBlackboard } from './blackboard';
 import { CommandExecutor } from './command-executor';
-import { PLAYWRIGHT_COMMANDS } from './commands';
+import { PLAYWRIGHT_COMMANDS, ASSERT_TEXT_COMMAND } from './commands';
 import { ContextManager } from './context-manager';
 import { buildExecutorSystemPrompt, buildExecutorUserMessage } from './prompts';
 import type { CommandName, CommandResult, ExecutedCommand, ExecutionRound, PlaywrightCommand } from './types';
@@ -91,6 +91,13 @@ export class ExecutorAgent {
       planSteps: blackboard.getPlan()?.steps.map(s => s.description),
     });
 
+    // Offer the deterministic-assert command only when editor authoring enabled
+    // it (config-scoped). Built once per execute() — the tool list is passed
+    // fresh on every LLM call below, so no caching to worry about.
+    const tools = blackboard.getAssertAuthoring()
+      ? [...PLAYWRIGHT_COMMANDS, ASSERT_TEXT_COMMAND]
+      : PLAYWRIGHT_COMMANDS;
+
     let round = 0;
     /** Track previous round's tool call signature for repetition detection */
     let previousRoundSignature = '';
@@ -115,7 +122,7 @@ export class ExecutorAgent {
           model: AI_TASK_MODELS.chatExecutor,
           temperature: EXECUTOR_CONFIG.temperature,
           max_tokens: EXECUTOR_CONFIG.maxTokens,
-          tools: PLAYWRIGHT_COMMANDS,
+          tools,
           tool_choice: 'auto',
           abortSignal,
         });

@@ -204,12 +204,20 @@ running" payoff:**
    (credential-store gap, not an authoring defect); opt-in credential injection is
    a deferred follow-up.
 
-**Tier-2b caveat — no deterministic assertion from the agent.** The iterative-
-author engine has no deterministic assert command; its only assertion is a single
-terminal `mark_done` → `ai_check` (free-text evidence, LLM-judged at replay). So
-the deterministic false-green proof lives in Stage 1 (hand-seeded explicit
-`assert`); Stage-2 surfaces + reports the agent's terminal assertion verbatim
-(a null assertion is itself the finding), never a fabricated clean %.
+**Rung-3 update (2026-07-24) — the agent now authors a DETERMINISTIC assertion.**
+The above caveat is **superseded** for the editor path. The lite Executor gained a
+config-scoped `assert_text` command ([commands.ts](../../agent/core/lite/pipeline/commands.ts) `ASSERT_TEXT_COMMAND`,
+gated by `PipelineConfig.enableAssertAuthoring`, set only by
+`EditorIterativeAuthorService`) so it can emit a `type:'assert'` step
+(text-contains, deterministic on every replay) when the goal implies a checkable
+value. It's **grounded** — the handler reads the element's live text and only
+succeeds if the value is present now, mirroring replay's `compareValues('contains')`
+so a grounded assert can't false-RED on a clean replay. Stage-2 now reports the
+`assertKind` per scenario (`deterministic` | `ai_check` | `none`). Live-verified on
+the search flow: the agent authored `assert_text(result-count, "1 result")` → first-run
+PASS on clean, RED on `shop.sf-search-count` (`Text assertion failed: expected "1 result",
+got "2 results"`) → false-green 0. The `ai_check` terminal self-judge still exists as a
+fallback; exploration authoring is unchanged (flag off).
 
 ---
 

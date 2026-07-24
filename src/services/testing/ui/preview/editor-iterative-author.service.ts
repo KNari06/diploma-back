@@ -164,6 +164,10 @@ export class EditorIterativeAuthorService {
         // We cancel via externalAbortSignal instead.
         skipDbCancellationCheck: true,
         externalAbortSignal: lock.signal,
+        // Editor-scoped: let the agent author deterministic assertions
+        // (assert_text → type:'assert' steps). Exploration leaves this off, so
+        // the shared lite pipeline is unchanged there.
+        enableAssertAuthoring: true,
       };
 
       const pipeline = new TestPipeline(integrations);
@@ -174,7 +178,17 @@ export class EditorIterativeAuthorService {
       const result = await pipeline.run(goal, config);
 
       // Rounds → grounded steps + compiled plans (shared with exploration).
-      const { steps } = await extractDiscoveredSteps(result, page);
+      const { steps: extractedSteps } = await extractDiscoveredSteps(result, page);
+
+      // Editor-scoped guard (NOT in the shared toIntentSteps, which exploration
+      // also uses): drop a terminal `verify` step (from mark_done) that carries
+      // no evidence. Such a step converts to an ai_check with an undefined
+      // assertionText, which THROWS at replay ("assertionText is required") and
+      // false-REDs an otherwise-passing authored test. `mark_done` already
+      // requires evidence in its schema, so this is defensive.
+      const steps = extractedSteps.filter(
+        (s) => !(s.action === 'verify' && !(s.expectedOutcome && s.expectedOutcome.trim())),
+      );
 
       // Finalize the progress bubble (mirrors runStepsOnPreview's completed emit).
       webSocketService.emitToUser(userId, 'preview:run:completed', {

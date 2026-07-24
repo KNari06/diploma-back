@@ -31,13 +31,24 @@ import type { FixtureScenario } from './fixture-types';
 const EVAL_USER_ID = '00000000-0000-4000-8000-000000000001';
 const EVAL_PROJECT_ID = '00000000-0000-4000-8000-000000000003';
 
+/** What kind of assertion the agent authored — the headline finding of this rung. */
+export type AuthoredAssertKind = 'deterministic' | 'ai_check' | 'none';
+
 export interface AuthorOnFixtureResult {
   /** Authoring succeeded and produced at least one runnable step. */
   ok: boolean;
   /** Grounded, runnable steps (empty-assertion ai_checks dropped). */
   steps: IntentStep[];
-  /** The terminal assertion the agent authored, or null if it authored none. */
+  /**
+   * The most meaningful assertion the agent authored (null = none). Prefers a
+   * DETERMINISTIC `type:'assert'` step (the rung-3 capability) over the terminal
+   * `ai_check` self-judge.
+   */
   authoredAssertion: string | null;
+  /** Which kind of assertion `authoredAssertion` is — the run-proof of this rung. */
+  assertKind: AuthoredAssertKind;
+  /** Every deterministic `type:'assert'` the agent authored (human-readable). */
+  deterministicAsserts: string[];
   /** Rounds the authoring loop executed. */
   roundsExecuted: number;
   /** Why the loop stopped (goal met / blocked / timeout) or the start failure. */
@@ -79,18 +90,33 @@ export async function authorOnFixture(
 
     if (!result.success) {
       return {
-        ok: false, steps: [], authoredAssertion: null,
+        ok: false, steps: [], authoredAssertion: null, assertKind: 'none', deterministicAsserts: [],
         roundsExecuted: result.roundsExecuted, reason: result.reason, error: result.error,
       };
     }
 
     const allSteps = toIntentSteps(result.steps);
 
-    // The terminal assertion(s): ai_check steps with real text. Report the last.
-    const assertions = allSteps
+    // Rung-3 headline: deterministic `type:'assert'` steps (text-contains on a
+    // value). These are what makes an authored test catch a value-bug without an
+    // LLM judge — the whole point of this rung.
+    const deterministicAsserts = allSteps
+      .filter((s) => s.type === 'assert' && typeof s.value === 'string' && s.value.trim() !== '')
+      .map((s) => `${s.description || 'assert'} (expects "${(s.value as string).trim()}")`);
+
+    // The terminal LLM-judged assertion(s): ai_check steps with real text.
+    const aiChecks = allSteps
       .filter((s) => s.type === 'ai_check' && typeof s.assertionText === 'string' && s.assertionText.trim() !== '')
       .map((s) => s.assertionText as string);
-    const authoredAssertion = assertions.length > 0 ? assertions[assertions.length - 1] : null;
+
+    // Prefer the deterministic assert as THE authored assertion (it's the stronger
+    // check); fall back to the terminal ai_check evidence, else none.
+    const assertKind: AuthoredAssertKind =
+      deterministicAsserts.length > 0 ? 'deterministic' : aiChecks.length > 0 ? 'ai_check' : 'none';
+    const authoredAssertion =
+      deterministicAsserts.length > 0 ? deterministicAsserts[deterministicAsserts.length - 1]
+        : aiChecks.length > 0 ? aiChecks[aiChecks.length - 1]
+          : null;
 
     // Drop empty-assertion ai_checks so replay doesn't throw and false-RED.
     const steps = allSteps.filter(
@@ -101,12 +127,14 @@ export async function authorOnFixture(
       ok: steps.length > 0,
       steps,
       authoredAssertion,
+      assertKind,
+      deterministicAsserts,
       roundsExecuted: result.roundsExecuted,
       reason: result.reason,
     };
   } catch (err) {
     return {
-      ok: false, steps: [], authoredAssertion: null, roundsExecuted: 0,
+      ok: false, steps: [], authoredAssertion: null, assertKind: 'none', deterministicAsserts: [], roundsExecuted: 0,
       reason: 'author-on-fixture threw', error: err instanceof Error ? err.message : String(err),
     };
   } finally {
