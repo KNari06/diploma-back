@@ -16,10 +16,16 @@ the gotchas that cost time and the numbers that are easy to get wrong.
 | `npm run chat-eval` | Replays every bootstrap scenario N times through the real pipeline (headless), scores authored steps deterministically, prints a pass-rate baseline. | ~$0.33 (8×1) |
 | `npm run chat-eval -- --runs=3 --scope=edit` | Filter by run count / scope (`add`\|`edit`) / `--only=<substr>`. | — |
 | `npm run chat-eval:instrument [scenarioId]` | One replay with a per-call token breakdown + the verbatim request / authored steps / reply. | ~$0.04 |
+| `npm run chat-eval:fixture` | **Tier-2b** — replays hand-seeded golden web tests against a controlled fixture app; scores first-run-pass-rate + false-green-rate. DETERMINISTIC, no LLM. | ~$0 |
+| `npm run chat-eval:fixture -- --author` | Tier-2b Stage 2 — the agent AUTHORS the test against the live fixture, then it's replayed. | ~$0.05–0.15/scenario |
+| `npm run chat-eval:fixture:serve` | Boot the web fixture standalone on :4400 (manual poking). | ~$0 |
 
 Files: `replay.ts` (headless pipeline driver), `scoring.ts` (pure deterministic
 scorer), `scenarios.ts` (bootstrap corpus), `run-eval.ts` (CLI), `instrument-run.ts`
-(token profiler), `__tests__/scoring.test.ts` (18 pure unit tests).
+(token profiler), `__tests__/scoring.test.ts` (18 pure unit tests). **Tier-2b:**
+`fixture/` (Express web app + flag-toggle broken-state), `fixture-runner.ts` (run
+primitive), `author-on-fixture.ts` (Stage-2 live authoring), `fixture-scoring.ts`
+(+ 14 unit tests), `fixture-scenarios.ts`, `run-fixture-eval.ts` (CLI).
 
 ---
 
@@ -159,9 +165,51 @@ wrong one) · `noDuplicate` (edit never creates) · `stepsWellFormed` (known typ
 + non-empty description). Aggregated to per-scenario + overall **pass-rate over
 N**, with agent-flakiness flagged (passed some runs, not all).
 
-**Tier-2b (run-on-fixture + LLM-judge, deferred)** — the real
-**first-run pass-rate** / **false-green** numbers. Needs a fixture app (the
-eval's "world") and more credits. Deferred pending a fixture-app choice.
+**Tier-2b (run-on-fixture, BUILT — web)** — the real **first-run-pass-rate** /
+**false-green-rate**: actually RUN authored web tests against a controlled fixture
+app (`fixture/`, :4400 — login/search/checkout with keyed elements + a flag-toggle
+broken-state ported from qait-testbed's design; `shop.sf2-discount` silently omits
+the 10% discount). Chain (all existing tested fns): `authorTest(goal)` (or golden
+steps) → `toIntentSteps` → `convertIntentStepsToCommands` → `executePlaywrightTest`
+(own fresh headless browser) → `success`. Two stages:
+- **Stage 1** (`chat-eval:fixture`, no LLM): hand-seeded golden steps (pinned
+  `options.cssSelector` → deterministic via the executor's pinned-CSS
+  short-circuit). Proves the rig: 100% first-run-pass on the clean app, and the
+  checkout golden test goes RED on `sf2-discount` (false-green correctly caught).
+  A false-green here is a rig REGRESSION → non-zero exit.
+- **Stage 2** (`--author`, LLM): the agent authors against the live headless
+  preview (`startSession` → `EditorIterativeAuthorService.authorTest`, no DB/Redis/
+  WS gate; confirm-gate bypassed by calling the service directly). Measures the
+  REAL agent under production conditions — the only valid way (running the
+  headless-`about:blank`-authored steps would measure resolver-rescue, not
+  authoring; see gotcha #2).
+
+**Metric semantics (so the numbers aren't misread):** first-run-pass = green on
+clean; false-green = green on broken, and only over scenarios with a
+`breaksUnderFlag` pairing that ALSO passed clean (a red-on-clean test isn't
+false-green-measurable). N=1, biased corpus → directional, not a baseline.
+
+**Two run-only findings from the live Stage-2 runs (2026-07-24) — the "caught by
+running" payoff:**
+1. **Payment-action guard blocks unattended checkout authoring.** The agent's
+   production `isPaymentContext` guard ([clarification-gates.ts](../../agent/core/lite/analysis/clarification-gates.ts),
+   gated in pipeline [command-executor.ts](../../agent/core/lite/pipeline/command-executor.ts)) fires on
+   "Proceed to checkout"/"Place order" → `report_blocked`, authors nothing. So an
+   autonomous eval can't author a checkout/payment test — a substrate gap.
+2. **Authored login tests aren't self-contained → not reproducible.** The agent
+   logs in fine during authoring (creds surfaced to the Planner) but the credential
+   values are NOT frozen into the steps (empty/placeholder, secret-safety) → a fresh
+   replay types nothing → login 401s → the authored test first-run-FAILS. This
+   *run-proves* the credential-store gap (rung-1). The eval labels this honestly
+   (credential-store gap, not an authoring defect); opt-in credential injection is
+   a deferred follow-up.
+
+**Tier-2b caveat — no deterministic assertion from the agent.** The iterative-
+author engine has no deterministic assert command; its only assertion is a single
+terminal `mark_done` → `ai_check` (free-text evidence, LLM-judged at replay). So
+the deterministic false-green proof lives in Stage 1 (hand-seeded explicit
+`assert`); Stage-2 surfaces + reports the agent's terminal assertion verbatim
+(a null assertion is itself the finding), never a fabricated clean %.
 
 ---
 

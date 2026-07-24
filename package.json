@@ -21,6 +21,8 @@
     "eval-intent": "ts-node -r tsconfig-paths/register src/scripts/eval-intent-understanding.ts",
     "chat-eval": "ts-node -r tsconfig-paths/register src/scripts/chat-eval/run-eval.ts",
     "chat-eval:instrument": "ts-node -r tsconfig-paths/register src/scripts/chat-eval/instrument-run.ts",
+    "chat-eval:fixture": "ts-node -r tsconfig-paths/register src/scripts/chat-eval/run-fixture-eval.ts",
+    "chat-eval:fixture:serve": "node src/scripts/chat-eval/fixture/server.js",
     "eval-api-flow-baseline": "ts-node -r tsconfig-paths/register src/scripts/api-flow-baseline.ts",
     "lite:analyze": "ts-node -r tsconfig-paths/register src/scripts/lite-analyze/cli.ts",
     "create-test-users": "ts-node -r tsconfig-paths/register scripts/create-test-users.ts",
