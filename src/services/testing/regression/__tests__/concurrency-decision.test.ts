@@ -346,3 +346,98 @@ describe('dominantMobilePlatform', () => {
     ])).toBe('android');
   });
 });
+
+// ── Flutter host lane (host-aware bucketing + ios pool probe) ────────────
+
+function fakeCapacityWithIos(iosIdle: number, androidIdle = 3): RunnerCapacityProbe {
+  return {
+    async getCapacity() {
+      return {
+        pool: {
+          android: { total: 3, idle: androidIdle, busy: 3 - androidIdle },
+          ios: { total: Math.max(iosIdle, 1), idle: iosIdle, busy: 0 },
+        },
+        adhoc: { maxSessions: 10, activeSessions: 0, available: 10 },
+        mode: 'pool' as const,
+      };
+    },
+  };
+}
+
+describe('dominantMobilePlatform — flutter host lane', () => {
+  const lvl = (...tcs: Array<{ platform?: string; host_platform?: string | null }>) => [tcs];
+
+  it('flutter with host_platform=ios buckets as ios', () => {
+    expect(dominantMobilePlatform(lvl({ platform: 'mobile_flutter', host_platform: 'ios' }))).toBe('ios');
+  });
+
+  it('flutter with host_platform=android buckets as android even when project default is ios', () => {
+    expect(
+      dominantMobilePlatform(lvl({ platform: 'mobile_flutter', host_platform: 'android' }), 'ios'),
+    ).toBe('android');
+  });
+
+  it('flutter without override inherits the project default host', () => {
+    expect(dominantMobilePlatform(lvl({ platform: 'mobile_flutter' }), 'ios')).toBe('ios');
+    expect(dominantMobilePlatform(lvl({ platform: 'mobile_flutter', host_platform: null }), 'ios')).toBe('ios');
+  });
+
+  it('defaults to android with no project default (pre-host-lane behaviour)', () => {
+    expect(dominantMobilePlatform(lvl({ platform: 'mobile_flutter' }))).toBe('android');
+  });
+
+  it('mixed hosts within one run → mixed', () => {
+    expect(
+      dominantMobilePlatform(lvl(
+        { platform: 'mobile_flutter', host_platform: 'ios' },
+        { platform: 'mobile_flutter', host_platform: 'android' },
+      )),
+    ).toBe('mixed');
+  });
+
+  it('ignores an invalid host_platform value (treated as inherit)', () => {
+    expect(dominantMobilePlatform(lvl({ platform: 'mobile_flutter', host_platform: 'windows' }), 'ios')).toBe('ios');
+  });
+});
+
+describe('decideMaxMobileInFlight — ios pool probe (was unconditional serial)', () => {
+  const base = (probe: RunnerCapacityProbe): ConcurrencyInput => ({
+    testCount: 4,
+    platform: 'ios',
+    runnerClient: probe,
+  });
+
+  beforeEach(() => {
+    process.env.REGRESSION_MOBILE_MAX_CONCURRENCY = '5';
+  });
+  afterEach(() => {
+    delete process.env.REGRESSION_MOBILE_MAX_CONCURRENCY;
+  });
+
+  it('ios-dominant run with real simulator capacity parallelises', async () => {
+    const d = await decideMaxMobileInFlight(base(fakeCapacityWithIos(3)));
+    expect(d.cap).toBeGreaterThan(1);
+    expect(d.inputs.poolIdle).toBe(3);
+  });
+
+  it('ios-dominant run with <2 idle simulators stays serial (prod today)', async () => {
+    const d = await decideMaxMobileInFlight(base(fakeCapacityWithIos(1)));
+    expect(d.cap).toBe(1);
+    expect(d.reason).toContain('poolIdle=1');
+  });
+
+  it('ios-dominant run against a runner with no ios pool stays serial', async () => {
+    const d = await decideMaxMobileInFlight(base(fakeCapacity({ androidIdle: 3 })));
+    expect(d.cap).toBe(1);
+    expect(d.reason).toContain('no ios pool');
+  });
+
+  it('mixed run still caps by the android pool', async () => {
+    const d = await decideMaxMobileInFlight({
+      testCount: 4,
+      platform: 'mixed',
+      runnerClient: fakeCapacityWithIos(0, 3),
+    });
+    expect(d.inputs.poolIdle).toBe(3);
+  });
+});

@@ -12,7 +12,7 @@ import type { CompiledStepPlan, IntentStep, IntentTestCase, StepEvidence } from 
 import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 import { emitTestCaseMutated } from '@/websocket/helpers/project-mutation-emit';
 import { validateTriggers, sanitizeTriggers } from '@/services/mobile/trigger-validation.util';
-import { normaliseVariantOverride } from '@/services/mobile/project-mobile-app.helper';
+import { normaliseHostOverride, normaliseVariantOverride } from '@/services/mobile/project-mobile-app.helper';
 import { extractLinkedTestCaseIds, wouldCreateCycle, LinkGraphNode } from '@/utils/graph/link-graph';
 import { ValidationError } from '@/types';
 
@@ -160,6 +160,13 @@ export class IntentTestCaseService {
      */
     mobileVariantLabel?: string | null;
     /**
+     * Flutter-only per-test host override (android|ios). Undefined/invalid →
+     * inherit (project flutterDefaultHost → 'android'). Callers pass this
+     * ONLY on explicit user choice — the editor never auto-stamps the current
+     * lane, so flipping the project default re-targets all non-overridden tests.
+     */
+    hostPlatform?: string | null;
+    /**
      * Placeholder schema for {{param_*}} values in `steps` (chat-agent draft
      * save — sensitive values sanitized to placeholders before persist).
      * Persisted so a regression replay can resolve them; without it the runner
@@ -173,6 +180,7 @@ export class IntentTestCaseService {
       preconditions, importId, sourceStatus, stepsDegraded, parametersSchema,
     } = params;
     const mobileVariantLabel = normaliseVariantOverride(params.mobileVariantLabel);
+    const hostPlatform = normaliseHostOverride(params.hostPlatform);
     // Explicit `null` from the caller means "no opinion" → store NULL.
     // Anything else (undefined / valid enum) falls back to 'medium'.
     const priority: 'critical' | 'high' | 'medium' | 'low' | null =
@@ -293,6 +301,8 @@ export class IntentTestCaseService {
       ...(stepsDegraded !== undefined && { steps_degraded: stepsDegraded }),
       // Mobile per-test variant override (null = inherit).
       mobile_variant_label: mobileVariantLabel,
+      // Flutter per-test host override (null = inherit project default).
+      host_platform: hostPlatform,
       resource_bindings: resourceBindings,
       // Placeholder schema for sanitized {{param_*}} values — only written when
       // non-empty so ordinary creates leave the column at its default.
@@ -564,6 +574,8 @@ export class IntentTestCaseService {
     triggers?: unknown;
     /** Mobile per-test variant override. `null` clears it (inherit); `undefined` leaves it untouched. */
     mobileVariantLabel?: string | null;
+    /** Flutter per-test host override (android|ios). `null`/invalid clears it (inherit); `undefined` leaves it untouched. */
+    hostPlatform?: string | null;
     /**
      * Placeholder schema for {{param_*}} values in `steps` (mobile agent draft
      * save — sensitive values sanitized to placeholders). Persisted so a
@@ -579,7 +591,7 @@ export class IntentTestCaseService {
     // that the runner just wrote. No reentrancy risk — none of the already-
     // mutex'd methods call update() internally.
     return withTestCaseMutex(params.id, async () => {
-      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers, mobileVariantLabel, parametersSchema } = params;
+      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers, mobileVariantLabel, hostPlatform, parametersSchema } = params;
 
       const updates: Record<string, any> = {};
       if (name !== undefined) updates.name = name;
@@ -593,6 +605,10 @@ export class IntentTestCaseService {
       if (mobileVariantLabel !== undefined) {
         // `null` (or blank) clears the override → inherit. A non-blank string pins it.
         updates.mobile_variant_label = normaliseVariantOverride(mobileVariantLabel);
+      }
+      if (hostPlatform !== undefined) {
+        // `null`/invalid clears the override → inherit project default.
+        updates.host_platform = normaliseHostOverride(hostPlatform);
       }
       if (startUrl !== undefined) updates.start_url = startUrl;
       if (url !== undefined) updates.url = url;
@@ -969,6 +985,7 @@ export class IntentTestCaseService {
       kind: row.kind || 'standalone',
       platform: row.platform || 'web',
       mobileVariantLabel: row.mobile_variant_label ?? null,
+      hostPlatform: normaliseHostOverride(row.host_platform),
 
       // Replay data
       replayStrategy: row.replay_strategy || undefined,

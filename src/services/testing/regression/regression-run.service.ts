@@ -1221,11 +1221,13 @@ export class RegressionRunService {
       const uiCaseIds = expandedCases.filter((tc) => tc.testType === 'ui').map((tc) => tc.testCaseId);
       const depMap = new Map<string, string[]>();
       const priorityMap = new Map<string, string | null>();
+      const hostMap = new Map<string, string | null>();
       if (uiCaseIds.length > 0) {
         const depRows = await RegressionTestQueryService.getDependsOnRows(uiCaseIds);
         for (const row of depRows) {
           depMap.set(row.id, row.depends_on || []);
           priorityMap.set(row.id, row.priority ?? null);
+          hostMap.set(row.id, row.host_platform ?? null);
         }
       }
 
@@ -1236,6 +1238,7 @@ export class RegressionRunService {
         flowId: tc.flowId,
         dependsOn: depMap.get(tc.testCaseId) || [],
         priority: priorityMap.get(tc.testCaseId) ?? null,
+        host_platform: hostMap.get(tc.testCaseId) ?? null,
         ...(tc.isNegative && { isNegative: true }),
         ...(tc.platform && { platform: tc.platform }),
       }));

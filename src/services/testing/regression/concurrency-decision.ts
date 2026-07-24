@@ -123,24 +123,28 @@ export async function decideMaxMobileInFlight(
     return mk(1, `testCount=${input.testCount} (parallelism not useful)`, envCap, null, input);
   }
 
-  // 3. iOS-only regression — POOL_IOS_SIZE=0 in current prod, so every
-  //    test cold-starts regardless of cap. Parallelism just stacks
-  //    cold-starts; serial is fastest here.
-  if (input.platform === 'ios') {
-    return mk(1, 'platform=ios (no pool capacity in prod)', envCap, null, input);
-  }
-
-  // 4. Probe the runner for real-time pool capacity. 5s timeout matches
-  //    the existing MobileRunnerClient.getCapacity client timeout. Any
-  //    failure → cap=1 (warn + fall back to serial). NEVER throws to
-  //    the regression caller — analytics signal lives in the log line.
+  // 3+4. Probe the runner for real-time pool capacity in the run's dominant
+  //    lane. 5s timeout matches the existing MobileRunnerClient.getCapacity
+  //    client timeout. Any failure → cap=1 (warn + fall back to serial).
+  //    NEVER throws to the regression caller — analytics signal lives in
+  //    the log line.
+  //
+  //    ios-dominant runs (incl. flutter-on-ios) now read the ios pool
+  //    instead of being unconditionally serial: with POOL_IOS_SIZE<2 the
+  //    `poolIdle < 2` gate below still yields serial (prod today), but a
+  //    runner with real simulator capacity can parallelise.
   let poolIdle: number | null = null;
   try {
     const cap = await input.runnerClient.getCapacity();
-    // For 'mixed' regressions we still cap by android pool. iOS sessions
-    // cold-start regardless (no prod pool); the bottleneck is android.
-    if (cap?.pool?.android) {
-      poolIdle = cap.pool.android.idle;
+    // For 'mixed' regressions we still cap by android pool — the in-flight
+    // cap is global across lanes and android is the dominant bottleneck.
+    const bucket = input.platform === 'ios' ? cap?.pool?.ios : cap?.pool?.android;
+    if (bucket) {
+      poolIdle = bucket.idle;
+    } else if (input.platform === 'ios' && cap?.pool) {
+      // Pool mode but no ios sub-pool on this runner — every ios claim
+      // cold-starts; parallelism just stacks cold-starts. Serial.
+      return mk(1, 'platform=ios (runner has no ios pool)', envCap, null, input);
     }
   } catch (err) {
     logger.warn('[REGRESSION_RUN] getCapacity failed — falling back to serial', {
@@ -200,18 +204,20 @@ export function countMobileTests(
  * Determine the dominant mobile platform in a regression. Returns:
  *   'none'    — no mobile tests at all
  *   'android' — only Android (or Android-hosted Flutter) tests
- *   'ios'     — only iOS tests
+ *   'ios'     — only iOS (or iOS-hosted Flutter) tests
  *   'mixed'   — both Android and iOS tests
  *
- * Why Flutter is bucketed as Android: the runner's `FlutterSession.hostPlatform`
- * can be either Android or iOS at runtime, but from the backend's static
- * type information we can't tell. The default in `dispatchMobileTest`
- * is Android (PLATFORM_MAP at regression-run.service.ts:605-609 maps
- * unknown to 'android'), so treating Flutter as Android here matches
- * what we'd actually claim from the pool.
+ * A `mobile_flutter` test buckets by its HOST lane: the row's
+ * `host_platform` override when set, else `flutterDefaultHost` (the
+ * project's `settings.flutterDefaultHost`, resolved once by the caller —
+ * this function stays sync/pure for unit-testability). Default 'android'
+ * preserves the pre-host-lane behaviour byte-for-byte. Known limitation
+ * (accepted): a `mobile_android`-typed case that the dispatcher's
+ * detectedFramework upgrade later runs as flutter still counts android here.
  */
 export function dominantMobilePlatform(
-  levels: Array<Array<{ platform?: string }>>,
+  levels: Array<Array<{ platform?: string; host_platform?: string | null }>>,
+  flutterDefaultHost: 'android' | 'ios' = 'android',
 ): RegressionMobilePlatform {
   let android = 0;
   let ios = 0;
@@ -221,7 +227,16 @@ export function dominantMobilePlatform(
       if (!p) continue;
       if (p === 'mobile_ios') {
         ios += 1;
-      } else if (p === 'mobile_android' || p === 'mobile_flutter') {
+      } else if (p === 'mobile_flutter') {
+        // Inline host check (no helper import — this module is deliberately
+        // dependency-light). The column is CHECK-constrained to android|ios.
+        const host =
+          tc.host_platform === 'ios' || tc.host_platform === 'android'
+            ? tc.host_platform
+            : flutterDefaultHost;
+        if (host === 'ios') ios += 1;
+        else android += 1;
+      } else if (p === 'mobile_android') {
         android += 1;
       }
       // Other platforms (web_ui, api, undefined) are ignored — they

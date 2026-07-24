@@ -9,9 +9,9 @@
  */
 
 import { supabaseAdmin } from '@/db/supabase';
-import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import type { FlutterHostPlatform, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { detectBuildInfoFromBuffer } from '@/services/mobile/archive-platform-detect';
-import { DEFAULT_VARIANT_LABEL, getDefaultVariantLabel, variantStoragePlatform } from '@/services/mobile/project-mobile-app.helper';
+import { DEFAULT_VARIANT_LABEL, getDefaultVariantLabel, getFlutterDefaultHost, variantStoragePlatform } from '@/services/mobile/project-mobile-app.helper';
 import { getBlobStore } from './blob';
 import { logger } from '@/utils/core/logger';
 import path from 'path';
@@ -933,6 +933,25 @@ export class MobileAppStorageService {
       return DEFAULT_VARIANT_LABEL;
     }
     return getDefaultVariantLabel(data?.settings as Record<string, unknown> | undefined, platform);
+  }
+
+  /**
+   * The host a project's Flutter runs default to when the test case has no
+   * `host_platform` override. Reads `projects.settings.flutterDefaultHost`
+   * (written by the editor's Android/iOS toggle); 'android' when unset or
+   * on read failure (back-compat — pre-existing behavior was always-Android).
+   */
+  static async getProjectDefaultFlutterHost(projectId: string): Promise<FlutterHostPlatform> {
+    const { data, error } = await supabaseAdmin
+      .from('projects')
+      .select('settings')
+      .eq('id', projectId)
+      .maybeSingle();
+    if (error) {
+      logger.warn('[MOBILE_APP_STORAGE] getProjectDefaultFlutterHost failed', { error: error.message, projectId });
+      return 'android';
+    }
+    return getFlutterDefaultHost(data?.settings as Record<string, unknown> | undefined);
   }
 
   /**
