@@ -203,6 +203,7 @@ export class NegativeTestGeneratorService {
           parametersSchema: sourceCase.parameters_schema,
           resourceBindings: sourceCase.resource_bindings,
           mobileVariantLabel: sourceCase.mobile_variant_label,
+          hostPlatform: sourceCase.host_platform,
           triggers: sourceCase.triggers,
         });
 

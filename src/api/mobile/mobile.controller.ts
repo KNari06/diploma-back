@@ -337,6 +337,32 @@ export async function setDefaultMobileAppVariant(req: Request, res: Response): P
   res.json({ success: true, defaultVariant: result.defaultVariant });
 }
 
+/**
+ * PUT /api/v1/mobile/projects/:projectId/app/flutter-host  Body: { host: 'android'|'ios' }
+ *
+ * Persists the editor's Flutter host toggle as the PROJECT default
+ * (`settings.flutterDefaultHost`) so non-editor runs (regression /
+ * scheduled / CI) target the same host. Per-test-case `host_platform`
+ * overrides still win at dispatch time.
+ */
+export async function setFlutterDefaultHost(req: Request, res: Response): Promise<void> {
+  const userId = requireUserId(req, res);
+  if (!userId) return;
+
+  const result = await MobileAppService.setFlutterDefaultHost(
+    req.params.projectId,
+    userId,
+    req.body?.host,
+  );
+
+  if ('kind' in result) {
+    sendMobileAppError(res, result);
+    return;
+  }
+
+  res.json({ success: true, flutterDefaultHost: result.flutterDefaultHost });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // DELETE APP
 // ═══════════════════════════════════════════════════════════════════════════

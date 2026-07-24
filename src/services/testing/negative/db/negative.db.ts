@@ -83,6 +83,7 @@ export interface SourceTestCaseRow {
   parameters_schema: any;
   resource_bindings: any;
   mobile_variant_label: string | null;
+  host_platform: string | null;
   triggers: any;
 }
 
@@ -95,7 +96,7 @@ export async function getSourceTestCase(
     .select(
       'id, name, flow_id, steps_json, url, start_url, project_id, ' +
         'platform, replay_strategy, parameters_schema, resource_bindings, ' +
-        'mobile_variant_label, triggers',
+        'mobile_variant_label, host_platform, triggers',
     )
     .eq('id', sourceTestCaseId)
     .maybeSingle();
@@ -192,6 +193,7 @@ export interface InsertNegativeInput {
   parametersSchema: any;
   resourceBindings: any;
   mobileVariantLabel: string | null;
+  hostPlatform: string | null;
   triggers: any;
 }
 
@@ -228,6 +230,8 @@ export async function insertNegativeTestCase(
       parameters_schema: input.parametersSchema ?? null,
       resource_bindings: input.resourceBindings ?? [],
       mobile_variant_label: input.mobileVariantLabel ?? null,
+      // host_platform pins the same Flutter host lane (android|ios).
+      host_platform: input.hostPlatform ?? null,
       triggers: input.triggers ?? [],
     })
     .select('id')

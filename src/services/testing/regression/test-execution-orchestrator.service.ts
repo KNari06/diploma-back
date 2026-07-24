@@ -13,6 +13,7 @@ import { ManualTestService } from '../ui/manualTest.service';
 import { IntentTestCaseService } from '../ui/preview/intent-test-case.service';
 import { mobileTestRunQueue, mobileTestRunQueueEvents } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import type { ExecutableTestCase } from '@/types/testing.types';
 import type { RegressionRunProgressPayload } from '@/websocket/types/types';
 import { getProjectWorkspaceMemberIds } from './regression-report-assembler.service';
@@ -347,9 +348,19 @@ export class TestExecutionOrchestratorService {
     // See docs/mobile-test-orchestration-plan.md Phase 4.
     let MAX_MOBILE_IN_FLIGHT = 1;
     try {
+      // Flutter host lane: resolve the project default ONCE so
+      // dominantMobilePlatform (sync/pure) can bucket flutter rows by their
+      // effective host (row override > project default > android). Only read
+      // when the run actually contains a flutter case; read failure falls
+      // back to 'android' inside the storage helper.
+      const hasFlutter = levels.some((lvl) => lvl.some((tc) => tc.platform === 'mobile_flutter'));
+      const flutterDefaultHost =
+        hasFlutter && projectIdForWs
+          ? await MobileAppStorageService.getProjectDefaultFlutterHost(projectIdForWs)
+          : 'android';
       const decision = await decideMaxMobileInFlight({
         testCount: countMobileTests(levels),
-        platform: dominantMobilePlatform(levels),
+        platform: dominantMobilePlatform(levels, flutterDefaultHost),
         runnerClient: getMobileRunnerClient(),
       });
       MAX_MOBILE_IN_FLIGHT = decision.cap;

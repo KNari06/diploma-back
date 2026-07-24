@@ -255,5 +255,9 @@ export function sendMobileAppError(res: Response, err: MobileAppError): void {
     case 'variant_name_taken':
       res.status(409).json({ success: false, error: `A variant named "${err.label}" already exists` });
       return;
+
+    case 'invalid_host':
+      res.status(400).json({ success: false, error: 'host must be "android" or "ios"' });
+      return;
   }
 }

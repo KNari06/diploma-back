@@ -171,3 +171,65 @@ describe('getProjectMobileVariants', () => {
     expect(lanes[0].latest.storagePath).toBe('reg.apk'); // registry's own, not synthesized
   });
 });
+
+// ── Flutter host lane (ADR-0019 deferred half) ───────────────────────────
+
+import {
+  normaliseHostOverride,
+  getFlutterDefaultHost,
+  buildSetFlutterDefaultHostPatch,
+  resolveFlutterHost,
+} from '@/services/mobile/project-mobile-app.helper';
+
+describe('normaliseHostOverride', () => {
+  it('passes through the two valid hosts', () => {
+    expect(normaliseHostOverride('android')).toBe('android');
+    expect(normaliseHostOverride('ios')).toBe('ios');
+  });
+
+  it('nulls anything else (inherit)', () => {
+    expect(normaliseHostOverride(undefined)).toBeNull();
+    expect(normaliseHostOverride(null)).toBeNull();
+    expect(normaliseHostOverride('')).toBeNull();
+    expect(normaliseHostOverride('IOS')).toBeNull();
+    expect(normaliseHostOverride('flutter')).toBeNull();
+    expect(normaliseHostOverride(1)).toBeNull();
+  });
+});
+
+describe('getFlutterDefaultHost', () => {
+  it('reads settings.flutterDefaultHost', () => {
+    expect(getFlutterDefaultHost({ flutterDefaultHost: 'ios' })).toBe('ios');
+    expect(getFlutterDefaultHost({ flutterDefaultHost: 'android' })).toBe('android');
+  });
+
+  it('falls back to android when unset or invalid (back-compat)', () => {
+    expect(getFlutterDefaultHost(undefined)).toBe('android');
+    expect(getFlutterDefaultHost(null)).toBe('android');
+    expect(getFlutterDefaultHost({})).toBe('android');
+    expect(getFlutterDefaultHost({ flutterDefaultHost: 'windows' })).toBe('android');
+  });
+});
+
+describe('buildSetFlutterDefaultHostPatch', () => {
+  it('builds the scalar settings patch', () => {
+    expect(buildSetFlutterDefaultHostPatch('ios')).toEqual({ flutterDefaultHost: 'ios' });
+  });
+});
+
+describe('resolveFlutterHost (case override > project default > android)', () => {
+  it('case override wins over the project default', () => {
+    expect(resolveFlutterHost('android', { flutterDefaultHost: 'ios' })).toBe('android');
+    expect(resolveFlutterHost('ios', { flutterDefaultHost: 'android' })).toBe('ios');
+  });
+
+  it('inherits the project default when the case has no override', () => {
+    expect(resolveFlutterHost(null, { flutterDefaultHost: 'ios' })).toBe('ios');
+    expect(resolveFlutterHost(undefined, { flutterDefaultHost: 'ios' })).toBe('ios');
+  });
+
+  it('defaults to android when neither is set', () => {
+    expect(resolveFlutterHost(null, {})).toBe('android');
+    expect(resolveFlutterHost('bogus', undefined)).toBe('android');
+  });
+});

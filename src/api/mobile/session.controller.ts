@@ -14,7 +14,7 @@
 import { randomUUID } from 'crypto';
 import { env } from '@/config/environment/env';
 import { redisConnection, QueueManager } from '@/config/infrastructure/queues';
-import { getMobileRunnerClient, MobileRunnerClient, type IMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { getMobileRunnerClient, MobileRunnerClient, resolveRunnerUrlForHost, type IMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { CompanionRunnerClient } from '@/services/mobile/companion/companion-runner-client';
 import { companionRegistry } from '@/services/mobile/companion/companion-registry';
 import {
@@ -28,7 +28,7 @@ import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { normalizeMobileBriefing } from '@/services/mobile/mobile-briefing.util';
 import { ProjectService } from '@/services/core/project.service';
-import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
+import { getProjectMobileApp, getFlutterDefaultHost, getDefaultVariantLabel, resolveFlutterHost } from '@/services/mobile/project-mobile-app.helper';
 import { sendMobileRunnerError, isSessionGoneError } from './mobile-error-mapper';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { uploadEditorTrace, closeAndUploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
@@ -408,9 +408,14 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   const isFlutter = platform === 'flutter';
   // HOST lane for a Flutter test: android (default) or ios. A Flutter app is a
   // NATIVE session under the hood (upgraded via attach-flutter), so we acquire
-  // the host platform, not 'flutter'. Only 'ios' opts into the new simulator
-  // path; anything else keeps the legacy android host (zero behaviour change).
-  const flutterHostPlatform: 'android' | 'ios' = rawHostPlatform === 'ios' ? 'ios' : 'android';
+  // the host platform, not 'flutter'. Precedence: explicit request-body host >
+  // project default (`settings.flutterDefaultHost`) > android. The frontend
+  // always sends the host, so the project-default fallback only matters for raw
+  // API callers — without it they silently got android even for an iOS project.
+  const flutterHostPlatform: 'android' | 'ios' = resolveFlutterHost(
+    rawHostPlatform,
+    accessibleProject.settings,
+  );
   const sessionCreatePlatform: MobilePlatform = isFlutter ? flutterHostPlatform : platform;
 
   // Phase 2.6: validate `deviceSelector` if present. Inline validator to
@@ -956,10 +961,18 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // fall back to the env-singleton. dedicated is already resolved above.
     const dedicatedRunnerUrl = dedicated?.runnerUrl ?? null;
     const dedicatedRunnerApiKey = dedicated?.runnerApiKey ?? null;
+    // Host-lane routing (ADR-0019 deferred half): an ios-host Flutter warmup
+    // targets MOBILE_RUNNER_IOS_URL when configured. Locally inert — the var
+    // is unset, so hostRunnerUrl === env.MOBILE_RUNNER_URL and the singleton
+    // is used as before. Dedicated/companion still take precedence.
+    const hostRunnerUrl = resolveRunnerUrlForHost(isFlutter ? flutterHostPlatform : undefined);
+    const isDistinctHostRunner = hostRunnerUrl !== env.MOBILE_RUNNER_URL;
     const client: IMobileRunnerClient = useCompanionRunner
       ? new CompanionRunnerClient(userId)
       : dedicatedRunnerUrl
       ? new MobileRunnerClient({ baseUrl: dedicatedRunnerUrl, apiKey: dedicatedRunnerApiKey ?? '' })
+      : isDistinctHostRunner
+      ? new MobileRunnerClient({ baseUrl: hostRunnerUrl })
       : getMobileRunnerClient();
     const healthy = await time('runner_health_check', () => client.isHealthy());
     if (!healthy) {
@@ -1081,11 +1094,13 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // right socket without staleness risk (dedicated URL is DB-sourced, not an
     // env var that can drift). Shared pool: derive socket URL from live env
     // (2026-04-21 stale-cache lesson).
-    const effectiveRunnerUrl = dedicatedRunnerUrl ?? env.MOBILE_RUNNER_URL;
+    const effectiveRunnerUrl = dedicatedRunnerUrl ?? hostRunnerUrl;
     const effectiveRunnerSocketUrl = useCompanionRunner
       ? null
       : dedicatedRunnerUrl
       ? runnerUrlToSocketUrl(dedicatedRunnerUrl)
+      : isDistinctHostRunner
+      ? runnerUrlToSocketUrl(hostRunnerUrl)
       : currentRunnerSocketUrl();
 
     // Store mapping in Redis
@@ -1120,6 +1135,15 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       await storeSessionRunnerBinding(
         session.sessionId,
         { kind: 'companion', userId },
+        WARMUP_TTL,
+      );
+    } else if (isDistinctHostRunner) {
+      // The session lives on the iOS-host runner — without a binding, later
+      // session-scoped calls (getMobileRunnerClientForSession) would fall
+      // back to the shared env runner and hit the WRONG host.
+      await storeSessionRunnerBinding(
+        session.sessionId,
+        { runnerUrl: hostRunnerUrl, runnerApiKey: null },
         WARMUP_TTL,
       );
     }
@@ -2110,14 +2134,43 @@ export async function autoBootAndInstall(
     const legacyApp = (project?.settings as any)?.mobileApp;
     const appStoragePath = projectAppForPend?.storagePath ?? legacyApp?.storagePath;
 
+    // Flutter host lane. A Flutter app boots on its resolved host (project
+    // default: android|ios), NOT the raw 'flutter' platform — the runner can't
+    // create a 'flutter' session directly (the VM Service probe runs before the
+    // app is installed → always fails). Mirror warmup: detect flutter (declared,
+    // or an android-typed upload the parser flagged as flutter) and resolve the
+    // host + default variant so the SAME artifact lane the editor installs is
+    // prepped here. Without the host, a Flutter project defaulted to iOS would
+    // silently boot android and prep the android slot after every upload.
+    const autoBootFramework = platform === 'android'
+      ? await MobileAppStorageService.getDetectedFramework(projectId).catch(() => undefined)
+      : undefined;
+    const autoBootIsFlutter = platform === 'flutter' || autoBootFramework === 'flutter';
+    const autoBootHostPlatform: 'android' | 'ios' = autoBootIsFlutter
+      ? getFlutterDefaultHost(project.settings)
+      : 'android';
+    const autoBootPrepPlatform: MobilePlatform = autoBootIsFlutter ? 'flutter' : platform;
+    const autoBootVariantLabel = getDefaultVariantLabel(project.settings, autoBootPrepPlatform);
+    const sessionCreatePlatform: MobilePlatform = autoBootIsFlutter ? autoBootHostPlatform : platform;
+
     // Resolve dedicated device early so we can use the right runner client for
-    // both the sessionExists check and session creation below.
+    // both the sessionExists check and session creation below. Resolve against
+    // the HOST (iOS is shared-only → returns null, so an iOS-host Flutter run
+    // never pins an android dedicated device).
     const autoBootWorkspaceId: string | undefined = project.workspace_id ?? undefined;
-    const autoBootDedicated = await resolveDedicatedDevice(autoBootWorkspaceId, platform);
+    const autoBootDedicated = await resolveDedicatedDevice(autoBootWorkspaceId, sessionCreatePlatform);
     const autoBootRunnerUrl = autoBootDedicated?.runnerUrl ?? null;
     const autoBootRunnerApiKey = autoBootDedicated?.runnerApiKey ?? null;
+    // Route Flutter-on-iOS to MOBILE_RUNNER_IOS_URL when configured; locally
+    // inert (the var is unset → same shared runner). Dedicated takes precedence.
+    const autoBootHostRunnerUrl = resolveRunnerUrlForHost(
+      autoBootIsFlutter ? autoBootHostPlatform : undefined,
+    );
+    const autoBootIsDistinctHostRunner = autoBootHostRunnerUrl !== env.MOBILE_RUNNER_URL;
     const client = autoBootRunnerUrl
       ? new MobileRunnerClient({ baseUrl: autoBootRunnerUrl, apiKey: autoBootRunnerApiKey ?? '' })
+      : autoBootIsDistinctHostRunner
+      ? new MobileRunnerClient({ baseUrl: autoBootHostRunnerUrl })
       : getMobileRunnerClient();
 
     // Check for existing session
@@ -2133,6 +2186,13 @@ export async function autoBootAndInstall(
         const existingClient: IMobileRunnerClient = existing.runnerBindingKind === 'companion' && existing.companionUserId
           ? new CompanionRunnerClient(existing.companionUserId)
           : existing.isDedicated && existing.runnerUrl
+          ? new MobileRunnerClient({ baseUrl: existing.runnerUrl, apiKey: existing.runnerApiKey ?? '' })
+          // An iOS-host Flutter session lives on the iOS runner (its runnerUrl
+          // was stored at birth). Probe THAT runner, not the shared android one
+          // — otherwise sessionExists always returns false and we needlessly
+          // cold-boot. Dark locally (MOBILE_RUNNER_IOS_URL unset → runnerUrl is
+          // the shared runner anyway).
+          : existing.hostPlatform === 'ios' && existing.runnerUrl
           ? new MobileRunnerClient({ baseUrl: existing.runnerUrl, apiKey: existing.runnerApiKey ?? '' })
           : getMobileRunnerClient();
         const alive = await existingClient.sessionExists(existing.sessionId);
@@ -2175,9 +2235,11 @@ export async function autoBootAndInstall(
       // Set a "booting" placeholder in Redis BEFORE starting the emulator.
       // This prevents warmupSession from creating a duplicate emulator if
       // the user opens the editor while the boot is still in progress.
-      const autoBootEffectiveRunnerUrl = autoBootRunnerUrl ?? env.MOBILE_RUNNER_URL;
+      const autoBootEffectiveRunnerUrl = autoBootRunnerUrl ?? autoBootHostRunnerUrl;
       const autoBootEffectiveSocketUrl = autoBootRunnerUrl
         ? runnerUrlToSocketUrl(autoBootRunnerUrl)
+        : autoBootIsDistinctHostRunner
+        ? runnerUrlToSocketUrl(autoBootHostRunnerUrl)
         : currentRunnerSocketUrl();
       const bootingData: WarmupData = {
         sessionId: '_booting',
@@ -2186,6 +2248,9 @@ export async function autoBootAndInstall(
         runnerSocketUrl: autoBootEffectiveSocketUrl,
         runnerApiKey: autoBootRunnerApiKey ?? undefined,
         platform,
+        // Record the Flutter host so a later warmup reuse-gate can tell this
+        // session apart from an android-host one (mirrors the warmup branch).
+        ...(autoBootIsFlutter ? { hostPlatform: autoBootHostPlatform } : {}),
         createdAt: new Date().toISOString(),
       };
       await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
@@ -2193,7 +2258,7 @@ export async function autoBootAndInstall(
       const autoBootOwnerId = autoBootDedicated
         ? autoBootWorkspaceId
         : (env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined);
-      const session = await client.createSession(platform, {
+      const session = await client.createSession(sessionCreatePlatform, {
         ownerId: autoBootOwnerId,
         userId,
         ...(autoBootDedicated ? { deviceSelector: { serial: autoBootDedicated.serial }, dedicated: true } : {}),
@@ -2204,11 +2269,19 @@ export async function autoBootAndInstall(
       bootingData.sessionId = sessionId;
       await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
 
-      // Store per-session runner binding only for dedicated sessions.
+      // Store per-session runner binding for dedicated OR distinct-host (iOS)
+      // sessions — without it, later session-scoped calls fall back to the
+      // shared env runner and hit the WRONG host.
       if (autoBootRunnerUrl) {
         await storeSessionRunnerBinding(
           sessionId,
           { runnerUrl: autoBootRunnerUrl, runnerApiKey: autoBootRunnerApiKey },
+          WARMUP_TTL,
+        );
+      } else if (autoBootIsDistinctHostRunner) {
+        await storeSessionRunnerBinding(
+          sessionId,
+          { runnerUrl: autoBootHostRunnerUrl, runnerApiKey: null },
           WARMUP_TTL,
         );
       }
@@ -2233,7 +2306,9 @@ export async function autoBootAndInstall(
       sessionId,
       projectId,
       userId,
-      platform,
+      platform: autoBootPrepPlatform,
+      hostPlatform: autoBootHostPlatform,
+      variantLabel: autoBootVariantLabel,
       skipLaunch: true,
       onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
     });
@@ -2346,6 +2421,16 @@ export async function autoBootAndInstall(
 export async function claimWarmedSession(
   projectId: string,
   userId: string,
+  /**
+   * When supplied, the warmed record must match this platform (and, for
+   * Flutter, the host lane) or the claim is REFUSED — and, crucially, the
+   * Redis record is left in place. Pre-fix the caller compared platforms
+   * AFTER the delete, so every mismatched flutter regression run silently
+   * ate the editor's warmup and cold-started anyway. Flutter matching:
+   * `platform === 'flutter'` plus `hostPlatform` (absent = 'android',
+   * mirroring the editor reuse gate).
+   */
+  match?: { platform: MobilePlatform; hostPlatform?: 'android' | 'ios' },
 ): Promise<WarmupData | null> {
   const key = `${WARMUP_PREFIX}${projectId}:${userId}`;
 
@@ -2353,10 +2438,30 @@ export async function claimWarmedSession(
     const raw = await redisConnection.get(key);
     if (!raw) return null;
 
+    const data = JSON.parse(raw) as WarmupData;
+
+    // Platform/host gate BEFORE the delete — a mismatched record belongs to
+    // the editor (or another platform's warmup) and must survive this claim.
+    if (match) {
+      const platformMatches = data.platform === match.platform;
+      const hostMatches =
+        match.platform !== 'flutter' ||
+        (data.hostPlatform ?? 'android') === (match.hostPlatform ?? 'android');
+      if (!platformMatches || !hostMatches) {
+        logger.warn('[MOBILE_SESSION] Warmed session left unclaimed — platform/host mismatch', {
+          projectId,
+          userId,
+          warmedPlatform: data.platform,
+          warmedHostPlatform: data.hostPlatform ?? null,
+          requestedPlatform: match.platform,
+          requestedHostPlatform: match.hostPlatform ?? null,
+        });
+        return null;
+      }
+    }
+
     // Atomically delete so no other job can claim
     await redisConnection.del(key);
-
-    const data = JSON.parse(raw) as WarmupData;
 
     // Skip the liveness check for placeholder rows that autoBootAndInstall
     // writes BEFORE the real session id is available. Returning a literal

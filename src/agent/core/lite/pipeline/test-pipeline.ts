@@ -169,6 +169,12 @@ export class TestPipeline {
       this.blackboard.setGoalUrl(config.goalUrl);
     }
 
+    // Deterministic-assertion authoring (editor-only; exploration leaves it off).
+    // Gates the Executor's `assert_text` command + assertion prompt guidance.
+    if (config.enableAssertAuthoring) {
+      this.blackboard.setAssertAuthoring(true);
+    }
+
     // Seed the Planner's contextual hints with the Cartographer's page
     // understanding (forms/entities) so round 1 plans against known structure
     // instead of re-deriving it from raw DOM. GoalDetector replaces hints in

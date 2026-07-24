@@ -27,6 +27,7 @@ import {
   probeDriverExtension,
   renameMobileAppVariant,
   setDefaultMobileAppVariant,
+  setFlutterDefaultHost,
   setProjectPermissionPolicy,
 } from './mobile.controller';
 import { generateCiKey, revokeCiKey, getCiKeyStatus } from './ci-key.controller';
@@ -185,6 +186,18 @@ router.put(
   requireAuth,
   requireMobilePlan,
   asyncHandler(setDefaultMobileAppVariant),
+);
+
+/**
+ * PUT /api/v1/mobile/projects/:projectId/app/flutter-host  Body: { host }
+ * Persist the editor's Flutter host toggle (android|ios) as the project
+ * default lane for non-editor runs (regression / scheduled / CI).
+ */
+router.put(
+  '/projects/:projectId/app/flutter-host',
+  requireAuth,
+  requireMobilePlan,
+  asyncHandler(setFlutterDefaultHost),
 );
 
 /**

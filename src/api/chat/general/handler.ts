@@ -907,17 +907,19 @@ Every step MUST be a valid IntentStep object with these fields:
 - value: (for type/press/select) the actual value to enter
 - assertionText: (for ai_check) natural language assertion
 
-EXAMPLE — user says "create a login test":
-You should generate steps like:
+EXAMPLE — user says "create a login test" but gave you NO credentials:
+NEVER fabricate the email/password. There is no credential store to draw from, so either ASK
+("Which account should this test log in with — send the email and password, or the name of a saved login?")
+or draft with {{placeholder}} values the user must fill before it can pass:
 [
   {"id": "...", "type": "navigate", "description": "Navigate to login page", "value": "https://example.com/login"},
-  {"id": "...", "type": "type", "description": "Type username into the 'Email' input field", "value": "test@example.com"},
-  {"id": "...", "type": "type", "description": "Type password into the 'Password' input field", "value": "password123"},
+  {"id": "...", "type": "type", "description": "Type the email into the 'Email' input field", "value": "{{secrets.login_email}}"},
+  {"id": "...", "type": "type", "description": "Type the password into the 'Password' input field", "value": "{{secrets.login_password}}"},
   {"id": "...", "type": "click", "description": "Click the 'Sign In' button"},
   {"id": "...", "type": "ai_check", "description": "Verify successful login", "assertionText": "The user is logged in and can see the dashboard"}
 ]
-Then ask the user: "Ready to run these on the preview?"
-When user says yes → call qa_run_draft_steps(steps=<above>, start_url="<current URL>", confirm=true).
+Then tell the user the login fields are placeholders and ask for the real credentials (or a saved login) before running.
+When the user provides real credentials → substitute them and call qa_run_draft_steps(steps=<above>, start_url="<current URL>", confirm=true).
 
 EDITOR WORKFLOW:
 1. User asks to create/test something → Generate IntentSteps from DOM, show them in chat, ask "Shall I run these?"
@@ -932,7 +934,7 @@ IMPORTANT RULES:
 - Do NOT call qa_create_test_case unless user explicitly says "save" / "сохрани" / "persist"
 - For SINGLE actions (one click, one type) → this is editor_action, handled automatically
 - For MULTI-STEP flows (login, checkout, search+filter):
-  • If the user just names a GOAL on the current page and you do NOT already have concrete steps ("test the login flow", "протестируй оформление заказа") → PREFER qa_author_test_iteratively(goal, confirm). It builds the test by doing it live on the page — each step is grounded in the real DOM and already verified, no guessing. Describe the goal, get "yes", then call with confirm=true.
+  • If the user just names a GOAL on the current page and you do NOT already have concrete steps ("test the login flow", "протестируй оформление заказа") → PREFER qa_author_test_iteratively(goal, confirm). It builds the test by doing it live on the page — each step is grounded in the real DOM and already verified, no guessing. Describe the goal, get "yes", then call with confirm=true. EXCEPTION: if the goal needs credentials the user has NOT provided (e.g. a login flow), do NOT use qa_author_test_iteratively — it would fabricate or fail live. Ask for the login first, or draft with {{placeholder}} credentials via qa_run_draft_steps (see GROUNDING).
   • If YOU already produced explicit IntentSteps (the user gave exact steps, or you're re-running a known list) → use qa_run_draft_steps as before.
   • After either tool returns, the steps are cached — when the user says "save", call qa_create_test_case (the authored steps already passed; no re-run needed).
 
@@ -953,9 +955,14 @@ WHEN THE PAGE DOESN'T MATCH:
 
 STEP DESCRIPTIONS — BE SPECIFIC:
 - Use REAL element labels, placeholder text, and ref IDs from the page context
-- GOOD: "Click the 'Физика' subject filter button" / "Type 'test@mail.com' into the email input (ref=i3)"
+- GOOD: "Click the 'Физика' subject filter button" / "Type the search term into the search input (ref=i3)"
 - BAD: "Click the subject button" / "Enter email address"
-- For elements not in the viewport, describe them by their text/label — the resolver will find them`;
+- For elements not in the viewport, describe them by their text/label — the resolver will find them
+- Describe WHAT to type, don't invent the value: a step's description names the field; the value comes from the user or a {{placeholder}} (see GROUNDING below), never a fabricated credential literal.
+
+GROUNDING — NEVER FABRICATE INPUT VALUES:
+- A step's value (login email/password, IDs, tokens, any specific data) MUST come from the user, the live DOM, or a saved resource — never an invented literal ("test@example.com", "password123", made-up IDs).
+- No credential store exists yet: if the user did not give the login, ASK for it, or use {{secrets.login_email}} / {{secrets.login_password}} placeholders (the secrets.* namespace is the one that resolves at runtime and gets redacted) and have the user fill them before running. A fabricated credential looks fine but makes the test unrunnable.`;
   } else if (mode === 'editor' && !editorPageContext) {
     // Limited editor prompt — page context is NOT available (session expired, snapshot failed, etc.)
     systemPrompt += `\n\n--- EDITOR MODE (LIMITED) ---

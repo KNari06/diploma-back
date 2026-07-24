@@ -77,6 +77,15 @@ export class TestBlackboard {
     return this.state.hasCredentials;
   }
 
+  /** Whether the Executor may author deterministic assertions (editor-only). */
+  getAssertAuthoring(): boolean {
+    return this.state.assertAuthoring === true;
+  }
+
+  setAssertAuthoring(enabled: boolean): void {
+    this.state.assertAuthoring = enabled;
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // PHASE
   // ═══════════════════════════════════════════════════════════════════════

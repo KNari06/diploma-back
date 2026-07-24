@@ -30,7 +30,7 @@
  */
 
 import type { MobileAppMetadata } from '@/services/storage/mobile-app-storage.service';
-import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import type { FlutterHostPlatform, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { env } from '@/config/environment/env';
 
 /**
@@ -130,6 +130,53 @@ export function buildSetDefaultVariantPatch(
   const existing = (currentSettings ?? {}) as any;
   const ptr = (existing.mobileDefaultVariant as MobileDefaultVariantByPlatform | undefined) ?? {};
   return { mobileDefaultVariant: { ...ptr, [platform]: label } };
+}
+
+/**
+ * Normalise a Flutter host value (`android`|`ios`) where absence means
+ * "inherit". Anything that isn't exactly one of the two hosts → `null`.
+ * Use this for the per-test-case `host_platform` override and any
+ * caller-supplied host so the call sites can't drift (mirrors
+ * `normaliseVariantOverride`).
+ */
+export function normaliseHostOverride(raw: unknown): FlutterHostPlatform | null {
+  return raw === 'android' || raw === 'ios' ? raw : null;
+}
+
+/**
+ * The host a Flutter run resolves to when the test case has no override.
+ * Reads the scalar `settings.flutterDefaultHost` pointer (written by the
+ * editor's Android/iOS toggle). Absent/invalid = `'android'` (back-compat:
+ * every Flutter run was implicitly Android-hosted before this existed).
+ *
+ * Scalar, not a per-platform map like `mobileDefaultVariant`: only
+ * `mobile_flutter` tests have a host choice — native platforms already
+ * encode their OS in the platform key (ADR-0019: host lane, not a key).
+ */
+export function getFlutterDefaultHost(
+  settings: ProjectSettings | undefined | null,
+): FlutterHostPlatform {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return normaliseHostOverride((settings as any)?.flutterDefaultHost) ?? 'android';
+}
+
+/** Build the settings patch that sets the project's Flutter default host. */
+export function buildSetFlutterDefaultHostPatch(
+  host: FlutterHostPlatform,
+): Record<string, unknown> {
+  return { flutterDefaultHost: host };
+}
+
+/**
+ * Resolve the effective host for one Flutter run:
+ * test-case override > project default > 'android'. Callers pass the raw
+ * `intent_test_cases.host_platform` value and the project settings.
+ */
+export function resolveFlutterHost(
+  caseHostPlatform: unknown,
+  settings: ProjectSettings | undefined | null,
+): FlutterHostPlatform {
+  return normaliseHostOverride(caseHostPlatform) ?? getFlutterDefaultHost(settings);
 }
 
 /**

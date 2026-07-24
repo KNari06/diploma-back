@@ -77,6 +77,43 @@ function findMatchingStep(
 }
 
 /**
+ * Tools whose args carry an authored step set, mapped to the trace `source`.
+ * `qa_author_test_iteratively` is intentionally absent — it takes a `goal`, not
+ * a `steps` array (its steps are produced inside the tool result, a separate
+ * capture left for a follow-up).
+ */
+const STEP_TRACE_SOURCE: Record<string, 'saved' | 'updated' | 'run'> = {
+  qa_create_test_case: 'saved',
+  qa_update_test_case_steps: 'updated',
+  qa_run_draft_steps: 'run',
+};
+
+/** Cap the traced step detail so a pathological array can't bloat the JSONL line. */
+const MAX_TRACED_STEPS = 200;
+
+/**
+ * Map a step-producing tool call to a `writeSteps` trace payload, or null if the
+ * tool doesn't author steps / carries none. Steps are reduced to the
+ * `{type, description}` contract — `value`/`assertionText` are dropped so no
+ * interpolated value reaches the trace — while `stepCount` stays the true count.
+ */
+function buildStepTrace(
+  toolName: string,
+  toolArgs: Record<string, any>,
+): { source: 'saved' | 'updated' | 'run'; stepCount: number; steps: Array<{ type?: string; description?: string }>; startUrl?: string } | null {
+  const source = STEP_TRACE_SOURCE[toolName];
+  if (!source) return null;
+  const rawSteps = toolArgs?.steps;
+  if (!Array.isArray(rawSteps) || rawSteps.length === 0) return null;
+  const steps = rawSteps.slice(0, MAX_TRACED_STEPS).map((s: any) => ({
+    type: typeof s?.type === 'string' ? s.type : undefined,
+    description: typeof s?.description === 'string' ? s.description : undefined,
+  }));
+  const startUrl = typeof toolArgs?.start_url === 'string' ? toolArgs.start_url : undefined;
+  return { source, stepCount: rawSteps.length, steps, startUrl };
+}
+
+/**
  * Execute tool calls in a focused loop with filtered tool subset.
  *
  * Supports two modes:
@@ -251,17 +288,22 @@ export async function executeTools(
       if (context.testCaseId && context.chatSessionId) {
         try {
           const { ChatTestTraceService } = require('@/services/chat/chat-test-trace.service');
-          ChatTestTraceService.getOrCreate(
+          const trace = ChatTestTraceService.getOrCreate(
             context.chatSessionId,
             context.userId,
             context.testCaseId,
-          ).writeToolCall({
+          );
+          trace.writeToolCall({
             toolName,
             args: toolArgs as Record<string, unknown>,
             success: callResult.toolResult.success,
             resultSummary: callResult.toolResult.message,
             durationMs: callResult.record.durationMs,
           });
+          // Capture the authored step set — the primary signal for measuring
+          // authoring quality — whenever this tool carried one.
+          const stepTrace = buildStepTrace(toolName, toolArgs);
+          if (stepTrace) trace.writeSteps(stepTrace);
         } catch { /* trace must never break tool execution */ }
       }
 

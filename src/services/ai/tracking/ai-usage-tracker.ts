@@ -13,6 +13,8 @@ export interface AIUsageRecord {
   provider: 'openai' | 'gemini';
   model: string;
   inputTokens: number;
+  /** Subset of inputTokens served from OpenAI's automatic prompt cache. */
+  cachedInputTokens?: number;
   outputTokens: number;
   totalTokens: number;
   costUSD: number;
@@ -22,6 +24,7 @@ export interface AIUsageRecord {
 
 export interface AIUsageSessionSummary {
   totalInputTokens: number;
+  totalCachedInputTokens: number;
   totalOutputTokens: number;
   totalTokens: number;
   totalCostUSD: number;
@@ -30,6 +33,7 @@ export interface AIUsageSessionSummary {
     provider: string;
     model: string;
     inputTokens: number;
+    cachedInputTokens: number;
     outputTokens: number;
     count: number;
   }>;
@@ -177,17 +181,20 @@ export class AIUsageTracker {
    */
   private static aggregate(session: AIUsageSession): AIUsageSessionSummary {
     let totalInputTokens = 0;
+    let totalCachedInputTokens = 0;
     let totalOutputTokens = 0;
     let totalTokens = 0;
     let totalCostUSD = 0;
 
     const modelMap = new Map<
       string,
-      { provider: string; model: string; inputTokens: number; outputTokens: number; count: number }
+      { provider: string; model: string; inputTokens: number; cachedInputTokens: number; outputTokens: number; count: number }
     >();
 
     for (const record of session.records) {
+      const cachedInputTokens = record.cachedInputTokens || 0;
       totalInputTokens += record.inputTokens;
+      totalCachedInputTokens += cachedInputTokens;
       totalOutputTokens += record.outputTokens;
       totalTokens += record.totalTokens;
       totalCostUSD += record.costUSD;
@@ -196,6 +203,7 @@ export class AIUsageTracker {
       const existing = modelMap.get(key);
       if (existing) {
         existing.inputTokens += record.inputTokens;
+        existing.cachedInputTokens += cachedInputTokens;
         existing.outputTokens += record.outputTokens;
         existing.count += 1;
       } else {
@@ -203,6 +211,7 @@ export class AIUsageTracker {
           provider: record.provider,
           model: record.model,
           inputTokens: record.inputTokens,
+          cachedInputTokens,
           outputTokens: record.outputTokens,
           count: 1,
         });
@@ -213,6 +222,7 @@ export class AIUsageTracker {
 
     return {
       totalInputTokens,
+      totalCachedInputTokens,
       totalOutputTokens,
       totalTokens,
       totalCostUSD,
@@ -311,10 +321,23 @@ export class AIUsageTracker {
 /**
  * Calculate cost for OpenAI models.
  * Reuses pricing from ai-cost-manager.service.ts.
+ *
+ * `cachedInputTokens` is the subset of `inputTokens` that OpenAI served from
+ * its automatic prompt cache (`usage.prompt_tokens_details.cached_tokens`).
+ * When the model publishes a `cachedInput` rate, that subset is billed at the
+ * cheaper rate; otherwise it falls back to the full input rate (never
+ * over-discounts billing for a model we haven't priced a cache hit for).
  */
-export function calculateOpenAICost(model: string, inputTokens: number, outputTokens: number): number {
+export function calculateOpenAICost(
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+  cachedInputTokens = 0
+): number {
   const pricing = AI_PRICING[model as AIModel] || AI_PRICING['gpt-4.1-mini']; // Fallback to cheapest
-  return inputTokens * pricing.input + outputTokens * pricing.output;
+  const cached = Math.min(Math.max(cachedInputTokens, 0), inputTokens);
+  const cachedRate = 'cachedInput' in pricing ? (pricing as { cachedInput: number }).cachedInput : pricing.input;
+  return (inputTokens - cached) * pricing.input + cached * cachedRate + outputTokens * pricing.output;
 }
 
 /**

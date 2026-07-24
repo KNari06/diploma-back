@@ -74,7 +74,7 @@ export class RegressionTestQueryService {
     // UI test cases from intent_test_cases (unified table)
     const { data: uiCases, error: uiError } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, flow_id, depends_on, platform, priority')
+      .select('id, flow_id, depends_on, platform, host_platform, priority')
       .in('flow_id', flowIds);
 
     if (uiError) {
@@ -91,6 +91,7 @@ export class RegressionTestQueryService {
         flowId,
         dependsOn: tc.depends_on || [],
         platform: tc.platform || undefined,
+        host_platform: tc.host_platform ?? null,
         priority: tc.priority ?? null,
       });
     }
@@ -254,19 +255,20 @@ export class RegressionTestQueryService {
   }
 
   /**
-   * depends_on + priority for the given UI test case ids. Empty input → empty array.
+   * depends_on + priority + flutter host-lane for the given UI test case ids.
+   * Empty input → empty array.
    */
   static async getDependsOnRows(
     uiCaseIds: string[],
-  ): Promise<Array<{ id: string; depends_on: string[] | null; priority: string | null }>> {
+  ): Promise<Array<{ id: string; depends_on: string[] | null; priority: string | null; host_platform: string | null }>> {
     if (uiCaseIds.length === 0) return [];
 
     const { data } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, depends_on, priority')
+      .select('id, depends_on, priority, host_platform')
       .in('id', uiCaseIds);
 
-    return (data as Array<{ id: string; depends_on: string[] | null; priority: string | null }>) || [];
+    return (data as Array<{ id: string; depends_on: string[] | null; priority: string | null; host_platform: string | null }>) || [];
   }
 
   /**
@@ -317,7 +319,7 @@ export class RegressionTestQueryService {
   static async getUiTestCasesByTag(projectId: string, tag: string): Promise<any[]> {
     const { data } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, flow_id, depends_on, platform, priority')
+      .select('id, flow_id, depends_on, platform, host_platform, priority')
       .eq('project_id', projectId)
       .contains('tags', [tag]);
 
@@ -330,7 +332,7 @@ export class RegressionTestQueryService {
   static async getUiTestCasesByPriority(projectId: string, priority: Priority): Promise<any[]> {
     const { data } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, flow_id, depends_on, platform, priority')
+      .select('id, flow_id, depends_on, platform, host_platform, priority')
       .eq('project_id', projectId)
       .eq('priority', priority);
 
