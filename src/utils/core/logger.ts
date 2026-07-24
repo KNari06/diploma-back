@@ -4,6 +4,7 @@ import * as path from 'path';
 import winston from 'winston';
 import Transport from 'winston-transport';
 import LokiTransport from 'winston-loki';
+import * as Sentry from '@sentry/node';
 import { logBuffer } from './log-buffer';
 import { PROCESS_KIND, publishLogEntry } from './log-bridge';
 
@@ -154,6 +155,103 @@ class RingBufferTransport extends Transport {
   }
 }
 
+/**
+ * Sentry transport — forwards error-level log entries to Sentry so the error
+ * dashboard reflects what the app actually logs. Before this, the ONLY capture
+ * path was Express's error middleware (which sees only errors propagated via
+ * `next(err)`), so caught-and-logged failures in services, jobs, and the worker
+ * never reached Sentry — the dashboard stayed empty. `logger.error` is the
+ * universal error sink across all three processes, so bridging it here gives
+ * broad coverage from one chokepoint.
+ *
+ * - Only `error` level is forwarded (transport is constructed with level:'error'),
+ *   so warn-level job retries never reach Sentry.
+ * - Events already captured explicitly with richer context (worker `job.failed`
+ *   / `worker.error`, see src/worker/index.ts) are skipped here to avoid
+ *   double-reporting the same failure.
+ * - Per-fingerprint rate limiting protects the free-tier quota.
+ * - Best-effort: a Sentry failure must never break logging.
+ */
+const SENTRY_SKIP_EVENTS = new Set(['job.failed', 'worker.error']);
+
+class SentryTransport extends Transport {
+  private lastSent = new Map<string, number>();
+  private static readonly WINDOW_MS = 30_000;
+  private static readonly MAX_TRACKED = 500;
+
+  private levelFor(severity: unknown): Sentry.SeverityLevel {
+    return severity === 'critical' ? 'fatal' : 'error';
+  }
+
+  log(info: winston.Logform.TransformableInfo, callback: () => void): void {
+    setImmediate(() => this.emit('logged', info));
+    try {
+      const meta = info as Record<string, unknown>;
+      const event = typeof meta.event === 'string' ? meta.event : undefined;
+      if (event && SENTRY_SKIP_EVENTS.has(event)) {
+        callback();
+        return;
+      }
+
+      const message =
+        typeof info.message === 'string'
+          ? info.message
+          : (() => {
+              try { return JSON.stringify(info.message); }
+              catch { return String(info.message); }
+            })();
+
+      // Rate-limit by (event + message prefix + distinguishers) so a hot error
+      // path can't drain the Sentry quota. Sentry's own dedupe only collapses
+      // identical consecutive exceptions, which isn't enough here. The
+      // distinguishers matter for events whose message is CONSTANT but whose
+      // meta varies (e.g. `http.error` logs the same string for every route —
+      // without `url`/`status` in the key, all 5xx would collapse to one).
+      const distinguishers = ['url', 'jobName', 'jobId', 'testId', 'status']
+        .map((k) => (meta[k] !== undefined ? `${k}=${String(meta[k])}` : ''))
+        .filter(Boolean)
+        .join('&');
+      const fingerprint = `${event ?? ''}|${message.slice(0, 120)}|${distinguishers}`;
+      const now = Date.now();
+      const last = this.lastSent.get(fingerprint);
+      if (last !== undefined && now - last < SentryTransport.WINDOW_MS) {
+        callback();
+        return;
+      }
+      if (this.lastSent.size > SentryTransport.MAX_TRACKED) this.lastSent.clear();
+      this.lastSent.set(fingerprint, now);
+
+      const level = this.levelFor(meta.severity);
+      const stack = typeof meta.stack === 'string' ? meta.stack : undefined;
+
+      Sentry.withScope((scope) => {
+        scope.setLevel(level);
+        scope.setTag('process', PROCESS_KIND);
+        if (event) scope.setTag('event', event);
+        // Attach remaining structured fields as context (drop winston internals).
+        const rest: Record<string, unknown> = { ...meta };
+        delete rest.level;
+        delete rest.message;
+        delete rest.timestamp;
+        delete rest.stack;
+        if (Object.keys(rest).length > 0) scope.setContext('log', rest);
+
+        if (stack) {
+          // Reconstruct an Error so Sentry groups by the original stack.
+          const err = new Error(message);
+          err.stack = stack;
+          Sentry.captureException(err);
+        } else {
+          Sentry.captureMessage(message, level);
+        }
+      });
+    } catch {
+      // Telemetry must never break logging.
+    }
+    callback();
+  }
+}
+
 // Define which transports the logger must use
 const transports: winston.transport[] = [
   new RingBufferTransport({
@@ -271,6 +369,20 @@ const transports: winston.transport[] = [
           // immediately or they stay invisible in Grafana.
           batching: PROCESS_KIND === 'api',
           onConnectionError: (e) => console.error('[loki]', e),
+        }),
+      ]
+    : []),
+  // Sentry — forward error-level logs to the error dashboard. Only wired when a
+  // DSN is configured (same gate as instrument.ts), so dev / tests stay off.
+  ...(process.env.SENTRY_DSN?.trim()
+    ? [
+        new SentryTransport({
+          level: 'error',
+          format: winston.format.combine(
+            winston.format.timestamp(),
+            winston.format.errors({ stack: true }),
+            truncateLargeFields(),
+          ),
         }),
       ]
     : []),
