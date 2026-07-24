@@ -293,6 +293,13 @@ export interface TestFlow {
   expectedResult?: string;
   /** Mobile-only flow variant override. null = inherit (plan → project default → 'default'). */
   mobileVariantLabel?: string | null;
+  /**
+   * Flutter-only host override, surfaced on the flow list for the per-flow host
+   * control + iOS badge. Read-through of the flow's `intent_test_cases.host_platform`
+   * (a flow's test cases share one host). null = inherit (project flutterDefaultHost
+   * → 'android'). Only populated by `listByModule`; other reads leave it undefined.
+   */
+  hostPlatform?: 'android' | 'ios' | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -1128,6 +1135,13 @@ export interface RunReportExecution {
    */
   platform?: string;
   /**
+   * Flutter host lane (android|ios) this execution targeted, for the
+   * "FLUTTER · iOS" run-report badge. Only meaningful when `platform` is
+   * `mobile_flutter`; absent otherwise. Read from the test case's host
+   * override (run-time host isn't denormalised onto the execution row).
+   */
+  hostPlatform?: 'android' | 'ios';
+  /**
    * Curator-set priority of the saved test case this execution ran, if any.
    * One of 'critical' | 'high' | 'medium' | 'low'. NULL for ad-hoc /
    * chat-lite runs (no saved test case) and for API tests (api_test_configs
@@ -1438,6 +1452,8 @@ export interface ExecutableTestCase {
   isNegative?: boolean;
   /** Test case platform — used to route mobile tests to the mobile runner */
   platform?: string;
+  /** Flutter host-lane override (android|ios, null = inherit project default) — used by the mobile concurrency decision */
+  host_platform?: string | null;
   /** Curator-set priority — used to order dispatch within a topological level */
   priority?: string | null;
 }

@@ -6,7 +6,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { FlowService } from '@/services/testing/flows/flow.service';
 import { ModuleService } from '@/services/testing/modules/module.service';
-import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
+import { getProjectMobileApp, normaliseHostOverride } from '@/services/mobile/project-mobile-app.helper';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
@@ -31,7 +31,7 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function createFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { moduleId, name, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings, mobileVariantLabel } = req.body;
+    const { moduleId, name, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings, mobileVariantLabel, hostPlatform } = req.body;
 
     // Validate moduleId required
     if (!moduleId) {
@@ -174,6 +174,15 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
 
         if (isMobilePlatform) {
           insertPayload.platform = platform; // 'mobile_android' | 'mobile_ios'
+        }
+
+        // Flutter-only per-test host override (android|ios; NULL = inherit the
+        // project default). Only meaningful for mobile_flutter — native
+        // android/ios already encode their host in the platform key. Persist it
+        // on the initial test case so a non-editor run (regression/scheduled/CI)
+        // targets the chosen host from the very first save.
+        if (platform === 'mobile_flutter' && hostPlatform !== undefined) {
+          insertPayload.host_platform = normaliseHostOverride(hostPlatform);
         }
 
         // Auto-attach workspace-configured resources matching this flow's
@@ -346,7 +355,7 @@ export async function listFlows(req: AuthenticatedRequest, res: Response): Promi
 export async function updateFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { name, moduleId, flowType, tags, priority, preconditions, expectedResult, orderIndex, mobileVariantLabel } = req.body;
+    const { name, moduleId, flowType, tags, priority, preconditions, expectedResult, orderIndex, mobileVariantLabel, hostPlatform } = req.body;
     const userId = getUserId(req);
 
     const flow = await FlowService.update({
@@ -362,6 +371,23 @@ export async function updateFlow(req: AuthenticatedRequest, res: Response): Prom
       orderIndex,
       ...(mobileVariantLabel !== undefined ? { mobileVariantLabel } : {}),
     });
+
+    // Flutter host override lives on the flow's test case(s), not the flow row
+    // (host is a per-test-case column with test-case > project-default
+    // precedence). A per-flow choice applies to all the flow's test cases.
+    // Flutter-only (mirrors createFlow) — native platforms encode their host in
+    // the platform key. Best-effort: the flow update already succeeded, so a
+    // host-write failure must not fail the whole request.
+    if (hostPlatform !== undefined && flow.platform === 'mobile_flutter') {
+      try {
+        await FlowService.setHostPlatformByFlow(id, userId, normaliseHostOverride(hostPlatform));
+      } catch (hostErr) {
+        logger.warn('[FLOWS_API] Failed to persist flow host override (non-fatal)', {
+          flowId: id,
+          error: hostErr instanceof Error ? hostErr.message : String(hostErr),
+        });
+      }
+    }
 
     const projectId = await resolveFlowProjectId(flow.moduleId, userId);
     if (projectId) {

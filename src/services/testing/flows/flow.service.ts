@@ -11,7 +11,7 @@ import type {
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
-import { normaliseVariantOverride } from '@/services/mobile/project-mobile-app.helper';
+import { normaliseVariantOverride, normaliseHostOverride } from '@/services/mobile/project-mobile-app.helper';
 
 /**
  * Service for managing test flows
@@ -127,7 +127,68 @@ export class FlowService {
       throw new Error(`Failed to list flows: ${error.message}`);
     }
 
-    return (data || []).map(this.mapToTestFlow);
+    const flows = (data || []).map(this.mapToTestFlow);
+
+    // Surface each flow's Flutter host override for the per-flow host control +
+    // iOS badge. Host lives on `intent_test_cases.host_platform` (a flow's test
+    // cases share one host — writes go to all of them), so one batched read maps
+    // flow_id → host. Best-effort: a failure just leaves the badge/control at
+    // "inherit" (null), never breaks the list.
+    const flowIds = flows.map((f) => f.id);
+    if (flowIds.length > 0) {
+      const { data: tcRows, error: tcErr } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('flow_id, host_platform')
+        .in('flow_id', flowIds)
+        .eq('user_id', userId)
+        // A flow's cases share one host (the write path enforces it); order for
+        // a deterministic pick if a legacy/drifted flow ever has mixed hosts.
+        .order('created_at', { ascending: true });
+      if (tcErr) {
+        logger.warn('[FLOW_SERVICE] Failed to load per-flow host overrides (non-fatal)', {
+          error: tcErr.message,
+          moduleId,
+        });
+      } else {
+        const hostByFlow = new Map<string, 'android' | 'ios'>();
+        for (const row of tcRows || []) {
+          const host = normaliseHostOverride((row as { host_platform?: unknown }).host_platform);
+          const fid = (row as { flow_id?: string }).flow_id;
+          if (host && fid && !hostByFlow.has(fid)) hostByFlow.set(fid, host);
+        }
+        for (const f of flows) f.hostPlatform = hostByFlow.get(f.id) ?? null;
+      }
+    }
+
+    return flows;
+  }
+
+  /**
+   * Set (or clear) the Flutter host override for every test case in a flow.
+   * Host is a per-test-case column (`intent_test_cases.host_platform`), but the
+   * UI is per-flow, so a flow's choice applies to all its test cases. `null`
+   * clears the override → inherit the project default. Best-effort at the call
+   * site (the flow update itself already succeeded).
+   */
+  static async setHostPlatformByFlow(
+    flowId: string,
+    userId: string,
+    host: 'android' | 'ios' | null,
+  ): Promise<void> {
+    const normalized = normaliseHostOverride(host);
+    const { error } = await supabaseAdmin
+      .from('intent_test_cases')
+      .update({ host_platform: normalized })
+      .eq('flow_id', flowId)
+      .eq('user_id', userId);
+    if (error) {
+      logger.warn('[FLOW_SERVICE] Failed to set per-flow host override', {
+        error: error.message,
+        flowId,
+        host: normalized,
+      });
+      throw new Error(`Failed to set flow host: ${error.message}`);
+    }
   }
 
   /**

@@ -18,6 +18,7 @@ jest.mock('@/services/testing/regression/db/regression-report.db', () => ({
   getNegativeMetaByIds: jest.fn(),
   getTestCasePhaseInfoByIds: jest.fn(),
   getTestsByRegressionRunId: jest.fn(),
+  getTestOptionsByTestIds: jest.fn(() => Promise.resolve([])),
 }));
 
 jest.mock('@/services/testing/regression/db/regression.db', () => ({

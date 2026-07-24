@@ -11,10 +11,11 @@
 import { env } from '@/config/environment/env';
 import { QueueManager, redisConnection } from '@/config/infrastructure/queues';
 import { dbAdminService, supabaseAdmin } from '@/db/supabase';
-import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { getMobileRunnerClient, resolveRunnerUrlForHost } from '@/services/mobile/mobile-runner-client';
+import { normaliseHostOverride } from '@/services/mobile/project-mobile-app.helper';
 import { isPaidUser } from '@/services/core/plan-access.service';
 import { PAID_FEATURE_LABELS } from '@/config/features/feature-labels';
-import type { MobileIntentStep, MobilePlatform, MobileTestJobData, MobileTestMetadata } from '@/services/mobile/mobile-runner.types';
+import type { FlutterHostPlatform, MobileIntentStep, MobilePlatform, MobileTestJobData, MobileTestMetadata } from '@/services/mobile/mobile-runner.types';
 import {
   MobileAppStorageService,
   MobileAppMetadata,
@@ -346,6 +347,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
     let testCases: Array<{
       id: string;
       name: string;
+      hostPlatform?: string | null;
       intentSteps: MobileIntentStep[];
       metadata?: MobileTestMetadata;
     }> = [];
@@ -374,6 +376,42 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
       return;
     }
 
+    // ── Step 4b: Host lanes for a Flutter CI run (ADR-0019) ────────
+    // Per-case override > project default. The artifact is resolved PER HOST
+    // LANE — at most two resolutions per run (android .apk / ios .app). The
+    // run-level `appStoragePath` above stays the android-host artifact
+    // (fresh upload or resolver); the ios lane resolves from storage here
+    // (an appUrl upload is an .apk and can never serve an ios-host case).
+    let ciDefaultFlutterHost: FlutterHostPlatform = 'android';
+    let iosLaneApp: { storagePath?: string; originalName?: string; packageName?: string } | null = null;
+    if (platform === 'flutter') {
+      ciDefaultFlutterHost = await MobileAppStorageService.getProjectDefaultFlutterHost(projectId);
+      const needsIosLane = testCases.some(
+        (tc) => (normaliseHostOverride(tc.hostPlatform) ?? ciDefaultFlutterHost) === 'ios',
+      );
+      if (needsIosLane) {
+        const iosVariant = await MobileAppStorageService.getProjectDefaultVariant(projectId, 'ios');
+        const resolvedIos = await MobileAppStorageService.resolveAppForRun({
+          projectId,
+          platform: 'ios',
+          branch,
+          commitSha,
+          variantLabel: iosVariant,
+        });
+        if (resolvedIos?.storagePath) {
+          iosLaneApp = {
+            storagePath: resolvedIos.storagePath,
+            originalName: resolvedIos.originalName,
+            packageName: resolvedIos.packageName,
+          };
+        } else {
+          logger.warn('[CI] iOS-host flutter case(s) in run but no ios-slot app build resolved — those cases will run without install', {
+            projectId,
+          });
+        }
+      }
+    }
+
     // ── Step 5: Create CI run ──────────────────────────────────────
     const runId = await CiRunService.createRun({
       projectId,
@@ -390,6 +428,16 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
       const testId = uuidv4();
       testIds.push(testId);
 
+      // Per-case host lane + lane-matched artifact (flutter only).
+      const tcHost: FlutterHostPlatform | undefined =
+        platform === 'flutter'
+          ? (normaliseHostOverride(tc.hostPlatform) ?? ciDefaultFlutterHost)
+          : undefined;
+      const laneApp =
+        tcHost === 'ios'
+          ? iosLaneApp ?? {}
+          : { storagePath: appStoragePath, originalName: appOriginalName, packageName: appPackage };
+
       // Create test record in DB
       await dbAdminService.createTest({
         id: testId,
@@ -403,7 +451,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
           platform,
           trigger: 'ci',
           ciRunId: runId,
-          appPackage,
+          appPackage: laneApp.packageName,
         },
         intelligent_mode: false,
         test_goal: `CI: ${tc.name} (${platform})`,
@@ -420,13 +468,14 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
         workspaceId,
         projectId,
         platform,
+        ...(tcHost ? { hostPlatform: tcHost } : {}),
         browser: browser as 'mobile-android' | 'mobile-ios',
         intentSteps: tc.intentSteps,
-        runnerUrl: env.MOBILE_RUNNER_URL,
+        runnerUrl: resolveRunnerUrlForHost(tcHost),
         runnerApiKey: env.MOBILE_RUNNER_API_KEY,
-        appStoragePath,
-        appOriginalName,
-        appPackage,
+        appStoragePath: laneApp.storagePath,
+        appOriginalName: laneApp.originalName,
+        appPackage: laneApp.packageName,
         ciRunId: runId,
         callbackUrl,
         testCaseId: tc.id,
@@ -522,10 +571,10 @@ export async function getCiRunStatus(req: Request, res: Response): Promise<void>
 async function fetchTestCaseSteps(
   testCaseIds: string[],
   projectId: string,
-): Promise<Array<{ id: string; name: string; intentSteps: MobileIntentStep[]; metadata?: MobileTestMetadata }>> {
+): Promise<Array<{ id: string; name: string; hostPlatform?: string | null; intentSteps: MobileIntentStep[]; metadata?: MobileTestMetadata }>> {
   const { data: rows, error } = await supabaseAdmin
     .from('intent_test_cases')
-    .select('id, name, description, expected_result, priority, tags, goal, platform, steps_json, commands, graph_ref, replay_strategy')
+    .select('id, name, description, expected_result, priority, tags, goal, platform, host_platform, steps_json, commands, graph_ref, replay_strategy')
     .in('id', testCaseIds)
     .eq('project_id', projectId)
     .in('platform', ['mobile_android', 'mobile_ios', 'mobile_flutter']);
@@ -539,6 +588,7 @@ async function fetchTestCaseSteps(
     .map((row: any) => ({
       id: row.id,
       name: row.name || `Test Case ${row.id.slice(0, 8)}`,
+      hostPlatform: row.host_platform ?? null,
       intentSteps: extractIntentSteps(row),
       metadata: buildTestMetadata(row),
     }))
@@ -561,10 +611,10 @@ function buildTestMetadata(row: any): MobileTestMetadata | undefined {
  */
 async function fetchAllProjectTestCases(
   projectId: string,
-): Promise<Array<{ id: string; name: string; intentSteps: MobileIntentStep[]; metadata?: MobileTestMetadata }>> {
+): Promise<Array<{ id: string; name: string; hostPlatform?: string | null; intentSteps: MobileIntentStep[]; metadata?: MobileTestMetadata }>> {
   const { data: rows, error } = await supabaseAdmin
     .from('intent_test_cases')
-    .select('id, name, description, expected_result, priority, tags, goal, platform, steps_json, commands, graph_ref, replay_strategy')
+    .select('id, name, description, expected_result, priority, tags, goal, platform, host_platform, steps_json, commands, graph_ref, replay_strategy')
     .eq('project_id', projectId)
     .in('platform', ['mobile_android', 'mobile_ios', 'mobile_flutter'])
     .neq('status', 'archived')
@@ -579,6 +629,7 @@ async function fetchAllProjectTestCases(
     .map((row: any) => ({
       id: row.id,
       name: row.name || `Test Case ${row.id.slice(0, 8)}`,
+      hostPlatform: row.host_platform ?? null,
       intentSteps: extractIntentSteps(row),
       metadata: buildTestMetadata(row),
     }))

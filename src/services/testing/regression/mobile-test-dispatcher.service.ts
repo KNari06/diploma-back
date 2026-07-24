@@ -6,7 +6,9 @@ import { dbAdminService } from '@/db/supabase';
 import { IntelligentTestStorageService } from '../results/intelligent-test-storage.service';
 import { QueueManager } from '@/config/infrastructure/queues';
 import { buildMetadataFromTestCase } from '@/services/mobile/mobile-runner.types';
-import type { MobileTestJobData, MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import type { FlutterHostPlatform, MobileTestJobData, MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { normaliseHostOverride } from '@/services/mobile/project-mobile-app.helper';
+import { resolveRunnerUrlForHost } from '@/services/mobile/mobile-runner-client';
 import { sanitizeTriggers } from '@/services/mobile/trigger-validation.util';
 import { env } from '@/config/environment/env';
 import { isPaidUser } from '@/services/core/plan-access.service';
@@ -128,6 +130,27 @@ export class MobileTestDispatcherService {
       : platform === 'flutter' ? 'mobile-flutter'
       : 'mobile-android';
 
+    // 1b. Host lane for a Flutter run (ADR-0019 deferred half): which OS the
+    // worker acquires, which artifact shard resolves, which runner routes.
+    // Precedence: test-case override > project default > 'android'.
+    const hostPlatform: FlutterHostPlatform | undefined =
+      platform === 'flutter'
+        ? (normaliseHostOverride(intentCase.host_platform) ??
+            (await MobileAppStorageService.getProjectDefaultFlutterHost(intentCase.project_id)))
+        : undefined;
+    // Mirror prepApp's resolve rule exactly: 'ios' ONLY for an ios-host
+    // Flutter run; android-host Flutter keeps 'flutter' so the resolver's
+    // legacy fallback chain is preserved byte-for-byte.
+    const artifactResolvePlatform: MobilePlatform =
+      platform === 'flutter' && hostPlatform === 'ios' ? 'ios' : platform;
+    if (hostPlatform) {
+      logger.debug('[MOBILE-DISPATCH] resolved flutter host lane', {
+        testCaseId: intentCase.id,
+        hostPlatform,
+        source: normaliseHostOverride(intentCase.host_platform) ? 'test' : 'project-default',
+      });
+    }
+
     // 2. Fetch project workspace (needed for MobileTestJobData; the APK
     // itself comes from the resolver below, not from project settings).
     // workspaceId is REQUIRED for a mobile run — it keys billing, telemetry,
@@ -157,7 +180,7 @@ export class MobileTestDispatcherService {
     let variantLabel = testVariant ?? flowVariant ?? triggerContext?.variantLabel;
     let variantSource = testVariant ? 'test' : flowVariant ? 'flow' : (triggerContext?.variantLabel ? 'plan' : 'project-default');
     if (!variantLabel) {
-      variantLabel = await MobileAppStorageService.getProjectDefaultVariant(intentCase.project_id, platform);
+      variantLabel = await MobileAppStorageService.getProjectDefaultVariant(intentCase.project_id, artifactResolvePlatform);
       variantSource = 'project-default';
     }
     if (variantLabel) {
@@ -177,7 +200,9 @@ export class MobileTestDispatcherService {
     // `MobileAppMetadata`, so downstream code is unchanged.
     const resolvedBuild = await MobileAppStorageService.resolveAppForRun({
       projectId: intentCase.project_id,
-      platform,
+      // Host-aware for Flutter: an ios-host run reads the `ios` shard (the
+      // simulator `.app`); android-host keeps the `flutter` platform intact.
+      platform: artifactResolvePlatform,
       buildId: triggerContext?.buildId,
       branch: triggerContext?.branch,
       commitSha: triggerContext?.commitSha,
@@ -282,6 +307,10 @@ export class MobileTestDispatcherService {
       options: {
         mode: 'lite',
         platform,
+        // Flutter host lane (android|ios) the run actually targeted. Surfaced on
+        // the run report ("FLUTTER · iOS" badge). Only for flutter — native
+        // platforms already encode their host in `platform`.
+        ...(hostPlatform ? { hostPlatform } : {}),
         trigger,
         // Chain view: mirrors the web dispatch path's `options.metadata`
         // shape (see WebTestRequestBuilderService.buildTestRequest / test-
@@ -337,9 +366,12 @@ export class MobileTestDispatcherService {
       // Routes WS progress/result to chat:<sessionId> when launched from chat.
       ...(chatSessionId ? { chatSessionId } : {}),
       platform,
+      // Host lane rides the job so the worker acquires the right pool and
+      // prepApp resolves the right shard. Absent for non-flutter platforms.
+      ...(hostPlatform ? { hostPlatform } : {}),
       browser,
       intentSteps: intentSteps as unknown as MobileTestJobData['intentSteps'],
-      runnerUrl: env.MOBILE_RUNNER_URL,
+      runnerUrl: resolveRunnerUrlForHost(hostPlatform),
       runnerApiKey: env.MOBILE_RUNNER_API_KEY,
       appStoragePath: resolvedBuild?.storagePath,
       appOriginalName: resolvedBuild?.originalName,

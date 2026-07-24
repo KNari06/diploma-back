@@ -56,6 +56,9 @@ const mockRunnerClient = {
 jest.mock('@/services/mobile/mobile-runner-client', () => ({
   getMobileRunnerClient: jest.fn(() => mockRunnerClient),
   MobileRunnerClient: class {},
+  // Host-lane routing: unset iOS URL → both hosts resolve to the env runner,
+  // so warmup keeps using the getMobileRunnerClient() singleton above.
+  resolveRunnerUrlForHost: jest.fn(() => 'http://runner.local:4100'),
 }));
 
 // In-memory Redis backing the warmup key + lock. NX honoured so lock
@@ -134,7 +137,13 @@ jest.mock('@/services/testing/ui/preview/editor-trace-upload', () => ({
   uploadEditorTrace: jest.fn(),
   closeAndUploadEditorTrace: jest.fn(),
 }));
-jest.mock('@/services/mobile/project-mobile-app.helper', () => ({ getProjectMobileApp: jest.fn() }));
+jest.mock('@/services/mobile/project-mobile-app.helper', () => ({
+  // Keep the real pure host/variant resolvers (resolveFlutterHost,
+  // getFlutterDefaultHost, getDefaultVariantLabel, normaliseHostOverride) — the
+  // warmup + auto-boot paths call them; only the app-slot reader is stubbed.
+  ...jest.requireActual('@/services/mobile/project-mobile-app.helper'),
+  getProjectMobileApp: jest.fn(),
+}));
 
 // ── Imports (after mocks) ───────────────────────────────────────────────────
 import { warmupSession, WARMUP_PREFIX, type WarmupData } from '@/api/mobile/session.controller';
