@@ -150,14 +150,18 @@ export async function findUserIdByEmail(email: string): Promise<string | null> {
 }
 
 /**
- * Promote a synced public.users row to a partner login: role='partner' +
- * status='approved' (so the account clears the requireApproved / ProtectedRoute
- * status gate and reaches the partner dashboard). Idempotent.
+ * Provision a partner login on a synced public.users row. Partnership is
+ * decoupled from `role`: we do NOT set role='partner' (that would lock the
+ * account out of the main platform). Partner status is derived from the linked
+ * partners row (partners.auth_user_id) instead — see /auth/me `isPartner`. Here
+ * we only ensure the account is approved so it clears the status gate. The
+ * `partners.auth_user_id` link itself is written by the caller (createPartner).
+ * Idempotent.
  */
 export async function markUserAsPartnerLogin(userId: string): Promise<void> {
   const { error } = await supabaseAdmin
     .from('users')
-    .update({ role: 'partner', status: 'approved', updated_at: new Date().toISOString() })
+    .update({ status: 'approved', updated_at: new Date().toISOString() })
     .eq('id', userId);
 
   if (error) throw error;
