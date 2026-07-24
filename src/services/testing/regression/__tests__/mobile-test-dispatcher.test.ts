@@ -15,6 +15,8 @@ jest.mock('@/services/storage/mobile-app-storage.service', () => ({
     // Flutter-upgrade behaviour is asserted in its own test below.
     getDetectedFramework: jest.fn().mockResolvedValue(undefined),
     getProjectDefaultVariant: jest.fn().mockResolvedValue(undefined),
+    // Default: no project default host → flutter runs bucket android.
+    getProjectDefaultFlutterHost: jest.fn().mockResolvedValue('android'),
   },
 }));
 
@@ -99,6 +101,7 @@ beforeEach(() => {
   // mockResolvedValueOnce can't bleed into a later test.
   MobileAppStorageService.getDetectedFramework.mockResolvedValue(undefined);
   MobileAppStorageService.getProjectDefaultVariant.mockResolvedValue(undefined);
+  MobileAppStorageService.getProjectDefaultFlutterHost.mockResolvedValue('android');
   dbAdminService.createTest.mockResolvedValue(undefined);
   QueueManager.addMobileTestRunJob.mockResolvedValue(undefined);
   isPaidUser.mockResolvedValue(true);
@@ -368,5 +371,72 @@ describe('triggers forwarding to the job', () => {
     );
     const jobData = QueueManager.addMobileTestRunJob.mock.calls[0][0];
     expect(jobData.triggers).toEqual([permissionTrigger]);
+  });
+});
+
+// ── Flutter host lane (ADR-0019 deferred half) ────────────────────────────────
+
+describe('flutter host lane resolution + stamping', () => {
+  it('flutter case with no override inherits the project default host and stamps it', async () => {
+    MobileAppStorageService.getProjectDefaultFlutterHost.mockResolvedValue('ios');
+    await MobileTestDispatcherService.dispatchMobileTest(
+      baseCase({ platform: 'mobile_flutter' }), 'user-1', 'manual',
+    );
+    const jobData = QueueManager.addMobileTestRunJob.mock.calls[0][0];
+    expect(jobData.platform).toBe('flutter');
+    expect(jobData.hostPlatform).toBe('ios');
+  });
+
+  it('per-case host_platform override beats the project default', async () => {
+    MobileAppStorageService.getProjectDefaultFlutterHost.mockResolvedValue('ios');
+    await MobileTestDispatcherService.dispatchMobileTest(
+      baseCase({ platform: 'mobile_flutter', host_platform: 'android' }), 'user-1', 'manual',
+    );
+    const jobData = QueueManager.addMobileTestRunJob.mock.calls[0][0];
+    expect(jobData.hostPlatform).toBe('android');
+    // Override present → the project default is never consulted.
+    expect(MobileAppStorageService.getProjectDefaultFlutterHost).not.toHaveBeenCalled();
+  });
+
+  it('ios-host flutter resolves the ios artifact shard; android-host keeps "flutter"', async () => {
+    MobileAppStorageService.getProjectDefaultFlutterHost.mockResolvedValue('ios');
+    await MobileTestDispatcherService.dispatchMobileTest(
+      baseCase({ platform: 'mobile_flutter' }), 'user-1', 'manual',
+    );
+    expect(MobileAppStorageService.resolveAppForRun).toHaveBeenCalledWith(
+      expect.objectContaining({ platform: 'ios' }),
+    );
+
+    jest.clearAllMocks();
+    MobileAppStorageService.getProjectDefaultFlutterHost.mockResolvedValue('android');
+    MobileAppStorageService.resolveAppForRun.mockResolvedValue(null);
+    MobileAppStorageService.getDetectedFramework.mockResolvedValue(undefined);
+    MobileAppStorageService.getProjectDefaultVariant.mockResolvedValue(undefined);
+    (regressionDb.getProjectWorkspaceId as jest.Mock).mockResolvedValue('ws-1');
+    isPaidUser.mockResolvedValue(true);
+    await MobileTestDispatcherService.dispatchMobileTest(
+      baseCase({ platform: 'mobile_flutter' }), 'user-1', 'manual',
+    );
+    expect(MobileAppStorageService.resolveAppForRun).toHaveBeenCalledWith(
+      expect.objectContaining({ platform: 'flutter' }),
+    );
+  });
+
+  it('non-flutter platforms never carry hostPlatform', async () => {
+    await MobileTestDispatcherService.dispatchMobileTest(
+      baseCase({ platform: 'mobile_ios' }), 'user-1', 'manual',
+    );
+    const jobData = QueueManager.addMobileTestRunJob.mock.calls[0][0];
+    expect(jobData.hostPlatform).toBeUndefined();
+    expect(MobileAppStorageService.getProjectDefaultFlutterHost).not.toHaveBeenCalled();
+  });
+
+  it('an invalid stored host_platform value falls back to the project default', async () => {
+    MobileAppStorageService.getProjectDefaultFlutterHost.mockResolvedValue('ios');
+    await MobileTestDispatcherService.dispatchMobileTest(
+      baseCase({ platform: 'mobile_flutter', host_platform: 'windows' }), 'user-1', 'manual',
+    );
+    const jobData = QueueManager.addMobileTestRunJob.mock.calls[0][0];
+    expect(jobData.hostPlatform).toBe('ios');
   });
 });

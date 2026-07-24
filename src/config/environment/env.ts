@@ -303,6 +303,10 @@ const envSchema = z.object({
 
   // Mobile Runner (qait-mobile-runner microservice)
   MOBILE_RUNNER_URL: z.string().url().optional().default('http://localhost:4100'),
+  // Optional iOS-host runner (the macOS runner from qait-infra/aws). Empty =
+  // fall back to MOBILE_RUNNER_URL (local dev: one runner serves both pools).
+  // Terraform already feeds this var on both clouds — this makes it read.
+  MOBILE_RUNNER_IOS_URL: z.string().url().optional().or(z.literal('')).default(''),
   MOBILE_RUNNER_ENABLED: z.string().transform(v => v === 'true').default('false'),
   MOBILE_RUNNER_API_KEY: z.string().optional().default(''),
   // Shared HMAC secret used to mint per-request X-User-Token headers for the

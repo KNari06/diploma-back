@@ -48,22 +48,6 @@ export async function fetchUserStatus(userId: string): Promise<string | null> {
 }
 
 /**
- * Read a user's account role ('admin' | 'user' | 'ai' | 'partner'). Returns null
- * when the row is missing. Used by provisioning to skip product setup for
- * partner logins (a partner is a dashboard login, not a QAIT product user).
- */
-export async function fetchUserRole(userId: string): Promise<string | null> {
-  const { data, error } = await supabaseAdmin
-    .from('users')
-    .select('role')
-    .eq('id', userId)
-    .maybeSingle();
-
-  if (error) throw error;
-  return (data?.role as string | undefined) ?? null;
-}
-
-/**
  * Mark a workspace's onboarding as completed by merging the flag into the
  * existing settings object. Read-then-write: under concurrent writes for the
  * same workspace the last write wins, which is acceptable here — this only

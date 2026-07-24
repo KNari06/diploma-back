@@ -1931,6 +1931,8 @@ export interface IntentTestCase {
   platform?: IntentTestCasePlatform;
   /** Mobile per-test variant override. null = inherit (plan → project default → 'default'). */
   mobileVariantLabel?: string | null;
+  /** Flutter per-test host override (android|ios). null = inherit (project flutterDefaultHost → 'android'). */
+  hostPlatform?: 'android' | 'ios' | null;
 
   // Replay data (populated when saved from completed test or published)
   replayStrategy?: ReplayStrategy;

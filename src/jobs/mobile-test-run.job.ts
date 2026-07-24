@@ -291,13 +291,15 @@ export class MobileTestRunJobHandler {
       client.setGeminiApiKey(geminiApiKey);
     }
 
-    // Flutter runs as a NATIVE android session that we upgrade via
-    // `attachFlutter` after install+launch. The runner's direct
-    // createSession('flutter') probes the VM Service before the app is
-    // installed (chicken-and-egg → always fails), and the pool only warms
-    // android, so we acquire 'android' here and attach below.
+    // Flutter runs as a NATIVE session that we upgrade via `attachFlutter`
+    // after install+launch. The runner's direct createSession('flutter')
+    // probes the VM Service before the app is installed (chicken-and-egg →
+    // always fails), so we acquire the HOST platform here and attach below.
+    // The host lane comes from dispatch (case override > project default);
+    // absent = 'android' for back-compat with in-flight jobs.
     const isFlutter = platform === 'flutter';
-    const acquirePlatform = isFlutter ? 'android' : platform;
+    const hostPlatform = job.data.hostPlatform ?? 'android';
+    const acquirePlatform = isFlutter ? hostPlatform : platform;
 
     let sessionId: string | null = null;
     let sessionSource: 'pool' | 'warmup' | 'cold' | 'dedicated' = 'cold';
@@ -454,6 +456,7 @@ export class MobileTestRunJobHandler {
           workspaceId,
           projectId,
           chatSessionId,
+          isFlutter,
         });
         sessionId = sessionAcq.sessionId;
         sessionSource = sessionAcq.sessionSource;
@@ -597,6 +600,12 @@ export class MobileTestRunJobHandler {
             projectId,
             userId,
             appPackage,
+            // Defense-in-depth: the dispatch-time appStoragePathOverride is
+            // the primary artifact choice (already host-resolved), but pass
+            // platform + host so prepApp's own slot logic agrees whenever it
+            // does resolve (e.g. override absent).
+            platform,
+            ...(isFlutter ? { hostPlatform } : {}),
             appStoragePathOverride: appStoragePath,
             appOriginalNameOverride: appOriginalName,
             // Flutter: install only — attachFlutter (below) clears logcat

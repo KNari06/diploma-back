@@ -44,13 +44,19 @@ export class MobileSessionAcquisitionService {
     workspaceId: string | undefined;
     projectId: string | undefined;
     chatSessionId: string | undefined;
+    /**
+     * Set for a Flutter job: `platform` above is then the HOST to acquire
+     * ('android' | 'ios'), while the editor's warmed session is recorded as
+     * platform 'flutter' + a hostPlatform. Drives host-aware warmup matching.
+     */
+    isFlutter?: boolean;
   }): Promise<{
     sessionId: string;
     sessionSource: 'pool' | 'warmup' | 'cold' | 'dedicated';
     sessionClaimMs: number;
     coldStartUsed: boolean;
   }> {
-    const { client, testId, platform, browser, userId, workspaceId, projectId, chatSessionId } = params;
+    const { client, testId, platform, browser, userId, workspaceId, projectId, chatSessionId, isFlutter } = params;
 
     // Announce session start to the frontend
     try {
@@ -178,11 +184,22 @@ export class MobileSessionAcquisitionService {
         });
       }
 
-      // Try 2: Warmed session (editor eager start)
+      // Try 2: Warmed session (editor eager start). The match criteria are
+      // enforced INSIDE claimWarmedSession, BEFORE its Redis delete — a
+      // mismatched record (other platform, or a Flutter warmup on the other
+      // host) is left in place for the editor instead of being eaten.
+      // For a Flutter job the warmed record is platform 'flutter' with a
+      // hostPlatform, while our `platform` is the host to acquire.
       if (!sessionId && projectId) {
         emitSessionPhase(`Checking warmed ${platform} session…`, 11);
-        const warmed = await claimWarmedSession(projectId, userId);
-        if (warmed && warmed.platform === platform) {
+        const warmed = await claimWarmedSession(
+          projectId,
+          userId,
+          isFlutter
+            ? { platform: 'flutter', hostPlatform: platform === 'ios' ? 'ios' : 'android' }
+            : { platform },
+        );
+        if (warmed) {
           sessionId = warmed.sessionId;
           sessionSource = 'warmup';
           logger.info('[MOBILE-TEST] Warmed session claimed', { testId, sessionId, platform });
@@ -206,19 +223,9 @@ export class MobileSessionAcquisitionService {
               error: bindErr instanceof Error ? bindErr.message : String(bindErr),
             });
           }
-        } else if (warmed && warmed.platform !== platform) {
-          // Pre-fix this branch was silent — a warmup existed but for a
-          // different platform (e.g. user warmed mobile_android in the
-          // editor, then ran a mobile_ios regression). The cold-start
-          // tax then applies anyway. Warn so operators can spot wasted
-          // warmups and tune the editor's eager-start heuristics.
-          logger.warn('[MOBILE-TEST] Warmed session discarded — platform mismatch', {
-            testId,
-            warmedSessionId: warmed.sessionId,
-            warmedPlatform: warmed.platform,
-            requestedPlatform: platform,
-          });
         }
+        // Platform/host mismatch is logged (and the record preserved) inside
+        // claimWarmedSession — no discard branch needed here anymore.
       }
 
       // Try 3: Cold start (fallback — creates new emulator/simulator ~60s)
@@ -227,7 +234,15 @@ export class MobileSessionAcquisitionService {
         // see "Booting emulator…" instead of a long silent pause after 10%.
         emitSessionPhase(`Booting ${platform} emulator (cold start, up to 60s)…`, 12);
         const effectiveOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
-        const session = await client.createSession(platform, { ownerId: effectiveOwnerId, userId });
+        const session = await client.createSession(platform, {
+          ownerId: effectiveOwnerId,
+          userId,
+          // iOS: pin to a simulator. The runner's default-source policy can
+          // flip to 'local-physical' when an iPhone is hotplugged via USB —
+          // a background regression must never silently claim a physical
+          // device (mirrors the editor's guard in session.controller.ts).
+          ...(platform === 'ios' ? { deviceSelector: { source: 'local-emulator' as const } } : {}),
+        });
         sessionId = session.sessionId;
         sessionSource = 'cold';
         logger.info('[MOBILE-TEST] Session created (cold start)', {

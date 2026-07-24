@@ -18,7 +18,10 @@ import {
   getAllProjectMobileApps,
   getProjectMobileVariants,
   getDefaultVariantLabel,
+  getFlutterDefaultHost,
   buildMobileAppSettingsPatch,
+  buildSetFlutterDefaultHostPatch,
+  normaliseHostOverride,
   getMaxMobileVariants,
   DEFAULT_VARIANT_LABEL,
 } from '@/services/mobile/project-mobile-app.helper';
@@ -29,7 +32,7 @@ import {
 } from '@/services/storage/mobile-app-storage.service';
 import type { MobileAppsByPlatform, MobileAppVariantEntry } from '@/services/mobile/project-mobile-app.helper';
 import { MobileAppParserService, type ParsedAppInfo } from '@/services/mobile/mobile-app-parser.service';
-import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import type { FlutterHostPlatform, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { logger } from '@/utils/core/logger';
 
 export const MAX_UPLOAD_SIZE_BYTES = 500 * 1024 * 1024; // 500MB
@@ -54,7 +57,8 @@ export type MobileAppError =
   | { kind: 'invalid_variant_name' }
   | { kind: 'cannot_modify_default_variant' }
   | { kind: 'variant_not_found'; label: string }
-  | { kind: 'variant_name_taken'; label: string };
+  | { kind: 'variant_name_taken'; label: string }
+  | { kind: 'invalid_host' };
 
 /**
  * Guard the per-platform variant cap. The default lane and any already-existing
@@ -363,6 +367,8 @@ export interface GetMobileAppResult {
   maxVariants: number;
   /** The configured default variant label. Single string when filtered, else per-platform. */
   defaultVariant?: string | Partial<Record<MobilePlatform, string>>;
+  /** The project's Flutter default host lane (editor toggle, server-persisted). Always present ('android' when unset). */
+  flutterDefaultHost: FlutterHostPlatform;
 }
 
 const VARIANT_PLATFORMS: MobilePlatform[] = ['android', 'ios', 'flutter'];
@@ -377,6 +383,8 @@ export async function getMobileApp(
 
   const maxVariants = getMaxMobileVariants();
 
+  const flutterDefaultHost = getFlutterDefaultHost(project.settings);
+
   if (filterPlatform) {
     const slot = getProjectMobileApp(project.settings, filterPlatform) ?? null;
     return {
@@ -384,6 +392,7 @@ export async function getMobileApp(
       variants: getProjectMobileVariants(project.settings, filterPlatform),
       defaultVariant: getDefaultVariantLabel(project.settings, filterPlatform),
       maxVariants,
+      flutterDefaultHost,
     };
   }
 
@@ -396,7 +405,32 @@ export async function getMobileApp(
     if (lanes.length > 0) variants[p] = lanes;
     defaultVariant[p] = getDefaultVariantLabel(project.settings, p);
   }
-  return { mobileApp: legacy, mobileApps: all, variants, defaultVariant, maxVariants };
+  return { mobileApp: legacy, mobileApps: all, variants, defaultVariant, maxVariants, flutterDefaultHost };
+}
+
+/**
+ * Set the project's Flutter default host lane (`settings.flutterDefaultHost`).
+ * Written by the editor's Android/iOS toggle so the choice survives the
+ * browser and drives every non-editor run (regression / scheduled / CI).
+ * Per-test-case `host_platform` overrides still win at dispatch time.
+ */
+export async function setFlutterDefaultHost(
+  projectId: string,
+  userId: string,
+  rawHost: unknown,
+): Promise<{ flutterDefaultHost: FlutterHostPlatform } | MobileAppError> {
+  const host = normaliseHostOverride(rawHost);
+  if (!host) return { kind: 'invalid_host' };
+
+  const project = await ProjectService.getProject(projectId, userId);
+  if (!project) return { kind: 'project_not_found' };
+
+  await ProjectService.updateProject(projectId, userId, {
+    settings: buildSetFlutterDefaultHostPatch(host),
+  });
+
+  logger.info('[MOBILE_APP] Set flutter default host', { projectId, host });
+  return { flutterDefaultHost: host };
 }
 
 export async function listMobileAppBuilds(

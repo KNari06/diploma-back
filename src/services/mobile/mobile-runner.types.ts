@@ -9,6 +9,15 @@
 export type MobilePlatform = 'android' | 'ios' | 'flutter';
 
 /**
+ * The OS that hosts a Flutter (or RN) session — which pool/simulator to
+ * acquire, which artifact shard to read, which runner to route to
+ * (ADR-0019's "host lane"). Persisted per test case
+ * (`intent_test_cases.host_platform`, NULL = inherit) with the project
+ * default in `projects.settings.flutterDefaultHost`.
+ */
+export type FlutterHostPlatform = 'android' | 'ios';
+
+/**
  * `intent_test_cases.platform` storage form (also used as the denormalised
  * `test_executions.platform` column). Distinct from `MobilePlatform`, which
  * is the short runner-facing form, and from the hyphenated `browser` key
@@ -722,6 +731,14 @@ export interface MobileTestJobData {
   projectId?: string;
   chatSessionId?: string;
   platform: MobilePlatform;
+  /**
+   * Host lane for a `flutter` job (ADR-0019): which OS the worker acquires
+   * and which runner URL was stamped. Resolved at dispatch time
+   * (case override > project default > 'android'). Absent = 'android'
+   * (back-compat for in-flight jobs enqueued before this field existed).
+   * Ignored for native platforms.
+   */
+  hostPlatform?: FlutterHostPlatform;
   browser: 'mobile-android' | 'mobile-ios' | 'mobile-flutter';
   appPackage?: string;
   intentSteps: MobileIntentStep[];

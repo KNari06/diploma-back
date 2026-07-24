@@ -7,7 +7,8 @@ import { supabaseAdmin } from '@/db/supabase';
 import { dbAdminService } from '@/db/supabase';
 import { env } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
-import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
+import { getProjectMobileApp, resolveFlutterHost } from '@/services/mobile/project-mobile-app.helper';
+import { resolveRunnerUrlForHost } from '@/services/mobile/mobile-runner-client';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { IntentStepConverterService } from '@/services/testing/ui/preview/intent-step-converter.service';
 import { injectAutoWaitForSteps } from '@/services/testing/ui/preview/auto-wait-for.utils';
@@ -187,7 +188,7 @@ export async function createIntentTestCase(req: Request, res: Response): Promise
       return;
     }
 
-    const { projectId, name, description, startUrl, steps, flowId, mobileVariantLabel } = req.body;
+    const { projectId, name, description, startUrl, steps, flowId, mobileVariantLabel, hostPlatform } = req.body;
 
     logger.info('[PREVIEW_CONTROLLER] Creating intent test case', {
       userId,
@@ -226,6 +227,7 @@ export async function createIntentTestCase(req: Request, res: Response): Promise
       steps: steps || [],
       flowId,
       ...(mobileVariantLabel !== undefined ? { mobileVariantLabel } : {}),
+      ...(hostPlatform !== undefined ? { hostPlatform } : {}),
     });
 
     res.status(201).json({
@@ -384,7 +386,7 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
     }
 
     const { id } = req.params;
-    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers, mobileVariantLabel, parametersSchema } = req.body;
+    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings, triggers, mobileVariantLabel, hostPlatform, parametersSchema } = req.body;
 
     logger.info('[PREVIEW_CONTROLLER] Updating intent test case', {
       intentTestCaseId: id,
@@ -560,6 +562,8 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       triggers,
       // Mobile per-test variant override. `undefined` leaves it; `null`/'' clears.
       ...(mobileVariantLabel !== undefined ? { mobileVariantLabel } : {}),
+      // Flutter per-test host override. `undefined` leaves it; `null`/invalid clears.
+      ...(hostPlatform !== undefined ? { hostPlatform } : {}),
       // Placeholder schema for {{param_*}} values (mobile agent draft save).
       // `undefined` leaves the column untouched.
       ...(parametersSchema !== undefined ? { parametersSchema } : {}),
@@ -727,11 +731,20 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
 
       const PLATFORM_MAP: Record<string, MobilePlatform> = { mobile_ios: 'ios', mobile_flutter: 'flutter' };
       const mobilePlatform: MobilePlatform = PLATFORM_MAP[platform ?? ''] ?? 'android';
+      // Host lane for a Flutter run: case override > project default >
+      // 'android'. Settings are already loaded — no extra read.
+      const hostPlatform =
+        mobilePlatform === 'flutter'
+          ? resolveFlutterHost((testCase as { hostPlatform?: unknown }).hostPlatform, project?.settings)
+          : undefined;
       // Read the platform-sharded slot, not the legacy singular one — for
       // dual-platform projects the legacy slot mirrors the latest upload
       // across platforms, so an iOS preview run could otherwise pick up
-      // an Android .apk and try to install it.
-      const mobileApp = getProjectMobileApp(project?.settings, mobilePlatform);
+      // an Android .apk and try to install it. An ios-host Flutter run reads
+      // the `ios` slot (the simulator .app), mirroring prepApp's rule.
+      const appSlotPlatform: MobilePlatform =
+        mobilePlatform === 'flutter' && hostPlatform === 'ios' ? 'ios' : mobilePlatform;
+      const mobileApp = getProjectMobileApp(project?.settings, appSlotPlatform);
       const BROWSER_MAP: Record<string, string> = { mobile_ios: 'mobile-ios', mobile_flutter: 'mobile-flutter' };
       const browser = BROWSER_MAP[platform ?? ''] ?? 'mobile-android';
 
@@ -771,9 +784,10 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
         workspaceId,
         projectId,
         platform: mobilePlatform,
+        ...(hostPlatform ? { hostPlatform } : {}),
         browser: browser as 'mobile-android' | 'mobile-ios' | 'mobile-flutter',
         intentSteps,
-        runnerUrl: env.MOBILE_RUNNER_URL,
+        runnerUrl: resolveRunnerUrlForHost(hostPlatform),
         runnerApiKey: env.MOBILE_RUNNER_API_KEY,
         appStoragePath: mobileApp?.storagePath,
         appOriginalName: mobileApp?.originalName,

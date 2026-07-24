@@ -38,7 +38,8 @@ export type CommandName =
   | 'navigate_to'        // go to a URL
   | 'wait_for_page'      // wait for page to settle (network idle)
   | 'mark_done'          // signal test goal achieved
-  | 'report_blocked';    // signal test blocked (CAPTCHA, 2FA, etc.)
+  | 'report_blocked'     // signal test blocked (CAPTCHA, 2FA, etc.)
+  | 'assert_text';       // deterministic assertion: element text contains expected value (editor authoring only)
 
 /** A command the LLM wants to execute */
 export interface PlaywrightCommand {
@@ -159,6 +160,14 @@ export interface TestBlackboardState {
    * is skipped, which is the current Pipeline v2 behavior.
    */
   goalUrl?: string;
+
+  /**
+   * Deterministic-assertion authoring enabled (from
+   * PipelineConfig.enableAssertAuthoring). When true the Executor is offered the
+   * `assert_text` command + assertion guidance. Set once at pipeline start;
+   * absent/false for exploration. Read by ExecutorAgent + the prompt builders.
+   */
+  assertAuthoring?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -316,6 +325,15 @@ export interface PipelineConfig {
    * regression). Exploration sets it from the entry point's category.
    */
   flowIsAuth?: boolean;
+  /**
+   * Enable deterministic-assertion authoring: offer the Executor the
+   * `assert_text` command + assertion guidance so it can author a
+   * `type:'assert'` step (a text-contains check the test re-verifies on replay)
+   * when the goal implies a checkable value. Config-scoped — set true ONLY by
+   * EditorIterativeAuthorService; exploration leaves it off so the shared
+   * pipeline's behaviour is unchanged. Default: false.
+   */
+  enableAssertAuthoring?: boolean;
   /**
    * Condensed Cartographer page understanding (forms, entities, interactive
    * areas) for the flow's starting page. Threaded into the Planner's

@@ -145,6 +145,12 @@ export interface OpenAIResponse {
     outputTokens: number;
     totalTokens: number;
     model: string;
+    /**
+     * Subset of inputTokens OpenAI served from its automatic prompt cache
+     * (`usage.prompt_tokens_details.cached_tokens`). Present only for OpenAI
+     * responses; undefined for providers that don't report it (e.g. Gemini).
+     */
+    cachedInputTokens?: number;
   };
 }
 
@@ -321,6 +327,10 @@ export async function getChatCompletionWithMessages(
       logger.warn('[OPENAI] No usage data in response', { model: actualModel });
     }
 
+    // OpenAI automatic prompt caching: the portion of the input prompt served
+    // from cache (identical ≥1024-token prefix seen recently). Billed cheaper.
+    const cachedInputTokens = usage?.prompt_tokens_details?.cached_tokens || 0;
+
     logger.info('[OPENAI] Chat completion with messages successful', {
       model: actualModel,
       requestedModel: model !== actualModel ? model : undefined,
@@ -329,6 +339,7 @@ export async function getChatCompletionWithMessages(
       hasToolCalls: !!toolCalls?.length,
       toolCallCount: toolCalls?.length || 0,
       inputTokens: usage?.prompt_tokens || 0,
+      cachedInputTokens,
       outputTokens: usage?.completion_tokens || 0,
       totalTokens: usage?.total_tokens || 0,
     });
@@ -341,16 +352,18 @@ export async function getChatCompletionWithMessages(
         outputTokens: usage?.completion_tokens || 0,
         totalTokens: usage?.total_tokens || 0,
         model: actualModel,
+        cachedInputTokens,
       },
     };
 
     // Track AI usage for billing/analytics — bill against the model that
     // actually served the request, not the one originally requested.
-    const aiCostUSD = calculateOpenAICost(actualModel, result.usage.inputTokens, result.usage.outputTokens);
+    const aiCostUSD = calculateOpenAICost(actualModel, result.usage.inputTokens, result.usage.outputTokens, cachedInputTokens);
     AIUsageTracker.record({
       provider: 'openai',
       model: actualModel,
       inputTokens: result.usage.inputTokens,
+      cachedInputTokens,
       outputTokens: result.usage.outputTokens,
       totalTokens: result.usage.totalTokens,
       costUSD: aiCostUSD,
@@ -369,6 +382,7 @@ export async function getChatCompletionWithMessages(
         message_count: messages.length,
         reply_length: reply.length,
         tool_call_count: toolCalls?.length ?? 0,
+        cached_input_tokens: cachedInputTokens,
         requested_model: model !== actualModel ? model : undefined,
         response_excerpt: reply,
       },
@@ -499,12 +513,14 @@ export async function getChatCompletion(
 
     const reply = response.choices[0]?.message?.content || '🤖 Could not understand the request.';
     const usage = response.usage;
+    const cachedInputTokens = usage?.prompt_tokens_details?.cached_tokens || 0;
 
     logger.info('[OPENAI] Chat completion successful', {
       model,
       promptLength: prompt.length,
       replyLength: reply.length,
       inputTokens: usage?.prompt_tokens || 0,
+      cachedInputTokens,
       outputTokens: usage?.completion_tokens || 0,
       totalTokens: usage?.total_tokens || 0,
     });
@@ -516,15 +532,17 @@ export async function getChatCompletion(
         outputTokens: usage?.completion_tokens || 0,
         totalTokens: usage?.total_tokens || 0,
         model,
+        cachedInputTokens,
       },
     };
 
     // Track AI usage for billing/analytics
-    const aiCostUSD = calculateOpenAICost(model, result.usage.inputTokens, result.usage.outputTokens);
+    const aiCostUSD = calculateOpenAICost(model, result.usage.inputTokens, result.usage.outputTokens, cachedInputTokens);
     AIUsageTracker.record({
       provider: 'openai',
       model,
       inputTokens: result.usage.inputTokens,
+      cachedInputTokens,
       outputTokens: result.usage.outputTokens,
       totalTokens: result.usage.totalTokens,
       costUSD: aiCostUSD,

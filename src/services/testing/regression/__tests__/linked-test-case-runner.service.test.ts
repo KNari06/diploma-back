@@ -138,6 +138,32 @@ describe('LinkedTestCaseRunnerService.run', () => {
     expect(outcome.outputs.size).toBe(0);
   });
 
+  // Flutter host lane: getSavedTestCase loads the full row (`select('*')`), so a
+  // linked case's `host_platform` must survive into the (host-aware) dispatcher.
+  // Without it, a run-before dependency of an iOS-hosted Flutter case would
+  // silently dispatch on android.
+  it('preserves the linked case host_platform into the mobile dispatcher', async () => {
+    mockGetSavedTestCase.mockResolvedValueOnce({
+      id: 'tc-flutter-ios',
+      name: 'Flutter iOS Linked Case',
+      platform: 'mobile_flutter',
+      host_platform: 'ios',
+      steps_json: [{ id: 's1', type: 'tap', description: 'tap' }],
+    });
+    mockDispatchMobileTest.mockResolvedValueOnce({ testId: 'nested-flutter-1' });
+    mockGetTestStatusAndStepsById.mockResolvedValue({
+      data: { id: 'nested-flutter-1', status: 'completed', executed_steps: [] },
+      error: null,
+    });
+
+    const step = linkStep('link1', 'tc-flutter-ios', 'mobile_flutter');
+    await LinkedTestCaseRunnerService.run(baseParams({ step }));
+
+    expect(mockDispatchMobileTest).toHaveBeenCalledTimes(1);
+    const dispatchedCase = mockDispatchMobileTest.mock.calls[0][0];
+    expect(dispatchedCase.host_platform).toBe('ios');
+  });
+
   it('throws a ValidationError when the linked run ends in a failure status', async () => {
     mockGetSavedTestCase.mockResolvedValueOnce({
       id: 'tc-1',

@@ -1,4 +1,5 @@
 import * as regressionDb from './db/regression.db';
+import { normaliseHostOverride } from '@/services/mobile/project-mobile-app.helper';
 import { sanitizeMobileSteps } from '@/services/testing/mobile/mobile-step-sanitizer';
 import { encodeMobileGoal } from '@/services/testing/mobile/mobile-goal-codec';
 import { NotFoundError, ValidationError } from '@/types';
@@ -68,6 +69,12 @@ export class RegressionSaveService {
     startActivity?: string;
     tags?: string[];
     /**
+     * Flutter-only per-case host override (android|ios). Persisted ONLY when
+     * explicitly supplied — the editor deliberately does NOT send its current
+     * lane, so saved cases inherit the project default (null = inherit).
+     */
+    hostPlatform?: string | null;
+    /**
      * Pre-computed parameters schema for {{param_*}} placeholders in `steps`
      * (mobile agent sanitizes sensitive values to placeholders before save).
      * Without it, a saved sensitive step can't resolve on regression replay —
@@ -101,6 +108,7 @@ export class RegressionSaveService {
         appPackage: params.appPackage,
         startActivity: params.startActivity,
         tags: params.tags,
+        hostPlatform: params.hostPlatform ?? null,
         parametersSchema: params.parametersSchema ?? null,
       });
     }
@@ -214,6 +222,7 @@ export class RegressionSaveService {
     appPackage?: string;
     startActivity?: string;
     tags?: string[];
+    hostPlatform?: string | null;
     parametersSchema?: Record<string, unknown> | null;
   }): Promise<{
     savedTestCaseId: string;
@@ -234,6 +243,10 @@ export class RegressionSaveService {
       tags,
       parametersSchema,
     } = params;
+    // Only meaningful for mobile_flutter; normalised so a bad value can never
+    // violate the CHECK constraint. null = inherit the project default.
+    const hostPlatform =
+      platform === 'mobile_flutter' ? normaliseHostOverride(params.hostPlatform) : null;
     // Persist the placeholder schema so {{param_*}} values resolve on replay.
     // Guard the same limit the from-test path enforces.
     const paramSchema =
@@ -354,6 +367,8 @@ export class RegressionSaveService {
       url: effectiveUrl,
       start_url: effectiveUrl,
       tags: tags || null,
+      // Flutter host override — persisted only on explicit caller choice.
+      ...(hostPlatform ? { host_platform: hostPlatform } : {}),
       // Mobile app metadata carried inline until we add a dedicated column.
       // Shape owned by mobile-goal-codec (single writer/reader convention).
       ...(isMobile

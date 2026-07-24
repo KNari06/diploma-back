@@ -9,6 +9,7 @@ import {
   getNegativeMetaByIds,
   getTestCasePhaseInfoByIds,
   getTestsByRegressionRunId,
+  getTestOptionsByTestIds,
 } from './db/regression-report.db';
 import { getProjectWorkspaceId, getActiveWorkspaceMemberIds } from './db/regression.db';
 import { describeDeviceError } from './device-error-catalog';
@@ -207,6 +208,11 @@ export class RegressionReportAssemblerService {
       // the same 'mobile_<platform>' | 'web' shape RunReportExecution.platform
       // uses elsewhere (PlatformBadge / bucketing logic already expect this).
       const platform = options.platform ? `mobile_${options.platform}` : 'web';
+      // Flutter host lane (android|ios) the run targeted, for the "FLUTTER · iOS"
+      // badge. Only meaningful when the platform is flutter; absent otherwise.
+      const hostPlatform = options.hostPlatform === 'ios' || options.hostPlatform === 'android'
+        ? options.hostPlatform
+        : undefined;
 
       return {
         id: row.id,
@@ -218,6 +224,7 @@ export class RegressionReportAssemblerService {
         durationMs,
         browser: Array.isArray(row.browsers) ? row.browsers[0] : undefined,
         platform,
+        ...(hostPlatform ? { hostPlatform } : {}),
         bugsCount: 0,
         steps,
         artifacts: {
@@ -467,6 +474,20 @@ export class RegressionReportAssemblerService {
     const reportsMap = new Map<string, any>();
     for (const report of testReports) {
       reportsMap.set(report.testId, report);
+    }
+
+    // Flutter host (android|ios) per test, for the "FLUTTER · iOS" run-report
+    // badge. Read from the RESOLVED run-time host the dispatcher stamped on
+    // `tests.options.hostPlatform` (override > project default > android) — so
+    // it covers the inherit case and never goes stale, matching how
+    // buildChainExecutions reads it. Keyed by tests.id (= exec.result.testId).
+    const hostByTestId = new Map<string, 'android' | 'ios'>();
+    if (testIds.length > 0) {
+      const optRows = await getTestOptionsByTestIds(testIds);
+      for (const row of optRows || []) {
+        const host = (row.options as { hostPlatform?: unknown })?.hostPlatform;
+        if (host === 'android' || host === 'ios') hostByTestId.set(row.id, host);
+      }
     }
 
     // Build executions, bugs, aggregated artifacts
@@ -804,6 +825,9 @@ export class RegressionReportAssemblerService {
         // artifacts (device screenshots, compiled plan viewer) without an
         // extra join. Undefined for legacy rows (pre-20260417 migration).
         ...(exec.platform ? { platform: exec.platform } : {}),
+        // Flutter host lane for the "FLUTTER · iOS" badge, from the resolved
+        // run-time host (tests.options.hostPlatform). Absent for non-flutter runs.
+        ...(testId && hostByTestId.get(testId) ? { hostPlatform: hostByTestId.get(testId) } : {}),
         // Curator-set priority of the saved test case, if any. Null for
         // ad-hoc / chat-lite runs (no saved test case) and API tests
         // (no priority column on api_test_configs). Display-only.

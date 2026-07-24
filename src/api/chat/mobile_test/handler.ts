@@ -18,7 +18,8 @@ import { env } from '@/config/environment/env';
 import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
-import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
+import { getFlutterDefaultHost, getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
+import { resolveRunnerUrlForHost } from '@/services/mobile/mobile-runner-client';
 import type { MobilePlatform, MobileIntentStep, MobileTestJobData } from '@/services/mobile/mobile-runner.types';
 import { toMobilePlatformKey } from '@/services/mobile/mobile-runner.types';
 import { AnalyticsQueryService } from '@/services/analytics/analytics-query.service';
@@ -263,13 +264,21 @@ export async function handleMobileTest(
     let appStoragePath: string | undefined;
     let appOriginalName: string | undefined;
     let projectAppPackage: string | undefined;
+    // Host lane for an ad-hoc Flutter chat run: no test-case override exists
+    // here, so the project default decides (android when unset).
+    let hostPlatform: 'android' | 'ios' | undefined;
 
     try {
       const project = (await dbAdminService.getProject(projectId)) as any;
+      if (platform === 'flutter') {
+        hostPlatform = getFlutterDefaultHost(project?.settings);
+      }
       // Read the platform-sharded slot so a dual-platform project doesn't
       // accidentally install the wrong-platform binary. `platform` is
-      // resolved above (line ~228) from the parsed intent.
-      const mobileApp = getProjectMobileApp(project?.settings, platform);
+      // resolved above (line ~228) from the parsed intent. An ios-host
+      // Flutter run reads the `ios` slot (simulator .app) — prepApp's rule.
+      const appSlotPlatform = platform === 'flutter' && hostPlatform === 'ios' ? 'ios' : platform;
+      const mobileApp = getProjectMobileApp(project?.settings, appSlotPlatform);
       if (mobileApp?.storagePath) {
         appStoragePath = mobileApp.storagePath;
         appOriginalName = mobileApp.originalName;
@@ -383,11 +392,12 @@ export async function handleMobileTest(
       projectId,
       chatSessionId,
       platform,
+      ...(hostPlatform ? { hostPlatform } : {}),
       browser: browser as 'mobile-android' | 'mobile-ios' | 'mobile-flutter',
       appPackage,
       intentSteps,
       geminiApiKey: parsedIntent?.geminiApiKey,
-      runnerUrl: env.MOBILE_RUNNER_URL,
+      runnerUrl: resolveRunnerUrlForHost(hostPlatform),
       runnerApiKey: env.MOBILE_RUNNER_API_KEY,
       appStoragePath,
       appOriginalName,

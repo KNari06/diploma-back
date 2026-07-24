@@ -135,6 +135,29 @@ export async function getTestsByRegressionRunId(
   return data || [];
 }
 
+/**
+ * Batch fetch each test's `options` blob by test id. Used to surface the
+ * run-time Flutter host (`options.hostPlatform`, stamped by the dispatcher —
+ * the RESOLVED host, so it covers the inherit-project-default case and never
+ * goes stale) on the run report. Empty input → empty array.
+ */
+export async function getTestOptionsByTestIds(
+  testIds: string[],
+): Promise<Array<{ id: string; options: any }>> {
+  if (!testIds.length) return [];
+
+  const { data, error } = await supabaseAdmin
+    .from('tests')
+    .select('id, options')
+    .in('id', testIds);
+
+  if (error) {
+    logger.warn('[REGRESSION_RUN] Failed to fetch test options for host badge', { error });
+    return [];
+  }
+  return data || [];
+}
+
 export async function getExecutedStepsByTestIds(
   testIds: string[],
 ): Promise<Array<{ id: string; executed_steps: any[] | null }>> {

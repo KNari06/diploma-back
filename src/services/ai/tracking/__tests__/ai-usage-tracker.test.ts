@@ -65,4 +65,30 @@ describe('calculateOpenAICost', () => {
     const cost = calculateOpenAICost('some-unreleased-model', 1_000_000, 1_000_000);
     expect(cost).toBeCloseTo(0.2 + 0.8);
   });
+
+  it('bills the cached input subset at the cheaper cachedInput rate (gpt-5.4-mini, 90% off)', () => {
+    // 1M input of which 800k cached, no output. Uncached 200k @ $2/1M + cached 800k @ $0.2/1M.
+    const cost = calculateOpenAICost('gpt-5.4-mini', 1_000_000, 0, 800_000);
+    expect(cost).toBeCloseTo(0.2 * 2 + 0.8 * 0.2); // 0.4 + 0.16 = 0.56
+  });
+
+  it('a full cache hit is cheaper than the same call with no cache', () => {
+    const cached = calculateOpenAICost('gpt-5.4-mini', 1_000_000, 0, 1_000_000);
+    const uncached = calculateOpenAICost('gpt-5.4-mini', 1_000_000, 0, 0);
+    expect(cached).toBeLessThan(uncached);
+    expect(cached).toBeCloseTo(0.2); // 1M @ $0.2/1M cachedInput rate
+  });
+
+  it('never over-discounts: cachedInputTokens is clamped to inputTokens', () => {
+    const clamped = calculateOpenAICost('gpt-5.4-mini', 1_000_000, 0, 5_000_000);
+    const fullyCached = calculateOpenAICost('gpt-5.4-mini', 1_000_000, 0, 1_000_000);
+    expect(clamped).toBeCloseTo(fullyCached);
+  });
+
+  it('falls back to the full input rate for a model without a cachedInput price', () => {
+    // gemini-2.5-flash has no cachedInput rate → cached tokens billed at full input.
+    const withCache = calculateOpenAICost('gemini-2.5-flash', 1_000_000, 0, 1_000_000);
+    const noCache = calculateOpenAICost('gemini-2.5-flash', 1_000_000, 0, 0);
+    expect(withCache).toBeCloseTo(noCache);
+  });
 });

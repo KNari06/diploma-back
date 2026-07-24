@@ -84,6 +84,7 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
       appPackage,
       startActivity,
       tags,
+      hostPlatform,
       // Common
       name,
       description,
@@ -128,6 +129,7 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
       appPackage,
       startActivity,
       tags,
+      hostPlatform,
       userId,
       name,
       description,

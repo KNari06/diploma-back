@@ -41,14 +41,32 @@ import { validateRunnerUrl, parseAllowedHosts } from './validate-runner-url';
  */
 function buildEffectiveAllowlist(): Set<string> {
   const fromCsv = parseAllowedHosts(env.MOBILE_RUNNER_ALLOWED_HOSTS);
-  try {
-    const envHost = new URL(env.MOBILE_RUNNER_URL).hostname.toLowerCase();
-    fromCsv.add(envHost);
-  } catch {
-    // If env.MOBILE_RUNNER_URL is malformed, we'll fail in the validator
-    // a moment later with a clearer error — don't suppress it here.
+  // Both operator-configured runner URLs are trust anchors: the default
+  // runner and the optional iOS-host runner (empty = unset). Without the
+  // second seed, an ios-host client on a distinct host would throw at
+  // construct time in prod.
+  for (const url of [env.MOBILE_RUNNER_URL, env.MOBILE_RUNNER_IOS_URL]) {
+    if (!url) continue;
+    try {
+      fromCsv.add(new URL(url).hostname.toLowerCase());
+    } catch {
+      // If a runner URL is malformed, we'll fail in the validator a
+      // moment later with a clearer error — don't suppress it here.
+    }
   }
   return fromCsv;
+}
+
+/**
+ * The runner base URL for a session's host lane (ADR-0019 deferred half):
+ * ios-host runs go to MOBILE_RUNNER_IOS_URL when configured, everything
+ * else (and unset) to MOBILE_RUNNER_URL. Locally inert — with the iOS URL
+ * empty both hosts hit the same runner (one process, both pools).
+ * Dedicated-runner bindings take precedence at the call sites.
+ */
+export function resolveRunnerUrlForHost(hostPlatform: 'android' | 'ios' | undefined): string {
+  if (hostPlatform === 'ios' && env.MOBILE_RUNNER_IOS_URL) return env.MOBILE_RUNNER_IOS_URL;
+  return env.MOBILE_RUNNER_URL;
 }
 
 // ============================================================================
