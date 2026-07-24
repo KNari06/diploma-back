@@ -1,6 +1,7 @@
 // IMPORTANT: `../instrument` must load before any other import so Sentry can
 // instrument http before it is required. Keep it first.
 import '../instrument';
+import * as Sentry from '@sentry/node';
 import { VideoStreamRegistry } from '@/agent/playwright/artifacts/video-stream-registry';
 import { createRunKey, TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
 import { env } from '@/config/environment/env';
@@ -509,6 +510,34 @@ const negativeGenerationWorker = new Worker(
   }
 );
 
+/**
+ * Report a worker failure to Sentry with the ORIGINAL error object (so grouping
+ * uses its real stack) plus structured tags/context for filtering by job type.
+ * The logger→Sentry bridge (src/utils/core/logger.ts) deliberately SKIPS the
+ * `job.failed` / `worker.error` events these carry, so this is the single
+ * capture site for worker failures — no double-reporting. No-op when Sentry has
+ * no DSN configured, and never throws (telemetry must not break the listener).
+ */
+const captureWorkerException = (
+  err: unknown,
+  context: Record<string, unknown>,
+  level: Sentry.SeverityLevel = 'error'
+): void => {
+  try {
+    const error = err instanceof Error ? err : new Error(String(err));
+    Sentry.withScope((scope) => {
+      scope.setLevel(level);
+      scope.setTag('process', 'worker');
+      if (typeof context.event === 'string') scope.setTag('event', context.event);
+      if (typeof context.jobName === 'string') scope.setTag('jobName', context.jobName);
+      scope.setContext('job', context);
+      Sentry.captureException(error);
+    });
+  } catch {
+    // Telemetry must never break the failure listener.
+  }
+};
+
 // Worker event listeners
 const setupWorkerEvents = (worker: Worker, workerName: string) => {
   worker.on('ready', () => {
@@ -544,6 +573,7 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
         error: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
       });
+      captureWorkerException(err, { event: 'job.failed', jobName: workerName });
       return;
     }
 
@@ -567,6 +597,20 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
       stack: err instanceof Error ? err.stack : undefined,
       jobData: job.data ? JSON.stringify(job.data).substring(0, 200) : 'N/A',
     });
+
+    // Report TERMINAL failures to Sentry with rich, groupable context. Transient
+    // retries (logged at warn as `job.retry`) are intentionally NOT reported.
+    if (finalFailure) {
+      captureWorkerException(err, {
+        event: 'job.failed',
+        jobName: workerName,
+        jobId: String(job.id),
+        attemptsMade: job.attemptsMade,
+        maxAttempts,
+        userId: (job.data as { userId?: string } | undefined)?.userId,
+        testId: (job.data as { testId?: string } | undefined)?.testId,
+      });
+    }
 
     // Root-cause finalization: if a test-owning job dies without writing a
     // terminal status (process killed / stall-death), its own catch/finally
@@ -595,6 +639,7 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
       error: err instanceof Error ? err.message : String(err),
       stack: err instanceof Error ? err.stack : undefined,
     });
+    captureWorkerException(err, { event: 'worker.error', jobName: workerName }, 'fatal');
   });
 
   worker.on('stalled', async (jobId) => {
