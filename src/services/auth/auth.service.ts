@@ -1074,11 +1074,25 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
     const userCredits = await UserCreditsService.getUserCredits(userId);
     const creditsBalance = userCredits ? (userCredits.credits_balance || 0) : 0;
 
+    // Partnership is decoupled from `role`: a user can be BOTH a normal
+    // platform user AND a referral partner. `isPartner` is derived from a linked
+    // partners row (partners.auth_user_id), so the frontend can grant /partner
+    // access without locking the account out of the main app. Best-effort — a
+    // read failure must never break /auth/me.
+    let isPartner = false;
+    try {
+      const { findPartnerByAuthUserId } = await import('@/services/core/db/referral.db');
+      isPartner = (await findPartnerByAuthUserId(userId)) !== null;
+    } catch {
+      isPartner = false;
+    }
+
     return {
       id: userId,
       email: userEmail,
       name: userData.name,
       role: userData.role || 'user',
+      isPartner,
       status: resolveEffectiveStatus(userData.status),
       avatar: userData.avatar_url,
       credits: creditsBalance,

@@ -105,6 +105,20 @@ export class ReferralService {
         return false;
       }
 
+      // Self-referral guard. Partner logins are now normal product users
+      // (partnership is a linked partners row, not a role), so a partner could
+      // otherwise attribute THEMSELVES to their own code and earn the revenue
+      // share on their own subscription. Also block attributing any user to a
+      // partner whose login is that same user. rewardOnPayment keys off
+      // referred_by_partner_id, so this is the only place to stop the loop.
+      if (partner.auth_user_id && partner.auth_user_id === userId) {
+        logger.info('[REFERRAL] Ignoring self-referral (user owns this partner code)', {
+          userId,
+          partnerId: partner.id,
+        });
+        return false;
+      }
+
       const didSet = await referralDb.attributeUserIfUnset(userId, partner.id);
       if (didSet) {
         logger.info('[REFERRAL] Attributed user to partner (first-touch)', {
