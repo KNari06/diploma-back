@@ -115,6 +115,28 @@ describe('findTraceFile', () => {
   it('throws on empty testId', async () => {
     await expect(findTraceFile('', tmpDir)).rejects.toThrow('testId is required');
   });
+
+  it('finds a trace inside a subdirectory (e.g. chat_test/)', async () => {
+    const subdir = path.join(tmpDir, 'chat_test');
+    await fs.mkdir(subdir);
+    const name = '2026-04-08_12-00-00_chat_test_sess-abc.jsonl';
+    await writeTraceFile(subdir, name);
+    const result = await findTraceFile('chat_test_sess-abc', tmpDir);
+    expect(result).not.toBeNull();
+    expect(path.basename(result!)).toBe(name);
+  });
+
+  it('prefers the most recent match across root and subdirectories', async () => {
+    const subdir = path.join(tmpDir, 'chat_test');
+    await fs.mkdir(subdir);
+    const rootOlder = '2026-04-01_10-00-00_mytest.jsonl';
+    const nestedNewer = '2026-04-08_12-00-00_mytest.jsonl';
+    await writeTraceFile(tmpDir, rootOlder, -3600_000); // 1h ago
+    await writeTraceFile(subdir, nestedNewer, 0); // now
+    const result = await findTraceFile('mytest', tmpDir);
+    expect(result).not.toBeNull();
+    expect(path.basename(result!)).toBe(nestedNewer);
+  });
 });
 
 describe('listTraceFiles', () => {
@@ -161,5 +183,16 @@ describe('listTraceFiles', () => {
     await writeTraceFile(tmpDir, 'a.jsonl');
     const result = await listTraceFiles(tmpDir);
     expect(result[0].sizeBytes).toBeGreaterThan(0);
+  });
+
+  it('includes traces from subdirectories, merged and sorted by recency', async () => {
+    const subdir = path.join(tmpDir, 'chat_test');
+    await fs.mkdir(subdir);
+    await writeTraceFile(tmpDir, 'root.jsonl', -3600_000); // 1h ago
+    await writeTraceFile(subdir, 'nested.jsonl', 0); // now
+    const result = await listTraceFiles(tmpDir);
+    expect(result).toHaveLength(2);
+    expect(path.basename(result[0].path)).toBe('nested.jsonl');
+    expect(path.basename(result[1].path)).toBe('root.jsonl');
   });
 });

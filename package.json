@@ -19,6 +19,8 @@
     "build-kb": "ts-node -r tsconfig-paths/register src/scripts/build-global-kb.ts",
     "eval-kb": "ts-node -r tsconfig-paths/register src/scripts/eval-kb.ts",
     "eval-intent": "ts-node -r tsconfig-paths/register src/scripts/eval-intent-understanding.ts",
+    "chat-eval": "ts-node -r tsconfig-paths/register src/scripts/chat-eval/run-eval.ts",
+    "chat-eval:instrument": "ts-node -r tsconfig-paths/register src/scripts/chat-eval/instrument-run.ts",
     "eval-api-flow-baseline": "ts-node -r tsconfig-paths/register src/scripts/api-flow-baseline.ts",
     "lite:analyze": "ts-node -r tsconfig-paths/register src/scripts/lite-analyze/cli.ts",
     "create-test-users": "ts-node -r tsconfig-paths/register scripts/create-test-users.ts",

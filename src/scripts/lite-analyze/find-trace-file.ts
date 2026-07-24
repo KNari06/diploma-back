@@ -35,7 +35,49 @@ export function sanitizeTestId(input: string): string {
 }
 
 /**
- * Find the most recently modified trace file for the given testId.
+ * Collect absolute paths of `.jsonl` files in logsDir AND its immediate
+ * subdirectories. The trace writers shard by surface
+ * (`test_logs/chat_test/`, `test_logs/editor/`, `test_logs/replay/`,
+ * `test_logs/regressions/`, …), so a flat readdir of the root would miss every
+ * sharded trace. One level deep is enough — no writer nests further.
+ */
+async function collectTraceFiles(logsDir: string): Promise<string[]> {
+  let entries;
+  try {
+    entries = await fs.readdir(logsDir, { withFileTypes: true });
+  } catch (error) {
+    const errCode = (error as NodeJS.ErrnoException).code;
+    if (errCode === 'ENOENT') return []; // directory doesn't exist yet → no traces
+    throw error;
+  }
+
+  const files: string[] = [];
+  const subdirs: string[] = [];
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      subdirs.push(path.join(logsDir, entry.name));
+    } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+      files.push(path.join(logsDir, entry.name));
+    }
+  }
+
+  const nested = await Promise.all(
+    subdirs.map(async (dir) => {
+      try {
+        const names = await fs.readdir(dir);
+        return names.filter((n) => n.endsWith('.jsonl')).map((n) => path.join(dir, n));
+      } catch {
+        return []; // unreadable subdir — skip
+      }
+    }),
+  );
+
+  return files.concat(...nested);
+}
+
+/**
+ * Find the most recently modified trace file for the given testId. Searches the
+ * logs dir and one level of subdirectories (see collectTraceFiles).
  *
  * @param testId  raw testId as the user knows it (uuid, name, etc.)
  * @param logsDir optional override (default: test_logs/ in cwd)
@@ -49,21 +91,11 @@ export async function findTraceFile(
     throw new Error('testId is required');
   }
 
-  let entries: string[];
-  try {
-    entries = await fs.readdir(logsDir);
-  } catch (error) {
-    const errCode = (error as NodeJS.ErrnoException).code;
-    if (errCode === 'ENOENT') {
-      return null; // directory doesn't exist yet → no traces
-    }
-    throw error;
-  }
+  const candidates = await collectTraceFiles(logsDir);
+  if (candidates.length === 0) return null;
 
   const sanitized = sanitizeTestId(testId);
-  const matching = entries.filter(
-    (name) => name.endsWith('.jsonl') && name.includes(sanitized),
-  );
+  const matching = candidates.filter((fullPath) => path.basename(fullPath).includes(sanitized));
 
   if (matching.length === 0) {
     return null;
@@ -73,8 +105,7 @@ export async function findTraceFile(
   // don't guess based on filename (which encodes creation time but not
   // last-write time — relevant if a test is re-run under the same id).
   const withStats = await Promise.all(
-    matching.map(async (name) => {
-      const fullPath = path.join(logsDir, name);
+    matching.map(async (fullPath) => {
       try {
         const stat = await fs.stat(fullPath);
         return { path: fullPath, mtimeMs: stat.mtimeMs };
@@ -100,19 +131,9 @@ export async function listTraceFiles(
   logsDir: string = DEFAULT_LOGS_DIR,
   limit: number = 20,
 ): Promise<Array<{ path: string; mtimeMs: number; sizeBytes: number }>> {
-  let entries: string[];
-  try {
-    entries = await fs.readdir(logsDir);
-  } catch (error) {
-    const errCode = (error as NodeJS.ErrnoException).code;
-    if (errCode === 'ENOENT') return [];
-    throw error;
-  }
-
-  const jsonlFiles = entries.filter((name) => name.endsWith('.jsonl'));
+  const jsonlFiles = await collectTraceFiles(logsDir);
   const withStats = await Promise.all(
-    jsonlFiles.map(async (name) => {
-      const fullPath = path.join(logsDir, name);
+    jsonlFiles.map(async (fullPath) => {
       try {
         const stat = await fs.stat(fullPath);
         return { path: fullPath, mtimeMs: stat.mtimeMs, sizeBytes: stat.size };

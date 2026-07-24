@@ -13,10 +13,15 @@ import { logger } from '@/utils/core/logger';
 export const AI_PRICING = {
   'gpt-5.4-mini': {
     input: 0.002 / 1000,   // $0.002 per 1K input tokens
+    // Cached input (OpenAI automatic prompt caching, ≥1024-token prefix).
+    // gpt-5 family bills a cache hit at 10% of the input rate (90% off).
+    cachedInput: 0.0002 / 1000,
     output: 0.008 / 1000,   // $0.008 per 1K output tokens
   },
   'gpt-4.1-mini': {
     input: 0.0002 / 1000,  // $0.20 per 1M input tokens
+    // gpt-4.1 family bills a cache hit at 25% of the input rate (75% off).
+    cachedInput: 0.00005 / 1000,
     output: 0.0008 / 1000, // $0.80 per 1M output tokens
   },
   'gemini-2.5-flash': {
@@ -184,7 +189,11 @@ export class AICostManager {
 
     let cost = 0;
 
-    // Token costs
+    // Token costs. Intentionally bills ALL input at the full rate — this
+    // per-test budget gate is not fed cached-token counts (recordOperation has
+    // no cached param), and over-estimating is the safe direction for a budget
+    // ceiling. The cache discount (pricing.cachedInput) is applied only in the
+    // actual billing path (calculateOpenAICost), which does receive the count.
     cost += inputTokens * pricing.input;
     cost += outputTokens * pricing.output;
 
