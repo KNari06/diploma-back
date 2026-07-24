@@ -12,7 +12,7 @@ import type { ExecutedCommand } from '../../pipeline/types';
 function exec(
   name: string,
   args: Record<string, unknown> = {},
-  result: Partial<{ success: boolean; output: string }> = {},
+  result: Partial<{ success: boolean; output: string; resolvedElement: unknown }> = {},
 ): ExecutedCommand {
   return {
     command: { name, args } as ExecutedCommand['command'],
@@ -35,6 +35,7 @@ describe('commandToStep — action mapping', () => {
     ['select_date', { ref: 'e8', value: '2026-01-01' }, 'selectDate'],
     ['clear_field', { ref: 'e9' }, 'clear'],
     ['mark_done', { evidence: 'logged in' }, 'verify'],
+    ['assert_text', { ref: 'e10', expected: '1 result' }, 'assert'],
   ])('maps %s → action "%s"', (name, args, expectedAction) => {
     const step = commandToStep(exec(name, args), 1, 'https://x.test');
     expect(step).not.toBeNull();
@@ -89,5 +90,51 @@ describe('commandToStep — description', () => {
   it('falls back to a generated description when output is empty', () => {
     const step = commandToStep(exec('click_element', { ref: 'e1' }, { output: '' }), 1, '');
     expect(step!.description).toContain('e1');
+  });
+});
+
+describe('commandToStep — assert_text (deterministic assertion authoring)', () => {
+  it('carries the expected value as the step value (load-bearing for text-contains)', () => {
+    const step = commandToStep(exec('assert_text', { ref: 'e1', expected: '$126.35' }), 1, '');
+    expect(step!.action).toBe('assert');
+    expect(step!.value).toBe('$126.35'); // → converter builds assertion.expected from this
+    expect(step!.ref).toBe('e1');
+    expect(step!.expectedOutcome).toContain('$126.35');
+  });
+
+  it('pins a data-testid structural selector from the resolved element', () => {
+    const step = commandToStep(
+      exec('assert_text', { ref: 'e1', expected: '1 result' }, { resolvedElement: { ref: 'e1', testIdAttr: 'result-count' } }),
+      1,
+      '',
+    );
+    expect(step!.selector).toBe('[data-testid="result-count"]');
+  });
+
+  it('falls back to an [id="…"] structural selector when there is no testid', () => {
+    const step = commandToStep(
+      exec('assert_text', { ref: 'e1', expected: '1 result' }, { resolvedElement: { ref: 'e1', id: 'result-count' } }),
+      1,
+      '',
+    );
+    expect(step!.selector).toBe('[id="result-count"]');
+  });
+
+  it('leaves the selector undefined when the resolved element has no stable identity', () => {
+    const step = commandToStep(
+      exec('assert_text', { ref: 'e1', expected: '1 result' }, { resolvedElement: { ref: 'e1' } }),
+      1,
+      '',
+    );
+    expect(step!.selector).toBeUndefined();
+  });
+
+  it('prefers the provided description over the generated one', () => {
+    const step = commandToStep(
+      exec('assert_text', { ref: 'e1', expected: '1 result', description: 'Result count shows one match' }),
+      1,
+      '',
+    );
+    expect(step!.description).toBe('Result count shows one match');
   });
 });

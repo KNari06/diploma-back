@@ -172,6 +172,13 @@ app.get('/dashboard', (req, res) => {
 app.get('/shop', (req, res) => {
   const q = (req.query.q || '').toString().trim().toLowerCase();
   const items = q ? PRODUCTS.filter((p) => p.name.toLowerCase().includes(q)) : PRODUCTS;
+  // Silent-functional bug: `sf-search-count` reports the count off-by-one while
+  // the product list itself still filters correctly — the DOM structure is
+  // identical, only the count NUMBER is wrong. Only an assertion on that number
+  // catches it (the search-flow analog of sf2-discount). Guarded so it never
+  // yields a negative count on an empty result set.
+  const countBroken = getFlag('shop.sf-search-count');
+  const displayCount = countBroken ? items.length + 1 : items.length;
   const rows = items.map((p) => `
     <div class="product" data-testid="product-${p.id}">
       <span data-testid="product-name-${p.id}">${p.name}</span>
@@ -188,7 +195,7 @@ app.get('/shop', (req, res) => {
     <input id="search" name="q" type="search" data-testid="search-input" value="${q ? String(req.query.q) : ''}" placeholder="Search…">
     <button type="submit" id="search-submit" data-testid="search-submit">Search</button>
   </form>
-  <p id="result-count" data-testid="result-count">${items.length} result${items.length === 1 ? '' : 's'}</p>
+  <h2 id="result-count" data-testid="result-count">${displayCount} result${displayCount === 1 ? '' : 's'}</h2>
   ${rows || '<p data-testid="no-results">No products found.</p>'}`));
 });
 

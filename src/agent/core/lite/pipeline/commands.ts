@@ -364,6 +364,44 @@ export const PLAYWRIGHT_COMMANDS: ChatCompletionTool[] = [
 ];
 
 /**
+ * Deterministic assertion command — offered to the Executor ONLY when
+ * assert-authoring is enabled (config-scoped to editor iterative authoring; see
+ * PipelineConfig.enableAssertAuthoring). Kept OUT of PLAYWRIGHT_COMMANDS so
+ * exploration and any other lite-pipeline caller are unchanged unless they opt in.
+ *
+ * Read-only: it asserts that an element's visible text contains `expected` — it
+ * takes no Playwright action. The handler grounds the assertion against the live
+ * page (the value must be present now) and returns the resolved element so a
+ * compiled locator plan freezes, giving replay a real selector.
+ */
+export const ASSERT_TEXT_COMMAND: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'assert_text',
+    description:
+      'Assert that an element on the page displays an expected value — a deterministic check the test will re-verify on every replay. Use this when the goal implies a specific, checkable value that is VISIBLE in the current page state (an order total, a result count, a displayed price, a confirmation message). Copy the value exactly as shown. Only assert a value you can see now; the command fails (and tells you the real text) if the element does not contain it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        ref: {
+          type: 'string',
+          description: 'Ref of the element that displays the value (from observe_page).',
+        },
+        expected: {
+          type: 'string',
+          description: 'The exact text the element should contain, e.g. "1 result" or "$126.35". Must be non-empty.',
+        },
+        description: {
+          type: 'string',
+          description: 'Optional human-readable description of what is being verified, e.g. "Result count shows one match".',
+        },
+      },
+      required: ['ref', 'expected'],
+    },
+  },
+};
+
+/**
  * Command names that don't require a page snapshot for execution.
  * Used by CommandExecutor to decide whether to collect a snapshot.
  */

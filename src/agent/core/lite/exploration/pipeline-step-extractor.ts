@@ -28,6 +28,9 @@ import type { TestAction } from '../test-case/types';
  */
 export const PLAN_WORTHY_ACTIONS: ReadonlySet<TestAction> = new Set<TestAction>([
   'click', 'fill', 'select', 'hover', 'toggle', 'setRange', 'selectDate', 'clear',
+  // 'assert' targets the element whose text is checked — freezing a compiled plan
+  // gives replay's `assert` action the selector it requires.
+  'assert',
 ]);
 
 /**
@@ -159,6 +162,33 @@ export function commandToStep(
         ref: cmd.args.ref,
         pageUrl,
       };
+    case 'assert_text': {
+      // Deterministic assertion (editor authoring only). value = the text-contains
+      // `expected`; selector = a STRUCTURAL locator captured from the resolved
+      // element so replay's primary is text-independent (see toIntentSteps). Only
+      // successful (grounded) asserts reach here — extractDiscoveredSteps drops
+      // failed commands.
+      const el = executed.result.resolvedElement;
+      const structuralSelector = el?.testIdAttr
+        ? `[data-testid="${String(el.testIdAttr).replace(/"/g, '\\"')}"]`
+        : el?.id
+          ? `[id="${String(el.id).replace(/"/g, '\\"')}"]`
+          : undefined;
+      // Freeze the TRIMMED expected — the same value the handler grounded against
+      // (assertText trims before comparing). Replay compares raw DOM text against
+      // this frozen value, so any surrounding whitespace here would false-RED.
+      const expected = String(cmd.args.expected ?? '').trim();
+      return {
+        stepNumber,
+        description: cmd.args.description || output || `Assert "${cmd.args.ref}" contains "${expected}"`,
+        action: 'assert',
+        ref: cmd.args.ref,
+        value: expected,
+        selector: structuralSelector,
+        pageUrl,
+        expectedOutcome: `Text "${expected}" is present`,
+      };
+    }
     case 'mark_done':
       return {
         stepNumber,

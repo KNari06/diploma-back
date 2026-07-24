@@ -505,6 +505,9 @@ export class CommandExecutor {
         case 'clear_field':
           result = await this.clearField(args);
           break;
+        case 'assert_text':
+          result = await this.assertText(args);
+          break;
         default:
           result = { success: false, output: '', error: `Unknown command: ${commandName}` };
       }
@@ -1211,6 +1214,90 @@ export class CommandExecutor {
       success: true,
       output: `Test blocked: ${reason} [type: ${blockerType}, user_help: ${canUserHelp}]`,
       blocked: true,
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // ASSERT TEXT — deterministic, grounded, read-only (editor authoring only)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Assert that the element at `ref` displays text containing `expected`.
+   *
+   * Grounded + read-only: reads the element's LIVE text and only succeeds when
+   * the value is actually present now — so the agent can only author an
+   * assertion that is TRUE on the live page. Takes no Playwright action (not a
+   * MUTATING_COMMAND, not REF_BASED for the SafetyInterceptor). On success it
+   * returns `resolvedElement` so the extractor freezes a compiled locator plan
+   * (replay's `assert` action needs a selector) and pins the element's stable
+   * identity as a structural css override.
+   */
+  private async assertText(args: Record<string, any>): Promise<CommandResult> {
+    const ref: string | undefined = args.ref;
+    const expectedRaw = args.expected;
+
+    if (!ref) {
+      return { success: false, output: '', error: 'Missing required parameter: ref' };
+    }
+    const expected = typeof expectedRaw === 'string' ? expectedRaw.trim() : '';
+    if (!expected) {
+      return {
+        success: false,
+        output: '',
+        error: 'assert_text requires a non-empty "expected" value — the exact text the element should contain.',
+      };
+    }
+
+    const refCheck = this.checkRefExists(ref);
+    if (!refCheck.valid) {
+      return { success: false, output: '', error: refCheck.error! };
+    }
+
+    const snapshot = this.blackboard.getCurrentPageSnapshot();
+    if (!snapshot) {
+      return { success: false, output: '', error: 'No page snapshot available. Call observe_page first.' };
+    }
+    const element = snapshot.elements.find(el => el.ref === ref);
+
+    // Read the element's LIVE text (refs are tagged data-agent-ref on the page).
+    // Keep it RAW (no whitespace normalization) so grounding mirrors the replay
+    // comparison EXACTLY — replay's assert does compareValues('contains') =
+    // rawTextContent.toLowerCase().includes(expected.toLowerCase()). Collapsing
+    // whitespace here would be MORE lenient than replay, green-lighting an assert
+    // that then false-REDs on a clean replay (e.g. DOM "1  result" grounds against
+    // "1 result" but replay's raw substring check does not).
+    let actual = '';
+    try {
+      const raw = await this.page.locator(`[data-agent-ref="${ref}"]`).first().textContent();
+      actual = raw || '';
+    } catch {
+      // Fall back to the snapshot's captured name if the live read fails.
+      logger.debug('[CMD_EXECUTOR] assert_text live read failed, grounding on snapshot name', { ref });
+      actual = element?.name || '';
+    }
+
+    // Same operator replay uses (case-insensitive substring). `expected` is
+    // already trimmed; commandToStep freezes the same trimmed value.
+    const contains = actual.toLowerCase().includes(expected.toLowerCase());
+
+    // Page-derived text may echo a credential — redact before it reaches the LLM
+    // tool result / JSONL trace (folder invariant #3, root invariant #10).
+    const safeActual = this.redactCredentials(actual);
+
+    if (!contains) {
+      // Tell the agent the real text so it can correct `expected` or pick another
+      // ref — this is what keeps authored assertions grounded in reality.
+      return {
+        success: false,
+        output: '',
+        error: `assert failed: "${ref}" shows "${safeActual}", expected it to contain "${expected}".`,
+      };
+    }
+
+    return {
+      success: true,
+      output: `Asserted "${ref}" contains "${expected}"`,
+      resolvedElement: element,
     };
   }
 

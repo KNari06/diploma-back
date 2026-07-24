@@ -65,16 +65,18 @@ async function scoreScenario(
   // Obtain the step set (golden = deterministic; authored = live agent).
   let steps = scenario.goldenSteps;
   let authoredAssertion: string | null | undefined;
+  let assertKind: import('./author-on-fixture').AuthoredAssertKind | undefined;
   if (author) {
     process.stdout.write(' authoring…');
     const authored = await authorOnFixture(scenario, baseUrl);
     authoredAssertion = authored.authoredAssertion;
+    assertKind = authored.assertKind;
     if (!authored.ok) {
       // Authoring failed → a red first-run (counted), false-green N/A.
       return scoreFixtureRun({
         scenarioId: scenario.id, source: 'authored',
         cleanOutcome: { passed: false, status: 'author-failed', stepsRun: 0, errorSummary: authored.error ?? authored.reason },
-        hasFlagPairing, authoredAssertion,
+        hasFlagPairing, authoredAssertion, assertKind,
       });
     }
     steps = authored.steps;
@@ -102,6 +104,7 @@ async function scoreScenario(
     brokenOutcome,
     hasFlagPairing,
     authoredAssertion,
+    assertKind,
   });
 
   // Honesty label: a Stage-2 credential flow that first-run-fails often does so

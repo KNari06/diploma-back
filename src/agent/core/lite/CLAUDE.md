@@ -43,10 +43,27 @@ pipeline, analysis):**
 | --- | --- | --- |
 | [test-pipeline.ts](pipeline/test-pipeline.ts) | The round loop: Planner → Executor → Reviewer until done/blocked/timeout. Owns the `TestBlackboard`. | `TestPipeline` |
 | [blackboard.ts](pipeline/blackboard.ts) | Per-flow shared state (plan, rounds, insights, progress, `pageHealth`, `roundInfo`). | `TestBlackboard` |
-| [command-executor.ts](pipeline/command-executor.ts) | Maps LLM commands → Playwright; `observePage` enriches output with progress / network / console / **PAGE HEALTH**; redacts creds before LLM/trace. | `CommandExecutor` |
+| [command-executor.ts](pipeline/command-executor.ts) | Maps LLM commands → Playwright; `observePage` enriches output with progress / network / console / **PAGE HEALTH**; redacts creds before LLM/trace. `assertText` is a grounded read-only assertion (see below). | `CommandExecutor` |
+| [commands.ts](pipeline/commands.ts) | Executor tool schemas. `PLAYWRIGHT_COMMANDS` (always offered) + `ASSERT_TEXT_COMMAND` (offered ONLY when assert authoring is on). | `PLAYWRIGHT_COMMANDS`, `ASSERT_TEXT_COMMAND` |
 | [planner-agent.ts](pipeline/planner-agent.ts) · [executor-agent.ts](pipeline/executor-agent.ts) · [reviewer-agent.ts](pipeline/reviewer-agent.ts) | The three agents. Reviewer runs a deterministic **health gate** before the done-claim. | — |
 | [prompts.ts](pipeline/prompts.ts) | Planner / Executor / Reviewer prompt builders (read the blackboard). | `buildPlannerPrompt`, `buildReviewerPrompt`, … |
 | [types.ts](pipeline/types.ts) | `PipelineConfig`, `TestBlackboardState`, `CommandResult`. | — |
+
+**Deterministic-assert authoring (editor-only, config-scoped).** When
+`PipelineConfig.enableAssertAuthoring` is set (ONLY by
+`EditorIterativeAuthorService`; exploration leaves it off), the Executor is
+offered `assert_text(ref, expected)` + prompt guidance so it can author a
+`type:'assert'` step — a deterministic text-contains check the test re-verifies
+on every replay (vs the terminal `mark_done`→`ai_check` LLM self-judge). The
+handler is **grounded** (reads the element's live text, succeeds only if it
+contains `expected`) and its comparison **mirrors replay's**
+`compareValues('contains')` exactly (case-insensitive raw substring, no
+whitespace collapse) so a grounded assert can't false-RED on a clean replay.
+`commandToStep` freezes a structural `data-testid`/`id` selector (via
+`options.cssSelector`) so replay's primary locator is text-independent — a
+named heading's `role=heading[name="…"]` primary would otherwise locator-miss
+on a changed value. Flag threads config → `TestBlackboard.setAssertAuthoring` →
+`ExecutorAgent` tool list + the prompt builders.
 
 ---
 

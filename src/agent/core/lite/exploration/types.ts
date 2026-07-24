@@ -510,6 +510,14 @@ export interface DiscoveredTestCase {
  * for direct replay execution via TestCaseExecutor.
  */
 export function toTestCase(discovered: DiscoveredTestCase): TestCase {
+  // NOTE: `action:'assert'` (deterministic assert authored via the editor path)
+  // is NOT handled by the direct-replay TestCaseExecutor — only by the IntentStep
+  // chain (toIntentSteps → intent-step-converter → the replay command-executor
+  // `assert` case). This is a LATENT gap, not a live one: assert authoring is
+  // config-scoped to the editor (which persists via toIntentSteps, never this
+  // function), and exploration — the only caller of toTestCase — never emits
+  // assert (its pipeline has the flag off). If assert authoring is ever enabled
+  // for exploration, add an `assert` case to TestCaseExecutor first.
   return {
     id: discovered.id,
     name: discovered.name,
@@ -543,6 +551,7 @@ export const ACTION_TO_INTENT_TYPE: Record<string, IntentActionType> = {
   scroll: 'scroll',
   wait: 'wait',
   verify: 'ai_check',
+  assert: 'assert',
   custom: 'click',
   toggle: 'toggle',
   setRange: 'type',
@@ -568,7 +577,11 @@ export function toIntentSteps(steps: DiscoveredStep[]): IntentStep[] {
     if (step.value) {
       if (intentType === 'type') {
         intentStep.value = step.isSensitive ? '{{password}}' : step.value;
-      } else if (['select', 'navigate', 'press'].includes(intentType)) {
+      } else if (['select', 'navigate', 'press', 'assert'].includes(intentType)) {
+        // 'assert' is load-bearing: the converter's `type:'assert'` branch reads
+        // `value` as the text-contains `expected`. Dropping it here silently
+        // degrades the assert to a visibility check that passes on ANY page
+        // (clean AND broken) — the whole deterministic-assert win no-ops.
         intentStep.value = step.value;
       }
     }
@@ -576,6 +589,17 @@ export function toIntentSteps(steps: DiscoveredStep[]): IntentStep[] {
     // Add assertion text for verify/ai_check actions
     if (intentType === 'ai_check' && step.expectedOutcome) {
       intentStep.assertionText = step.expectedOutcome;
+    }
+
+    // Deterministic assert: pin a STRUCTURAL selector (data-testid / id) captured
+    // at authoring time so replay's primary locator is text-independent. Without
+    // this the compiled plan's primary is role-full-name (confidence 0.9 > testId
+    // 0.8) — e.g. role=heading[name="1 result"] — which on a broken page shows a
+    // different value and LOCATOR-MISSES instead of producing a clean text
+    // assertion failure. options.cssSelector overrides command.selector (the same
+    // pin the deterministic golden steps use).
+    if (intentType === 'assert' && step.selector) {
+      intentStep.options = { ...(intentStep.options ?? {}), cssSelector: step.selector };
     }
 
     // Propagate expectedOutcome — DiscoveredStep stores a string description,

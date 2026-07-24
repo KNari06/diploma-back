@@ -125,6 +125,13 @@ export function buildPlannerPrompt(bb: TestBlackboard): string {
     sections.push(`TEAM INSIGHTS:\n${insights.map((i, idx) => `  ${idx + 1}. ${i}`).join('\n')}`);
   }
 
+  // Deterministic-assertion authoring (editor-only). When enabled, guide the
+  // Planner to include a final assertion step whenever the goal is about
+  // verifying a value — the Executor then emits assert_text for it.
+  const assertPlanningRule = bb.getAssertAuthoring()
+    ? `\n- VERIFY A VALUE: if the goal implies checking a specific value (a total, a result count, a displayed price, a confirmation message, a status), add a FINAL step that asserts that value on the element showing it (e.g. "Assert the result count shows 1 result"). This becomes a deterministic assertion the test re-checks on every replay.`
+    : '';
+
   return `You are a TEST PLANNER agent. Analyze the current page and create a step-by-step plan to achieve the goal.
 
 ${sections.join('\n\n')}
@@ -168,7 +175,7 @@ RULES:
 - For sliders (role="slider", input[type="range"]): use set_range with target value
 - For date/time inputs (input[type="date"], [type="time"], [type="datetime-local"]): use select_date with ISO format
 - For checkboxes and radio buttons: use toggle_element to check/uncheck them
-- Maximum 8 steps per plan
+- Maximum 8 steps per plan${assertPlanningRule}
 - If goal seems already achieved, create a single step: "Verify goal is complete"
 - CAPTCHA DETECTION: If the page has a checkbox inside an [IFRAME] with an empty or generic name (reCAPTCHA/hCaptcha/Turnstile widget), or if PAGE ALERTS mention "CAPTCHA", "reCAPTCHA", "hCaptcha", "Turnstile", or "bot verification" — plan a single step: report_blocked with blocker_type="captcha". Do NOT attempt to fill or submit the form — it will fail.
 - IMPORTANT: If PAGE ALERTS show authentication errors (e.g. "Invalid email or password", "Wrong credentials", "Account locked") after a login attempt:
@@ -208,6 +215,22 @@ export function buildExecutorSystemPrompt(bb: TestBlackboard): string {
 - NEVER include real credential values in your output`);
   }
 
+  // Deterministic-assertion authoring (editor-only; gated by the blackboard flag
+  // that PipelineConfig.enableAssertAuthoring set). Adds the command + a rule so
+  // the agent checks a goal-implied value; absent for exploration so its
+  // behaviour is unchanged.
+  const assertEnabled = bb.getAssertAuthoring();
+  const assertCommandLine = assertEnabled
+    ? '\n- assert_text(ref, expected, description?) — assert an element\'s visible text CONTAINS an expected value (a deterministic check re-verified on every replay)'
+    : '';
+  const assertRule = assertEnabled
+    ? `
+17. AUTHOR A DETERMINISTIC ASSERTION when the goal implies a specific, checkable value. If the goal is to verify/confirm a value that is VISIBLE in the current page state — an order total, a result count, a displayed price, a confirmation message, a status — call assert_text(ref, expected) on the element that shows it, copying the value EXACTLY as rendered. Do this AFTER the action that produces the value and BEFORE mark_done. Rules:
+    - Assert only a value you can currently see in the page state; assert_text fails (and tells you the real text) if the element does not contain it — never guess.
+    - Prefer a stable, goal-relevant value. Do NOT assert volatile values (timestamps, random ids, session tokens).
+    - A deterministic assert_text is STRONGER than done-evidence — still call mark_done at the end. Author at most one or two asserts that capture what the goal is really checking.`
+    : '';
+
   return `You are a BROWSER AUTOMATION EXECUTOR. Use Playwright commands to complete the plan.
 
 ${sections.join('\n\n')}
@@ -228,7 +251,7 @@ COMMANDS AVAILABLE:
 - navigate_to(url) — go to URL (only if no on-page link works)
 - wait_for_page(reason) — wait after submit/navigation
 - mark_done(reason, evidence) — signal goal achieved
-- report_blocked(reason) — signal blocked (CAPTCHA, 2FA, etc.)
+- report_blocked(reason) — signal blocked (CAPTCHA, 2FA, etc.)${assertCommandLine}
 
 EXECUTION RULES:
 1. If CURRENT PAGE STATE is already provided above, DO NOT call a redundant observe_page — you already have the page state. Legitimate observe_page cases: (a) the PLAN explicitly includes an observe_page step (execute it as planned — it's there to reveal refs), (b) after navigation/submit, (c) after an action revealed NEW content (modal/accordion/form opened) whose refs you don't have, (d) refs went stale.
@@ -254,7 +277,7 @@ EXECUTION RULES:
     - [POST-ACTION] shows validation errors that block progress → THEN call observe_page for the full state.
 14. CRITICAL: If observe_page shows PAGE ALERTS with authentication errors like "Invalid email or password", "Wrong credentials", "Incorrect password", or "Account locked" after a login attempt: call report_blocked with reason="credentials_invalid", blocker_type="auth_failure", can_user_help=true. Do NOT retry — the user-provided credentials are wrong.
 15. CAPTCHA DETECTION: If observe_page shows a checkbox inside an [IFRAME] with empty name (CAPTCHA widget), or if PAGE ALERTS mention "reCAPTCHA", "CAPTCHA", "hCaptcha", "Turnstile", or "bot verification" — immediately call report_blocked with blocker_type="captcha". Do NOT retry form submission.
-16. NEEDS REAL DATA: If a REQUIRED field blocks the goal and needs a specific real value you cannot invent — a promo/referral/coupon code, an existing account or order number, an SMS/email one-time code that is NOT app-2FA, an invitation token — and a made-up placeholder was (or would be) rejected, call report_blocked with blocker_type="needs_data", can_user_help=true, and reason=WHAT value is needed (name the field/purpose, e.g. "a valid promo code for the checkout form"). Do NOT use this for fields you can reasonably fill yourself (names, emails, generic search terms, free-text) or for OPTIONAL fields — only when a real, unguessable value is the sole thing blocking progress. Ask at most once per flow.`;
+16. NEEDS REAL DATA: If a REQUIRED field blocks the goal and needs a specific real value you cannot invent — a promo/referral/coupon code, an existing account or order number, an SMS/email one-time code that is NOT app-2FA, an invitation token — and a made-up placeholder was (or would be) rejected, call report_blocked with blocker_type="needs_data", can_user_help=true, and reason=WHAT value is needed (name the field/purpose, e.g. "a valid promo code for the checkout form"). Do NOT use this for fields you can reasonably fill yourself (names, emails, generic search terms, free-text) or for OPTIONAL fields — only when a real, unguessable value is the sole thing blocking progress. Ask at most once per flow.${assertRule}`;
 }
 
 /**

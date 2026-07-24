@@ -8,6 +8,7 @@
  */
 
 import type { FixtureRunOutcome, FixtureScore, FixtureSource, FixtureSummary } from './fixture-types';
+import type { AuthoredAssertKind } from './author-on-fixture';
 
 export interface ScoreFixtureRunInput {
   scenarioId: string;
@@ -17,8 +18,10 @@ export interface ScoreFixtureRunInput {
   brokenOutcome?: FixtureRunOutcome;
   /** True when the scenario declares a false-green pairing. */
   hasFlagPairing: boolean;
-  /** Stage-2 only — the terminal assertion the agent authored (null = none). */
+  /** Stage-2 only — the assertion the agent authored (null = none). */
   authoredAssertion?: string | null;
+  /** Stage-2 only — which kind of assertion the agent authored (rung-3 run-proof). */
+  assertKind?: AuthoredAssertKind;
 }
 
 /**
@@ -31,7 +34,7 @@ export interface ScoreFixtureRunInput {
  *                  false-green-measurable, so it's ineligible.
  */
 export function scoreFixtureRun(input: ScoreFixtureRunInput): FixtureScore {
-  const { scenarioId, source, cleanOutcome, brokenOutcome, hasFlagPairing, authoredAssertion } = input;
+  const { scenarioId, source, cleanOutcome, brokenOutcome, hasFlagPairing, authoredAssertion, assertKind } = input;
   const notes: string[] = [];
 
   const firstRunPass = cleanOutcome.passed;
@@ -55,11 +58,13 @@ export function scoreFixtureRun(input: ScoreFixtureRunInput): FixtureScore {
   }
 
   if (source === 'authored') {
-    notes.push(
-      authoredAssertion
-        ? `authored terminal assertion: "${authoredAssertion}"`
-        : 'authored NO assertion — the iterative-author engine emitted no terminal check (capability gap; plan §5).',
-    );
+    if (assertKind === 'deterministic') {
+      notes.push(`authored a DETERMINISTIC assertion: ${authoredAssertion} — a real value-check, not an LLM self-judge (rung-3 capability).`);
+    } else if (assertKind === 'ai_check') {
+      notes.push(`authored only a terminal LLM-judged assertion: "${authoredAssertion}" — no deterministic value-check.`);
+    } else {
+      notes.push('authored NO assertion — the iterative-author engine emitted no check (capability gap; plan §5).');
+    }
   }
 
   return {
