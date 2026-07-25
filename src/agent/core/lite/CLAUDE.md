@@ -65,6 +65,16 @@ named heading's `role=heading[name="…"]` primary would otherwise locator-miss
 on a changed value. Flag threads config → `TestBlackboard.setAssertAuthoring` →
 `ExecutorAgent` tool list + the prompt builders.
 
+**Credential freezing (editor-only, caller-scoped).** A credential fill is
+persisted as `{{secrets.<key>}}` bound to a stored `secret` resource, so an
+authored login test can actually re-run. `EditorIterativeAuthorService` supplies
+a `SecretKeyForKind` mapper to `extractDiscoveredSteps`; exploration passes none
+and is unchanged. The mapper is keyed on
+`CommandResult.injectedCredentialKind` — the kind `overrideCredentialFillValue`
+**actually injected** — so the frozen placeholder and the injected value agree by
+construction, and the authoring service surfaces the matching
+`resourceBindings` for the caller to persist.
+
 ---
 
 ## `exploration/` — autonomous site exploration
@@ -123,7 +133,17 @@ console errors ⇒ visible JS break · progress%+rounds ⇒ "stuck, change strat
    must never fail the flow (CLAUDE.md hard invariant #11).
 5. **Login/auth URL detection lives only in [auth-url-patterns.ts](exploration/auth-url-patterns.ts).**
    Never inline a second login-URL regex — import `isLoginUrl`.
-6. **LiteEngine bills 1 credit per successful executed step; Exploration does NOT.**
+6. **A credential fill is frozen from `result.injectedCredentialKind`, never from `cmd.args.value`.**
+   The executor prompt tells the model to emit a *throwaway* placeholder and
+   `overrideCredentialFillValue` injects the real credential into a NEW command
+   without touching `args` — so `args.value` is the model's fake string by
+   design. The injected kind also OUTRANKS the model's `is_sensitive` flag
+   (injection is decided by the classifier, not the flag), but only at **high**
+   confidence: a medium match is a guess from a label (`username` patterns
+   include the token `name`, so "Full name" would otherwise bind the account
+   email to a name field). A credential field never keeps `args.value` —
+   without a binding it loses its value rather than persisting a literal.
+7. **LiteEngine bills 1 credit per successful executed step; Exploration does NOT.**
    Lite chat runs are UI tests (product decision 2026-07-17: 1cr/executed step, same
    as replay; NO refund on failure). **Billing ACCRUES then SETTLES once — it is NOT
    eager.** `chargeStepCredit(action)` (legacy loop: prefilled-replay, credential

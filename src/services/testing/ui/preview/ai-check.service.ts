@@ -7,6 +7,7 @@
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
+import { redactWithValues } from '@/utils/interpolation/redact-secrets';
 import { PreviewAccessibilityNode } from '@/websocket/types/types';
 import { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 
@@ -28,6 +29,18 @@ export interface AiCheckInput {
   a11yTree?: PreviewAccessibilityNode[];
   /** Screenshot base64 (JPEG, optional) */
   screenshotBase64?: string;
+  /**
+   * Resolved `secrets.*` values active for this run (from
+   * `executor.getRedactValues()`). The assertion text and the page HTML are
+   * sent to a third-party LLM, and an authored assertion can legitimately
+   * quote page text containing a credential (e.g. "Welcome back, <email>") —
+   * so every string leaving this service is masked against these first
+   * (CLAUDE.md invariant #10).
+   *
+   * NOTE: this cannot mask the SCREENSHOT, which may still render the value
+   * visually. Prefer not authoring credential-bearing assertions at all.
+   */
+  secretValues?: readonly string[];
 }
 
 /**
@@ -211,8 +224,13 @@ function serializeA11yTree(nodes: PreviewAccessibilityNode[], depth: number = 0,
 export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResult> {
   const startTime = Date.now();
 
+  // No secrets in play → identity, zero cost (redactWithValues short-circuits).
+  const secretValues = input.secretValues ?? [];
+  const maskSecrets = (value: string): string =>
+    (secretValues.length > 0 ? redactWithValues(value, secretValues) : value);
+
   logger.info('[AI_CHECK] Starting evaluation', {
-    assertion: input.assertionText,
+    assertion: maskSecrets(input.assertionText),
     url: input.url,
     hasHtml: !!input.html,
     hasA11y: !!input.a11yTree,
@@ -249,6 +267,12 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
       { role: 'system', content: buildSystemPrompt() },
     ];
 
+    // Mask resolved secrets in the ONE assembled string, so the assertion, the
+    // HTML and the a11y tree are all masked identically — the model still sees
+    // a consistent comparison ("shows ***" vs "shows ***"), it just never sees
+    // the credential. Cannot mask the screenshot (see AiCheckInput.secretValues).
+    const userPrompt = maskSecrets(buildUserPrompt({ ...input, html }, truncatedFlags));
+
     // Build user message with text and optional screenshot
     if (input.screenshotBase64) {
       // Multimodal: text + image
@@ -257,7 +281,7 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
         content: [
           {
             type: 'text',
-            text: buildUserPrompt({ ...input, html }, truncatedFlags),
+            text: userPrompt,
           },
           {
             type: 'image_url',
@@ -272,7 +296,7 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
       // Text-only
       messages.push({
         role: 'user',
-        content: buildUserPrompt({ ...input, html }, truncatedFlags),
+        content: userPrompt,
       });
     }
 
@@ -292,7 +316,7 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
     const parsed: AiCheckLLMResponse = JSON.parse(response.content);
 
     logger.info('[AI_CHECK] Evaluation completed', {
-      assertion: input.assertionText,
+      assertion: maskSecrets(input.assertionText),
       pass: parsed.pass,
       confidence: parsed.confidence,
       tokensUsed: response.usage.totalTokens,
@@ -309,7 +333,7 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
     };
   } catch (error) {
     logger.error('[AI_CHECK] Evaluation failed', {
-      assertion: input.assertionText,
+      assertion: maskSecrets(input.assertionText),
       error: error instanceof Error ? error.message : String(error),
       durationMs: Date.now() - startTime,
     });

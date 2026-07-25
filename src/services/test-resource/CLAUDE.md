@@ -66,7 +66,7 @@ test ends
 3. **Adapter** — implement `ResourceAdapter<TConfig, TSensitive>` in `adapters/<kind>.adapter.ts`. Pattern:
    - `validate({ config })` — instant feedback on bad shape; reject reserved-prefix key names.
    - `sensitiveFields()` — STATIC list of `config` keys to encrypt. For "envelope-wrapped" maps (secret-style), return the wrapper key (`['values']`).
-   - `apply(ctx, resource)` — write `<prefix>.<KEY>` into `ctx.runVariables`. Idempotent.
+   - `apply(ctx, resource)` — write `<prefix>.<KEY>` into `ctx.runVariables`. Idempotent. Read anything you declared in `sensitiveFields()` from **`resource.sensitive`**, not `config` (invariant #9), and **throw** rather than return when there is nothing to apply (invariant #10).
    - `isFresh()` — `() => true` for static config; lifecycle-aware otherwise.
 4. **Registration** — add to `registerBuiltinResourceAdapters()` in [index.ts](index.ts).
 5. **Topological rank** — add to `rank()` in [resource-applier.ts:118](resource-applier.ts) AND `rank()` in [resource-step-compiler.service.ts:667](resource-step-compiler.service.ts).
@@ -88,7 +88,9 @@ test ends
 6. **Adapters never touch DB.** Lifecycle columns (`status`, `captured_at`, `expires_at`, `heal_count`) are written ONLY by `test-resource.service.ts`. Adapters return shapes; the service persists.
 7. **`mergeValues: true` only applies to envelope-wrapped value maps** (currently `secret.values`). It's opt-in per request, not a global flag. The default replace-whole-config semantic is preserved.
 8. **Snapshot-staleness contract.** `command-executor.setRunVariables` and `replayTrace.setRedactValues` capture the secret-value list ONCE per run. Mid-run resource refresh (heal hook applying a freshened `secret`) does NOT propagate to the cached redaction list. If you add mid-run reapply, refresh both explicitly. Pinned in `redact-snapshot-staleness.test.ts`.
-9. **Auth detector v3 is score-based, not boolean.** Six suppression layers + two-positive-trigger minimum. Hostname-scoped 401 cache. Multistep memory keyed on registrable domain. `__qai_origin_host__` set on every main-frame nav (decoupled from emit). Don't regress to v1's "any signal fires" pattern. See [src/services/testing/ui/preview/auth-detector.ts](../testing/ui/preview/auth-detector.ts).
+9. **An adapter reads its encrypted payload from `resource.sensitive`, NEVER from `config`.** `loadDecrypted` returns the decrypted envelope under `sensitive` and leaves `config` as the row's plaintext half — it does **not** merge them. Any key listed in `sensitiveFields()` has been moved out of `config` by `splitSensitive` on every write path, so reading `config.<key>` at runtime gets `undefined`. `auth` gets this right (`resource.sensitive.storageState`); `secret` did not, and `apply()` was a silent no-op for months — **`{{secrets.X}}` never resolved on the runtime path**, which also meant `collectSecretValues` returned `[]` and every redactor was a no-op. Unit tests did not catch it because they built the resource with `config:{values}, sensitive:{}` — the same wrong assumption as the code. **Test an adapter against the shape `loadDecrypted` actually returns.**
+10. **An adapter's `apply()` fails CLOSED.** `applyBindingsToContext` only escalates a binding to an error when `apply()` **throws**; returning early marks the binding `applied` while nothing was injected. That is precisely how #9 hid. If there is nothing to apply, throw — the applier downgrades a non-required binding to `skipped` on its own.
+11. **Auth detector v3 is score-based, not boolean.** Six suppression layers + two-positive-trigger minimum. Hostname-scoped 401 cache. Multistep memory keyed on registrable domain. `__qai_origin_host__` set on every main-frame nav (decoupled from emit). Don't regress to v1's "any signal fires" pattern. See [src/services/testing/ui/preview/auth-detector.ts](../testing/ui/preview/auth-detector.ts).
 
 ---
 

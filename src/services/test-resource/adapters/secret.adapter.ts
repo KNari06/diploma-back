@@ -62,15 +62,27 @@ export interface SecretConfig extends Record<string, unknown> {
   values: Record<string, SecretScalar>;
 }
 
-/** No separate `sensitive` channel — `values` is the sensitive payload. */
-export interface SecretSensitive extends Record<string, unknown> {}
+/**
+ * `values` IS the sensitive payload, so after the service splits it into the
+ * encrypted envelope this is where it comes back — `loadDecrypted` returns the
+ * decrypted envelope under `sensitive` and leaves `config` empty. Declaring it
+ * here is what lets `apply()` read it without a cast.
+ */
+export interface SecretSensitive extends Record<string, unknown> {
+  values?: Record<string, SecretScalar>;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Validation rules — strict because malformed names later cause silent
 // `{{secrets.foo}}` literals to leak into pages instead of substituting.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const KEY_RE = /^[A-Za-z_][A-Za-z0-9_.\-]*$/;
+/**
+ * Valid secret key name. Exported as the single source so anything that BUILDS
+ * a `{{secrets.<key>}}` placeholder validates against the same grammar the
+ * adapter accepts on write.
+ */
+export const KEY_RE = /^[A-Za-z_][A-Za-z0-9_.\-]*$/;
 const RESERVED_PREFIXES = ['env.', 'secrets.', 'fixtures.', 'email.'];
 const MAX_KEYS = 200;
 /**
@@ -207,18 +219,26 @@ export const secretAdapter: ResourceAdapter<SecretConfig, SecretSensitive> = {
     ctx: ApplyContext,
     resource: DecryptedResource<SecretConfig, SecretSensitive>,
   ): Promise<void> {
-    // After decryption the service merges `sensitive.values` into
-    // `config.values` (because the adapter declared `values` sensitive,
-    // splitSensitive pushed it to the envelope, and on read it's
-    // restored back to the top of `config`). So the runtime shape we
-    // see is `resource.config.values`.
-    const values = resource.config?.values;
+    // `values` is declared sensitive, so `splitSensitive` moves it into the
+    // encrypted envelope on write and `loadDecrypted` hands it back under
+    // `resource.sensitive` — it does NOT merge it into `config` (same shape the
+    // auth adapter reads its `storageState` from). Read `sensitive` first.
+    //
+    // The `config` fallback is deliberate: callers that build a resource by
+    // hand (validate() returns the normalized map under `config`) still work.
+    // An earlier version read ONLY `config.values`, which is empty on the real
+    // runtime path — so every `{{secrets.X}}` silently stayed unresolved.
+    const values = resource.sensitive?.values ?? resource.config?.values;
     if (!values || typeof values !== 'object') {
-      logger.warn('[SECRET_ADAPTER] No values to apply', {
-        resourceId: resource.id,
-        name: resource.name,
-      });
-      return;
+      // Fail CLOSED. `applyBindingsToContext` only escalates on a throw, so
+      // returning quietly marks the binding "applied" while every
+      // `{{secrets.X}}` stays unresolved — which is exactly how the
+      // config-vs-sensitive read bug stayed invisible. A `required: true`
+      // binding must break the run here; a non-required one is downgraded to
+      // `skipped` by the applier.
+      throw new Error(
+        `Secret resource "${resource.name}" has no values to apply (nothing to expose as secrets.*)`,
+      );
     }
 
     const names: string[] = [];

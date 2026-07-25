@@ -127,10 +127,23 @@ describe('SecretAdapter.apply', () => {
     expect(c.runVariables.get('secrets.TOKEN')).toBe('tok_y');
   });
 
-  it('is a no-op (warns) when there are no values', async () => {
+  it('THROWS when there are no values, so a required binding fails loudly', async () => {
     const c = ctx();
-    await secretAdapter.apply!(c, resource(undefined));
+    await expect(secretAdapter.apply!(c, resource(undefined))).rejects.toThrow(/no values to apply/i);
     expect(c.runVariables.size).toBe(0);
+  });
+
+  it('applies values from the DECRYPTED envelope — the real loadDecrypted shape', async () => {
+    // Regression guard, duplicated from the sibling suite in
+    // test-resource/__tests__/ so it lives wherever someone looks. `values` is
+    // sensitive, so at runtime it arrives under `sensitive` and `config` is
+    // empty; reading only `config.values` made apply() a silent no-op and left
+    // every {{secrets.X}} unresolved.
+    const c = ctx();
+    await secretAdapter.apply!(c, {
+      id: 'r1', name: 'creds', config: {}, sensitive: { values: { LOGIN: 'demo' } },
+    } as never);
+    expect(c.runVariables.get('secrets.LOGIN')).toBe('demo');
   });
 
   it('logs key NAMES but never secret VALUES', async () => {

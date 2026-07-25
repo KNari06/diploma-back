@@ -12,7 +12,12 @@ import type { ExecutedCommand } from '../../pipeline/types';
 function exec(
   name: string,
   args: Record<string, unknown> = {},
-  result: Partial<{ success: boolean; output: string; resolvedElement: unknown }> = {},
+  result: Partial<{
+    success: boolean;
+    output: string;
+    resolvedElement: unknown;
+    injectedCredentialKind: string;
+  }> = {},
 ): ExecutedCommand {
   return {
     command: { name, args } as ExecutedCommand['command'],
@@ -68,6 +73,72 @@ describe('commandToStep — value + secret handling', () => {
     expect(step!.value).toBeUndefined(); // secret must not survive into the step
     expect(step!.description).not.toContain('hunter2'); // nor into the description
     expect(step!.description).toContain('[credential]');
+  });
+});
+
+describe('commandToStep — credential binding (rung 4)', () => {
+  const keyForKind = (kind: string): string | undefined =>
+    ({ password: 'login_password', email: 'login_email' } as Record<string, string>)[kind];
+
+  it('freezes a {{secrets.*}} placeholder for the credential kind that was injected', () => {
+    const step = commandToStep(
+      exec('fill_field', { ref: 'e1', value: 'user@test.com', is_sensitive: true }, {
+        injectedCredentialKind: 'password',
+      }),
+      1,
+      '',
+      keyForKind,
+    );
+    expect(step!.value).toBe('{{secrets.login_password}}');
+    expect(step!.isSensitive).toBe(true);
+  });
+
+  it('keys off the INJECTED kind, never the command args (args hold the LLM placeholder)', () => {
+    const step = commandToStep(
+      // The LLM's arg value is a throwaway — it must not influence the mapping,
+      // and must never be frozen into the step.
+      exec('fill_field', { ref: 'e1', value: 'totally-made-up@example.com', is_sensitive: true }, {
+        injectedCredentialKind: 'email',
+      }),
+      1,
+      '',
+      keyForKind,
+    );
+    expect(step!.value).toBe('{{secrets.login_email}}');
+    expect(step!.value).not.toContain('made-up');
+  });
+
+  it('drops the value when a credential was injected but the kind has no mapped key', () => {
+    const step = commandToStep(
+      exec('fill_field', { ref: 'e1', value: 'x', is_sensitive: true }, { injectedCredentialKind: 'phone' }),
+      1,
+      '',
+      keyForKind, // no phone key
+    );
+    expect(step!.value).toBeUndefined();
+  });
+
+  it('drops the value when NO credential was injected, even with a mapper', () => {
+    // A sensitive field the classifier could not identify: the executor kept the
+    // LLM's placeholder, so there is no real credential behind it to bind.
+    const step = commandToStep(
+      exec('fill_field', { ref: 'e1', value: 'promo-code-123', is_sensitive: true }),
+      1,
+      '',
+      keyForKind,
+    );
+    expect(step!.value).toBeUndefined();
+  });
+
+  it('leaves exploration unchanged — no mapper means the old value-less behaviour', () => {
+    const step = commandToStep(
+      exec('fill_field', { ref: 'e1', value: 'hunter2', is_sensitive: true }, {
+        injectedCredentialKind: 'password',
+      }),
+      1,
+      '',
+    );
+    expect(step!.value).toBeUndefined();
   });
 });
 

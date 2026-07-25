@@ -19,6 +19,7 @@
 import type { TestAction, TestCase, TestStep } from '../test-case/types';
 import type { IntentStep, IntentActionType, CompiledStepPlan } from '@/services/testing/ui/preview/preview.types';
 import type { IntentTestCase, Priority } from '@/types/testing.types';
+import { isBoundSecretPlaceholder } from '@/utils/interpolation/redact-secrets';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // EXPLORATION CONFIG (input)
@@ -576,7 +577,15 @@ export function toIntentSteps(steps: DiscoveredStep[]): IntentStep[] {
     // Add value for actions that carry data
     if (step.value) {
       if (intentType === 'type') {
-        intentStep.value = step.isSensitive ? '{{password}}' : step.value;
+        // A sensitive step whose value is already a `{{secrets.*}}` placeholder
+        // was frozen against a BOUND credential resource (see
+        // `SecretKeyForKind` in pipeline-step-extractor) — carry it through so
+        // replay resolves it from `runVariables`. The legacy `{{password}}`
+        // mask stays for any sensitive value that isn't such a placeholder.
+        intentStep.value =
+          step.isSensitive && !isBoundSecretPlaceholder(step.value)
+            ? '{{password}}'
+            : step.value;
       } else if (['select', 'navigate', 'press', 'assert'].includes(intentType)) {
         // 'assert' is load-bearing: the converter's `type:'assert'` branch reads
         // `value` as the text-contains `expected`. Dropping it here silently

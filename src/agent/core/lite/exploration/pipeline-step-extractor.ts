@@ -14,6 +14,8 @@
 
 import type { Page } from 'playwright';
 import { logger } from '@/utils/core/logger';
+import type { CredentialKind } from '@/config/testing/credential-field-patterns';
+import { buildSecretPlaceholder } from '@/utils/interpolation/redact-secrets';
 import type { TestPipelineResult, ExecutedCommand } from '../pipeline/types';
 import { ACTION_TO_INTENT_TYPE, type DiscoveredStep } from './types';
 import { LocatorPlanBuilder } from '@/services/testing/ui/preview/locator-plan-builder.service';
@@ -41,6 +43,18 @@ export const VALUE_CARRYING_ACTIONS: ReadonlySet<TestAction> = new Set<TestActio
   'fill', 'select', 'setRange', 'selectDate',
 ]);
 
+/**
+ * Maps an injected credential kind → the name of the key inside a bound
+ * `secret` resource, so a credential fill can be frozen as
+ * `{{secrets.<key>}}` instead of being dropped. Return undefined to keep the
+ * previous (value-less) behaviour for that kind.
+ *
+ * Supplied ONLY by editor authoring (`EditorIterativeAuthorService`) when the
+ * caller bound a credential; exploration never passes it, so exploration's
+ * output is unchanged.
+ */
+export type SecretKeyForKind = (kind: CredentialKind) => string | undefined;
+
 /** Extract URL from a formatted snapshot text ("URL: https://… \n Title: …"). */
 function extractUrlFromSnapshot(snapshot: string): string {
   const match = snapshot.match(/URL:\s*(\S+)/i);
@@ -56,6 +70,7 @@ export function commandToStep(
   executed: ExecutedCommand,
   stepNumber: number,
   pageUrl: string,
+  secretKeyForKind?: SecretKeyForKind,
 ): DiscoveredStep | null {
   const cmd = executed.command;
   // result.output is the human-readable description ('Clicked "CONTACT" (a)').
@@ -63,17 +78,52 @@ export function commandToStep(
   const output = (executed.result.output || '').replace(/\s*\[POST-ACTION:.*$/s, '').trim();
 
   switch (cmd.name) {
-    case 'fill_field':
+    case 'fill_field': {
+      // Credential fills: freeze a `{{secrets.<key>}}` placeholder — NEVER the
+      // literal (CLAUDE.md invariant #10). We key off the credential kind the
+      // executor ACTUALLY injected, not off `cmd.args.value` (which is the LLM's
+      // throwaway placeholder by design — see the executor prompt's CREDENTIALS
+      // block). No binding, or a field we couldn't identify as a credential →
+      // drop the value, exactly as before.
+      const injectedKind = executed.result.injectedCredentialKind;
+      const secretKey = injectedKind ? secretKeyForKind?.(injectedKind) : undefined;
+      // buildSecretPlaceholder returns undefined for a key that wouldn't
+      // resolve — better to drop the value than to freeze a placeholder replay
+      // would type verbatim into the app's password field.
+      const sensitiveValue = secretKey ? buildSecretPlaceholder(secretKey) : undefined;
+      if (secretKeyForKind && injectedKind && !sensitiveValue) {
+        // Otherwise this is a silent value-drop: replay leaves the field empty
+        // and 401s with nothing in the logs explaining why.
+        logger.warn('[PIPELINE_STEP_EXTRACTOR] Credential injected but no usable secret key — value dropped', {
+          kind: injectedKind,
+          ref: cmd.args.ref,
+          hadKey: !!secretKey,
+        });
+      }
+      // An injected credential is GROUND TRUTH and outranks the model's
+      // `is_sensitive` flag. The executor injects whenever the field CLASSIFIES
+      // as a credential, regardless of that flag, so keying on the flag alone
+      // is wrong in both directions:
+      //   - flag false + credential injected → we'd persist the model's
+      //     throwaway literal and replay would type gibberish into a password
+      //     box (silently reintroducing the 401 this rung fixes);
+      //   - worse, if the model copied a credential it read off the page into
+      //     that arg, we'd persist a REAL credential in plaintext.
+      // So: a credential field never keeps `cmd.args.value`. Without a binding
+      // it loses its value (previous behaviour); with one it gets the
+      // placeholder.
+      const isCredential = !!injectedKind || !!cmd.args.is_sensitive;
       return {
         stepNumber,
-        description: output || `Fill "${cmd.args.ref}" with ${cmd.args.is_sensitive ? '[credential]' : `"${cmd.args.value}"`}`,
+        description: output || `Fill "${cmd.args.ref}" with ${isCredential ? '[credential]' : `"${cmd.args.value}"`}`,
         action: 'fill',
         ref: cmd.args.ref,
-        value: cmd.args.is_sensitive ? undefined : cmd.args.value,
-        isSensitive: cmd.args.is_sensitive,
+        value: isCredential ? sensitiveValue : cmd.args.value,
+        isSensitive: isCredential,
         pageUrl,
         expectedOutcome: 'Field is filled with the value',
       };
+    }
     case 'click_element':
       return {
         stepNumber,
@@ -274,6 +324,7 @@ export async function attachCompiledPlan(
 export async function extractDiscoveredSteps(
   result: TestPipelineResult,
   page?: Page,
+  secretKeyForKind?: SecretKeyForKind,
 ): Promise<{ steps: DiscoveredStep[]; stepsByRound: Array<number | null> }> {
   const steps: DiscoveredStep[] = [];
   const stepsByRound: Array<number | null> = [];
@@ -286,7 +337,7 @@ export async function extractDiscoveredSteps(
     for (const executed of round.commands) {
       if (!executed.result.success) continue;
 
-      const step = commandToStep(executed, stepNumber + 1, roundPageUrl);
+      const step = commandToStep(executed, stepNumber + 1, roundPageUrl, secretKeyForKind);
       if (step) {
         step.stepNumber = ++stepNumber;
         await attachCompiledPlan(step, executed, roundPageUrl, page);
