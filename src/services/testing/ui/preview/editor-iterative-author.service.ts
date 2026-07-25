@@ -26,7 +26,13 @@ import { NetworkTracker } from '@/agent/core/lite/collectors/network-tracker';
 import { GoalDetector } from '@/agent/core/lite/analysis/goal-detector';
 import { TestPipeline, type PipelineIntegrations } from '@/agent/core/lite/pipeline/test-pipeline';
 import type { PipelineConfig, ExecutionRound } from '@/agent/core/lite/pipeline/types';
-import { extractDiscoveredSteps, commandToStep } from '@/agent/core/lite/exploration/pipeline-step-extractor';
+import {
+  extractDiscoveredSteps,
+  commandToStep,
+  type SecretKeyForKind,
+} from '@/agent/core/lite/exploration/pipeline-step-extractor';
+import { KEY_RE as SECRET_KEY_RE } from '@/services/test-resource/adapters/secret.adapter';
+import { isBoundSecretPlaceholder } from '@/utils/interpolation/redact-secrets';
 import type { DiscoveredStep } from '@/agent/core/lite/exploration/types';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -38,6 +44,27 @@ const DEFAULT_MAX_ROUNDS = 12;
 /** Hard wall-clock cap for an authoring session. */
 const DEFAULT_TIMEOUT_MS = 4 * 60 * 1000;
 
+/**
+ * Binds the credentials used during authoring to a stored `secret` resource, so
+ * the authored test is REPRODUCIBLE: each credential fill is frozen as
+ * `{{secrets.<key>}}` and the test carries a `resource_bindings` entry that
+ * makes replay resolve the real value from the encrypted store.
+ *
+ * Only key NAMES live here — never credential values.
+ */
+export interface CredentialSecretBinding {
+  /** `test_resources` row id (kind `secret`) holding the credential values. */
+  resourceId: string;
+  /** Key inside the secret's `values` map for an email field. */
+  emailKey?: string;
+  /** Key for a password field. */
+  passwordKey?: string;
+  /** Key for a username field. Falls back to `emailKey` (mirrors the executor). */
+  usernameKey?: string;
+  /** Key for a phone field. */
+  phoneKey?: string;
+}
+
 export interface AuthorTestParams {
   previewSessionId: string;
   userId: string;
@@ -45,6 +72,12 @@ export interface AuthorTestParams {
   goal: string;
   /** Optional credentials surfaced to the Planner (never frozen into plans). */
   credentials?: PipelineConfig['credentials'];
+  /**
+   * Bind those credentials to a stored `secret` so the authored steps freeze
+   * `{{secrets.*}}` placeholders instead of dropping the value. Without it,
+   * credential fills stay value-less (previous behaviour).
+   */
+  credentialSecret?: CredentialSecretBinding;
   maxRounds?: number;
   timeoutMs?: number;
 }
@@ -63,6 +96,13 @@ export interface AuthorTestResult {
   reason: string;
   /** Set when authoring could not start at all (no session / busy). */
   error?: string;
+  /**
+   * Resource bindings the authored test needs to replay. Present only when
+   * `credentialSecret` was supplied AND at least one credential was actually
+   * frozen — persist these onto the test case's `resource_bindings` or replay
+   * will resolve the `{{secrets.*}}` placeholders to nothing.
+   */
+  resourceBindings?: Array<{ kind: 'secret'; resource_id: string; required: boolean }>;
 }
 
 export class EditorIterativeAuthorService {
@@ -177,8 +217,38 @@ export class EditorIterativeAuthorService {
 
       const result = await pipeline.run(goal, config);
 
+      // Credential kind → secret key. Built from key NAMES only; no credential
+      // value is read or compared here. `username` falls back to the email key,
+      // mirroring the executor's own `username || email || phone` cascade.
+      const cs = params.credentialSecret;
+      const secretKeyForKind: SecretKeyForKind | undefined = cs
+        ? (kind) => {
+          const key = (() => {
+            switch (kind) {
+              case 'password': return cs.passwordKey;
+              case 'email': return cs.emailKey;
+              case 'username': return cs.usernameKey ?? cs.emailKey;
+              case 'phone': return cs.phoneKey;
+              default: return undefined;
+            }
+          })();
+          // Reject a key the secret adapter would never have accepted. A typo'd
+          // or malformed key produces a placeholder that resolves to nothing,
+          // and replay then TYPES `{{secrets.…}}` into the live app's password
+          // field — leaking the key name to that app's logs. Dropping the value
+          // fails the test loudly instead.
+          if (key && !SECRET_KEY_RE.test(key)) {
+            logger.warn('[EDITOR_AUTHOR] Ignoring malformed secret key — not freezing a placeholder', {
+              kind, key,
+            });
+            return undefined;
+          }
+          return key;
+        }
+        : undefined;
+
       // Rounds → grounded steps + compiled plans (shared with exploration).
-      const { steps: extractedSteps } = await extractDiscoveredSteps(result, page);
+      const { steps: extractedSteps } = await extractDiscoveredSteps(result, page, secretKeyForKind);
 
       // Editor-scoped guard (NOT in the shared toIntentSteps, which exploration
       // also uses): drop a terminal `verify` step (from mark_done) that carries
@@ -203,12 +273,26 @@ export class EditorIterativeAuthorService {
       });
 
       const endUrl = (() => { try { return page.url(); } catch { return startUrl; } })();
+
+      // Only claim a binding if a credential was actually frozen — an unused
+      // binding would make replay demand a resource the steps never reference.
+      // Anchored check, not `startsWith`: a malformed key can yield something
+      // like `{{secrets.a}}b}}`, which is NOT resolvable. Counting that would
+      // emit a required binding for a step that references no secret.
+      const frozeCredential = steps.some(
+        (s) => s.isSensitive && isBoundSecretPlaceholder(s.value),
+      );
+      const resourceBindings = cs && frozeCredential
+        ? [{ kind: 'secret' as const, resource_id: cs.resourceId, required: true }]
+        : undefined;
+
       logger.info('[EDITOR_AUTHOR] Authoring finished', {
         previewSessionId,
         success: result.success,
         roundsExecuted: result.roundsExecuted,
         stepCount: steps.length,
         reason: result.reason,
+        boundCredentialSecret: !!resourceBindings,
       });
 
       return {
@@ -219,6 +303,7 @@ export class EditorIterativeAuthorService {
         roundsExecuted: result.roundsExecuted,
         durationMs: Date.now() - startedAt,
         reason: result.reason,
+        ...(resourceBindings ? { resourceBindings } : {}),
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

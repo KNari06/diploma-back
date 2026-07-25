@@ -18,10 +18,7 @@ import { convertIntentStepsToCommands } from '@/services/testing/ui/preview/inte
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import type { TestJobData } from '@/types';
 import type { FixtureRunOutcome } from './fixture-types';
-
-// Valid-format throwaway UUIDs (mirror replay.ts) — the run path scopes by UUID
-// but writes no real rows (workspace resolves to 'unknown', no userId → no credits).
-const EVAL_PROJECT_ID = '00000000-0000-4000-8000-000000000003';
+import { EVAL_PROJECT_ID, EVAL_USER_ID } from './eval-identity';
 
 /** Reset all fixture flags to the clean baseline. */
 export async function resetFixtureFlags(fixtureBaseUrl: string): Promise<void> {
@@ -46,15 +43,27 @@ export async function setFixtureFlag(fixtureBaseUrl: string, flagId: string, on:
 export async function runStepsOnFixture(
   steps: IntentStep[],
   startUrl: string,
+  opts: { resourceBindings?: TestJobData['resourceBindings'] } = {},
 ): Promise<FixtureRunOutcome> {
   const commands = convertIntentStepsToCommands(steps, startUrl);
+
+  // A credential-bearing test carries `{{secrets.*}}` placeholders, which only
+  // resolve if the bound resource is applied. `applyBindingsToContext` loads it
+  // via `loadDecrypted(resourceId, userId)`, so the userId MUST accompany the
+  // bindings — and MUST be the id the secret was seeded under.
+  const hasBindings = !!opts.resourceBindings?.length;
 
   const testData: TestJobData = {
     testId: randomUUID(),
     url: startUrl,
     browser: 'chrome', // → chromium (browser-pool.ts map); headless by default
     projectId: EVAL_PROJECT_ID,
-    // NO userId → skips per-step credit deduction (test-executor.ts:856).
+    // userId ONLY when bindings need it. Without bindings we keep it absent so
+    // the run skips per-step credit deduction (test-executor.ts:856). WITH
+    // bindings the deduction runs and provisions `user_credits` /
+    // `credit_transactions` rows for the synthetic user — `cleanupEvalUserBilling`
+    // removes them in the runner's finally.
+    ...(hasBindings ? { userId: EVAL_USER_ID, resourceBindings: opts.resourceBindings } : {}),
     commands,
     intelligentMode: false, // → replay path (isReplayMode, test-executor.ts:273)
     mode: 'lite',

@@ -178,8 +178,18 @@ steps) → `toIntentSteps` → `convertIntentStepsToCommands` → `executePlaywr
   checkout golden test goes RED on `sf2-discount` (false-green correctly caught).
   A false-green here is a rig REGRESSION → non-zero exit.
 - **Stage 2** (`--author`, LLM): the agent authors against the live headless
-  preview (`startSession` → `EditorIterativeAuthorService.authorTest`, no DB/Redis/
-  WS gate; confirm-gate bypassed by calling the service directly). Measures the
+  preview (`startSession` → `EditorIterativeAuthorService.authorTest`; confirm-gate
+  bypassed by calling the service directly). **Needs a DB** since rung 4: a
+  credential-bearing scenario seeds a real encrypted `secret` (so it needs
+  `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` and at least one row in `projects`
+  to satisfy the FK) and a bound run also provisions `user_credits` /
+  `credit_transactions` for the synthetic eval user (passing a `userId` is what
+  `loadDecrypted` authorizes on, and it also switches on per-step billing). The
+  secret and `user_credits` are deleted in the runner's `finally`;
+  **`credit_transactions` rows remain** — that ledger is append-only by DB
+  trigger, which we deliberately don't work around. They're inert (synthetic
+  all-zeros user id, no `user_credits` row left) but they accumulate a few rows
+  per bound run. An unbound run still writes nothing. Measures the
   REAL agent under production conditions — the only valid way (running the
   headless-`about:blank`-authored steps would measure resolver-rescue, not
   authoring; see gotcha #2).
@@ -202,7 +212,26 @@ running" payoff:**
    replay types nothing → login 401s → the authored test first-run-FAILS. This
    *run-proves* the credential-store gap (rung-1). The eval labels this honestly
    (credential-store gap, not an authoring defect); opt-in credential injection is
-   a deferred follow-up.
+   a deferred follow-up. **← superseded by the rung-4 update below.**
+
+**Rung-4 update (2026-07-25) — authored login tests now REPLAY GREEN.** Finding 2
+above is **closed**. A credential fill is frozen as `{{secrets.<key>}}` bound to a
+stored encrypted `secret` (`seed-eval-credential.ts` seeds the fixture's demo
+login through the real `createResource`), the authored test carries
+`resourceBindings`, and replay resolves the value through the existing
+`applyBindingsToContext` → `runVariables` → `resolvePlaceholders` path.
+`fx-login-happy` went from 401 to **first-run PASS**, with the credential
+redacted (`"value": "***"`) in the run logs.
+
+Two bugs this run-proof caught that unit tests could not:
+- `secretAdapter.apply` read `config.values` instead of `sensitive.values`, so
+  **`{{secrets.X}}` had never resolved at runtime** — and the existing unit test
+  encoded the same wrong assumption.
+- the standalone script had an EMPTY adapter registry (the rung-1 lesson,
+  repeating) → `No adapter registered for resource kind 'secret'`.
+
+The honesty note is now conditional: it only blames the substrate when no binding
+was emitted, or when a bound run errored before the secret applied.
 
 **Rung-3 update (2026-07-24) — the agent now authors a DETERMINISTIC assertion.**
 The above caveat is **superseded** for the editor path. The lite Executor gained a

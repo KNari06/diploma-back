@@ -29,6 +29,13 @@ import { resetFixtureFlags, setFixtureFlag, runStepsOnFixture } from './fixture-
 import { authorOnFixture } from './author-on-fixture';
 import { scoreFixtureRun, aggregateFixture } from './fixture-scoring';
 import type { FixtureScenario, FixtureScore } from './fixture-types';
+import { registerBuiltinResourceAdapters } from '@/services/test-resource';
+import {
+  seedEvalCredential,
+  deleteEvalCredential,
+  cleanupEvalUserBilling,
+  type SeededCredential,
+} from './seed-eval-credential';
 
 const fixtureServer = require('./fixture/server') as {
   start: (port?: number) => Promise<Server>;
@@ -58,6 +65,7 @@ async function scoreScenario(
   scenario: FixtureScenario,
   baseUrl: string,
   author: boolean,
+  seededCredential?: SeededCredential,
 ): Promise<FixtureScore> {
   const startUrl = `${baseUrl}${scenario.startPath}`;
   const hasFlagPairing = !!scenario.breaksUnderFlag;
@@ -66,9 +74,12 @@ async function scoreScenario(
   let steps = scenario.goldenSteps;
   let authoredAssertion: string | null | undefined;
   let assertKind: import('./author-on-fixture').AuthoredAssertKind | undefined;
+  // Rung-4: replay must apply the bound credential secret, or `{{secrets.*}}`
+  // resolves to nothing and a login test 401s.
+  let resourceBindings: import('@/types').TestJobData['resourceBindings'];
   if (author) {
     process.stdout.write(' authoring…');
-    const authored = await authorOnFixture(scenario, baseUrl);
+    const authored = await authorOnFixture(scenario, baseUrl, seededCredential);
     authoredAssertion = authored.authoredAssertion;
     assertKind = authored.assertKind;
     if (!authored.ok) {
@@ -80,12 +91,13 @@ async function scoreScenario(
       });
     }
     steps = authored.steps;
+    resourceBindings = authored.resourceBindings;
   }
 
   // Clean run.
   await resetFixtureFlags(baseUrl);
   process.stdout.write(' clean…');
-  const cleanOutcome = await runStepsOnFixture(steps, startUrl);
+  const cleanOutcome = await runStepsOnFixture(steps, startUrl, { resourceBindings });
 
   // Broken run (only if paired and the clean run passed — a red-on-clean test
   // isn't false-green-measurable, so don't spend a broken run on it).
@@ -93,7 +105,7 @@ async function scoreScenario(
   if (scenario.breaksUnderFlag && cleanOutcome.passed) {
     await setFixtureFlag(baseUrl, scenario.breaksUnderFlag.flagId, true);
     process.stdout.write(' broken…');
-    brokenOutcome = await runStepsOnFixture(steps, startUrl);
+    brokenOutcome = await runStepsOnFixture(steps, startUrl, { resourceBindings });
     await resetFixtureFlags(baseUrl);
   }
 
@@ -107,22 +119,41 @@ async function scoreScenario(
     assertKind,
   });
 
-  // Honesty label: a Stage-2 credential flow that first-run-fails often does so
-  // because the agent authored empty/placeholder credential values (the steps
-  // aren't self-contained) — the credential-store SUBSTRATE gap, NOT an
-  // authoring-flow defect. Flag it so the number is read correctly. Injecting a
-  // credential store for the eval is a deliberate follow-up (roadmap §6).
+  // Honesty label for credential flows. Rung 4 closed the substrate gap: a
+  // credential fill is now frozen as `{{secrets.*}}` against a stored secret and
+  // resolved at replay. So the note is only warranted when the binding is
+  // ABSENT — with a binding present, a red run is a genuine authoring/flow
+  // result and must NOT be excused as "substrate missing".
   if (author && scenario.credentials && !score.firstRunPass) {
+    // A binding being EMITTED is not proof it RESOLVED. If the run errored
+    // before/while applying it (missing resource, empty secret, FK cascade),
+    // that is still a substrate failure and must not be labelled a genuine
+    // authoring result — that mislabelling is the thing this note exists to
+    // prevent.
+    const bindingApplied = !!resourceBindings?.length && cleanOutcome.status !== 'error';
     score.notes.push(
-      'credential-bearing flow: authored steps carry no usable credential (the value is '
-      + 'empty/placeholder). This is the credential-store gap — the authored test is not '
-      + 'self-contained — NOT necessarily an authoring-flow defect. See LESSONS.',
+      bindingApplied
+        ? 'credential-bearing flow WITH a bound credential secret that applied cleanly — this '
+          + 'red is a real authoring/flow result, not the substrate gap.'
+        : resourceBindings?.length
+          ? 'credential-bearing flow: a binding was emitted but the run ERRORED — the secret may '
+            + 'not have applied (missing/empty resource). Treat as a substrate failure, not an '
+            + 'authoring result.'
+          : 'credential-bearing flow: the agent froze NO credential placeholder, so the authored '
+            + 'test is not self-contained (no binding emitted). Credential-store gap — check that '
+            + 'the login fields classify as credentials and that a secret was seeded.',
     );
   }
   return score;
 }
 
 async function main(): Promise<void> {
+  // Boot wiring the API/worker entrypoints do for us. A standalone script gets
+  // an EMPTY adapter registry, so seeding or applying a `secret` dies with
+  // "No adapter registered for resource kind 'secret'". Same class of bug as the
+  // empty skill registry that bit rung 1 — see LESSONS.
+  registerBuiltinResourceAdapters();
+
   const args = parseArgs(process.argv.slice(2));
   const scenarios = FIXTURE_SCENARIOS.filter((s) => !args.only || `${s.id} ${s.name}`.toLowerCase().includes(args.only));
   if (scenarios.length === 0) {
@@ -137,17 +168,40 @@ async function main(): Promise<void> {
   console.log(`\nTier-2b run-on-fixture — ${stage}`);
   console.log(`Fixture: ${baseUrl}   Scenarios: ${scenarios.length}\n`);
 
+  // Rung-4: put the fixture's demo login into the REAL encrypted credential
+  // store so authored login steps can bind to it and resolve at replay. Seeded
+  // once per run, only when a scenario actually needs credentials, and always
+  // deleted in the `finally` below.
+  const needsCredential = args.author && scenarios.some((s) => s.credentials);
+  let seededCredential: SeededCredential | undefined;
+  if (needsCredential) {
+    const withCreds = scenarios.find((s) => s.credentials)!;
+    seededCredential = await seedEvalCredential(withCreds.credentials!);
+    console.log(`Credential store: seeded secret ${seededCredential.resourceId} `
+      + `(keys: ${seededCredential.emailKey}, ${seededCredential.passwordKey})\n`);
+  }
+
   const scores: FixtureScore[] = [];
   try {
     for (const scenario of scenarios) {
       process.stdout.write(`▶ ${scenario.id.padEnd(22)}`);
-      const score = await scoreScenario(scenario, baseUrl, args.author);
+      // Only credential-bearing scenarios get the binding.
+      const score = await scoreScenario(
+        scenario, baseUrl, args.author,
+        scenario.credentials ? seededCredential : undefined,
+      );
       scores.push(score);
       const clean = score.firstRunPass ? 'PASS' : 'FAIL';
       const broken = score.falseGreenEligible ? (score.falseGreen ? ' ⚠ FALSE-GREEN' : ' ✓ caught') : '';
       process.stdout.write(`  → clean:${clean}${broken}\n`);
     }
   } finally {
+    if (seededCredential) {
+      await deleteEvalCredential(seededCredential.resourceId);
+      // A bound run bills per step, which provisions credit rows for the
+      // synthetic user. Drop them so repeat runs don't accrete billing debris.
+      await cleanupEvalUserBilling();
+    }
     await resetFixtureFlags(baseUrl).catch(() => { /* ignore */ });
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
