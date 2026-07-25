@@ -17,6 +17,22 @@ function buildResource(
   };
 }
 
+/**
+ * The shape `loadDecrypted` ACTUALLY returns: `values` was declared sensitive,
+ * so it round-trips through the encrypted envelope and comes back under
+ * `sensitive` — `config` stays empty. `buildResource` above models the
+ * hand-built/normalized shape instead; both must apply.
+ */
+function buildDecryptedResource(
+  values: Record<string, unknown>,
+): DecryptedResource<{ values: Record<string, string | number | boolean> }, Record<string, unknown>> {
+  return {
+    ...buildResource(values),
+    config: {} as never,
+    sensitive: { values },
+  };
+}
+
 function buildCtx(): ApplyContext {
   return {
     userId: 'u',
@@ -112,6 +128,22 @@ describe('secretAdapter.apply', () => {
     expect(ctx.runVariables.size).toBe(2);
   });
 
+  it('applies values from the DECRYPTED envelope — the real loadDecrypted shape', async () => {
+    // Regression guard. `values` is sensitive, so at runtime it arrives under
+    // `sensitive` and `config` is empty. Reading only `config.values` made
+    // apply() a silent no-op, so every `{{secrets.X}}` stayed unresolved and
+    // credential-bearing tests failed to authenticate.
+    const ctx = buildCtx();
+    await secretAdapter.apply(
+      ctx,
+      buildDecryptedResource({ login_email: 'demo@qait.dev', login_password: 'password' }),
+    );
+
+    expect(ctx.runVariables.get('secrets.login_email')).toBe('demo@qait.dev');
+    expect(ctx.runVariables.get('secrets.login_password')).toBe('password');
+    expect(ctx.runVariables.size).toBe(2);
+  });
+
   it('coexists with environment vars in the same Map (different prefix)', async () => {
     const ctx = buildCtx();
     ctx.runVariables.set('env.BASE_URL', 'https://stg.app.com');
@@ -129,13 +161,30 @@ describe('secretAdapter.apply', () => {
     expect(ctx.runVariables.size).toBe(1);
   });
 
-  it('does not throw on missing values (graceful no-op)', async () => {
+  it('THROWS when there are no values to apply, so a required binding fails loudly', async () => {
+    // Fails closed on purpose: the applier only escalates on a throw, so a
+    // silent no-op would report the binding as applied while every
+    // {{secrets.X}} stayed unresolved — how the config-vs-sensitive read bug
+    // hid for so long.
     const ctx = buildCtx();
-    await secretAdapter.apply(
-      ctx,
-      { ...buildResource({ X: 'x_long_enough' }), config: {} as never },
-    );
+    await expect(
+      secretAdapter.apply(
+        ctx,
+        { ...buildResource({ X: 'x_long_enough' }), config: {} as never, sensitive: {} },
+      ),
+    ).rejects.toThrow(/no values to apply/i);
     expect(ctx.runVariables.size).toBe(0);
+  });
+
+  it('prefers the decrypted envelope over config when both are present', async () => {
+    // Pins the `??` order. Flipping the operands would silently reintroduce the
+    // bug for DB-loaded secrets, and every other test would still pass.
+    const ctx = buildCtx();
+    await secretAdapter.apply(ctx, {
+      ...buildResource({ K: 'from_config' }),
+      sensitive: { values: { K: 'from_envelope' } },
+    });
+    expect(ctx.runVariables.get('secrets.K')).toBe('from_envelope');
   });
 });
 

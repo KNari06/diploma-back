@@ -24,12 +24,12 @@ import { getPreviewSessionService } from '@/services/testing/ui/preview/preview-
 import { EditorIterativeAuthorService } from '@/services/testing/ui/preview/editor-iterative-author.service';
 import { toIntentSteps } from '@/agent/core/lite/exploration/types';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
+import type { TestJobData } from '@/types';
 import type { FixtureScenario } from './fixture-types';
-
+import type { SeededCredential } from './seed-eval-credential';
 // Same synthetic ids for startSession AND authorTest (ownership is checked in the
-// in-process singleton). Valid-format UUIDs — no real rows are read/written.
-const EVAL_USER_ID = '00000000-0000-4000-8000-000000000001';
-const EVAL_PROJECT_ID = '00000000-0000-4000-8000-000000000003';
+// in-process singleton), and — critically — for the seeded credential's owner.
+import { EVAL_USER_ID, EVAL_PROJECT_ID } from './eval-identity';
 
 /** What kind of assertion the agent authored — the headline finding of this rung. */
 export type AuthoredAssertKind = 'deterministic' | 'ai_check' | 'none';
@@ -54,6 +54,13 @@ export interface AuthorOnFixtureResult {
   /** Why the loop stopped (goal met / blocked / timeout) or the start failure. */
   reason: string;
   error?: string;
+  /**
+   * Bindings the authored steps need to replay — present only when the agent
+   * actually froze a `{{secrets.*}}` credential against the seeded secret.
+   * Rung-4: without these, a credential-bearing test replays with unresolved
+   * placeholders and 401s (which is exactly what rung 2 measured).
+   */
+  resourceBindings?: TestJobData['resourceBindings'];
 }
 
 /**
@@ -64,6 +71,7 @@ export interface AuthorOnFixtureResult {
 export async function authorOnFixture(
   scenario: FixtureScenario,
   fixtureBaseUrl: string,
+  seededCredential?: SeededCredential,
 ): Promise<AuthorOnFixtureResult> {
   const sessionService = getPreviewSessionService();
   const startUrl = `${fixtureBaseUrl}${scenario.startPath}`;
@@ -86,6 +94,20 @@ export async function authorOnFixture(
       userId: EVAL_USER_ID,
       goal: scenario.goal,
       credentials,
+      // Bind the same credentials to the stored secret, so each credential fill
+      // is frozen as `{{secrets.<key>}}` and the authored test is replayable.
+      // The fixture's email input is `type="email"` → classifies as `email`;
+      // `usernameKey` covers a form that classifies as `username` instead.
+      ...(seededCredential
+        ? {
+          credentialSecret: {
+            resourceId: seededCredential.resourceId,
+            emailKey: seededCredential.emailKey,
+            usernameKey: seededCredential.emailKey,
+            passwordKey: seededCredential.passwordKey,
+          },
+        }
+        : {}),
     });
 
     if (!result.success) {
@@ -131,6 +153,7 @@ export async function authorOnFixture(
       deterministicAsserts,
       roundsExecuted: result.roundsExecuted,
       reason: result.reason,
+      ...(result.resourceBindings ? { resourceBindings: result.resourceBindings } : {}),
     };
   } catch (err) {
     return {
