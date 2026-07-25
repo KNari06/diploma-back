@@ -47,6 +47,33 @@ const MASK = '***';
 const MIN_REDACT_LENGTH = 4;
 
 /**
+ * A step value bound to a stored secret: exactly `{{secrets.<key>}}`, nothing
+ * around it. The key grammar matches `resolvePlaceholders`' own
+ * `[\w.-]+` — a value that does NOT match must be treated as an unbound
+ * literal and masked, so this is deliberately anchored (fails closed).
+ *
+ * Single source for the three places that need this shape: the authoring
+ * freeze, the `toIntentSteps` mask guard, and the binding-emission check.
+ */
+const SECRET_PLACEHOLDER_RE = /^\{\{secrets\.[\w.-]+\}\}$/;
+
+/** Is this value a `{{secrets.<key>}}` placeholder bound to a stored secret? */
+export function isBoundSecretPlaceholder(value: unknown): value is string {
+  return typeof value === 'string' && SECRET_PLACEHOLDER_RE.test(value);
+}
+
+/**
+ * Build the placeholder frozen into an authored credential step. Returns
+ * undefined for a key that could not round-trip through
+ * `isBoundSecretPlaceholder` / `resolvePlaceholders` — freezing one of those
+ * would make replay TYPE the literal `{{secrets.…}}` into the app under test.
+ */
+export function buildSecretPlaceholder(key: string): string | undefined {
+  const candidate = `{{${SECRET_PREFIX}${key}}}`;
+  return isBoundSecretPlaceholder(candidate) ? candidate : undefined;
+}
+
+/**
  * Replace every occurrence of every `secrets.*` value in `runVariables`
  * with `***`. Returns the input unchanged when nothing to mask.
  *

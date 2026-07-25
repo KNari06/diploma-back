@@ -12,6 +12,7 @@
  * - "Blackboard" = Shared mutable state between all agents
  */
 
+import type { CredentialKind } from '@/config/testing/credential-field-patterns';
 import type { AICommand, LiteSnapshot, LiteElement } from '../lite-types';
 // Type-only import (erased at compile time → no runtime cycle) for the overlay
 // dismissal record the blackboard accumulates.
@@ -66,6 +67,16 @@ export interface CommandResult {
    * second resolution pass. Undefined for non-targeting / failed commands.
    */
   resolvedElement?: LiteElement;
+  /**
+   * Which credential kind the executor actually injected into this fill
+   * (`overrideCredentialFillValue`). Set ONLY when a real credential replaced
+   * the LLM's throwaway placeholder. Authoring reads it to freeze the matching
+   * `{{secrets.<key>}}` placeholder into the persisted step, so the frozen
+   * placeholder and the injected value agree by construction. Undefined when
+   * the field wasn't identified as a credential — such a field is never frozen
+   * as one.
+   */
+  injectedCredentialKind?: CredentialKind;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -22,6 +22,7 @@ import { logger } from '@/utils/core/logger';
 import type { Page } from 'playwright';
 import { buildSnapshotSummary } from '../analysis/ai-goal-evaluator';
 import { isDownloadText, isFileUploadTarget, isPaymentContext } from '../analysis/clarification-gates';
+import type { CredentialKind } from '@/config/testing/credential-field-patterns';
 import { classifyField } from '../analysis/field-classifier';
 import type { GoalDetector } from '../analysis/goal-detector';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
@@ -730,7 +731,8 @@ export class CommandExecutor {
     };
 
     // Credential override: replace placeholder with real credentials
-    command = this.overrideCredentialFillValue(command);
+    const { command: overridden, injectedKind } = this.overrideCredentialFillValue(command);
+    command = overridden;
 
     const snapshot = this.blackboard.getCurrentPageSnapshot();
     if (!snapshot) {
@@ -746,6 +748,7 @@ export class CommandExecutor {
         success: true,
         output: `Filled ${fieldDesc} with ${is_sensitive ? '[CREDENTIALS]' : `"${value}"`}`,
         resolvedElement: element,
+        ...(injectedKind ? { injectedCredentialKind: injectedKind } : {}),
       };
     }
 
@@ -1590,16 +1593,35 @@ export class CommandExecutor {
    * Override fill value for credential fields.
    * SECURITY: Never sends real credentials to LLM — backend injects correct values.
    * Uses shared field classifier (3-level hierarchy).
+   *
+   * Also reports WHICH credential kind was actually injected (`injectedKind`),
+   * but ONLY for a HIGH-confidence classification (Level 1: type / autocomplete
+   * / inputmode). Authoring uses that to freeze a `{{secrets.<key>}}`
+   * placeholder into the persisted step — keyed on the kind we really injected,
+   * so the frozen placeholder and the injected value agree by construction.
+   *
+   * The high-confidence restriction matters because authoring treats this as
+   * ground truth that OUTRANKS the model's `is_sensitive` flag. A medium/low
+   * match is a guess from a label or a field name — e.g. `CREDENTIAL_FALLBACK_
+   * PATTERNS.username` contains the token `name`, so a signup form's "Full name"
+   * classifies as `username`. Freezing that would permanently bind the account
+   * email to a name field and hide it from the editor. We still inject there
+   * (unchanged behaviour), we just don't rewrite the authored step.
+   *
+   * `injectedKind` is also undefined whenever we keep the LLM's throwaway
+   * placeholder, so a field we could not identify is never frozen as a credential.
    */
-  private overrideCredentialFillValue(command: AICommand): AICommand {
-    if (command.action !== 'fill' || !command.ref) return command;
-    if (!this.config.credentials) return command;
+  private overrideCredentialFillValue(
+    command: AICommand,
+  ): { command: AICommand; injectedKind?: CredentialKind } {
+    if (command.action !== 'fill' || !command.ref) return { command };
+    if (!this.config.credentials) return { command };
 
     const snapshot = this.blackboard.getCurrentPageSnapshot();
-    if (!snapshot) return command;
+    if (!snapshot) return { command };
 
     const element = snapshot.elements.find(el => el.ref === command.ref);
-    if (!element) return command;
+    if (!element) return { command };
 
     const classification = classifyField(element);
 
@@ -1608,31 +1630,34 @@ export class CommandExecutor {
     // - Classifier with LOW/MEDIUM confidence → trust LLM's is_sensitive, fall through to generic override
     if (command.isSensitive && !classification.kind) {
       if (classification.confidence === 'high') {
-        return command; // Classifier is confident this is NOT a credential field
+        return { command }; // Classifier is confident this is NOT a credential field
       }
       // Low/medium classifier confidence + LLM says sensitive → fall through to generic override at end
     }
 
-    if (!classification.kind && !command.isSensitive) return command;
+    if (!classification.kind && !command.isSensitive) return { command };
 
     const { credentials } = this.config;
+    // Only a Level-1 (type/autocomplete/inputmode) match is certain enough to
+    // rewrite the authored step — see the doc comment above.
+    const reportKind = classification.confidence === 'high';
 
     switch (classification.kind) {
       case 'password':
         logger.debug('[CMD_EXECUTOR] Overriding password field', { ref: command.ref });
-        return { ...command, value: credentials.password };
+        return { command: { ...command, value: credentials.password }, injectedKind: reportKind ? 'password' : undefined };
 
       case 'phone':
         if (credentials.phone) {
           logger.debug('[CMD_EXECUTOR] Overriding phone field', { ref: command.ref });
-          return { ...command, value: credentials.phone };
+          return { command: { ...command, value: credentials.phone }, injectedKind: reportKind ? 'phone' : undefined };
         }
         break;
 
       case 'email':
         if (credentials.email) {
           logger.debug('[CMD_EXECUTOR] Overriding email field', { ref: command.ref });
-          return { ...command, value: credentials.email };
+          return { command: { ...command, value: credentials.email }, injectedKind: reportKind ? 'email' : undefined };
         }
         break;
 
@@ -1640,7 +1665,7 @@ export class CommandExecutor {
         const usernameValue = credentials.username || credentials.email || credentials.phone;
         if (usernameValue) {
           logger.debug('[CMD_EXECUTOR] Overriding username field', { ref: command.ref });
-          return { ...command, value: usernameValue };
+          return { command: { ...command, value: usernameValue }, injectedKind: reportKind ? 'username' : undefined };
         }
         break;
       }
@@ -1658,7 +1683,7 @@ export class CommandExecutor {
       });
     }
 
-    return command;
+    return { command };
   }
 
   // ═══════════════════════════════════════════════════════════════════════

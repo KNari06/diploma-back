@@ -1501,7 +1501,13 @@ export class CommandExecutor {
             if (!passed) {
               throw new Error(`Text assertion failed for ${selector}: expected "${expectedText}", got "${actualText}"`);
             }
-            logger.info('Assertion passed: Text matches', { selector, expected: expectedText, actual: actualText });
+            // `actual` is live DOM text and `expected` may be a resolved
+            // secret — both go through the redactor (invariant #10).
+            logger.info('Assertion passed: Text matches', {
+              selector,
+              expected: this.redactString(expectedText),
+              actual: this.redactString(actualText || ''),
+            });
           };
 
           // Intent command path — compiled plan → LLM resolver → smart → self-heal
@@ -1553,7 +1559,13 @@ export class CommandExecutor {
             if (!valuePassed) {
               throw new Error(`Value assertion failed for ${selector}: expected "${expectedValue}", got "${actualValue}"`);
             }
-            logger.info('Assertion passed: Value matches', { selector, expected: expectedValue, actual: actualValue });
+            // `actual` is the field's live value — on a password input that IS
+            // the credential. Never log it raw (invariant #10).
+            logger.info('Assertion passed: Value matches', {
+              selector,
+              expected: this.redactString(expectedValue),
+              actual: this.redactString(actualValue),
+            });
           };
 
           // Intent command path
@@ -2127,7 +2139,11 @@ export class CommandExecutor {
         case 'aiCheck': {
           logger.info('[COMMAND_EXECUTOR] Executing aiCheck assertion', {
             stepId: isIntentCommand ? intentCommand.intentMeta?.stepId : undefined,
-            assertionText: isIntentCommand ? intentCommand.intentMeta?.assertionText : undefined,
+            // An authored assertion can quote page text that contains a
+            // credential (e.g. "Welcome back, <email>") — redact (invariant #10).
+            assertionText: isIntentCommand
+              ? this.redactString(intentCommand.intentMeta?.assertionText ?? '')
+              : undefined,
           });
 
           if (!isIntentCommand || !intentCommand.intentMeta?.assertionText) {
@@ -2218,6 +2234,10 @@ export class CommandExecutor {
               html,
               a11yTree,
               screenshotBase64,
+              // The assertion + page HTML go to a third-party LLM, and an
+              // authored assertion can quote page text containing a credential
+              // ("Welcome back, <email>"). Mask before it leaves the machine.
+              secretValues: this.getRedactValues(),
             });
 
             logger.info('[COMMAND_EXECUTOR] aiCheck evaluation completed', {
