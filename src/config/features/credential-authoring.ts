@@ -9,7 +9,13 @@ import { env } from '@/config/environment/env';
  * `{{secrets.<key>}}` into the steps so the SAVED test replays against the
  * encrypted store.
  *
- * Default OFF. Three surfaces read this, and they must agree — a flag that
+ * Default ON — set `CREDENTIAL_AUTHORING_ENABLED=false` to disable without a
+ * deploy. It shipped default-OFF so it could be enabled deliberately from the
+ * infra env, but that env lives in a separate repo, and a flag nobody can set
+ * leaves working code permanently dark. The path is opt-in by nature: it runs
+ * only when a user NAMES a saved login.
+ *
+ * Three surfaces read this, and they must agree — a flag that
  * gated only the handler would leave the prompts telling the model to use a
  * parameter the tool no longer accepts, turning a disabled feature into a loop
  * of failed tool calls:
@@ -27,8 +33,13 @@ import { env } from '@/config/environment/env';
  * redaction fix. The binding carry-through (draft cache → saved test case) is
  * also ungated: with the flag OFF nothing produces a binding, so it is inert.
  *
- * Keep OFF in production until `ENCRYPTION_SECRET` is a real value — see
- * `.claude/deferred/20260726-encryption-secret-production-key.md`.
+ * NOTE on `ENCRYPTION_SECRET`: stored credentials are encrypted with the schema
+ * default (a value public in this repo) until a real one is set — see
+ * `.claude/deferred/20260726-encryption-secret-production-key.md`. That is NOT
+ * caused by this feature and is not a reason to keep it off: users can already
+ * save secrets under Settings → Secrets, and `/test-resource` was never gated.
+ * This feature routes more credentials through that store, so it raises the
+ * priority of fixing the key — it does not create the exposure.
  */
 export const CredentialAuthoringFeature = {
   isEnabled(): boolean {
