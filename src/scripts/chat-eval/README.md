@@ -3,7 +3,7 @@
 Measuring and iterating on the **chat test-authoring agent** (the
 Planner→Executor→Reviewer pipeline in `src/api/chat/general/sub-agents/`).
 
-Companion to the plan: [`claude-plans/qait-agents-to-be-state-20260718.md`](../../../../claude-plans/qait-agents-to-be-state-20260718.md).
+Companion to the plan: [`.claude/plans/20260718-qait-agents-to-be-state.md`](../../../../.claude/plans/20260718-qait-agents-to-be-state.md).
 This file records what we *learned* building the observability + eval loop —
 the gotchas that cost time and the numbers that are easy to get wrong.
 
