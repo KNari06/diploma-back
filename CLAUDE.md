@@ -289,7 +289,7 @@ does **NOT** set it in prod. Local and prod are two separate places:
   Merge to the branch the infra pipeline watches → it runs `terraform plan` →
   `apply` → the Container App rolls a new revision with the value. No image rebuild.
 
-**The trap (see [../LESSONS.md](../LESSONS.md)):** a feature gated by a
+**The trap (see [ship the switch, not just the code](../.claude/lessons/20260615-ship-the-switch-not-just-the-code.md)):** a feature gated by a
 default-off flag is **dark in prod until the flag is set in that shared `.env`** —
 having it `true` in your local `.env` proves nothing about prod. "Done" isn't done
 until the prod value is wired there. This is exactly how the companion relay shipped
