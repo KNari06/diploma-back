@@ -1,4 +1,5 @@
-import { mapSource, resolvePlaceholders } from '@/utils/interpolation/resolve-placeholders';
+import { mapSource } from '@/utils/interpolation/resolve-placeholders';
+import { interpolateCommandPlaceholders } from '@/utils/interpolation/interpolate-command';
 import { env, isDevelopment } from '@/config/environment/env';
 import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
@@ -892,18 +893,15 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                 mapSource('extractedData', scratchpadData),
                 mapSource('runVariables', runVariables ?? null),
               ];
-              // PlaywrightCommand is a discriminated union; rather than
-              // type-narrow per branch we adopt the same `as any` style the
-              // pre-refactor code used. resolvePlaceholders is a no-op for
-              // non-string inputs so we don't need to gate by typeof here,
-              // but doing so still avoids unnecessary object reshuffling.
-              const cmd = command as any;
-              if (typeof cmd.value === 'string') cmd.value = resolvePlaceholders(cmd.value, sources);
-              if (typeof cmd.assertionText === 'string') cmd.assertionText = resolvePlaceholders(cmd.assertionText, sources);
-              if (typeof cmd.url === 'string') cmd.url = resolvePlaceholders(cmd.url, sources);
-              if (cmd.intentMeta && typeof cmd.intentMeta.value === 'string') {
-                cmd.intentMeta.value = resolvePlaceholders(cmd.intentMeta.value, sources);
-              }
+              // Single helper over the full command field set — including the
+              // two assertion channels the CONVERTER actually writes
+              // (`intentMeta.assertionText` for ai_check, `assertion.expected`
+              // for a deterministic assert). Substituting only the top-level
+              // fields left a `{{secrets.*}}` assertion unresolved here while
+              // the editor paths (preview-step-apply / preview-run) resolved it
+              // at the IntentStep level — so such a test passed in the editor
+              // and false-RED'd in background replay.
+              interpolateCommandPlaceholders(command as object, sources);
             }
 
             // Execute command via CommandExecutor

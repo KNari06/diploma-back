@@ -1903,7 +1903,14 @@ export class CommandExecutor {
                   const exp = String(command.assertion.expected || '');
                   const op = command.assertion.operator || 'contains';
                   if (!this.compareValues(txt || '', exp, op)) {
-                    throw new Error(`Text assertion failed: expected "${exp}", got "${txt}"`);
+                    // Both sides can carry a resolved `secrets.*` value: the
+                    // expectation after interpolation, and the page text an
+                    // app renders back ("Welcome back, <email>"). This message
+                    // reaches logs and the persisted step error — redact it
+                    // (Hard invariant #10).
+                    throw new Error(
+                      `Text assertion failed: expected "${this.redactString(exp)}", got "${this.redactString(txt || '')}"`,
+                    );
                   }
                   break;
                 }
@@ -1913,7 +1920,11 @@ export class CommandExecutor {
                   const expVal = String(command.assertion.expected || '');
                   const opVal = command.assertion.operator || '=';
                   if (!this.compareValues(val, expVal, opVal)) {
-                    throw new Error(`Value assertion failed: expected "${expVal}", got "${val}"`);
+                    // Same reasoning as the 'text' branch above — an input's
+                    // value assertion can compare a resolved credential.
+                    throw new Error(
+                      `Value assertion failed: expected "${this.redactString(expVal)}", got "${this.redactString(val)}"`,
+                    );
                   }
                   break;
                 }
@@ -2222,9 +2233,36 @@ export class CommandExecutor {
               }
             }
 
-            if (contextMode.includes('screenshot')) {
+            // A screenshot is the ONE artifact we cannot mask. When the
+            // assertion itself is about credential-bearing text (it resolved
+            // from `{{secrets.*}}`, so redacting changes it), sending the image
+            // both leaks the rendered credential to the vision model AND makes
+            // the check impossible to pass: the text prompt says `***` while
+            // the picture says `demo@qait.dev`, so the model correctly reports a
+            // mismatch. Evaluate such assertions from HTML + a11y, which ARE
+            // masked consistently on both sides.
+            const assertionCarriesSecret =
+              this.redactString(intentCommand.intentMeta.assertionText) !== intentCommand.intentMeta.assertionText;
+            if (contextMode.includes('screenshot') && !assertionCarriesSecret) {
               const screenshot = await this.page.screenshot({ type: 'jpeg', quality: 80, fullPage: false });
               screenshotBase64 = screenshot.toString('base64');
+            } else if (assertionCarriesSecret) {
+              // `aiContextMode` may legitimately be 'screenshot' alone, in which
+              // case html/a11y were never collected above — dropping the image
+              // too would send the judge a URL and nothing else, guaranteeing a
+              // false RED with no diagnosable cause. Collect the maskable
+              // channels instead of leaving it blind.
+              if (!html && !a11yTree) {
+                html = await buildSemanticHtmlFromPage(this.page, {
+                  assertionText: intentCommand.intentMeta.assertionText,
+                  tokenBudget: 8000,
+                  expandForNegative: true,
+                }).then((r) => r.html).catch(async () => (await this.page.content()).slice(0, 100 * 1024));
+              }
+              logger.info('[COMMAND_EXECUTOR] aiCheck screenshot skipped — assertion carries a secret', {
+                stepId: intentCommand.intentMeta.stepId,
+                substitutedHtml: !!html,
+              });
             }
 
             // Evaluate AI check

@@ -30,6 +30,16 @@ interface CachedDraftSteps {
    * derived from the steps themselves (first navigate URL, etc.).
    */
   suggestedName?: string;
+  /**
+   * Resource bindings the authored steps NEED in order to replay — currently
+   * the `secret` holding the credentials frozen as `{{secrets.*}}`.
+   *
+   * Server-side state on purpose: it never travels through the LLM, so a
+   * hallucinated `resource_id` can't reach the DB. Every save route must carry
+   * it onto the test case or the saved test resolves the placeholders to
+   * nothing and 401s — the authored draft works, the SAVED test doesn't.
+   */
+  resourceBindings?: Array<{ kind: 'secret'; resource_id: string; required: boolean }>;
 }
 
 /** TTL: 30 minutes — generous enough for slow human workflows */
@@ -53,7 +63,30 @@ export const DraftStepsCache = {
    * Overwrites any existing entry (e.g., when user modifies steps and re-runs).
    */
   set(chatSessionId: string, data: Omit<CachedDraftSteps, 'createdAt'>): void {
-    cache.set(chatSessionId, { ...data, createdAt: Date.now() });
+    // `resourceBindings` is PRESERVED across overwrites unless the caller
+    // supplies its own. Every other field is replaced as before.
+    //
+    // Why: authoring is what discovers the credential binding, but several
+    // other writers overwrite the same entry afterwards (qa_run_draft_steps
+    // re-running or tweaking the steps, the draft controller restoring after a
+    // failed save). Each builds a fresh object with no binding, so a plain
+    // replace silently drops it and the eventual save 401s — with nothing in
+    // the logs pointing at the overwrite.
+    // Preservation is scoped to the SAME user. One chat session is shared by a
+    // whole workspace (see the module header), so an unscoped carry-over hands
+    // user B's draft a binding to user A's resource — and `loadDecrypted`
+    // filters on `user_id`, so at replay a `required` binding resolves to
+    // nothing and THROWS, failing B's test at setup for a reason nothing in
+    // B's test explains.
+    const prev = cache.get(chatSessionId);
+    const inheritable = prev && prev.userId === data.userId ? prev.resourceBindings : undefined;
+    const resourceBindings = data.resourceBindings ?? inheritable;
+
+    cache.set(chatSessionId, {
+      ...data,
+      ...(resourceBindings ? { resourceBindings } : {}),
+      createdAt: Date.now(),
+    });
 
     // Lazy cleanup when map grows beyond threshold
     if (cache.size > CLEANUP_THRESHOLD) {
@@ -69,6 +102,7 @@ export const DraftStepsCache = {
       chatSessionId,
       stepCount: data.steps.length,
       startUrl: data.startUrl,
+      resourceBindingCount: resourceBindings?.length ?? 0,
     });
   },
 

@@ -325,7 +325,13 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
 
     return {
       pass: parsed.pass,
-      explanation: parsed.explanation || 'No explanation provided',
+      // The model's free text is an UNTRUSTED sink for secrets, not a safe one:
+      // the prompt is masked, but a screenshot cannot be, so a vision model can
+      // read a rendered credential off the page and quote it back here — from
+      // where it flows into the thrown error, the step's failure explanation and
+      // the persisted run report. Mask at this single choke point so every
+      // consumer inherits it (invariant #10).
+      explanation: maskSecrets(parsed.explanation || 'No explanation provided'),
       confidence: parsed.confidence,
       evaluationError: false,
       artifactsUsed,

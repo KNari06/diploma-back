@@ -351,6 +351,18 @@ const envSchema = z.object({
   // deploy flips this AND ops provisions a dedicated container + DB row.
   DEDICATED_MOBILE_EMULATOR_ENABLED: z.string().transform(v => v === 'true').default('false'),
 
+  // Credential-bound test authoring (ADR-0023). When ON, the chat agent may
+  // author a LOGIN test against a saved `secret`: the user names the login, the
+  // server injects the real values for the live authoring run, and the steps
+  // freeze `{{secrets.*}}` so the saved test replays. Default OFF — the tool
+  // stops advertising `credential_secret_name`, the prompts stop offering the
+  // path, and the handler refuses it, so behaviour matches pre-rung-5.
+  //
+  // Keep OFF in production until `ENCRYPTION_SECRET` is a real value: this
+  // feature is what makes customer logins flow into `test_resources.sensitive`
+  // as a routine action, and that envelope is only as strong as that key.
+  CREDENTIAL_AUTHORING_ENABLED: z.string().transform(v => v === 'true').default('false'),
+
   // Companion relay — per-user launch-and-go physical device support (ADR-0009).
   // COMPANION_TOKEN_SECRET: separate HMAC secret from RUNNER_USER_TOKEN_SECRET
   // (separate audience — a companion token must not be replayable as a runner
@@ -632,6 +644,33 @@ if (parsedEnv.NODE_ENV === 'development') {
   if (!parsedEnv.JWT_SECRET || !parsedEnv.API_KEY_SECRET) {
     console.error('❌ JWT_SECRET and API_KEY_SECRET are required in production');
     process.exit(1);
+  }
+}
+
+/**
+ * ENCRYPTION_SECRET derives the AES-256-GCM key protecting everything stored
+ * at rest and recoverable: `test_resources.sensitive` (login storageState,
+ * TOTP seeds, credential maps) and `test_credentials`. Running production on
+ * the schema default means every one of those envelopes is encrypted under a
+ * key that is public in this repo.
+ *
+ * WARN, not exit: a hard failure here would refuse to boot an environment
+ * that is already running on the default, and rotating the key makes anything
+ * already encrypted under it undecryptable. Setting the real value in the
+ * infra env + a data migration must come first — tracked as follow-up work.
+ * Until then this line is the loud, greppable signal that the hole is open.
+ */
+if (parsedEnv.NODE_ENV === 'production') {
+  const usingDefaultEncryptionKey =
+    !parsedEnv.ENCRYPTION_SECRET ||
+    parsedEnv.ENCRYPTION_SECRET === 'change-this-secret-in-production-minimum-32-characters';
+  if (usingDefaultEncryptionKey) {
+    console.error(
+      '❌ SECURITY: ENCRYPTION_SECRET is unset or still the built-in default in production. ' +
+      'Stored credentials and login state are encrypted with a publicly-known key. ' +
+      'Set a high-entropy ENCRYPTION_SECRET in the infra environment (qait-infra/azure/terraform/.env) — ' +
+      'note that rotating it makes existing encrypted rows undecryptable, so plan the migration.',
+    );
   }
 }
 

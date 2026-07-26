@@ -1,4 +1,27 @@
 import type { TrackedPlanStep } from '../types';
+import { CredentialAuthoringFeature } from '@/config/features/credential-authoring';
+
+/**
+ * The GROUNDING credentials guidance, in both flag states.
+ *
+ * Kept as two explicit blocks rather than one block with a conditional
+ * sentence: with the feature OFF the model must not merely avoid the parameter,
+ * it must fall back to the pre-rung-5 behaviour (ask, or draft with
+ * placeholders and do not run). A half-edited prompt is how a disabled feature
+ * turns into a loop of refused tool calls.
+ */
+const CREDENTIALS_BLOCK_ON = `- CREDENTIALS are the trap. There IS a credential store: logins saved under Settings → Secrets, referenced BY NAME. You never see or type the values — the server injects them.
+  • If the user named a saved login (or you already know which one this test uses): call qa_author_test_iteratively with credential_secret_name set to that name. The server injects the stored credentials for the live run and freezes {{secrets.*}} into the steps, so the SAVED test replays for real.
+  • If you do NOT know which one: ASK one specific question — "Which saved login should this test use?" (This is a required, specific question — NOT the vague kind banned above.) If the name you pass is unknown, the tool answers with the saved logins that DO exist — ask again using those, do not guess.
+  • If the project has NO saved login at all: say so, and draft via qa_run_draft_steps with explicit {{secrets.*}} placeholder values ({{secrets.login_email}}, {{secrets.login_password}}) and confirm=false (do NOT run), telling the user to add the login under Settings → Secrets before the test can pass. Use the secrets.* namespace — it is the one resolvePlaceholders + secret redaction recognise; a made-up namespace never resolves and is never masked.
+  • NEVER put a real credential VALUE in a step, even one the user typed in chat. Bind by name.`;
+
+const CREDENTIALS_BLOCK_OFF = `- CREDENTIALS are the trap, and this deployment cannot bind a test to a stored login. If the user did NOT supply the login to use:
+  • Do NOT call qa_author_test_iteratively for it — you cannot execute a login flow live without real credentials, so it would fabricate or fail.
+  • PREFER to ASK one specific question: "Which account should this test log in with?" (This is a required, specific question — NOT the vague kind banned above.)
+  • OR draft via qa_run_draft_steps with explicit {{secrets.*}} placeholder values ({{secrets.login_email}}, {{secrets.login_password}}) and confirm=false (do NOT run), then tell the user to provide real credentials before the test can pass. Use the secrets.* namespace — it is the one resolvePlaceholders + secret redaction recognise; a made-up namespace never resolves and is never masked.
+  • NEVER put a real credential VALUE in a step, even one the user typed in chat.`;
+
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -151,10 +174,7 @@ You are operating inside the editor with a live browser preview. The user can se
 
 GROUNDING — NEVER FABRICATE INPUT VALUES (CRITICAL):
 - Every value you put in a step (login email/password, IDs, tokens, order/account numbers, any specific data) MUST come from the user, the live DOM context, or an existing saved resource. NEVER invent a realistic-looking literal for data you were not given — no "valid.email@example.com", "test@example.com", "password123", or made-up IDs.
-- CREDENTIALS are the trap, and there is NO credential store to draw from yet. If the user did NOT supply the login to use:
-  • Do NOT call qa_author_test_iteratively for it — you cannot execute a login flow live without real credentials, so it would fabricate or fail.
-  • PREFER to ASK one specific question: "Which account should this test log in with — send the email and password, or the name of a saved login?" (This is a required, specific question — NOT the vague kind banned above.)
-  • OR draft via qa_run_draft_steps with explicit {{secrets.*}} placeholder values ({{secrets.login_email}}, {{secrets.login_password}}) and confirm=false (do NOT run), then tell the user to provide real credentials before the test can pass. Use the secrets.* namespace — it is the one resolvePlaceholders + secret redaction recognise; a made-up namespace never resolves and is never masked.
+${CredentialAuthoringFeature.isEnabled() ? CREDENTIALS_BLOCK_ON : CREDENTIALS_BLOCK_OFF}
 - Same rule for ANY ungrounded input (unknown IDs, API keys, unspecified data): ask, or use a {{placeholder}} — never a fabricated literal.
 - A fabricated credential yields a structurally-perfect test that CANNOT actually run (a false-green). Asking is better than a test that silently can't pass.
 
