@@ -90,7 +90,11 @@ CREATE POLICY mas_project_owner_read
     EXISTS (
       SELECT 1 FROM projects p
       WHERE p.id = mobile_app_skeletons.project_id
-        AND p.user_id = auth.uid()
+        -- projects.user_id is TEXT in this schema, so auth.uid() (uuid) MUST be
+        -- cast or the whole migration fails with "operator does not exist:
+        -- text = uuid". Same convention as project_kb_chunks and
+        -- mobile_test_results.
+        AND p.user_id = (auth.uid())::text
     )
   );
 
