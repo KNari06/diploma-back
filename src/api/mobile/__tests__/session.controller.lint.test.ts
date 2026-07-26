@@ -33,6 +33,9 @@ jest.mock('@/services/storage/mobile-app-storage.service', () => ({ MobileAppSto
 jest.mock('@/services/mobile/permission-policy.service', () => ({ applyProjectPolicyToSession: jest.fn() }));
 // Dynamically imported inside lintSession — identity normalizer keeps input intact.
 jest.mock('@/services/mobile/normalize-description', () => ({ normalizeMobileDescription: (s: string) => s }));
+// NOTE: `@/services/mobile/lint-action-type` is deliberately NOT mocked — the
+// step-kind → actionType mapping is the behaviour two of these tests assert,
+// and stubbing it would let them pass against a broken map.
 
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
@@ -52,11 +55,11 @@ function makeRes() {
   return res;
 }
 
-function makeReq() {
+function makeReq(stepType = 'tap') {
   return {
     user: { id: 'user-1' },
     params: { sessionId: 'sess-1' },
-    body: { stepDraft: { type: 'tap', elementDescription: 'Order' } },
+    body: { stepDraft: { type: stepType, elementDescription: 'Order' } },
   } as any;
 }
 
@@ -119,6 +122,28 @@ describe('lintSession editor-trace contract', () => {
       { type: 'FlutterView', bounds: { left: 0, top: 0, right: 10, bottom: 10 } },
     ]);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, status: 'resolved' }));
+  });
+
+  /**
+   * `extract_text` READS an element; it never taps. Falling to the `'tap'`
+   * default sent the runner into clickable-only resolution, which refuses a
+   * plain text node outright ("vision NO MATCH: not clickable" — reproduced
+   * live on a Flutter screen). The step kind must reach the runner as itself.
+   */
+  it('sends extract_text as its own action type, not the tap default', async () => {
+    lintElement.mockResolvedValue({ status: 'resolved', boundingBox: { x: 0, y: 0, width: 10, height: 10 } });
+
+    await lintSession(makeReq('extract_text'), makeRes());
+
+    expect(lintElement).toHaveBeenCalledWith('sess-1', 'Order', 'extract_text', undefined, { userId: 'user-1' });
+  });
+
+  it('still defaults an unmapped step kind to tap', async () => {
+    lintElement.mockResolvedValue({ status: 'resolved', boundingBox: { x: 0, y: 0, width: 10, height: 10 } });
+
+    await lintSession(makeReq('some_future_kind'), makeRes());
+
+    expect(lintElement).toHaveBeenCalledWith('sess-1', 'Order', 'tap', undefined, { userId: 'user-1' });
   });
 
   it('does NOT write an orphan result when the throw precedes the request event', async () => {
