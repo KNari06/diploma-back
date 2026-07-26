@@ -1094,7 +1094,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
           steps: {
             type: 'array',
-            description: 'Full array of steps to replace existing steps. Each step: {id: string (UUID), type: string, description: string, value?: string, assertionText?: string, expectedOutcome?: "success"|"error"}',
+            description: 'Full array of steps to replace existing steps. Each step: {id: string (UUID), type: string, description: string, value?: string, assertionText?: string, expectedOutcome?: "success"|"error"}. OMIT this when persisting steps just authored by qa_author_test_iteratively — that tool keeps its steps server-side (they carry compiled locator plans and a credential binding), so leaving this out saves the server copy. Do not reconstruct those steps from memory.',
             items: {
               type: 'object',
               properties: {
@@ -1121,7 +1121,10 @@ const QA_TOOLS: ChatCompletionTool[] = [
             description: 'Must be true. Set ONLY after describing changes to user AND receiving explicit approval.',
           },
         },
-        required: ['test_case_id', 'steps', 'confirm'],
+        // `steps` is deliberately NOT required: the authored-draft path has no
+        // steps to pass (the server holds them), and a required field forced the
+        // model to either invent them or skip the call entirely.
+        required: ['test_case_id', 'confirm'],
       },
     },
   },
@@ -1314,7 +1317,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
           steps: {
             type: 'array',
-            description: 'Array of steps. Each step: {id: string (UUID), type: string, description: string, value?: string, assertionText?: string, expectedOutcome?: "success"|"error"}',
+            description: 'Array of steps. Each step: {id: string (UUID), type: string, description: string, value?: string, assertionText?: string, expectedOutcome?: "success"|"error"}. OMIT this when persisting steps just authored by qa_author_test_iteratively — that tool keeps its steps server-side (they carry compiled locator plans and a credential binding), so leaving this out saves the server copy. Do not reconstruct those steps from memory.',
             items: {
               type: 'object',
               properties: {
@@ -1364,7 +1367,10 @@ const QA_TOOLS: ChatCompletionTool[] = [
             description: 'Must be true. Set ONLY after describing the test case to user AND receiving explicit approval.',
           },
         },
-        required: ['project_id', 'name', 'steps', 'confirm'],
+        // `steps` is deliberately NOT required — see qa_update_test_case_steps:
+        // the authored-draft path has no steps to pass, and requiring them made
+        // the model invent steps or skip the call.
+        required: ['project_id', 'name', 'confirm'],
       },
     },
   },

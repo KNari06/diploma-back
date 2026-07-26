@@ -2808,8 +2808,31 @@ export async function handleUpdateTestCaseSteps(
   context: SkillContext
 ): Promise<SkillResult> {
   let testCaseId = args.test_case_id as string | undefined;
-  const steps = args.steps as IntentStep[] | undefined;
   const confirm = args.confirm === true;
+
+  // Steps may come from the model OR from the server-held draft.
+  //
+  // `qa_author_test_iteratively` deliberately does NOT return its steps to the
+  // model — they carry compiled locator plans and a credential `resource_id`
+  // that must never travel through the LLM — so it caches them and returns only
+  // a count. In test-case scope the prompt then tells the model to "save" via
+  // this tool "with the new steps", which it cannot do: it has none. Observed
+  // consequence: the model called no tool at all and replied "Saved the login
+  // flow as a reusable test case" while nothing was written. Falling back to the
+  // cache makes "save" mean what the user was told it meant.
+  const argSteps = args.steps as IntentStep[] | undefined;
+  const cachedDraft = context.chatSessionId
+    ? (await import('@/services/testing/ui/preview/draft-steps-cache')).DraftStepsCache.get(
+      context.chatSessionId,
+    )
+    : undefined;
+  const cachedUsable =
+    !!cachedDraft && cachedDraft.userId === context.userId && cachedDraft.steps.length > 0;
+  const usingCachedDraft =
+    (!argSteps || !Array.isArray(argSteps) || argSteps.length === 0) && cachedUsable;
+  const steps: IntentStep[] | undefined = usingCachedDraft
+    ? (cachedDraft!.steps as IntentStep[])
+    : argSteps;
 
   // Resolve test_case_id by name
   if (testCaseId && !isUUID(testCaseId)) {
@@ -2826,7 +2849,12 @@ export async function handleUpdateTestCaseSteps(
   }
 
   if (!steps || !Array.isArray(steps) || steps.length === 0) {
-    return { success: false, message: 'Missing or empty required field: steps (array of step objects)', displayToUser: false };
+    return {
+      success: false,
+      message:
+        'Missing or empty required field: steps (array of step objects). If you meant to persist steps you just authored on the live preview, there is no cached draft for this chat session — re-author them first.',
+      displayToUser: false,
+    };
   }
 
   // Gate: agent must explicitly set confirm=true after user approval
@@ -2923,11 +2951,33 @@ export async function handleUpdateTestCaseSteps(
       };
     });
 
+    // Carry the authored credential binding onto the test case, on the same
+    // fail-closed rule the create path uses: attach it ONLY while the steps
+    // being written still reference `{{secrets.*}}`. A required binding on
+    // steps that use no placeholder would demand a resource nothing reads;
+    // placeholders with no binding is the worse half — the saved test resolves
+    // them to nothing and 401s. Bindings come from the cache only, never from
+    // `args`: the model must not be able to name a `resource_id`.
+    const stepsReferenceSecret = mergedSteps.some(
+      (s) => containsBoundSecretPlaceholder(s.value) || containsBoundSecretPlaceholder(s.assertionText),
+    );
+    const bindingsToSave =
+      cachedDraft?.resourceBindings?.length && stepsReferenceSecret
+        ? cachedDraft.resourceBindings
+        : undefined;
+    if (cachedDraft?.resourceBindings?.length && !stepsReferenceSecret) {
+      logger.warn('[QA_TOOL] Dropping credential binding on update — steps reference no {{secrets.*}}', {
+        testCaseId,
+        stepCount: mergedSteps.length,
+      });
+    }
+
     // Perform the update via IntentTestCaseService (also enforces user_id ownership)
     const updated = await IntentTestCaseService.update({
       id: testCaseId,
       userId: context.userId,
       steps: mergedSteps,
+      ...(bindingsToSave ? { resourceBindings: bindingsToSave } : {}),
     });
 
     logger.info('[QA_TOOL] Test case steps updated', {
@@ -2935,6 +2985,8 @@ export async function handleUpdateTestCaseSteps(
       userId: context.userId,
       previousStepCount,
       newStepCount: steps.length,
+      fromCachedDraft: usingCachedDraft,
+      credentialBindingAttached: !!bindingsToSave,
     });
 
     return {
@@ -3594,8 +3646,26 @@ export async function handleCreateTestCase(
 ): Promise<SkillResult> {
   const projectId = resolveProjectId(args, context);
   const name = args.name as string | undefined;
-  const steps = args.steps as IntentStep[] | undefined;
   const confirm = args.confirm === true;
+
+  // Same fallback as the update path: `qa_author_test_iteratively` keeps its
+  // steps server-side and hands the model only a count, so on "save" the model
+  // has nothing to pass. Requiring it here forced the same failure — invent
+  // steps, or claim a save that never happened. An omitted array means "persist
+  // what you authored"; the cache is still only read for THIS user's session.
+  const argSteps = args.steps as IntentStep[] | undefined;
+  const draftForFallback = context.chatSessionId
+    ? (await import('@/services/testing/ui/preview/draft-steps-cache')).DraftStepsCache.get(
+      context.chatSessionId,
+    )
+    : undefined;
+  const steps: IntentStep[] | undefined =
+    (!argSteps || !Array.isArray(argSteps) || argSteps.length === 0)
+      && draftForFallback
+      && draftForFallback.userId === context.userId
+      && draftForFallback.steps.length > 0
+      ? (draftForFallback.steps as IntentStep[])
+      : argSteps;
 
   if (!projectId) {
     return { success: false, message: 'Missing required field: project_id', displayToUser: false };
@@ -3604,7 +3674,12 @@ export async function handleCreateTestCase(
     return { success: false, message: 'Missing required field: name', displayToUser: false };
   }
   if (!steps || !Array.isArray(steps) || steps.length === 0) {
-    return { success: false, message: 'Missing or empty required field: steps (array of step objects)', displayToUser: false };
+    return {
+      success: false,
+      message:
+        'Missing or empty required field: steps (array of step objects). If you meant to persist steps you just authored on the live preview, there is no cached draft for this chat session — re-author them first.',
+      displayToUser: false,
+    };
   }
 
   if (!confirm) {
@@ -5560,21 +5635,12 @@ export async function handleAuthorTestIteratively(
     : undefined;
   const confirm = args.confirm === true;
 
-  // 1. Confirm gate (mirrors the other WRITE tools).
-  if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. You MUST first describe the test you will build to the user (the goal + that you will execute steps live on the preview), wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
-  }
-
-  // 2. Validate goal.
+  // 1. Validate goal.
   if (!goal) {
     return { success: false, message: 'Missing required field: goal (what the test should accomplish, in plain language)', displayToUser: false };
   }
 
-  // 3. Validate preview session.
+  // 2. Validate preview session.
   if (!context.previewSessionId) {
     return {
       success: false,
@@ -5583,7 +5649,7 @@ export async function handleAuthorTestIteratively(
     };
   }
 
-  // 3.5 Resolve the saved login the user named, if any. Without credentials the
+  // 3. Resolve the saved login the user named, if any. Without credentials the
   //     agent cannot complete a login flow live (it would fabricate or fail),
   //     and without the key map there is nothing to freeze — so a login test
   //     authored blind replays empty and 401s.
@@ -5627,7 +5693,39 @@ export async function handleAuthorTestIteratively(
     }
   }
 
-  // 4. Drive build-by-executing on the live preview.
+  // 4. Confirm gate (mirrors the other WRITE tools) — deliberately AFTER
+  //    credential resolution. That resolution is a read: it creates nothing and
+  //    changes no test state. It is not side-effect FREE — `loadDecrypted`
+  //    fire-and-forget bumps the resource's `last_used_at`, so a preview turn
+  //    that the user never approves still marks the login as used. That is a
+  //    cosmetic skew in a telemetry column, and the alternative (a second
+  //    resolve pass just to avoid it) buys nothing.
+  //
+  //    Ordering matters: with the gate first, a call naming a login that does
+  //    not exist returned "describe it and get approval" and the model, having
+  //    received no verdict on the name, announced the login as usable and asked
+  //    the user to approve it — a credential confirmed into existence. Resolving
+  //    first means an unknown name fails closed on the FIRST call, with the list
+  //    of names that do exist, and the approval question the model then asks
+  //    names a login the server has actually resolved.
+  if (!confirm) {
+    // The resource name is user-supplied text being placed into a model-facing
+    // message, so cap it — a secret named with a paragraph of instructions
+    // should not get to steer the next turn.
+    const credentialNote = credentialBinding?.ok
+      ? ` This test will use the saved login "${credentialBinding.resourceName.slice(0, 80)}" — its stored values are injected for the live run and frozen as {{secrets.*}} in the saved steps, so you never type or see them.`
+      : '';
+    return {
+      success: false,
+      message:
+        'WRITE operation requires confirmation. You MUST first describe the test you will build to the user (the goal + that you will execute steps live on the preview), wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.' +
+        credentialNote +
+        ' State ONLY what this message confirms — do not tell the user a saved login is usable unless the sentence above says it resolved.',
+      displayToUser: false,
+    };
+  }
+
+  // 5. Drive build-by-executing on the live preview.
   const { EditorIterativeAuthorService } = await import('@/services/testing/ui/preview/editor-iterative-author.service');
   const result = await EditorIterativeAuthorService.authorTest({
     previewSessionId: context.previewSessionId,
@@ -5646,7 +5744,7 @@ export async function handleAuthorTestIteratively(
     return { success: false, message: result.error, displayToUser: true };
   }
 
-  // 5. Convert grounded DiscoveredStep[] → IntentStep[] (carries compiled plans
+  // 6. Convert grounded DiscoveredStep[] → IntentStep[] (carries compiled plans
   //    + masks secrets) and cache for the later save / quick action.
   const { toIntentSteps } = await import('@/agent/core/lite/exploration/types');
   const intentSteps = toIntentSteps(result.steps);
@@ -5664,7 +5762,7 @@ export async function handleAuthorTestIteratively(
     });
   }
 
-  // 5.5 Per-AI-work credit charge. Iterative authoring drives the
+  // 6.5 Per-AI-work credit charge. Iterative authoring drives the
   //     Planner→Executor→Reviewer loop once PER ROUND (each round = several LLM
   //     calls), so the flat 1-credit chat turn under-charges. We charge the
   //     EXTRA AI rounds here; the base 1 is taken by the surrounding chat turn.
