@@ -43,7 +43,7 @@ const loadPrompt = () =>
 const authorTool = (skill: ReturnType<typeof loadSkill>) =>
   skill.tools.find((t) => t.function?.name === 'qa_author_test_iteratively')!;
 
-describe('credential authoring flag — OFF (the default)', () => {
+describe('credential authoring flag — OFF (explicitly disabled)', () => {
   beforeEach(() => setFlag(false));
 
   it('does not advertise credential_secret_name on the tool', () => {
@@ -79,7 +79,7 @@ describe('credential authoring flag — OFF (the default)', () => {
   });
 });
 
-describe('credential authoring flag — ON', () => {
+describe('credential authoring flag — ON (the default)', () => {
   beforeEach(() => setFlag(true));
 
   it('advertises credential_secret_name on the tool', () => {
@@ -96,5 +96,38 @@ describe('credential authoring flag — ON', () => {
 
   it('still forbids fabricating credentials', () => {
     expect(loadPrompt()(undefined, 'p1', 'editor')).toContain('NEVER put a real credential VALUE in a step');
+  });
+});
+
+/**
+ * The default itself.
+ *
+ * Asserted against the REAL declaration in env.ts, read from source — NOT by
+ * re-declaring the zod schema here. `src/test/jest.setup.ts` globally mocks
+ * `@/config/environment/env`, so `env.*` is undefined for every flag under
+ * Jest, and importing the module for real would run its process.exit-on-invalid
+ * boot path. A re-declared copy of the schema would pass while env.ts said
+ * something else entirely — the exact failure mode L-0031 records.
+ */
+describe('CREDENTIAL_AUTHORING_ENABLED default', () => {
+  const declaration = (): string => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { readFileSync } = require('fs');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { join } = require('path');
+    const src = readFileSync(join(__dirname, '../../environment/env.ts'), 'utf8');
+    const line = src.split('\n').find((l: string) => l.includes('CREDENTIAL_AUTHORING_ENABLED:'));
+    if (!line) throw new Error('CREDENTIAL_AUTHORING_ENABLED is not declared in env.ts');
+    return line;
+  };
+
+  it('defaults to ON, so the feature works without any env wiring', () => {
+    expect(declaration()).toContain(".default('true')");
+  });
+
+  it('uses the same === comparison as every other flag in the file', () => {
+    // A `!== \'false\'` variant would read identically at a glance but behave
+    // differently for a typo\'d value.
+    expect(declaration()).toContain("v === 'true'");
   });
 });

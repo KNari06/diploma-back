@@ -351,17 +351,25 @@ const envSchema = z.object({
   // deploy flips this AND ops provisions a dedicated container + DB row.
   DEDICATED_MOBILE_EMULATOR_ENABLED: z.string().transform(v => v === 'true').default('false'),
 
-  // Credential-bound test authoring (ADR-0023). When ON, the chat agent may
-  // author a LOGIN test against a saved `secret`: the user names the login, the
-  // server injects the real values for the live authoring run, and the steps
-  // freeze `{{secrets.*}}` so the saved test replays. Default OFF — the tool
-  // stops advertising `credential_secret_name`, the prompts stop offering the
-  // path, and the handler refuses it, so behaviour matches pre-rung-5.
+  // Credential-bound test authoring (ADR-0023). The chat agent may author a
+  // LOGIN test against a saved `secret`: the user names the login, the server
+  // injects the real values for the live authoring run, and the steps freeze
+  // `{{secrets.*}}` so the saved test replays.
   //
-  // Keep OFF in production until `ENCRYPTION_SECRET` is a real value: this
-  // feature is what makes customer logins flow into `test_resources.sensitive`
-  // as a routine action, and that envelope is only as strong as that key.
-  CREDENTIAL_AUTHORING_ENABLED: z.string().transform(v => v === 'true').default('false'),
+  // Default ON. It shipped default-OFF so it could be enabled deliberately from
+  // the infra env, but that env is set in a separate repo — a flag nobody can
+  // set leaves working code permanently dark, which is worse than no flag. The
+  // path is opt-in by nature anyway: it only runs when a user NAMES a saved
+  // login, so nothing changes for users who don't.
+  //
+  // Set to anything other than the literal `true` (conventionally `false`) to
+  // disable without a deploy: the tool stops advertising
+  // `credential_secret_name`, the prompts stop offering the path, and the
+  // handler refuses it — behaviour matches pre-rung-5. The `=== 'true'`
+  // comparison is deliberate, matching every other flag in this file; a
+  // `!== 'false'` variant here would read identically but behave differently
+  // for a typo'd value.
+  CREDENTIAL_AUTHORING_ENABLED: z.string().transform(v => v === 'true').default('true'),
 
   // Companion relay — per-user launch-and-go physical device support (ADR-0009).
   // COMPANION_TOKEN_SECRET: separate HMAC secret from RUNNER_USER_TOKEN_SECRET

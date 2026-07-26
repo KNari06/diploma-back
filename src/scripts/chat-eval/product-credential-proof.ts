@@ -2,10 +2,11 @@
  * Rung-5 run-proof — a PRODUCTION-path saved test that replays green with the
  * credential resolved from the encrypted store.
  *
- *   CREDENTIAL_AUTHORING_ENABLED=true npm run chat-eval:credential-proof
+ *   npm run chat-eval:credential-proof
  *
- * (the feature is default-OFF, so the flag is required — see
- * `src/config/features/credential-authoring.ts`)
+ * (the feature is default-ON; the guard below still checks, so an environment
+ * that has explicitly set CREDENTIAL_AUTHORING_ENABLED=false fails with a clear
+ * message instead of a confusing refusal mid-run)
  *
  * Rung 4 proved the substrate through the EVAL path (`authorOnFixture` calls
  * `EditorIterativeAuthorService` directly). That says nothing about the product:
@@ -130,12 +131,13 @@ async function assertNoDefaultSecret(projectId: string): Promise<void> {
 }
 
 async function main(): Promise<number> {
-  // The feature is default-OFF, so without this the script fails at the
-  // authoring step with a refusal message that reads like a regression.
+  // Default-ON, so this only fires where it was explicitly disabled — without
+  // the guard the script would fail at the authoring step with a refusal
+  // message that reads like a regression.
   if (!CredentialAuthoringFeature.isEnabled()) {
     console.error(
-      '\nCREDENTIAL_AUTHORING_ENABLED is off, so the tool will refuse to bind a saved login.\n' +
-      'Re-run with the flag on:\n\n' +
+      '\nCREDENTIAL_AUTHORING_ENABLED is set to false in this environment, so the\n' +
+      'tool will refuse to bind a saved login. Unset it (the default is on) or run:\n\n' +
       '  CREDENTIAL_AUTHORING_ENABLED=true npm run chat-eval:credential-proof\n',
     );
     return 1;
