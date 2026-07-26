@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
 import type { SkillDefinition, SkillContext, SkillResult } from './types';
 import { logger } from '@/utils/core/logger';
@@ -28,8 +29,55 @@ class SkillRegistryClass {
    */
   private confirmPreviews: Map<string, number> = new Map();
 
+  /**
+   * Tracks the last confirm=true call that was ALLOWED through.
+   * Key: `chatSessionId:toolName:<args fingerprint>`, Value: timestamp (ms).
+   * Used to recognise a duplicate call for an action that already ran, so the
+   * model is told "already done" instead of being sent back to ask for
+   * approval a second time.
+   *
+   * Keyed on the ARGUMENTS too, unlike `confirmPreviews`. Scoping it to
+   * (session, tool) alone would swallow a genuinely new request: "author a
+   * login test" → approved → runs, then "now author a checkout test" 30s later
+   * would match the window and come back "already executed" without ever
+   * running. The real duplicate is one assistant message emitting the same
+   * tool_call twice, so the arguments are identical and this still catches it.
+   */
+  private confirmAllowed: Map<string, number> = new Map();
+
   /** Preview entries expire after 5 minutes */
   private static readonly CONFIRM_TTL_MS = 5 * 60 * 1000;
+
+  /**
+   * How long after an approved run a further confirm=true still reads as a
+   * duplicate of it rather than a fresh, unapproved request. Long enough to
+   * cover a slow tool (iterative authoring runs ~20-60s) plus the model's
+   * follow-up turn; short enough that a genuine second request minutes later
+   * is still gated normally.
+   */
+  private static readonly DUPLICATE_WINDOW_MS = 2 * 60 * 1000;
+
+  /**
+   * Stable fingerprint of a tool call's arguments, ignoring `confirm` (which
+   * differs between the preview turn and the approved one). Hashed so a call
+   * carrying a large `steps` array doesn't become a multi-KB map key.
+   * Fingerprinting failures degrade to '' — that only makes duplicate
+   * detection coarser, never wrong in the unsafe direction, because a
+   * non-duplicate then falls through to the normal approval gate.
+   */
+  private static argsFingerprint(args: Record<string, any>): string {
+    try {
+      const { confirm: _confirm, ...rest } = args ?? {};
+      const canonical = JSON.stringify(
+        Object.keys(rest)
+          .sort()
+          .map((k) => [k, rest[k]]),
+      );
+      return createHash('sha1').update(canonical).digest('hex').slice(0, 16);
+    } catch {
+      return '';
+    }
+  }
 
   /**
    * Register a skill
@@ -218,6 +266,36 @@ class SkillRegistryClass {
           const previewKey = `${sessionId}:${toolName}`;
           const previewTs = this.confirmPreviews.get(previewKey);
 
+          const allowedKey = `${previewKey}:${SkillRegistryClass.argsFingerprint(args)}`;
+          const allowedTs = this.confirmAllowed.get(allowedKey);
+          const isDuplicateOfApproved =
+            !previewTs &&
+            allowedTs !== undefined &&
+            Date.now() - allowedTs <= SkillRegistryClass.DUPLICATE_WINDOW_MS;
+
+          if (isDuplicateOfApproved) {
+            // A SECOND confirm=true for an action that was just approved and
+            // run. The model emits these (two tool_calls in one assistant
+            // message, or a retry while the first is still executing). Treating
+            // it as unapproved was actively misleading: the duplicate's
+            // "requires confirmation" reply is the LAST tool result the model
+            // sees, so it told the user the test "was not executed yet" — right
+            // after it had authored five steps and logged in for real. Answer
+            // with the truth instead, and do NOT re-enter the handler (that
+            // would author the whole test a second time).
+            logger.info('[SKILL_REGISTRY] Confirm guard: duplicate confirm=true for an already-approved call', {
+              toolName,
+              chatSessionId: sessionId,
+            });
+            return {
+              success: true,
+              message:
+                'This action was already approved and executed earlier in this turn — this is a duplicate call and was not run again. ' +
+                'Report the result of the earlier call to the user. Do NOT ask them to approve it again.',
+              displayToUser: false,
+            };
+          }
+
           if (!previewTs || Date.now() - previewTs > SkillRegistryClass.CONFIRM_TTL_MS) {
             // No prior preview or expired — override to false so handler returns preview message
             logger.warn('[SKILL_REGISTRY] Confirm guard: overriding confirm=true (no prior preview)', {
@@ -226,9 +304,33 @@ class SkillRegistryClass {
               mode: context.mode,
             });
             args.confirm = false;
+            // The downgraded call IS the preview turn, so record it. Without
+            // this the guard never advances: the prompts tell the model to
+            // describe the action in prose and then call with confirm=true, so
+            // an explicit confirm=false call — the only thing that used to
+            // register a preview — never happens. Every subsequent confirm=true
+            // then found no preview and was downgraded again, and the user got
+            // asked to approve the same action forever (observed on
+            // qa_author_test_iteratively: five identical approval requests, each
+            // answered "yes"). Recording here keeps the security property
+            // intact — the user still has to answer the question this turn
+            // produces before the next confirm=true is honoured.
+            this.confirmPreviews.set(previewKey, Date.now());
           } else {
             // Valid preview exists — allow through and consume it
             this.confirmPreviews.delete(previewKey);
+            this.confirmAllowed.set(allowedKey, Date.now());
+            // Prune HERE, not on the confirm=false path: with the deadlock fix
+            // an explicit confirm=false call is rare, so pruning there would
+            // almost never run and this map would grow for the process's life.
+            if (this.confirmAllowed.size > 100) {
+              const now = Date.now();
+              for (const [key, ts] of this.confirmAllowed) {
+                if (now - ts > SkillRegistryClass.DUPLICATE_WINDOW_MS) {
+                  this.confirmAllowed.delete(key);
+                }
+              }
+            }
             logger.info('[SKILL_REGISTRY] Confirm guard: allowing confirm=true (preview found)', {
               toolName,
               chatSessionId: sessionId,
@@ -361,6 +463,7 @@ class SkillRegistryClass {
     this.toolNameToSkillId.clear();
     this.toolsWithConfirm.clear();
     this.confirmPreviews.clear();
+    this.confirmAllowed.clear();
     logger.info('[SKILL_REGISTRY] Registry cleared');
   }
 }
