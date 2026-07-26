@@ -11,7 +11,8 @@ import { CredentialAuthoringFeature } from '@/config/features/credential-authori
  * turns into a loop of refused tool calls.
  */
 const CREDENTIALS_BLOCK_ON = `- CREDENTIALS are the trap. There IS a credential store: logins saved under Settings → Secrets, referenced BY NAME. You never see or type the values — the server injects them.
-  • If the user named a saved login (or you already know which one this test uses): call qa_author_test_iteratively with credential_secret_name set to that name. The server injects the stored credentials for the live run and freezes {{secrets.*}} into the steps, so the SAVED test replays for real.
+  • If the user named a saved login (or you already know which one this test uses): call qa_author_test_iteratively with credential_secret_name set to that name — confirm=false on the FIRST call (it validates the name and returns the preview to relay), confirm=true only after the user answers "yes". The server injects the stored credentials for the live run and freezes {{secrets.*}} into the steps, so the SAVED test replays for real.
+  • Never tell the user a saved login is usable before a tool result has said so. The confirm=false call is what checks the name; until it comes back OK, you do not know the login exists.
   • If you do NOT know which one: ASK one specific question — "Which saved login should this test use?" (This is a required, specific question — NOT the vague kind banned above.) If the name you pass is unknown, the tool answers with the saved logins that DO exist — ask again using those, do not guess.
   • If the project has NO saved login at all: say so, and draft via qa_run_draft_steps with explicit {{secrets.*}} placeholder values ({{secrets.login_email}}, {{secrets.login_password}}) and confirm=false (do NOT run), telling the user to add the login under Settings → Secrets before the test can pass. Use the secrets.* namespace — it is the one resolvePlaceholders + secret redaction recognise; a made-up namespace never resolves and is never masked.
   • NEVER put a real credential VALUE in a step, even one the user typed in chat. Bind by name.`;
@@ -205,6 +206,11 @@ case unless they explicitly say otherwise.
 - "save" / "сохрани" / "update" / "обнови" / "apply" → call qa_update_test_case_steps
   with test_case_id="${testCaseId}" and the new/edited steps. This OVERWRITES this
   test case's steps — that is the intended behavior here.
+  • If the steps came from qa_author_test_iteratively, you do NOT have them — that
+    tool returns only a count, because the steps carry compiled locator plans and a
+    credential binding that must not pass through you. OMIT the steps argument and
+    the server persists its own copy, binding included. Do not reconstruct them from
+    memory, and never claim you saved without calling this tool.
 - Do NOT call qa_create_test_case to "save" in this scope — that creates a SEPARATE
   duplicate test case. Only call qa_create_test_case if the user EXPLICITLY asks for
   a NEW / separate / additional test case ("создай новый тест", "make another test").
