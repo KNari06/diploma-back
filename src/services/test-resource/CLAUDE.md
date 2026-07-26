@@ -59,6 +59,43 @@ test ends
 
 ---
 
+## Hot flow — authoring a test BOUND to a `secret` (the production credential path)
+
+The first consumer of this substrate from outside the apply flow: the chat agent
+authors a login test against a stored credential.
+
+```
+user names a saved login in chat
+ → qa_author_test_iteratively(credential_secret_name)
+ → resolveNamedCredentialSecret({ userId, projectId ← preview session, name })
+     listResources(kind:'secret') → exact-name match → loadDecrypted
+     key NAME → credential kind (password > email > phone > username)
+     ⟶ { credentials (VALUES, in memory only), credentialSecret (KEY NAMES), valueToKey }
+ → EditorIterativeAuthorService.authorTest
+     executor injects the real value; commandToStep freezes {{secrets.<key>}}
+     templateCredentialsInSteps rewrites a rendered-back credential
+     ⟶ resourceBindings [{ kind:'secret', resource_id, required:true }]
+ → DraftStepsCache (server-side; the binding never travels through the LLM)
+ → IntentTestCaseService.create(resourceBindings) → intent_test_cases.resource_bindings
+ → replay: applyBindingsToContext → runVariables → resolvePlaceholders
+```
+
+**The trap this closes:** every seam above had to carry `resourceBindings`. Miss
+any one and the authored draft works while the SAVED test resolves its
+placeholders to nothing and 401s — with nothing in the logs pointing at the
+seam that dropped it.
+
+**Two consequences worth knowing before touching this path:**
+- A credential-bearing assertion is evaluated WITHOUT a screenshot
+  (`command-executor` `assertionCarriesSecret`). The text prompt is masked on
+  both sides, but an image cannot be — so a vision model reads the real value
+  off the page, compares it to the masked expectation, and reports a mismatch.
+- `{{secrets.*}}` must survive `sanitizeSteps`. A string CONTAINING a bound
+  placeholder is already safe; re-parameterising it to `{{param_*}}` destroys
+  the binding (`containsBoundSecretPlaceholder` guards both call sites).
+
+---
+
 ## Adding a new resource kind — checklist
 
 1. **TS union** — add the kind name to `ResourceKind` in [types.ts](types.ts:17-27).

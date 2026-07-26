@@ -30,6 +30,7 @@ import { executeTool } from '@/services/skills/tool-executor';
 import { ToolCallTracker } from '@/services/skills/hooks/loop-detection.hook';
 import { humanizeToolName, computeToolProgress } from './sub-agents/agents/executor-agent';
 import { getLocalizedMessages } from '../regression/localization';
+import { CredentialAuthoringFeature } from '@/config/features/credential-authoring';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPER: Resolve project ID (Tier 1: session → Tier 2: workspace default)
@@ -934,7 +935,7 @@ IMPORTANT RULES:
 - Do NOT call qa_create_test_case unless user explicitly says "save" / "сохрани" / "persist"
 - For SINGLE actions (one click, one type) → this is editor_action, handled automatically
 - For MULTI-STEP flows (login, checkout, search+filter):
-  • If the user just names a GOAL on the current page and you do NOT already have concrete steps ("test the login flow", "протестируй оформление заказа") → PREFER qa_author_test_iteratively(goal, confirm). It builds the test by doing it live on the page — each step is grounded in the real DOM and already verified, no guessing. Describe the goal, get "yes", then call with confirm=true. EXCEPTION: if the goal needs credentials the user has NOT provided (e.g. a login flow), do NOT use qa_author_test_iteratively — it would fabricate or fail live. Ask for the login first, or draft with {{placeholder}} credentials via qa_run_draft_steps (see GROUNDING).
+  • If the user just names a GOAL on the current page and you do NOT already have concrete steps ("test the login flow", "протестируй оформление заказа") → PREFER qa_author_test_iteratively(goal, confirm). It builds the test by doing it live on the page — each step is grounded in the real DOM and already verified, no guessing. Describe the goal, get "yes", then call with confirm=true.${CredentialAuthoringFeature.isEnabled() ? 'LOGIN FLOWS: pass the name of a SAVED login as credential_secret_name — the server injects the stored credentials for the live run and freezes {{secrets.*}} into the steps, so the saved test replays. If you do not know which saved login to use, ASK ("which saved login should this test use?"); if the project has none, say so and draft with {{secrets.*}} placeholders via qa_run_draft_steps instead (see GROUNDING). Never invent credentials.' : 'EXCEPTION: if the goal needs credentials the user has NOT provided (e.g. a login flow), do NOT use qa_author_test_iteratively — it would fabricate or fail live. Ask for the login first, or draft with {{secrets.*}} placeholders via qa_run_draft_steps (see GROUNDING).'}
   • If YOU already produced explicit IntentSteps (the user gave exact steps, or you're re-running a known list) → use qa_run_draft_steps as before.
   • After either tool returns, the steps are cached — when the user says "save", call qa_create_test_case (the authored steps already passed; no re-run needed).
 

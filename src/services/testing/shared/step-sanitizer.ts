@@ -30,6 +30,8 @@
  * bound below is deliberately loose (no index signature) so those types
  * satisfy it without one.
  */
+import { containsBoundSecretPlaceholder } from '@/utils/interpolation/redact-secrets';
+
 export interface SanitizableStep {
   id?: string;
   value?: unknown;
@@ -112,6 +114,12 @@ export function sanitizeSteps<T extends SanitizableStep>(steps: T[]): SanitizedS
     // namespaces ({{secrets.*}}, {{env.*}}, {{extracted.*}}) are NOT parameters
     // and stay out of the schema. Persist the trimmed form so a later
     // double-pass stays idempotent through whitespace drift.
+    // A value templated against a stored secret is already safe, even when the
+    // placeholder is embedded in surrounding text (a deterministic `assert`
+    // step's expected text, e.g. `Welcome back, {{secrets.login_email}}`).
+    // Re-parameterising it to `{{param_*}}` would destroy the binding.
+    if (containsBoundSecretPlaceholder(value)) return step;
+
     const trimmed = value.trim();
     if (/^\{\{.+\}\}$/.test(trimmed)) {
       const paramMatch = /^\{\{(param_[a-zA-Z0-9_]+)\}\}$/.exec(trimmed);
@@ -177,6 +185,13 @@ function maskSensitiveAssertionText<T extends SanitizableStep>(step: T): T {
   const at = step.assertionText;
   if (typeof at !== 'string' || at.length === 0) return step;
   if (/^\{\{.+\}\}$/.test(at.trim())) return step;
+  // Already templated against a stored secret — e.g. `Welcome back,
+  // {{secrets.login_email}}`. The anchored check above misses it (the
+  // placeholder is embedded, not the whole string), and the patterns below
+  // match on the KEY NAME (`{{secrets.login_password}}` hits /password/), so
+  // without this the whole assertion would be replaced by a placeholder that
+  // resolves to nothing and the test would false-RED at replay.
+  if (containsBoundSecretPlaceholder(at)) return step;
   if (!SENSITIVE_PATTERNS.some((pat) => pat.test(at))) return step;
   return { ...step, assertionText: MASKED_SECRET } as T;
 }

@@ -13,6 +13,7 @@ import type { Request, Response } from 'express';
 import { logger } from '@/utils/core/logger';
 import { supabaseAdmin } from '@/db/supabase';
 import * as TestResourceService from '@/services/test-resource/test-resource.service';
+import { hasProjectAccess } from '@/services/core/project-access.service';
 import {
   AUDIT_EVENTS,
   WorkspaceAuditService,
@@ -96,6 +97,15 @@ export async function createResource(req: Request, res: Response): Promise<void>
     }
     if (!name || typeof name !== 'string') {
       res.status(400).json({ success: false, error: 'name is required' });
+      return;
+    }
+
+    // The AUTHORITATIVE gate lives in `createResource` itself, so every caller
+    // inherits it. This one exists only to shape the HTTP response: without it
+    // the service's throw would surface as a 500 instead of a 403.
+    if (!(await hasProjectAccess(projectId, userId))) {
+      logger.warn('[TEST_RESOURCE] create denied — no access to project', { projectId, userId });
+      res.status(403).json({ success: false, error: 'No access to this project' });
       return;
     }
 

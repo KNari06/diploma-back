@@ -11,6 +11,9 @@ import { FixtureService } from '@/services/testing/fixtures/fixture.service';
 import { ApiConfigService } from '@/services/api/api-config.service';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { sanitizeSteps } from '@/services/testing/shared/step-sanitizer';
+import { containsBoundSecretPlaceholder } from '@/utils/interpolation/redact-secrets';
+import { CredentialAuthoringFeature } from '@/config/features/credential-authoring';
+import type { resolveNamedCredentialSecret } from '@/services/testing/ui/preview/named-credential-secret';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
 import { ScheduleService } from '@/services/testing/schedules/schedule.service';
@@ -3564,6 +3567,27 @@ export async function handleRunDraftSteps(
  * - Requires `confirm: true`
  * - Steps validated against VALID_STEP_TYPES
  */
+/**
+ * Is the model's re-emitted step array the SAME test as the cached draft?
+ *
+ * Compares only what the model is expected to echo faithfully — order, type and
+ * the value/assertion payloads. Deliberately ignores compiled plans, evidence
+ * and ids: those are exactly what the model drops and the cache exists to
+ * restore. Any divergence means the user edited something, so the model's array
+ * is the truth.
+ */
+export function stepsMatchCachedDraft(fromModel: IntentStep[], cached: IntentStep[]): boolean {
+  if (fromModel.length !== cached.length) return false;
+  const norm = (v: unknown): string => (typeof v === 'string' ? v.trim() : '');
+  return cached.every((c, i) => {
+    const m = fromModel[i];
+    return !!m
+      && m.type === c.type
+      && norm(m.value) === norm(c.value)
+      && norm(m.assertionText) === norm(c.assertionText);
+  });
+}
+
 export async function handleCreateTestCase(
   args: Record<string, any>,
   context: SkillContext
@@ -3633,7 +3657,54 @@ export async function handleCreateTestCase(
   // and persist the resulting parameters_schema so a regression replay can
   // resolve them (without it the runner types the literal placeholder). Same
   // fix + shared sanitizer as the mobile agent save path.
-  const { steps: sanitizedSteps, parametersSchema } = sanitizeSteps(steps);
+  // Prefer the SERVER's copy of the draft over the LLM's — but ONLY when the
+  // model re-emitted the same steps. The cache uniquely holds the compiled
+  // locator plans (the model's copy drops them), so using it makes the saved
+  // test replay on the fast path.
+  //
+  // The equivalence check is not paranoia: the editor prompt tells the model to
+  // reuse the cached steps when the user asks to run, save, OR MODIFY them, so
+  // a "save it, but drop the last step" turn re-emits a DELIBERATELY DIFFERENT
+  // array — and nothing rewrites the cache on that path. Preferring the cache
+  // unconditionally would silently discard the user's edit and then report the
+  // cached step count back, so the confirmation would look correct.
+  //
+  // The credential binding still comes from the cache, never from `args`: the
+  // model must not be able to name a `resource_id`.
+  const cachedDraft = context.chatSessionId
+    ? (await import('@/services/testing/ui/preview/draft-steps-cache')).DraftStepsCache.get(context.chatSessionId)
+    : undefined;
+  const cachedUsable = !!cachedDraft
+    && cachedDraft.userId === context.userId
+    && cachedDraft.steps.length > 0
+    && stepsMatchCachedDraft(steps, cachedDraft.steps as IntentStep[]);
+  const stepsToSave = cachedUsable ? (cachedDraft!.steps as IntentStep[]) : steps;
+  if (cachedDraft && !cachedUsable) {
+    logger.info('[QA_TOOL] Using the model\'s steps — cached draft absent or diverged', {
+      chatSessionId: context.chatSessionId,
+      cachedCount: cachedDraft.steps.length,
+      argCount: steps.length,
+    });
+  }
+
+  const { steps: sanitizedSteps, parametersSchema } = sanitizeSteps(stepsToSave);
+
+  // Fail closed: only attach the binding if the steps being saved still
+  // reference a bound secret. If the model rewrote them and dropped the
+  // placeholders, a required binding would demand a resource nothing uses.
+  const stepsReferenceSecret = sanitizedSteps.some(
+    (s) => containsBoundSecretPlaceholder(s.value) || containsBoundSecretPlaceholder(s.assertionText),
+  );
+  const bindingsToSave =
+    cachedDraft?.resourceBindings?.length && stepsReferenceSecret
+      ? cachedDraft.resourceBindings
+      : undefined;
+  if (cachedDraft?.resourceBindings?.length && !stepsReferenceSecret) {
+    logger.warn('[QA_TOOL] Dropping credential binding — saved steps reference no {{secrets.*}}', {
+      chatSessionId: context.chatSessionId,
+      stepCount: sanitizedSteps.length,
+    });
+  }
 
   try {
     const created = await IntentTestCaseService.create({
@@ -3641,9 +3712,13 @@ export async function handleCreateTestCase(
       userId: context.userId,
       name,
       description: args.description || undefined,
-      startUrl: args.start_url || undefined,
+      // Pair the start URL with whichever step source won: saving the server's
+      // steps against the model's URL can hand the test a drifted (or absent)
+      // origin, and a `navigate` step with no value has nothing to fall back to.
+      startUrl: (cachedUsable ? cachedDraft!.startUrl : args.start_url) || args.start_url || undefined,
       steps: sanitizedSteps,
       parametersSchema,
+      ...(bindingsToSave ? { resourceBindings: bindingsToSave } : {}),
       status: args.status || 'draft',
       // Pass priority straight to create() — eliminates the previous
       // create→update round-trip and avoids the brief window where the
@@ -3667,7 +3742,9 @@ export async function handleCreateTestCase(
     logger.info('[QA_TOOL] Test case created', {
       testCaseId: created.id,
       userId: context.userId,
-      stepCount: steps.length,
+      stepCount: sanitizedSteps.length,
+      stepsFrom: stepsToSave === steps ? 'tool_args' : 'draft_cache',
+      resourceBindings: bindingsToSave?.length ?? 0,
     });
 
     // Clear draft steps cache — steps have been persisted to DB
@@ -3684,9 +3761,9 @@ export async function handleCreateTestCase(
         testCaseId: created.id,
         name: created.name,
         status: created.status,
-        stepCount: steps.length,
+        stepCount: sanitizedSteps.length,
       },
-      message: `Created test case "${created.name}" with ${steps.length} steps`,
+      message: `Created test case "${created.name}" with ${sanitizedSteps.length} steps`,
       displayToUser: true,
     };
   } catch (error) {
@@ -5506,12 +5583,63 @@ export async function handleAuthorTestIteratively(
     };
   }
 
+  // 3.5 Resolve the saved login the user named, if any. Without credentials the
+  //     agent cannot complete a login flow live (it would fabricate or fail),
+  //     and without the key map there is nothing to freeze — so a login test
+  //     authored blind replays empty and 401s.
+  //
+  //     The model passes a NAME the user spoke; the resource id is resolved
+  //     here, scoped to the session's project (server-derived) and this user.
+  let credentialBinding: Awaited<ReturnType<typeof resolveNamedCredentialSecret>> | undefined;
+  const secretNameRaw = args.credential_secret_name;
+  const secretName = typeof secretNameRaw === 'string' ? secretNameRaw.trim() : '';
+  if (secretName && !CredentialAuthoringFeature.isEnabled()) {
+    // The schema stops advertising the parameter when the flag is off, so this
+    // only fires on a stale prompt or a replayed call. Refuse rather than
+    // silently authoring without the credential: that would produce exactly the
+    // unreproducible login test this feature exists to prevent.
+    logger.warn('[QA_TOOL] credential_secret_name ignored — credential authoring is disabled');
+    return {
+      success: false,
+      message: 'Authoring a test against a saved login is not enabled on this deployment. Ask the user for the steps, or draft the login with {{secrets.*}} placeholder values and tell them the test cannot run until credentials are configured.',
+      displayToUser: false,
+    };
+  }
+  if (secretName) {
+    const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+    const projectId = getPreviewSessionService().getSession(context.previewSessionId)?.projectId;
+    if (!projectId) {
+      return { success: false, message: 'Preview session is missing project context.', displayToUser: false };
+    }
+
+    const { resolveNamedCredentialSecret: resolve, describeCredentialSecretFailure } =
+      await import('@/services/testing/ui/preview/named-credential-secret');
+    credentialBinding = await resolve({ userId: context.userId, projectId, name: secretName });
+
+    if (!credentialBinding.ok) {
+      // Fail closed and tell the agent to ask — never author a login with a
+      // credential we could not resolve.
+      return {
+        success: false,
+        message: describeCredentialSecretFailure(credentialBinding, secretName),
+        displayToUser: false,
+      };
+    }
+  }
+
   // 4. Drive build-by-executing on the live preview.
   const { EditorIterativeAuthorService } = await import('@/services/testing/ui/preview/editor-iterative-author.service');
   const result = await EditorIterativeAuthorService.authorTest({
     previewSessionId: context.previewSessionId,
     userId: context.userId,
     goal,
+    ...(credentialBinding?.ok
+      ? {
+        credentials: credentialBinding.credentials,
+        credentialSecret: credentialBinding.credentialSecret,
+        credentialValueToKey: credentialBinding.valueToKey,
+      }
+      : {}),
   });
 
   if (result.error) {
@@ -5530,6 +5658,9 @@ export async function handleAuthorTestIteratively(
       startUrl: result.startUrl,
       userId: context.userId,
       ...(suggestedName ? { suggestedName } : {}),
+      // The binding rides server-side with the draft; every save route reads it
+      // from here. Present only when a credential was ACTUALLY frozen.
+      ...(result.resourceBindings?.length ? { resourceBindings: result.resourceBindings } : {}),
     });
   }
 

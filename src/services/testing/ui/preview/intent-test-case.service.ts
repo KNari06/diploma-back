@@ -173,6 +173,15 @@ export class IntentTestCaseService {
      * types the literal placeholder. Empty/undefined → column left null.
      */
     parametersSchema?: Record<string, unknown> | null;
+    /**
+     * Bindings the STEPS themselves require — currently the `secret` holding
+     * credentials the authoring agent froze as `{{secrets.*}}`. Without them a
+     * saved login test resolves its placeholders to nothing and 401s on replay.
+     *
+     * Explicit bindings win; workspace defaults are still layered on top for
+     * the kinds not named here (see `enrichBindingsWithDefaults` below).
+     */
+    resourceBindings?: Array<{ kind: string; resource_id: string; required?: boolean }>;
   }): Promise<IntentTestCase> {
     const {
       projectId, userId, name, description, startUrl, steps, flowId,
@@ -208,7 +217,10 @@ export class IntentTestCaseService {
     // mobile_flutter is intentionally skipped — no resource adapter
     // supports it yet; enriching with a web/android fallback would
     // silently bind the wrong profile.
-    let resourceBindings: Array<{ kind: string; resource_id: string; required?: boolean }> = [];
+    // Seeded with the caller's explicit bindings so a credential the authoring
+    // agent bound survives; enrichment only ADDS kinds that aren't present.
+    let resourceBindings: Array<{ kind: string; resource_id: string; required?: boolean }> =
+      params.resourceBindings ? [...params.resourceBindings] : [];
     const scopePlatform: 'web' | 'android' | 'ios' | null =
       platform === 'web'
         ? 'web'
@@ -223,17 +235,29 @@ export class IntentTestCaseService {
         resourceBindings = (await enrichBindingsWithDefaults({
           userId,
           projectId,
-          bindings: [],
+          // Explicit bindings are the SEED, not an empty list: enrichment skips
+          // any kind already present, so the caller's `secret` survives and
+          // defaults still attach for the other kinds.
+          bindings: resourceBindings as Parameters<typeof enrichBindingsWithDefaults>[0]['bindings'],
           scope: {
             platform: scopePlatform,
             url: startUrl ?? null,
           },
         })) as Array<{ kind: string; resource_id: string; required?: boolean }>;
       } catch (enrichErr) {
+        // Non-fatal: keep whatever the caller passed rather than dropping a
+        // binding the steps actually need.
         logger.warn('[INTENT_TEST_CASE] enrichBindingsWithDefaults failed (non-fatal)', {
           error: enrichErr instanceof Error ? enrichErr.message : String(enrichErr),
         });
       }
+    }
+
+    if (resourceBindings.length > 0) {
+      logger.info('[INTENT_TEST_CASE] Attaching resource bindings', {
+        kinds: resourceBindings.map((b) => b.kind),
+        explicit: params.resourceBindings?.length ?? 0,
+      });
     }
 
     const normalizedSteps = this.normalizeSteps(steps);

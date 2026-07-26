@@ -27,6 +27,7 @@ import { getPreviewSessionService } from '@/services/testing/ui/preview/preview-
 import { DraftStepsCache } from '@/services/testing/ui/preview/draft-steps-cache';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { sanitizeSteps } from '@/services/testing/shared/step-sanitizer';
+import { containsBoundSecretPlaceholder } from '@/utils/interpolation/redact-secrets';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -231,6 +232,20 @@ export async function saveDraftRunAsTestCase(req: Request, res: Response): Promi
     //    first, mirroring handleCreateTestCase (avoids plaintext secrets in
     //    steps_json + lets a regression replay resolve them).
     const { steps: sanitizedSteps, parametersSchema } = sanitizeSteps(cached.steps);
+
+    // Same fail-closed guard `handleCreateTestCase` applies: attach the
+    // credential binding only if these steps still reference a bound secret.
+    // A draft cached from an earlier authoring turn can outlive the test it
+    // belonged to (30-minute TTL), and a `required` binding on a test that
+    // references no `{{secrets.*}}` fails the run for a reason its steps do
+    // not explain.
+    const stepsReferenceSecret = sanitizedSteps.some(
+      (s) => containsBoundSecretPlaceholder(s.value) || containsBoundSecretPlaceholder(s.assertionText),
+    );
+    const bindingsToSave = cached.resourceBindings?.length && stepsReferenceSecret
+      ? cached.resourceBindings
+      : undefined;
+
     let createdTestCase;
     try {
       createdTestCase = await IntentTestCaseService.create({
@@ -241,6 +256,9 @@ export async function saveDraftRunAsTestCase(req: Request, res: Response): Promi
         steps: sanitizedSteps,
         parametersSchema,
         status: 'draft',
+        // Carry the credential binding the authoring agent discovered — without
+        // it the saved test's `{{secrets.*}}` resolve to nothing and it 401s.
+        ...(bindingsToSave ? { resourceBindings: bindingsToSave } : {}),
       });
     } catch (createErr) {
       logger.error('[DRAFT_CONTROLLER] IntentTestCaseService.create failed', {
@@ -257,6 +275,9 @@ export async function saveDraftRunAsTestCase(req: Request, res: Response): Promi
         startUrl: cached.startUrl,
         userId: cached.userId,
         ...(cached.suggestedName ? { suggestedName: cached.suggestedName } : {}),
+        // Restore the binding too — a retry after a failed save must not
+        // silently produce a test case that 401s.
+        ...(cached.resourceBindings?.length ? { resourceBindings: cached.resourceBindings } : {}),
       });
       res.status(500).json({
         success: false,

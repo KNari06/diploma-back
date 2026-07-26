@@ -58,6 +58,7 @@ import {
   handleManageAutomationAction,
 } from './qa-tool-handlers';
 import { logger } from '@/utils/core/logger';
+import { CredentialAuthoringFeature } from '@/config/features/credential-authoring';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -71,6 +72,14 @@ import { logger } from '@/utils/core/logger';
  *
  * ═══════════════════════════════════════════════════════════════════════════
  */
+
+/**
+ * The credential sentence in `qa_author_test_iteratively`'s description. Kept as
+ * a constant so the flag-off variant is produced by REMOVING it, rather than by
+ * maintaining two copies of a long description that would drift apart.
+ */
+const CREDENTIAL_TOOL_SENTENCE =
+  ' LOGIN FLOWS ARE SUPPORTED: ask the user which SAVED login to use and pass its name as credential_secret_name — the server injects the stored credentials and freezes {{secrets.*}} into the steps.';
 
 const QA_TOOLS: ChatCompletionTool[] = [
   {
@@ -1261,7 +1270,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_author_test_iteratively',
       description:
-        '⚠️ WRITE operation — Autonomously BUILD a test case by generating-and-executing each step live on the editor preview, grounded in the real page at every step (snapshot → pick real element → execute → re-snapshot → next). PREFER THIS over qa_run_draft_steps when the user asks to "test <a flow>" on the current page and you do NOT already have explicit steps — it discovers the steps by doing them, so they are verified, not guessed. Requires an active editor preview session. Describe the goal → get approval → call with confirm=true. The result is already-passed steps; the user then says "save" to persist (qa_create_test_case).',
+        `⚠️ WRITE operation — Autonomously BUILD a test case by generating-and-executing each step live on the editor preview, grounded in the real page at every step (snapshot → pick real element → execute → re-snapshot → next). PREFER THIS over qa_run_draft_steps when the user asks to "test <a flow>" on the current page and you do NOT already have explicit steps — it discovers the steps by doing them, so they are verified, not guessed. Requires an active editor preview session.${CREDENTIAL_TOOL_SENTENCE} Describe the goal → get approval → call with confirm=true. The result is already-passed steps; the user then says "save" to persist (qa_create_test_case).`,
       parameters: {
         type: 'object',
         properties: {
@@ -1272,6 +1281,10 @@ const QA_TOOLS: ChatCompletionTool[] = [
           suggested_name: {
             type: 'string',
             description: 'Short 3-5 word title for the scenario (e.g. "Valid Login Flow"). Used as the default test case name when the user saves.',
+          },
+          credential_secret_name: {
+            type: 'string',
+            description: 'REQUIRED for any flow that needs a login. The NAME of a saved login the user told you to use (e.g. "Demo login") — ask them which one, never guess and never invent credentials. The server looks the name up in this project and injects the stored values, freezing {{secrets.*}} placeholders into the steps so the saved test can replay. If the name is unknown the tool replies with the available names so you can ask again.',
           },
           confirm: {
             type: 'boolean',
@@ -1713,13 +1726,45 @@ const QA_TOOLS: ChatCompletionTool[] = [
 /**
  * QA Skill definition
  */
+/**
+ * Tool list for the current flag state. When credential authoring is OFF the
+ * `credential_secret_name` parameter is not advertised and the description does
+ * not mention it — otherwise the model would keep passing an argument the
+ * handler refuses, burning turns on a feature that is switched off.
+ *
+ * Computed per call, not at module load, so flipping the env var takes effect
+ * on restart without depending on import order.
+ */
+function buildQaTools(): ChatCompletionTool[] {
+  if (CredentialAuthoringFeature.isEnabled()) return QA_TOOLS;
+
+  return QA_TOOLS.map((tool) => {
+    if (tool.type !== 'function' || tool.function.name !== 'qa_author_test_iteratively') return tool;
+
+    const params = tool.function.parameters as { properties?: Record<string, unknown> } | undefined;
+    const properties = { ...(params?.properties ?? {}) };
+    delete properties.credential_secret_name;
+
+    return {
+      ...tool,
+      function: {
+        ...tool.function,
+        description: (tool.function.description ?? '').replace(CREDENTIAL_TOOL_SENTENCE, ''),
+        parameters: { ...(params ?? {}), properties },
+      },
+    } as ChatCompletionTool;
+  });
+}
+
 export const QASkill: SkillDefinition = {
   id: 'qa',
   name: 'QA Tools',
   provider: 'qa',
   description:
     'Query and manage test cases, executions, regression plans, analytics, API test configs/history, coverage reports, failure analysis, recommendations, fixtures, deployments, Jira issues, element interactions, AI usage, heatmaps, time series, and full dashboard snapshots. 31 read-only tools + 11 write tools for comprehensive QA data access and management.',
-  tools: QA_TOOLS,
+  get tools(): ChatCompletionTool[] {
+    return buildQaTools();
+  },
 
   /**
    * QA tools are always available when projectId is in context

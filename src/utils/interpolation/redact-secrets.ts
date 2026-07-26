@@ -55,11 +55,39 @@ const MIN_REDACT_LENGTH = 4;
  * Single source for the three places that need this shape: the authoring
  * freeze, the `toIntentSteps` mask guard, and the binding-emission check.
  */
-const SECRET_PLACEHOLDER_RE = /^\{\{secrets\.[\w.-]+\}\}$/;
+/**
+ * The ONE encoding of the bound-placeholder grammar. Everything that needs the
+ * shape — anchored, unanchored, or as an alternation branch inside a larger
+ * regex (`credential-step-templater`) — derives from this string, so the key
+ * charset cannot drift between copies.
+ */
+export const SECRET_PLACEHOLDER_SOURCE = '\\{\\{secrets\\.[\\w.-]+\\}\\}';
+
+const SECRET_PLACEHOLDER_RE = new RegExp(`^${SECRET_PLACEHOLDER_SOURCE}$`);
 
 /** Is this value a `{{secrets.<key>}}` placeholder bound to a stored secret? */
 export function isBoundSecretPlaceholder(value: unknown): value is string {
   return typeof value === 'string' && SECRET_PLACEHOLDER_RE.test(value);
+}
+
+/**
+ * Unanchored sibling: does the string CONTAIN a bound placeholder somewhere?
+ *
+ * An authored assertion is templated in place — `Welcome back,
+ * {{secrets.login_email}}` — so it is a credential-safe string that the
+ * anchored check above rejects. Callers that ask "has this already been made
+ * safe?" (rather than "is this exactly a bound value?") need this one. Keeping
+ * both here keeps the placeholder grammar in a single file.
+ */
+const SECRET_PLACEHOLDER_CONTAINS_RE = new RegExp(SECRET_PLACEHOLDER_SOURCE);
+
+/**
+ * Deliberately NOT a type predicate: callers ask this about a value they have
+ * already narrowed to `string`, and `value is string` would narrow the FALSE
+ * branch to `never` and break them.
+ */
+export function containsBoundSecretPlaceholder(value: unknown): boolean {
+  return typeof value === 'string' && SECRET_PLACEHOLDER_CONTAINS_RE.test(value);
 }
 
 /**

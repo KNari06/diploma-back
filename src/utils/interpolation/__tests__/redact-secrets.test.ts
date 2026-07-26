@@ -1,5 +1,7 @@
 import {
   collectSecretValues,
+  containsBoundSecretPlaceholder,
+  isBoundSecretPlaceholder,
   redactCredentialValues,
   redactSecrets,
   redactSnapshotValues,
@@ -198,5 +200,40 @@ describe('redactCredentialValues', () => {
     });
     expect(out).not.toContain('@acme.io');
     expect(out).toBe('contact *** now');
+  });
+});
+
+describe('containsBoundSecretPlaceholder', () => {
+  it('accepts an EMBEDDED placeholder, where the anchored check does not', () => {
+    // This is the whole reason it exists: templating a credential out of an
+    // assertion produces a placeholder inside surrounding text, and the
+    // sanitizer must treat that string as already safe.
+    expect(containsBoundSecretPlaceholder('Welcome back, {{secrets.login_email}}!')).toBe(true);
+    expect(isBoundSecretPlaceholder('Welcome back, {{secrets.login_email}}!')).toBe(false);
+  });
+
+  it('accepts a bare placeholder too', () => {
+    expect(containsBoundSecretPlaceholder('{{secrets.login_password}}')).toBe(true);
+  });
+
+  it('rejects other namespaces and malformed shapes', () => {
+    expect(containsBoundSecretPlaceholder('{{param_secret}}')).toBe(false);
+    expect(containsBoundSecretPlaceholder('{{env.API_BASE}}')).toBe(false);
+    expect(containsBoundSecretPlaceholder('{{secrets.}}')).toBe(false);
+    expect(containsBoundSecretPlaceholder('plain text')).toBe(false);
+    expect(containsBoundSecretPlaceholder(undefined)).toBe(false);
+    expect(containsBoundSecretPlaceholder(42)).toBe(false);
+  });
+
+  it('treats a CORRUPTED nesting as containing a placeholder — documented, and why it is safe', () => {
+    // `{{secrets.login_{{secrets.login_password}}}}` was produced by a real bug
+    // (a credential value occurring inside its own key name). The inner match
+    // makes this true, so `sanitizeSteps` waves the string through instead of
+    // masking it. That is the RIGHT trade-off here: the string contains no
+    // credential literal (it is placeholders all the way down), so nothing
+    // leaks; it merely fails to resolve. Masking it would swap a resolution
+    // failure for a different one while hiding the real defect. The corruption
+    // itself is prevented upstream in credential-step-templater.
+    expect(containsBoundSecretPlaceholder('{{secrets.login_{{secrets.login_password}}}}')).toBe(true);
   });
 });

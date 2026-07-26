@@ -94,6 +94,46 @@ describe('sanitizeSteps (shared web + mobile)', () => {
     expect(Object.keys(parametersSchema).sort()).toEqual(['param_password', 'param_password_2']);
   });
 
+  // ── Templated-against-a-stored-secret strings (credential-store binding) ──
+  // These are already safe; re-parameterising them to {{param_*}} destroys the
+  // binding and the step resolves to nothing at replay (a false RED).
+  describe('values/assertions templated with {{secrets.*}}', () => {
+    it('leaves an embedded secret placeholder in assertionText alone even when the KEY NAME looks sensitive', () => {
+      const step = mk({
+        id: 'a',
+        type: 'ai_check',
+        description: 'Check the greeting',
+        assertionText: 'Welcome back, {{secrets.login_password}}',
+      });
+      const { steps } = sanitizeSteps([step]);
+      expect(steps[0].assertionText).toBe('Welcome back, {{secrets.login_password}}');
+    });
+
+    it('leaves an embedded secret placeholder in an assert value alone despite a sensitive description', () => {
+      const step = mk({
+        id: 'a',
+        type: 'assert',
+        description: 'Assert the credential greeting is shown',
+        value: 'Welcome back, {{secrets.login_email}}',
+      });
+      const { steps, parametersSchema } = sanitizeSteps([step]);
+      expect(steps[0].value).toBe('Welcome back, {{secrets.login_email}}');
+      expect(parametersSchema).toEqual({});
+    });
+
+    it('still parameterises a sensitive value that is NOT bound to a secret', () => {
+      const step = mk({ id: 'a', type: 'type', description: 'Type the password', value: 'hunter2' });
+      const { steps } = sanitizeSteps([step]);
+      expect(steps[0].value).toMatch(PLACEHOLDER);
+    });
+
+    it('still masks an assertionText that quotes a secret with no placeholder', () => {
+      const step = mk({ id: 'a', type: 'ai_check', assertionText: 'the password is hunter2' });
+      const { steps } = sanitizeSteps([step]);
+      expect(steps[0].assertionText).toBe('{{param_secret}}');
+    });
+  });
+
   it('exports the secret option fields + slugify helper', () => {
     expect(SECRET_OPTION_FIELDS).toContain('totpSecret');
     expect(slugify('Type the Password!', 32)).toBe('type_the_password');
