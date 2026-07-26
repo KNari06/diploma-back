@@ -91,6 +91,18 @@ export function commandToStep(
       // resolve — better to drop the value than to freeze a placeholder replay
       // would type verbatim into the app's password field.
       const sensitiveValue = secretKey ? buildSecretPlaceholder(secretKey) : undefined;
+      if (secretKeyForKind && !injectedKind && cmd.args.is_sensitive) {
+        // The executor injects a credential for ANY classified kind but only
+        // REPORTS the kind at HIGH (Level-1 type/autocomplete/inputmode)
+        // confidence. So a credential field identified only by label text is
+        // filled for real during authoring and then persisted WITHOUT a
+        // placeholder — the saved test replays with an empty/garbage field and
+        // 401s, while authoring looked perfect. Name it in the log; silence
+        // here is what makes that class of failure so expensive to diagnose.
+        logger.warn('[PIPELINE_STEP_EXTRACTOR] Sensitive fill with no high-confidence credential kind — not frozen', {
+          ref: cmd.args.ref,
+        });
+      }
       if (secretKeyForKind && injectedKind && !sensitiveValue) {
         // Otherwise this is a silent value-drop: replay leaves the field empty
         // and 401s with nothing in the logs explaining why.

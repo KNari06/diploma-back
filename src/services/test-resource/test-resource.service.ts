@@ -25,6 +25,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { encryptString, decryptString } from '@/utils/security/crypto';
 import { requireResourceAdapter, getResourceAdapter } from './adapter-registry';
+import { hasProjectAccess } from '@/services/core/project-access.service';
 import type {
   ResourceKind,
   ResourceRow,
@@ -56,6 +57,12 @@ export interface CreateResourceInput {
   refreshMethod?: RefreshMethod;
   refreshConfig?: Record<string, unknown>;
   recipe?: unknown[];
+  /**
+   * Bypass the owner-or-workspace-member gate. TRUSTED callers only — the
+   * chat-eval scripts, which run under a synthetic user id and borrow a real
+   * project row solely to satisfy the FK. Never set from an HTTP request body.
+   */
+  skipAccessCheck?: boolean;
 }
 
 export interface UpdateResourceInput {
@@ -287,6 +294,21 @@ export async function createResource(
   const projectId = assertNonEmpty(input.projectId, 'projectId');
   const name = assertNonEmpty(input.name, 'name');
   const adapter = requireResourceAdapter(input.kind);
+
+  // Authorization lives INSIDE the function it guards, so every caller
+  // inherits it — a gate in the controller alone would leave any future job,
+  // script or second route unprotected. Without it, `projectId` is just a
+  // caller-supplied string, so a resource (including a `secret`, and with
+  // `setAsDefault` one that other tests then bind to) could be planted in a
+  // project the caller has no access to.
+  //
+  // `skipAccessCheck` is for TRUSTED, non-request callers only: the chat-eval
+  // scripts run under a synthetic user id and deliberately borrow a real
+  // project row purely to satisfy the NOT NULL FK. It is never reachable from
+  // an HTTP body — the controller does not forward it.
+  if (!input.skipAccessCheck && !(await hasProjectAccess(projectId, userId))) {
+    throw new Error('No access to this project');
+  }
 
   // Symmetric with updateResource: TTL must be a positive integer or
   // omitted. ttlSeconds=0 silently produced a permanently-stale resource

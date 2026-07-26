@@ -61,6 +61,9 @@ export async function seedEvalCredential(credentials: {
         [EVAL_SECRET_PASSWORD_KEY]: credentials.password,
       },
     },
+    // EVAL_USER_ID is synthetic and the project is borrowed purely for the FK,
+    // so the owner-or-member gate has nothing real to check here.
+    skipAccessCheck: true,
   });
 
   // Names only — never the values (CLAUDE.md invariant #10).

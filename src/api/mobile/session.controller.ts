@@ -27,6 +27,7 @@ import { resolveDedicatedDevice } from '@/services/mobile/dedicated-device.servi
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { normalizeMobileBriefing } from '@/services/mobile/mobile-briefing.util';
+import { toRunnerActionType } from '@/services/mobile/lint-action-type';
 import { ProjectService } from '@/services/core/project.service';
 import { getProjectMobileApp, getFlutterDefaultHost, getDefaultVariantLabel, resolveFlutterHost } from '@/services/mobile/project-mobile-app.helper';
 import { sendMobileRunnerError, isSessionGoneError } from './mobile-error-mapper';
@@ -1740,45 +1741,9 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
     const { normalizeMobileDescription } = await import('@/services/mobile/normalize-description');
     const description = normalizeMobileDescription(rawDescription);
 
-    // Map frontend step kind → mobile runner actionType for element resolution context.
-    // The actionType tells the LLM what the user intends to do with the element,
-    // which affects how it scores candidates (e.g., clickable for tap, editable for type).
-    const ACTION_TYPE_MAP: Record<string, string> = {
-      // Core actions
-      tap: 'tap',
-      click: 'tap',
-      type: 'type_text',
-      fill: 'type_text',
-      scroll: 'scroll',
-      swipe: 'swipe',
-      long_press: 'long_press',
-      double_tap: 'double_tap',
-      drag: 'drag',
-      press: 'press_key',
-      // Assertions
-      assert: 'assert_visible',
-      ai_check: 'assert_visible',
-      // Navigation (no element resolution needed, but pass through)
-      go_back: 'go_back',
-      go_home: 'go_home',
-      // `dismiss` closes the top modal without resolving an element.
-      // The `actionType` here is only used to tell the resolver what the
-      // user intended; for dismiss there's nothing to resolve, but we
-      // still pass it through so the schema validator accepts the step.
-      dismiss: 'dismiss',
-      navigate: 'open_url',
-      open_app: 'launch_app',
-      close_app: 'close_app',
-      // Device actions (no element resolution needed)
-      biometric: 'biometric',
-      otp: 'otp',
-      permission: 'permission_dialog',
-      network: 'set_network_condition',
-      pinch: 'pinch_zoom',
-      clipboard: 'set_clipboard',
-      upload: 'upload_file',
-    };
-    const actionType = ACTION_TYPE_MAP[stepType] || 'tap';
+    // Step kind → runner actionType. The map is resolution POLICY, so it lives
+    // in the service layer (see lint-action-type.ts for why it matters).
+    const actionType = toRunnerActionType(stepType);
 
     // Trace logging for mobile editor
     lintDescription = description;

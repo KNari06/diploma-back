@@ -32,7 +32,8 @@ import {
   type SecretKeyForKind,
 } from '@/agent/core/lite/exploration/pipeline-step-extractor';
 import { KEY_RE as SECRET_KEY_RE } from '@/services/test-resource/adapters/secret.adapter';
-import { isBoundSecretPlaceholder } from '@/utils/interpolation/redact-secrets';
+import { isBoundSecretPlaceholder, redactWithValues } from '@/utils/interpolation/redact-secrets';
+import { templateCredentialsInSteps } from './credential-step-templater';
 import type { DiscoveredStep } from '@/agent/core/lite/exploration/types';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -78,6 +79,13 @@ export interface AuthorTestParams {
    * credential fills stay value-less (previous behaviour).
    */
   credentialSecret?: CredentialSecretBinding;
+  /**
+   * Credential VALUE → secret key. When present, a credential the app RENDERS
+   * BACK ("Welcome back, demo@qait.dev") is templated to `{{secrets.<key>}}`
+   * in the authored assertion / description / compiled locator chain, so the
+   * persisted test carries no credential literal. Held in memory only.
+   */
+  credentialValueToKey?: Map<string, string>;
   maxRounds?: number;
   timeoutMs?: number;
 }
@@ -256,9 +264,19 @@ export class EditorIterativeAuthorService {
       // assertionText, which THROWS at replay ("assertionText is required") and
       // false-REDs an otherwise-passing authored test. `mark_done` already
       // requires evidence in its schema, so this is defensive.
-      const steps = extractedSteps.filter(
+      const survivingSteps = extractedSteps.filter(
         (s) => !(s.action === 'verify' && !(s.expectedOutcome && s.expectedOutcome.trim())),
       );
+
+      // Template out any credential the app rendered BACK to us. The freeze in
+      // commandToStep only covers what the agent TYPES; a successful login
+      // lands on "Welcome back, <email>", so the assertion, the description
+      // and the compiled locator chain (built from that element's own text
+      // inside extractDiscoveredSteps, i.e. already attached by now) all hold
+      // the literal. Must run BEFORE toIntentSteps / sanitizeSteps.
+      const steps = params.credentialValueToKey
+        ? templateCredentialsInSteps(survivingSteps, params.credentialValueToKey)
+        : survivingSteps;
 
       // Finalize the progress bubble (mirrors runStepsOnPreview's completed emit).
       webSocketService.emitToUser(userId, 'preview:run:completed', {
@@ -286,12 +304,22 @@ export class EditorIterativeAuthorService {
         ? [{ kind: 'secret' as const, resource_id: cs.resourceId, required: true }]
         : undefined;
 
+      // The agent's own stop reason quotes the page as evidence ("welcome
+      // message reads 'Welcome back, <email>'"), so on a credential flow it
+      // carries the credential into this log AND into the chat message the
+      // tool returns. Mask it (invariant #10) — unlike the steps, this is
+      // free text, so masking beats templating.
+      const credentialValues = [...(params.credentialValueToKey?.keys() ?? [])];
+      const reason = credentialValues.length > 0
+        ? redactWithValues(result.reason, credentialValues)
+        : result.reason;
+
       logger.info('[EDITOR_AUTHOR] Authoring finished', {
         previewSessionId,
         success: result.success,
         roundsExecuted: result.roundsExecuted,
         stepCount: steps.length,
-        reason: result.reason,
+        reason,
         boundCredentialSecret: !!resourceBindings,
       });
 
@@ -302,7 +330,7 @@ export class EditorIterativeAuthorService {
         endUrl,
         roundsExecuted: result.roundsExecuted,
         durationMs: Date.now() - startedAt,
-        reason: result.reason,
+        reason,
         ...(resourceBindings ? { resourceBindings } : {}),
       };
     } catch (err) {
