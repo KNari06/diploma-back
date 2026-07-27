@@ -13,11 +13,13 @@ jest.mock('../credit-cost-tracker.service', () => ({
 }));
 jest.mock('@/config/features/authoring-credits', () => {
   const PAID = new Set(['llm', 'vision']);
+  const PAID_MOBILE = new Set(['llm', 'vision', 'thinking']);
   return {
     AuthoringCreditsFeature: {
       isEnabled: jest.fn(),
       getPerResolve: jest.fn(() => 1),
       isPaidResolverPath: (p?: string) => !!p && PAID.has(p),
+      isPaidMobileResolvedVia: (v?: string) => !!v && PAID_MOBILE.has(v),
     },
   };
 });
@@ -91,5 +93,67 @@ describe('AuthoringCreditsService.chargeForApply', () => {
     const other = await AuthoringCreditsService.chargeForApply({ ...base, stepId: 'step2' });
     expect(other.charged).toBe(true);
     expect(mockDeduct).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not charge when the apply carried no step id', async () => {
+    const r = await AuthoringCreditsService.chargeForApply({ ...base, stepId: '' });
+    expect(r.reason).toBe('no_step_id');
+    expect(mockDeduct).not.toHaveBeenCalled();
+  });
+});
+
+describe('AuthoringCreditsService.chargeForMobileApply', () => {
+  const mobileBase = { userId: 'u1', previewSessionId: 'msess1', stepId: 'step1' };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockIsEnabled.mockReturnValue(true);
+    mockDeduct.mockResolvedValue({ success: true, newBalance: 42 });
+    AuthoringCreditsService.clearSession('msess1');
+  });
+
+  it.each(['llm', 'vision', 'thinking'])('charges a mobile apply resolved via %s', async (resolvedVia) => {
+    const r = await AuthoringCreditsService.chargeForMobileApply({ ...mobileBase, resolvedVia });
+    expect(r).toEqual({ charged: true, credits: 1 });
+  });
+
+  it.each(['compiled', 'exact_label', 'exact_text', 'text_match', 'coordinates', 'passthrough'])(
+    'does not charge a deterministic mobile resolve (%s)',
+    async (resolvedVia) => {
+      const r = await AuthoringCreditsService.chargeForMobileApply({ ...mobileBase, resolvedVia });
+      expect(r.reason).toBe('no_llm');
+      expect(mockDeduct).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not charge an unrecognised resolvedVia the runner may add later', async () => {
+    const r = await AuthoringCreditsService.chargeForMobileApply({ ...mobileBase, resolvedVia: 'some_future_path' });
+    expect(r.reason).toBe('no_llm');
+    expect(mockDeduct).not.toHaveBeenCalled();
+  });
+
+  it('does not charge when resolvedVia is absent', async () => {
+    const r = await AuthoringCreditsService.chargeForMobileApply({ ...mobileBase, resolvedVia: undefined });
+    expect(r.reason).toBe('no_llm');
+  });
+
+  it('charges mobile at the same rate as web', async () => {
+    const web = await AuthoringCreditsService.chargeForApply(base);
+    const mobile = await AuthoringCreditsService.chargeForMobileApply({ ...mobileBase, resolvedVia: 'llm' });
+    expect(mobile.credits).toBe(web.credits);
+  });
+
+  it('dedupes a re-apply of the same mobile step in the same session', async () => {
+    await AuthoringCreditsService.chargeForMobileApply({ ...mobileBase, resolvedVia: 'llm' });
+    const second = await AuthoringCreditsService.chargeForMobileApply({ ...mobileBase, resolvedVia: 'llm' });
+    expect(second.reason).toBe('already_charged');
+    expect(mockDeduct).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not charge when the feature is disabled', async () => {
+    mockIsEnabled.mockReturnValue(false);
+    const r = await AuthoringCreditsService.chargeForMobileApply({ ...mobileBase, resolvedVia: 'llm' });
+    expect(r.reason).toBe('disabled');
+    expect(mockDeduct).not.toHaveBeenCalled();
   });
 });

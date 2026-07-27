@@ -1332,6 +1332,14 @@ export async function destroySession(req: Request, res: Response): Promise<void>
     // Clear per-session runner binding (best-effort).
     clearSessionRunnerBinding(sessionId).catch(() => {});
 
+    // Drop this session's authoring-credit dedup entries, mirroring what the
+    // web preview does on teardown (preview-session.service.ts). Without it the
+    // in-memory set only ever grows for mobile — session ids are unique, so the
+    // stale keys can never match again, they just accumulate for the lifetime
+    // of the API process.
+    const { AuthoringCreditsService } = await import('@/services/core/authoring-credits.service');
+    AuthoringCreditsService.clearSession(sessionId);
+
     // Remove Redis mapping (best effort — might not match exactly)
     if (projectId) {
       await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`);
@@ -1968,6 +1976,29 @@ export async function applySession(req: Request, res: Response): Promise<void> {
         durationMs: output.stepResult?.durationMs,
       },
     });
+
+    // Charge credits for an AI-assisted mobile apply — same rate and dedup as
+    // the web preview path (preview.handler.ts). Only fires when the runner
+    // needed the LLM (resolvedVia 'llm'/'vision'/'thinking'); deterministic
+    // tree matches are free. Fire-and-forget: billing must never delay or fail
+    // the apply, which is on the interactive editor hot path.
+    if (output.stepResult?.success) {
+      void import('@/services/core/authoring-credits.service')
+        .then(({ AuthoringCreditsService }) =>
+          AuthoringCreditsService.chargeForMobileApply({
+            userId: req.user!.id,
+            previewSessionId: sessionId,
+            stepId: stepDraft.id,
+            resolvedVia: output.stepResult?.resolvedVia,
+          }),
+        )
+        .catch((err) => {
+          logger.warn('[applySession] authoring credit charge failed (non-fatal)', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+    }
 
     // Auto-persist compiled plan to `intent_test_cases.steps_json[].compiled`
     // when the apply succeeded AND the caller passed `intentTestCaseId`.
