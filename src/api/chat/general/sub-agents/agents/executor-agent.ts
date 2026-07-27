@@ -10,6 +10,10 @@ import { emitProcessingStep } from '@/api/chat/shared/utils';
 import { PROGRESS } from '@/api/chat/shared/constants';
 import { executeTool } from '@/services/skills/tool-executor';
 import { ToolCallTracker } from '@/services/skills/hooks/loop-detection.hook';
+import {
+  isReplayableConfirmTool,
+  storePendingEditorConfirmation,
+} from '@/api/chat/shared/editor-confirmation';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -269,6 +273,8 @@ export async function executeTools(
         projectId: context.projectId,
         previewSessionId: context.previewSessionId,
         mode: context.mode,
+        storeKind: context.storeKind,
+        testCaseId: context.testCaseId,
       };
 
       const callResult = await executeTool({
@@ -283,6 +289,24 @@ export async function executeTools(
       // Push messages (tool_result + possible screenshot image)
       messages.push(...callResult.messages);
       toolResults.push(callResult.record);
+
+      // Two-phase confirm, editor half: a write tool that refused pending
+      // approval gets its exact call cached, so the user's next "yes" replays
+      // THIS call instead of letting the executor re-plan (which is what
+      // silently dropped every save in the 2026-07-26 session). Test-case scope
+      // only — global chat has its own interceptor. Best-effort by design.
+      if (
+        context.testCaseId
+        && context.chatSessionId
+        && callResult.toolResult.needsConfirmation
+        && isReplayableConfirmTool(toolName)
+      ) {
+        await storePendingEditorConfirmation(context.chatSessionId, {
+          toolName,
+          args: toolArgs,
+          skillContext,
+        });
+      }
 
       // Trace the tool call into test_logs/chat_test/ (test-case scope only).
       if (context.testCaseId && context.chatSessionId) {

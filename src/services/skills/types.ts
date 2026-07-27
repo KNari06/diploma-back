@@ -48,6 +48,14 @@ export interface SkillResult {
   data?: any;
   message: string;
   displayToUser?: boolean; // Whether to show this result to the user
+  /**
+   * Set by a write tool's confirm gate when it refused because `confirm` was
+   * not true. Machine-readable on purpose: callers that implement a two-phase
+   * confirm (see `api/chat/shared/editor-confirmation.ts`) must recognise a
+   * preview refusal WITHOUT string-matching the gate's LLM-targeted prose,
+   * which is not a stable contract. Never set on any other failure.
+   */
+  needsConfirmation?: boolean;
 }
 
 /**

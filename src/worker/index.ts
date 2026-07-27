@@ -17,6 +17,7 @@ import { MobileTestRunJobHandler } from '@/jobs/mobile-test-run.job';
 import { processNegativeGeneration } from '@/jobs/negative-generation.job';
 import { RegressionDoctorJobHandler } from '@/jobs/regression-doctor.job';
 import { VisualAnomalySweepJobHandler } from '@/jobs/visual-anomaly-sweep.job';
+import { registerBuiltinResourceAdapters } from '@/services/test-resource';
 import { StaleReaperService } from '@/services/testing/results/stale-reaper.service';
 import { logger } from '@/utils/core/logger';
 import { startLeaderElection, stopLeaderElection } from '@/scheduler/leader';
@@ -27,6 +28,17 @@ import { queueMonitor } from './queue-monitor';
 // The worker is high-volume (queue ticks, RAM guard, job heartbeats, etc.)
 // and would dominate the System Logs tab — operators read worker output via
 // its own console/file transports instead.
+
+// Resource adapters must be registered in EVERY process that applies a
+// binding, and the worker is where background replay actually runs — the API
+// only enqueues. Without this, `applyBindingsToContext` throws
+// "No adapter registered for resource kind 'secret'" at SETUP, before the
+// browser does anything, so a saved test carrying ANY binding (auth login,
+// environment, secret, fixture) can never pass in a regression or scheduled
+// run. Verified live 2026-07-27: a credential-bound login test failed with
+// exactly that error while the same steps replayed fine in the editor.
+// `src/index.ts` has always called this; the worker never did.
+registerBuiltinResourceAdapters();
 
 // Validate worker configuration
 const getValidatedConcurrency = (): number => {

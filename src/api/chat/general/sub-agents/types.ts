@@ -183,6 +183,16 @@ export interface PipelineContext {
   testCaseId?: string;
   /** Human-readable name of the test case in scope (for the executor prompt). */
   testCaseName?: string;
+  /**
+   * Chat scope, forwarded onto every `SkillContext` the pipeline builds.
+   *
+   * Skills gate themselves on this (`memory.skill.ts`'s `isAvailable`,
+   * `qa_create_test_case`'s save-the-open-test-case guard). The monolithic
+   * fallback loop in `general/handler.ts` has always set it; the sub-agent
+   * path — the one that actually runs — did not, so every such gate silently
+   * saw `undefined` and behaved as if the chat were global.
+   */
+  storeKind?: 'global' | 'testcase';
 }
 
 /**

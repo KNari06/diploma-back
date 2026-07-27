@@ -561,6 +561,10 @@ router.post('/cancel',
     try {
       const { clearPendingCompound } = await import('./shared/compound-queue');
       await clearPendingCompound(chatSessionId);
+      // Same for a pending editor write awaiting "yes" — cancel means cancel,
+      // and a survivor would fire on the user's next affirmative message.
+      const { clearPendingEditorConfirmation } = await import('./shared/editor-confirmation');
+      await clearPendingEditorConfirmation(chatSessionId);
     } catch {
       /* best-effort */
     }
