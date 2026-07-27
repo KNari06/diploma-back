@@ -58,6 +58,24 @@ class SkillRegistryClass {
   private static readonly DUPLICATE_WINDOW_MS = 2 * 60 * 1000;
 
   /**
+   * Re-arm the confirm-preview for (session, tool) so the very next
+   * `confirm: true` call is honoured instead of being downgraded.
+   *
+   * The ONLY sanctioned caller is a two-phase-confirm interceptor that has
+   * already observed BOTH halves of the handshake out-of-band: the tool's own
+   * preview refusal (which is what made it cache the pending op) and the
+   * user's classified affirmative reply. Re-arming there is not a bypass — it
+   * restores a preview that genuinely happened but whose in-memory record had
+   * aged out of the 5-minute window, which is routine: a real user took 22
+   * minutes to answer "yes" in the session this was written for. The LLM
+   * cannot reach this; it is deliberately not exposed as a tool.
+   */
+  recordConfirmationPreview(chatSessionId: string, toolName: string): void {
+    if (!chatSessionId || !this.toolsWithConfirm.has(toolName)) return;
+    this.confirmPreviews.set(`${chatSessionId}:${toolName}`, Date.now());
+  }
+
+  /**
    * Stable fingerprint of a tool call's arguments, ignoring `confirm` (which
    * differs between the preview turn and the approved one). Hashed so a call
    * carrying a large `steps` array doesn't become a multi-KB map key.

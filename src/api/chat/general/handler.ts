@@ -1244,6 +1244,11 @@ You are inside the editor for the test case currently open in the preview. The
             // sees zero progress events while sub-agents work.
             testCaseId,
             testCaseName,
+            // Scope marker for every SkillContext the pipeline builds — see
+            // PipelineContext.storeKind. The monolithic loop below already
+            // passes it; the sub-agent path did not, which left skill-level
+            // scope gates reading `undefined`.
+            storeKind: store.kind,
           });
 
           // Extract the user content from the last message (may be multimodal array with images)

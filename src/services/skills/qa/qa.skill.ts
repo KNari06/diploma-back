@@ -1362,6 +1362,10 @@ const QA_TOOLS: ChatCompletionTool[] = [
             items: { type: 'string' },
             description: 'Tags for the test case',
           },
+          new_separate_test: {
+            type: 'boolean',
+            description: 'Only meaningful while editing an existing test case. Set true ONLY when the user explicitly asked for a NEW, separate, additional test case ("create another test", "создай новый тест"). "save" / "update" / "apply" NEVER mean this — use qa_update_test_case_steps for those. Omit otherwise.',
+          },
           confirm: {
             type: 'boolean',
             description: 'Must be true. Set ONLY after describing the test case to user AND receiving explicit approval.',
