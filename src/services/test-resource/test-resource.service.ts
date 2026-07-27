@@ -496,7 +496,7 @@ export async function bindingSummaryByFlows(
 ): Promise<
   Record<
     string,
-    { authName?: string; envName?: string; secretNames?: string[]; fixtureNames?: string[]; setupName?: string }
+    { authName?: string; envName?: string; secretNames?: string[]; fixtureNames?: string[] }
   >
 > {
   const uid = assertNonEmpty(userId, 'userId');
@@ -593,7 +593,7 @@ export async function bindingSummaryByFlows(
   // 4) Compose per-flow summary.
   const out: Record<
     string,
-    { authName?: string; envName?: string; secretNames?: string[]; fixtureNames?: string[]; setupName?: string }
+    { authName?: string; envName?: string; secretNames?: string[]; fixtureNames?: string[] }
   > = {};
   for (const [flowId, preferred] of preferredByFlow) {
     const bindings = Array.isArray(preferred.resource_bindings)
@@ -604,7 +604,6 @@ export async function bindingSummaryByFlows(
       envName?: string;
       secretNames?: string[];
       fixtureNames?: string[];
-      setupName?: string;
     } = {};
     for (const b of bindings) {
       const r = b?.resource_id ? resById.get(b.resource_id) : undefined;
@@ -623,14 +622,6 @@ export async function bindingSummaryByFlows(
           break;
         case 'data_fixture':
           (summary.fixtureNames ||= []).push(r.name);
-          break;
-        case 'scenario_setup':
-          // One scenario_setup per test (single starting point). If a
-          // test ever ends up with multiple setup bindings (Slice 2+ —
-          // composability via direct array vs nested use_setup), the
-          // first wins. Names are top-level only; nested setups aren't
-          // listed here — the UI shows what the test author chose.
-          if (!summary.setupName) summary.setupName = r.name;
           break;
         default:
         // Other kinds (device/network/file/...) don't render badges yet.
@@ -1468,7 +1459,6 @@ export async function enrichBindingsWithDefaults(params: {
     'network',
     'file',
     'oauth_token',
-    'scenario_setup',
     'variables',
   ];
 

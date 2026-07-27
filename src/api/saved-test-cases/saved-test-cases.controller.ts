@@ -187,12 +187,10 @@ export async function updateSavedTestCase(req: AuthenticatedRequest, res: Respon
     const { id } = req.params;
     const userId = getUserId(req);
     // Phase A (May 2026) — `setupSteps` / `teardownSteps` PATCH fields removed.
-    // The inline-per-test-case columns are being deprecated in favour of the
-    // `scenario_setup` test_resource (which yields the same `phase:'setup'`
-    // prologue at run time but is reusable across many tests). The columns
-    // still default to `[]` and read paths still surface them, so existing
-    // clients that omit these fields are unaffected. Any client passing
-    // `setupSteps` or `teardownSteps` now is silently ignored.
+    // The inline-per-test-case columns are deprecated. The columns still
+    // default to `[]` and read paths still surface them, so existing clients
+    // that omit these fields are unaffected. Any client passing `setupSteps`
+    // or `teardownSteps` now is silently ignored.
     const {
       name,
       description,
@@ -251,7 +249,7 @@ export async function updateSavedTestCase(req: AuthenticatedRequest, res: Respon
     if (priority !== undefined) updates.priority = priority;
     if (preconditions !== undefined) updates.preconditions = preconditions;
     // setupSteps / teardownSteps no longer accepted on PATCH (see destructure
-    // note above). Use scenario_setup bindings via /api/v1/test-resource.
+    // note above).
     if (expectedResult !== undefined) updates.expected_result = expectedResult;
 
     if (Object.keys(updates).length === 0) {

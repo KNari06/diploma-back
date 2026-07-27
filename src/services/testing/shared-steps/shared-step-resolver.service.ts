@@ -4,9 +4,7 @@
  * Originally planned to inline-expand `action: 'shared_steps'` PlaywrightCommand
  * references to other test cases. The producer side (UI / AI / importer that
  * would create such commands) was never built — production has zero rows with
- * this action type. Replaced by `scenario_setup` test_resource bindings, which
- * deliver the same "reuse a sequence of steps across many tests" capability at
- * the IntentStep layer with full lifecycle (validate / apply / heal / capture).
+ * this action type.
  *
  * What this file is now:
  *   - A pass-through stub. `resolveCommands` returns the input commands unchanged.
