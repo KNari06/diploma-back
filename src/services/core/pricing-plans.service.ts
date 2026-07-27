@@ -58,8 +58,12 @@ export interface UserPlanInfo {
   credits_used_this_month: number;
   last_credit_reset_date: string;
   monthly_reset_date: string;
-  daily_remaining: number; // -1 for unlimited
-  monthly_remaining: number; // -1 for unlimited
+  // NOTE: no daily_remaining / monthly_remaining here. They used to be computed
+  // as `plan.credits_per_month - credits_used_this_month`, which was wrong on
+  // BOTH sides: credits_per_month came from the stale pricing_plans row, and
+  // credits_used_this_month is never incremented anywhere (the only writes set
+  // it to 0). The expression always returned the full allotment. A user's real
+  // remaining credits are `user_credits.credits_balance` — atomic and correct.
 }
 
 export interface CreditUsageResult {
@@ -182,10 +186,6 @@ export class PricingPlansService {
           (slug in WORKSPACE_PLANS)
         ) {
           const plan = syntheticB2bPlan(slug as B2bPlanSlug, Number(credits?.credits_balance));
-          const monthlyRemaining =
-            plan.credits_per_month === -1
-              ? -1
-              : Math.max(0, plan.credits_per_month - (data?.credits_used_this_month || 0));
           return {
             user_id: userId,
             plan,
@@ -194,8 +194,6 @@ export class PricingPlansService {
             credits_used_this_month: data?.credits_used_this_month || 0,
             last_credit_reset_date: data?.last_credit_reset_date,
             monthly_reset_date: data?.monthly_reset_date,
-            daily_remaining: -1,
-            monthly_remaining: monthlyRemaining,
           };
         }
 
@@ -209,15 +207,6 @@ export class PricingPlansService {
         ? data.pricing_plans[0] as PricingPlan
         : data.pricing_plans as PricingPlan;
 
-      // Calculate remaining credits
-      const dailyRemaining = plan.credits_per_day
-        ? Math.max(0, plan.credits_per_day - (data.credits_used_today || 0))
-        : -1; // unlimited
-
-      const monthlyRemaining = plan.credits_per_month === -1
-        ? -1 // unlimited
-        : Math.max(0, plan.credits_per_month - (data.credits_used_this_month || 0));
-
       return {
         user_id: data.id,
         plan,
@@ -226,8 +215,6 @@ export class PricingPlansService {
         credits_used_this_month: data.credits_used_this_month || 0,
         last_credit_reset_date: data.last_credit_reset_date,
         monthly_reset_date: data.monthly_reset_date,
-        daily_remaining: dailyRemaining,
-        monthly_remaining: monthlyRemaining,
       };
     } catch (error) {
       logger.error('[PRICING_PLANS] Exception in getUserPlanInfo', {

@@ -544,8 +544,6 @@ export const getUserPlan = async (req: Request, res: Response): Promise<void> =>
       usage: {
         credits_used_today: planInfo.credits_used_today,
         credits_used_this_month: planInfo.credits_used_this_month,
-        daily_remaining: planInfo.daily_remaining,
-        monthly_remaining: planInfo.monthly_remaining,
         last_reset_date: planInfo.last_credit_reset_date,
         monthly_reset_date: planInfo.monthly_reset_date,
       },

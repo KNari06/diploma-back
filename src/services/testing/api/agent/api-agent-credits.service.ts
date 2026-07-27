@@ -15,8 +15,24 @@ import { getBaselineCredits } from './api-agent-policy';
 // CREDIT CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Approximate USD cost per credit (for metadata) */
-const USD_PER_CREDIT = 0.0289; // Based on $28.9 / 1000 credits
+/**
+ * USD is NOT computed at deduction time.
+ *
+ * There is no single dollar value for a credit: Pro is three tiers whose
+ * per-credit prices differ 3.5x ($0.0192 / $0.0070 / $0.0055, stored per tier in
+ * `pro_plan_options.price_per_credit`). Cost-per-credit is a property of the
+ * SUBSCRIPTION, not of a credit, so it can only be resolved by joining the
+ * charge to the payer's tier — which is a reporting-time operation.
+ *
+ * This used to be a hardcoded 0.0289, derived from a retired $28.9/1000 plan.
+ * It matched no live tier and overstated cost by 1.5x-5x, silently propagating
+ * into any margin math reading `credit_transactions.cost_usd`.
+ *
+ * We therefore write 0 and derive USD at reporting time from `credits` x the
+ * tier's `price_per_credit`. Matches what the authoring-credits path already
+ * does, so the column means the same thing everywhere.
+ */
+const COST_USD_DERIVED_AT_REPORTING = 0;
 
 /** Model used for AI calls in agent */
 const DEFAULT_MODEL = AI_TASK_MODELS.creditDefault as string;
@@ -37,7 +53,7 @@ export class ApiAgentCreditsService {
     description: string
   ): Promise<{ success: boolean; credits: number; error?: string }> {
     const credits = getBaselineCredits(level);
-    const costUSD = credits * USD_PER_CREDIT;
+    const costUSD = COST_USD_DERIVED_AT_REPORTING;
 
     try {
       const result = await CreditCostTrackerService.deductCreditsForTest({
@@ -173,7 +189,7 @@ export class ApiAgentCreditsService {
       return { success: true, credits: 0 };
     }
 
-    const costUSD = incrementalCredits * USD_PER_CREDIT;
+    const costUSD = COST_USD_DERIVED_AT_REPORTING;
 
     try {
       const result = await CreditCostTrackerService.deductCreditsForTest({
