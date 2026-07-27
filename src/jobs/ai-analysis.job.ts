@@ -6,6 +6,7 @@ import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
+import { DeveloperFixPromptService } from '@/services/testing/analysis/developer-fix-prompt.service';
 import { JiraReportService } from '@/services/integrations/jira-report.service';
 import { resolveTestCasePriorityForTestId } from '@/services/testing/regression/resolve-test-case-priority.util';
 import { handleAIError } from '@/utils/core/error-handler';
@@ -239,6 +240,18 @@ export class AIAnalysisJobHandler {
         }
       }
 
+      // Developer fix-prompt (Phase 2, feature-flagged, only when bugs exist):
+      // one LLM call → paste-ready markdown. Best-effort; folded into the summary
+      // so it persists AND reaches the Jira feedback comment below.
+      if (env.DEVELOPER_FIX_PROMPT_ENABLED && (aiSummary.bugs?.length ?? 0) > 0) {
+        const fixPrompt = await DeveloperFixPromptService.generate({
+          testResult: testResultData,
+          aiSummary,
+          pageUrl: testResult?.tests?.url,
+        });
+        if (fixPrompt) aiSummary.fixPrompt = fixPrompt;
+      }
+
       // Save AI summary to database (after charge — preserve bugReportChargedAt
       // marker if it was set in the block above).
       const finalSummary = alreadyCharged
@@ -297,6 +310,10 @@ export class AIAnalysisJobHandler {
 
       // Send feedback to source Jira issue (if triggered from Jira QA orchestrator)
       await this.sendJiraFeedback(testId, testResultId, testResult, aiSummary);
+
+      // Advance the QA handoff to its post-run honest status (done / blocked) and
+      // link the fix-prompt — only for Jira-sourced runs. Best-effort.
+      await this.updateJiraHandoffPostRun(testId, testResultId, testResult, aiSummary);
 
       logger.info(`[AI-ANALYSIS] Analysis completed successfully: ${testResultId}`);
       logAIAnalysis(testId, aiSummary);
@@ -1116,6 +1133,7 @@ export class AIAnalysisJobHandler {
         summary: aiSummary?.summary || '',
         confidence: aiSummary?.confidence || 0,
         testUrl: test.url,
+        fixPrompt: aiSummary?.fixPrompt,
       });
 
       logger.info('[AI-ANALYSIS] Jira feedback sent to source issue', {
@@ -1125,6 +1143,44 @@ export class AIAnalysisJobHandler {
       });
     } catch (error) {
       logger.warn('[AI-ANALYSIS] Jira feedback failed (non-fatal)', {
+        testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Advance the QA handoff to its post-run honest status for a Jira-sourced run.
+   * A single Jira ticket run = one execution: passed (no bugs, no error) → `done`,
+   * bugs OR a failed/error status → `blocked`. Links the fix-prompt via the
+   * result id. Best-effort — never fails the job.
+   */
+  private static async updateJiraHandoffPostRun(
+    testId: string,
+    testResultId: string,
+    testResult: any,
+    aiSummary: any,
+  ): Promise<void> {
+    try {
+      const test = testResult?.tests;
+      const metadata = (test as any)?.options?.metadata;
+      if (!metadata?.sourceJiraIssueKey || !test?.project_id) return;
+
+      const bugCount = Array.isArray(aiSummary?.bugs) ? aiSummary.bugs.length : 0;
+      const errored = testResult?.status === 'failed' || testResult?.status === 'error';
+      const passed = bugCount === 0 && !errored;
+
+      const { HandoffService } = await import('@/services/testing/analysis/handoff.service');
+      await HandoffService.updatePostRun({
+        projectId: test.project_id,
+        issueKey: metadata.sourceJiraIssueKey,
+        // One-execution mapping: bugs/error → a failed execution, else a passed one.
+        run: { totalExecutions: 1, passed: passed ? 1 : 0, failed: passed ? 0 : 1, skipped: 0 },
+        testId,
+        fixPromptRef: aiSummary?.fixPrompt ? testResultId : undefined,
+      });
+    } catch (error) {
+      logger.warn('[AI-ANALYSIS] Handoff post-run update failed (non-fatal)', {
         testId,
         error: error instanceof Error ? error.message : String(error),
       });

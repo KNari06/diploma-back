@@ -3,27 +3,38 @@
  * When a task lands in the QA column: analyze (KB + test cases + past bugs + memory + capabilities),
  * then either run tests, send back to rework, or prepare test cases for manual QA.
  *
- * Context enrichment (v2): fetches 4 data sources in parallel for accurate AI decisions.
+ * Context enrichment: fetches data sources in parallel (KB, similar test cases, past bugs,
+ * workspace memory, connected integrations, scoped project coverage + the ticket's related
+ * tickets/subtasks/comments) so one LLM call can both triage AND assess task readiness /
+ * forgotten test cases (see TaskReadinessService + jira-readiness-prompts).
  */
 
 import { randomUUID } from 'crypto';
+import { env } from '@/config/environment/env';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
-import { TokenCalculatorService } from '@/services/core/token-calculator.service';
+import { RetrievalPlannerService } from '@/services/integrations/retrieval-planner.service';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { generateEmbedding } from '@/services/ai/core/embedding.service';
-import { getJiraToken, ensureValidToken, getJiraIssue, addJiraComment, transitionJiraIssue } from '@/services/api/jira.service';
+import { getJiraToken, ensureValidToken, getJiraIssueWithContext, addJiraComment, transitionJiraIssue, type JiraRelatedContext } from '@/services/api/jira.service';
 import { searchKB } from '@/services/kb/kb.service';
 import { TestCaseResolverService } from '@/services/testing/resolver/test-case-resolver.service';
 import { WorkspaceMemoryService } from '@/services/ai/memory/workspace-memory.service';
+import { CoverageAnalysisService } from '@/services/testing/analysis/coverage-analysis.service';
+import { TaskReadinessService } from '@/services/testing/analysis/task-readiness.service';
+import { buildJiraAnalysisMessages } from '@/ai/prompts/jira-readiness-prompts';
 import { createTest } from '@/services/testing/ui/manual/test-creator';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { QueueManager } from '@/config/infrastructure/queues';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { extractFirstUrl } from '@/utils/parsing/url-scope';
 import type { ResolverResult } from '@/services/testing/resolver/resolver.types';
 import type { IntentActionType } from '@/services/testing/ui/preview/preview.types';
+import type { CoverageGap, JiraQaOutcome, TaskReadinessAssessment } from '@/types/testing.types';
+import type { JiraIssueListItem } from '@/types';
 
-export type JiraQaOutcome = 'CAN_RUN_AUTO' | 'NEEDS_REWORK' | 'PREPARE_MANUAL';
+// Re-exported for existing importers; the canonical definition lives in testing.types.
+export type { JiraQaOutcome } from '@/types/testing.types';
 
 export interface JiraQaAnalysisResult {
   outcome: JiraQaOutcome;
@@ -38,6 +49,7 @@ export interface JiraQaAnalysisResult {
   testCaseSummary?: string;
   existingTestCaseId?: string | null;
   reworkQuestions?: string[];
+  readiness?: TaskReadinessAssessment;
 }
 
 export interface JiraQaOrchestratorParams {
@@ -82,106 +94,12 @@ const AI_ACTION_TO_INTENT: Record<string, string> = {
   selectDate: 'click',
 };
 
-const ANALYSIS_SYSTEM_PROMPT = `You are a senior QA engineer triaging Jira tickets for automated testing.
-Your job is to decide if a Jira issue can be auto-tested, needs more information, or should be prepared for manual QA.
-
-CAPABILITIES:
-- Platform (UI) tests: Lite (exploratory AI) or Pro (intelligent multi-agent). Requires a start URL.
-- API tests: Light / Medium / Hard. Requires API URL and optional method/body.
-- Manual test case generation (no URL required).
-
-OUTPUT FORMAT:
-Respond with JSON only. Schema:
-{
-  "outcome": "CAN_RUN_AUTO" | "NEEDS_REWORK" | "PREPARE_MANUAL",
-  "reason": "1-2 sentence explanation",
-  "missingData": ["item1", "item2"],
-  "suggestedAction": { "type": "platform_test"|"api_test", "mode"?: "lite"|"pro", "level"?: "light"|"medium"|"hard" } | null,
-  "extractedUrl": "URL to test or null",
-  "testCaseSummary": "step-by-step if PREPARE_MANUAL",
-  "existingTestCaseId": "ID or null",
-  "reworkQuestions": ["question1"]
-}
-
-DECISION RULES:
-1. CAN_RUN_AUTO — we have a URL (from description, KB, or existing test case) AND clear test scope.
-   - If EXACT MATCH test case exists → always CAN_RUN_AUTO with existingTestCaseId.
-   - If related test cases have URLs → use as extractedUrl.
-   - Default to "lite" mode unless task explicitly needs deep validation.
-2. NEEDS_REWORK — missing critical data. MUST include specific reworkQuestions.
-   - BAD question: "What is the URL?"
-   - GOOD question: "The checkout flow needs a URL — is it /checkout or /cart/checkout based on your routing?"
-   - Use HISTORICAL BUGS to ask targeted questions (e.g. "Similar bug X was found last time — does this affect the same component?").
-   - Maximum 3 questions, each must be answerable in one sentence.
-3. PREPARE_MANUAL — task is testable but not suitable for automation (visual review, one-off, complex multi-system flow).
-   - testCaseSummary must be step-by-step (numbered), not a paragraph.
-   - Reference related test cases when building steps.
-
-EDGE CASES:
-- If description says "test this page" with a URL → CAN_RUN_AUTO platform_test lite.
-- If description is vague ("fix the bug") with no URL, no KB match, no test case → NEEDS_REWORK.
-- If issue is about API/backend with endpoint mentioned → CAN_RUN_AUTO api_test.
-- If issue is a design review or "check if it looks right" → PREPARE_MANUAL.
-- Never guess URLs — only use URLs found in the task description, KB, or existing test cases.
-- CONNECTED INTEGRATIONS tells you what notification channels are available. When suggesting outcomes, consider whether the user can receive notifications via Slack, Telegram, etc.
-
-FEW-SHOT EXAMPLES:
-
-Example 1 — CAN_RUN_AUTO with existing test case:
-Input: Summary="Login page returns 500 after deploy", TestCase="Login Flow (exact match, ID=tc-123, URL=/login)"
-Output: {"outcome":"CAN_RUN_AUTO","reason":"Exact match test case exists for login flow with URL","suggestedAction":{"type":"platform_test","mode":"lite"},"extractedUrl":"/login","existingTestCaseId":"tc-123","reworkQuestions":[]}
-
-Example 2 — NEEDS_REWORK with historical context:
-Input: Summary="Payment form validation broken", Description="users complain about checkout", HistoricalBug="[HIGH] Stripe iframe not loading on /checkout (similarity: 0.82)"
-Output: {"outcome":"NEEDS_REWORK","reason":"No specific URL and unclear which validation — similar Stripe issue found before","missingData":["exact page URL","which validation rule is broken"],"suggestedAction":null,"extractedUrl":null,"reworkQuestions":["Is this the same Stripe iframe issue we found before on /checkout, or a different validation problem?","Which form field is affected — email, card number, or expiry?","Can you provide the exact URL where the form is broken?"]}
-
-Example 3 — PREPARE_MANUAL:
-Input: Summary="Verify new brand colors across all pages", Description="Design team updated the color palette, need visual review"
-Output: {"outcome":"PREPARE_MANUAL","reason":"Visual design review requires human judgment across multiple pages","suggestedAction":null,"extractedUrl":null,"testCaseSummary":"1. Open homepage and verify header uses new brand blue (#1A73E8)\\n2. Navigate to /about and check section backgrounds\\n3. Open /pricing and verify CTA button colors\\n4. Check mobile responsive view for color consistency\\n5. Compare against Figma design spec"}`;
-
-function buildAnalysisMessages(
-  issueSummary: string,
-  issueDescription: string | null,
-  kbContext: string,
-  testCaseContext: string,
-  pastBugsContext: string,
-  memoryContext: string,
-  integrationContext: string,
-): { system: string; user: string } {
-  const userSections: string[] = [];
-
-  userSections.push(`JIRA ISSUE:
-Summary: ${issueSummary}
-Description: ${issueDescription || '(none provided)'}`);
-
-  userSections.push(`KNOWLEDGE BASE:
-${kbContext || '(no relevant documentation found)'}`);
-
-  if (testCaseContext) {
-    userSections.push(`EXISTING TEST CASES:\n${testCaseContext}`);
-  }
-
-  if (pastBugsContext) {
-    userSections.push(`HISTORICAL BUGS:\n${pastBugsContext}`);
-  }
-
-  if (memoryContext) {
-    userSections.push(`WORKSPACE CONTEXT:\n${memoryContext}`);
-  }
-
-  if (integrationContext) {
-    userSections.push(`CONNECTED INTEGRATIONS:\n${integrationContext}`);
-  }
-
-  userSections.push('Analyze and respond with JSON.');
-
-  return { system: ANALYSIS_SYSTEM_PROMPT, user: userSections.join('\n\n') };
-}
-
 export class JiraQaOrchestratorService {
   /**
    * Analyze Jira task and execute the chosen outcome (run test, rework, or prepare manual).
-   * Enriches AI decision with 4 parallel data sources: KB, test cases, past bugs, workspace memory.
+   * Enriches the AI decision with parallel data sources (KB, similar test cases, past bugs,
+   * workspace memory, integrations, scoped coverage, related tickets) and also produces a
+   * task-readiness assessment (readiness score + forgotten-case gaps) on the result.
    */
   static async analyzeAndExecute(params: JiraQaOrchestratorParams): Promise<JiraQaOrchestratorResult> {
     const { issueKey, projectId, userId, cloudId, reworkStatusName } = params;
@@ -194,103 +112,11 @@ export class JiraQaOrchestratorService {
       const accessToken = await ensureValidToken(tokenData);
       const cloudIdToUse = cloudId || tokenData.cloud_id;
 
-      const issue = await getJiraIssue(accessToken, cloudIdToUse, issueKey);
-
-      // Resolve workspaceId (from params or from project)
-      const workspaceId = params.workspaceId || await this.resolveWorkspaceId(projectId);
-
-      const query = [issue.summary, issue.description].filter(Boolean).join(' ');
-
-      // Fetch all 4 data sources in parallel (each is non-fatal)
-      const [kbResult, resolverResult, findingsResult, memoryContext, integrationContext] = await Promise.all([
-        // 1. Knowledge Base (existing)
-        searchKB(query, projectId, { matchCount: 5, matchThreshold: 0.5 })
-          .catch((err) => {
-            logger.warn('[JIRA_QA] KB search failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
-            return { chunks: [] } as { chunks: Array<{ content?: string }> };
-          }),
-
-        // 2. Test Case Resolver (NEW) — find similar existing test cases
-        workspaceId
-          ? TestCaseResolverService.resolve({ message: query, userId, workspaceId })
-              .catch((err) => {
-                logger.warn('[JIRA_QA] Resolver failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
-                return null as ResolverResult | null;
-              })
-          : Promise.resolve(null as ResolverResult | null),
-
-        // 3. Past Bug Findings vector search (NEW) — similar bugs in this project
-        this.searchProjectFindings(query, projectId)
-          .catch((err) => {
-            logger.warn('[JIRA_QA] Findings search failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
-            return [] as FindingSearchResult[];
-          }),
-
-        // 4. Workspace Memory (NEW) — user-saved patterns and facts
-        workspaceId
-          ? WorkspaceMemoryService.getMemoryForContext(workspaceId, 1500)
-              .catch((err) => {
-                logger.warn('[JIRA_QA] Memory context failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
-                return '';
-              })
-          : Promise.resolve(''),
-
-        // 5. Integration status — which providers are connected
-        import('@/services/api/integration-token.service')
-          .then(m => m.IntegrationTokenService.getIntegrationSummary(userId, workspaceId ?? undefined))
-          .catch(() => ''),
-      ]);
-
-      // Build context strings
-      const kbContext = ((kbResult as { chunks: Array<{ content?: string }> }).chunks || [])
-        .map((c) => c.content)
-        .filter(Boolean)
-        .join('\n\n')
-        .slice(0, 3000);
-
-      const testCaseContext = this.buildTestCaseContext(resolverResult);
-      const pastBugsContext = this.buildPastBugsContext(findingsResult);
-
-      logger.info('[JIRA_QA] Context enrichment complete', {
-        issueKey,
-        kbChunks: ((kbResult as { chunks: any[] }).chunks || []).length,
-        resolverMatch: resolverResult?.matchType || 'none',
-        findingsCount: findingsResult.length,
-        hasMemory: !!memoryContext,
+      const { analysis, issue, resolverResult } = await this.analyzeTask({
+        issueKey, projectId, userId,
+        accessToken, cloudId: cloudIdToUse,
+        workspaceId: params.workspaceId,
       });
-
-      const { system, user } = buildAnalysisMessages(
-        issue.summary,
-        issue.description,
-        kbContext,
-        testCaseContext,
-        pastBugsContext,
-        memoryContext,
-        integrationContext,
-      );
-
-      const completion = await getChatCompletionWithMessages(
-        [{ role: 'system', content: system }, { role: 'user', content: user }],
-        { temperature: 0.2, max_tokens: 1000, response_format: { type: 'json_object' } }
-      );
-      let analysis: JiraQaAnalysisResult;
-      try {
-        const raw = JSON.parse(completion.content) as Record<string, unknown>;
-        analysis = {
-          outcome: (raw.outcome as JiraQaOutcome) || 'PREPARE_MANUAL',
-          reason: raw.reason as string | undefined,
-          missingData: Array.isArray(raw.missingData) ? (raw.missingData as string[]) : undefined,
-          suggestedAction: raw.suggestedAction as JiraQaAnalysisResult['suggestedAction'],
-          extractedUrl: raw.extractedUrl as string | undefined,
-          testCaseSummary: raw.testCaseSummary as string | undefined,
-          existingTestCaseId: (raw.existingTestCaseId as string | null) || null,
-          reworkQuestions: Array.isArray(raw.reworkQuestions) ? (raw.reworkQuestions as string[]) : undefined,
-        };
-      } catch {
-        analysis = { outcome: 'PREPARE_MANUAL', reason: 'Could not parse AI response' };
-      }
-
-      logger.info('[JIRA_QA] Analysis result', { issueKey, outcome: analysis.outcome, reason: analysis.reason });
 
       // ── NEEDS_REWORK ──────────────────────────────────────────────────
       if (analysis.outcome === 'NEEDS_REWORK') {
@@ -334,7 +160,7 @@ export class JiraQaOrchestratorService {
         }
 
         // Build test goal; include prefilled steps hint if resolver found a match
-        let testGoal = issue.summary + (issue.description ? '\n' + issue.description.slice(0, 500) : '');
+        const testGoal = issue.summary + (issue.description ? '\n' + issue.description.slice(0, 500) : '');
         const prefilledSteps = resolverResult?.prefilledSteps;
 
         const test = await createTest({
@@ -442,9 +268,197 @@ export class JiraQaOrchestratorService {
   }
 
   /**
-   * Get project Jira QA settings (qaColumn, reworkStatus from project.settings.integrations.jira).
+   * Assess a Jira task WITHOUT executing anything: fetch it + related context,
+   * enrich, and run the merged triage + readiness LLM call. Returns the parsed
+   * analysis (incl. `readiness`). Used by the live `runFromJiraViaChat` path to
+   * gate the auto-run. Throws only if Jira is not connected / the issue can't be
+   * fetched (caller decides how to degrade).
    */
-  static async getProjectJiraQaSettings(projectId: string, userId: string): Promise<{ reworkStatusName?: string }> {
+  static async assessReadiness(
+    params: JiraQaOrchestratorParams,
+  ): Promise<{ analysis: JiraQaAnalysisResult; issue: JiraIssueListItem; related: JiraRelatedContext }> {
+    const { issueKey, projectId, userId, cloudId } = params;
+    const tokenData = await getJiraToken(userId, cloudId);
+    if (!tokenData?.cloud_id) {
+      throw new Error('Jira not connected');
+    }
+    const accessToken = await ensureValidToken(tokenData);
+    const cloudIdToUse = cloudId || tokenData.cloud_id;
+    const { analysis, issue, related } = await this.analyzeTask({
+      issueKey, projectId, userId,
+      accessToken, cloudId: cloudIdToUse,
+      workspaceId: params.workspaceId,
+    });
+    return { analysis, issue, related };
+  }
+
+  /**
+   * Shared analysis half of the orchestrator: fetch the issue + related context,
+   * enrich from all data sources in parallel, and run ONE merged triage +
+   * readiness LLM call. Returns the parsed analysis plus the artifacts the
+   * execution branches need (`issue`, `resolverResult`). No side effects.
+   */
+  private static async analyzeTask(args: {
+    issueKey: string;
+    projectId: string;
+    userId: string;
+    accessToken: string;
+    cloudId: string;
+    workspaceId?: string;
+  }): Promise<{ analysis: JiraQaAnalysisResult; issue: JiraIssueListItem; related: JiraRelatedContext; resolverResult: ResolverResult | null }> {
+    const { issueKey, projectId, userId, accessToken, cloudId } = args;
+
+    const { issue, related } = await getJiraIssueWithContext(accessToken, cloudId, issueKey);
+
+    // Resolve workspaceId (from args or from project)
+    const workspaceId = args.workspaceId || await this.resolveWorkspaceId(projectId);
+
+    const rawQuery = [issue.summary, issue.description].filter(Boolean).join(' ');
+
+    // Query-driven retrieval (flagged): expand the ticket into search terms so
+    // context retrieval finds related work by meaning, not just literal words.
+    // Off / on failure → the raw ticket text is used (no regression).
+    let query = rawQuery;
+    if (env.JIRA_QUERY_PLANNER_ENABLED) {
+      const plan = await RetrievalPlannerService.plan({ summary: issue.summary, description: issue.description });
+      query = RetrievalPlannerService.enrichQuery(rawQuery, plan);
+      if (plan.searchTerms.length || plan.entities.length) {
+        logger.info('[JIRA_QA] Query planner expanded retrieval', {
+          issueKey, terms: plan.searchTerms, entities: plan.entities,
+        });
+      }
+    }
+
+    // Fetch all data sources in parallel (each is non-fatal)
+    const [kbResult, resolverResult, findingsResult, memoryContext, integrationContext, coverageGaps] = await Promise.all([
+      // 1. Knowledge Base
+      searchKB(query, projectId, { matchCount: 5, matchThreshold: 0.5 })
+        .catch((err) => {
+          logger.warn('[JIRA_QA] KB search failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
+          return { chunks: [] } as { chunks: Array<{ content?: string }> };
+        }),
+
+      // 2. Test Case Resolver — find similar existing test cases
+      workspaceId
+        ? TestCaseResolverService.resolve({ message: query, userId, workspaceId })
+            .catch((err) => {
+              logger.warn('[JIRA_QA] Resolver failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
+              return null as ResolverResult | null;
+            })
+        : Promise.resolve(null as ResolverResult | null),
+
+      // 3. Past Bug Findings vector search — similar bugs in this project
+      this.searchProjectFindings(query, projectId)
+        .catch((err) => {
+          logger.warn('[JIRA_QA] Findings search failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
+          return [] as FindingSearchResult[];
+        }),
+
+      // 4. Workspace Memory — user-saved patterns and facts
+      workspaceId
+        ? WorkspaceMemoryService.getMemoryForContext(workspaceId, 1500)
+            .catch((err) => {
+              logger.warn('[JIRA_QA] Memory context failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
+              return '';
+            })
+        : Promise.resolve(''),
+
+      // 5. Integration status — which providers are connected
+      import('@/services/api/integration-token.service')
+        .then(m => m.IntegrationTokenService.getIntegrationSummary(userId, workspaceId ?? undefined))
+        .catch(() => ''),
+
+      // 6. Project coverage — a URL/execution-level SIGNAL (scoped to the ticket below)
+      workspaceId
+        ? CoverageAnalysisService.analyze(projectId, userId, workspaceId)
+            .then((r) => r.gaps)
+            .catch((err) => {
+              logger.warn('[JIRA_QA] Coverage analysis failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
+              return [] as CoverageGap[];
+            })
+        : Promise.resolve([] as CoverageGap[]),
+    ]);
+
+    // Build context strings
+    const kbContext = ((kbResult as { chunks: Array<{ content?: string }> }).chunks || [])
+      .map((c) => c.content)
+      .filter(Boolean)
+      .join('\n\n')
+      .slice(0, 3000);
+
+    const testCaseContext = this.buildTestCaseContext(resolverResult);
+    const pastBugsContext = this.buildPastBugsContext(findingsResult);
+    const relatedTicketsContext = TaskReadinessService.buildRelatedTicketsContext(related);
+
+    // Scope project-wide coverage gaps to this ticket's feature (by ticket URL +
+    // matched test-case URLs), then render to a short signal string.
+    const ticketUrl = extractFirstUrl(query);
+    const scopedCoverage = TaskReadinessService.scopeCoverageGaps(
+      coverageGaps,
+      ticketUrl,
+      resolverResult?.relatedCases ?? (resolverResult?.bestMatch ? [resolverResult.bestMatch] : []),
+    );
+    const coverageContext = TaskReadinessService.buildCoverageContext(scopedCoverage);
+
+    logger.info('[JIRA_QA] Context enrichment complete', {
+      issueKey,
+      kbChunks: ((kbResult as { chunks: any[] }).chunks || []).length,
+      resolverMatch: resolverResult?.matchType || 'none',
+      findingsCount: findingsResult.length,
+      hasMemory: !!memoryContext,
+      relatedLinks: related.links.length,
+      relatedSubtasks: related.subtasks.length,
+      scopedCoverageGaps: scopedCoverage.length,
+    });
+
+    const { system, user } = buildJiraAnalysisMessages({
+      issueSummary: issue.summary,
+      issueDescription: issue.description,
+      kbContext,
+      testCaseContext,
+      pastBugsContext,
+      memoryContext,
+      integrationContext,
+      relatedTicketsContext,
+      coverageContext,
+    });
+
+    const completion = await getChatCompletionWithMessages(
+      [{ role: 'system', content: system }, { role: 'user', content: user }],
+      { temperature: 0.2, max_tokens: 1400, response_format: { type: 'json_object' } }
+    );
+    let analysis: JiraQaAnalysisResult;
+    try {
+      const raw = JSON.parse(completion.content) as Record<string, unknown>;
+      const outcome = (raw.outcome as JiraQaOutcome) || 'PREPARE_MANUAL';
+      analysis = {
+        outcome,
+        reason: raw.reason as string | undefined,
+        missingData: Array.isArray(raw.missingData) ? (raw.missingData as string[]) : undefined,
+        suggestedAction: raw.suggestedAction as JiraQaAnalysisResult['suggestedAction'],
+        extractedUrl: raw.extractedUrl as string | undefined,
+        testCaseSummary: raw.testCaseSummary as string | undefined,
+        existingTestCaseId: (raw.existingTestCaseId as string | null) || null,
+        reworkQuestions: Array.isArray(raw.reworkQuestions) ? (raw.reworkQuestions as string[]) : undefined,
+        readiness: TaskReadinessService.sanitizeReadiness(raw.readiness, outcome),
+      };
+    } catch {
+      analysis = { outcome: 'PREPARE_MANUAL', reason: 'Could not parse AI response' };
+    }
+
+    logger.info('[JIRA_QA] Analysis result', { issueKey, outcome: analysis.outcome, reason: analysis.reason });
+
+    return { analysis, issue, related, resolverResult };
+  }
+
+  /**
+   * Get project Jira QA settings (reworkStatus + hybrid-autonomy flag from
+   * project.settings.integrations.jira).
+   */
+  static async getProjectJiraQaSettings(
+    projectId: string,
+    userId: string,
+  ): Promise<{ reworkStatusName?: string; requireApprovalBeforeRun: boolean }> {
     const { data: project } = await supabaseAdmin
       .from('projects')
       .select('settings')
@@ -452,7 +466,10 @@ export class JiraQaOrchestratorService {
       .eq('user_id', userId)
       .maybeSingle();
     const jira = (project?.settings as any)?.integrations?.jira || {};
-    return { reworkStatusName: jira.reworkStatusName || undefined };
+    return {
+      reworkStatusName: jira.reworkStatusName || undefined,
+      requireApprovalBeforeRun: jira.requireApprovalBeforeRun === true,
+    };
   }
 
   // ════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,135 @@
+[
+  {
+    "name": "clean small change — ready, no gaps",
+    "summary": "Add a 'Copy link' button to the share dialog on /projects/:id",
+    "description": "Button copies the current project URL to the clipboard and shows a success toast.",
+    "expected": { "readyToTest": true, "gapTypes": [], "areas": ["share dialog", "copy link"] }
+  },
+  {
+    "name": "vague payment ticket — not ready, needs URL/field",
+    "summary": "Payment form validation broken",
+    "description": "Users complain that checkout doesn't work sometimes.",
+    "expected": { "readyToTest": false, "gapTypes": ["negative", "error_state"], "areas": ["checkout", "payment"] }
+  },
+  {
+    "name": "login 500 with clear scope — ready, error-state gap",
+    "summary": "Login page returns 500 after deploy on /login",
+    "description": "After the latest deploy, submitting the login form returns a 500. Expected: user logs in and lands on /dashboard.",
+    "expected": { "readyToTest": true, "gapTypes": ["error_state"], "areas": ["login"] }
+  },
+  {
+    "name": "role/permission change — permission gap",
+    "summary": "Hide the Admin settings tab for non-admin users on /settings",
+    "description": "Guests and regular members must not see or access the Admin tab; admins still do.",
+    "expected": { "readyToTest": true, "gapTypes": ["permission"], "areas": ["settings", "admin"] }
+  },
+  {
+    "name": "form field with limits — boundary + negative gaps",
+    "summary": "Add a 'display name' field (max 50 chars) to the profile page /profile",
+    "description": "Users can set a display name up to 50 characters. Longer input should be rejected with a message.",
+    "expected": { "readyToTest": true, "gapTypes": ["boundary", "negative"], "areas": ["profile", "display name"] }
+  },
+  {
+    "name": "design-only review — not auto-testable",
+    "summary": "Verify new brand colors across all pages",
+    "description": "Design updated the palette; needs a visual review against Figma.",
+    "expected": { "readyToTest": false, "gapTypes": ["data_variation"], "areas": ["brand colors"] }
+  },
+
+  {
+    "name": "checkout change that can break cart — related_flow gap",
+    "summary": "Apply promo code discount at checkout on /checkout",
+    "description": "Entering a valid promo code reduces the order total. Invalid codes show an error. The cart total and taxes must recompute.",
+    "expected": { "readyToTest": true, "gapTypes": ["related_flow", "negative", "boundary"], "areas": ["checkout", "promo code", "cart"] }
+  },
+  {
+    "name": "API endpoint ticket — ready, error-state + negative",
+    "summary": "POST /api/v1/users/invite should reject duplicate emails with 409",
+    "description": "Inviting an email that already has an account must return 409, not 500. Valid invites return 201.",
+    "expected": { "readyToTest": true, "gapTypes": ["negative", "error_state"], "areas": ["invite", "users api"] }
+  },
+  {
+    "name": "search with pagination — boundary + data_variation",
+    "summary": "Add pagination to the search results page /search",
+    "description": "Show 20 results per page with next/prev. Handle 0 results and very large result sets.",
+    "expected": { "readyToTest": true, "gapTypes": ["boundary", "data_variation"], "areas": ["search", "pagination"] }
+  },
+  {
+    "name": "one-word ticket — not ready, needs everything",
+    "summary": "Fix bug",
+    "description": "",
+    "expected": { "readyToTest": false, "gapTypes": [], "areas": [] }
+  },
+  {
+    "name": "no URL, feature named — not ready (missing where)",
+    "summary": "The export to CSV button doesn't work",
+    "description": "Clicking export does nothing. Which page? Unclear.",
+    "expected": { "readyToTest": false, "gapTypes": ["error_state"], "areas": ["export", "csv"] }
+  },
+  {
+    "name": "file upload limits — boundary + negative + error_state",
+    "summary": "Allow avatar upload (JPG/PNG, max 2MB) on /profile/edit",
+    "description": "Users upload an avatar. Reject wrong types and files over 2MB with a clear message; show upload progress.",
+    "expected": { "readyToTest": true, "gapTypes": ["boundary", "negative", "error_state"], "areas": ["avatar upload", "profile"] }
+  },
+  {
+    "name": "auth session expiry — permission + error_state",
+    "summary": "Redirect to /login when session expires on any protected page",
+    "description": "If a request returns 401, the app should redirect to login and preserve the intended destination.",
+    "expected": { "readyToTest": true, "gapTypes": ["permission", "error_state", "related_flow"], "areas": ["session", "login", "auth"] }
+  },
+  {
+    "name": "currency/locale display — data_variation",
+    "summary": "Show prices in the user's local currency on /pricing",
+    "description": "Detect the user's region and format prices (currency symbol, decimals, thousands separator) accordingly.",
+    "expected": { "readyToTest": true, "gapTypes": ["data_variation", "boundary"], "areas": ["pricing", "currency", "locale"] }
+  },
+  {
+    "name": "ru — clear login flow, ready",
+    "summary": "Кнопка 'Войти' не редиректит на /dashboard после входа",
+    "description": "После успешного входа пользователь должен попадать на /dashboard, сейчас остаётся на /login.",
+    "expected": { "readyToTest": true, "gapTypes": ["error_state"], "areas": ["вход", "login", "dashboard"] }
+  },
+  {
+    "name": "ru — vague, not ready",
+    "summary": "Оплата иногда не проходит",
+    "description": "Жалобы от пользователей, деталей нет.",
+    "expected": { "readyToTest": false, "gapTypes": ["negative", "error_state"], "areas": ["оплата", "payment"] }
+  },
+  {
+    "name": "kk — form validation, ready with negative gap",
+    "summary": "Тіркеу формасында email тексерілуі керек (/signup)",
+    "description": "Жарамсыз email енгізілсе, қате хабарлама көрсетілуі тиіс. Жарамды email қабылданады.",
+    "expected": { "readyToTest": true, "gapTypes": ["negative"], "areas": ["signup", "email"] }
+  },
+  {
+    "name": "looks ready but ambiguous acceptance — not ready",
+    "summary": "Improve the dashboard performance on /dashboard",
+    "description": "Dashboard feels slow. Make it faster.",
+    "expected": { "readyToTest": false, "gapTypes": [], "areas": ["dashboard", "performance"] }
+  },
+  {
+    "name": "delete flow — related_flow + permission",
+    "summary": "Add 'Delete project' with confirmation on /projects/:id/settings",
+    "description": "Owners can delete a project after confirming. Deletion removes associated test cases and cannot be undone.",
+    "expected": { "readyToTest": true, "gapTypes": ["permission", "related_flow", "error_state"], "areas": ["delete project", "settings"] }
+  },
+  {
+    "name": "empty-state UI — boundary + data_variation",
+    "summary": "Show an empty state on /reports when there are no reports yet",
+    "description": "New users with no reports should see an illustration + 'Create your first report' CTA instead of a blank table.",
+    "expected": { "readyToTest": true, "gapTypes": ["boundary", "data_variation"], "areas": ["reports", "empty state"] }
+  },
+  {
+    "name": "multi-step wizard — related_flow + negative",
+    "summary": "Add a 3-step onboarding wizard at /onboarding",
+    "description": "Step 1 profile, step 2 team, step 3 invite. Back/next navigation; can't skip required fields; finishing lands on /dashboard.",
+    "expected": { "readyToTest": true, "gapTypes": ["negative", "related_flow", "boundary"], "areas": ["onboarding", "wizard"] }
+  },
+  {
+    "name": "webhook/integration change — error_state + related_flow",
+    "summary": "Retry failed Slack notifications up to 3 times on /settings/integrations",
+    "description": "When a Slack notification fails, retry with backoff up to 3 times, then mark as failed and surface it in the UI.",
+    "expected": { "readyToTest": true, "gapTypes": ["error_state", "related_flow"], "areas": ["slack", "notifications", "integrations"] }
+  }
+]
