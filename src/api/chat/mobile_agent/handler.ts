@@ -22,6 +22,7 @@ import {
   NO_SESSION_REPLY,
 } from './shared';
 import { MobileBlackboard } from './blackboard';
+import { buildRunBeforeLine } from './prompts';
 import { runMobileAgentPipeline } from './pipeline';
 import { emitMobileAgentThinking } from './progress';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
@@ -146,6 +147,7 @@ async function buildOpenTestCaseBlock(
       '## OPEN TEST CASE (the editor is scoped to this saved test)\n' +
       'These steps ALREADY exist. When the user asks to add/change steps, EXTEND ' +
       'this flow — do not re-author steps it already has.\n' +
+      buildRunBeforeLine(tc.resolvedDependencies) +
       wrapUntrusted(body)
     );
   } catch (err) {
