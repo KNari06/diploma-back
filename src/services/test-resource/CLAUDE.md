@@ -1,6 +1,6 @@
 # Test Resources
 
-> Polymorphic table + adapter registry for **anything reusable across many tests**: logins, environments, secrets, future data fixtures, files, network mocks, scenario setups. One DB shape, one wire format, N adapters.
+> Polymorphic table + adapter registry for **anything reusable across many tests**: logins, environments, secrets, future data fixtures, files, network mocks. One DB shape, one wire format, N adapters.
 >
 > Touch this folder when adding a new resource kind, changing the lifecycle of an existing one, or wiring per-run runtime variables (`runVariables`).
 
@@ -41,7 +41,7 @@ Tests bind to resources via a single `intent_test_cases.resource_bindings` JSONB
 ```
 test starts
  → applyBindingsToContext({ userId, projectId, page, context, bindings })
- → topological sort: secret/env/variables → device/network → auth/oauth → fixture/file → scenario_setup
+ → topological sort: secret/env/variables → device/network → auth/oauth → fixture/file
  → for each binding:
      ensureFresh(resourceId)   ← under per-resource mutex
        loadDecrypted → adapter.isFresh? → adapter.heal? (if stale + ui_recipe) → adapter.apply

@@ -56,9 +56,9 @@ export class WebTestRequestBuilderService {
     if (intentCase.replay_strategy === 'commands' && Array.isArray(intentCase.commands) && intentCase.commands.length > 0) {
       commands = intentCase.commands;
       // Phase B (May 2026) — stitchCommandsForTestCase is now a pass-through.
-      // setup_steps / teardown_steps deprecated; scenario_setup bindings own
-      // the prologue. Helper call retained so any future restoration is a
-      // single-method change.
+      // The inline setup_steps / teardown_steps columns are deprecated and
+      // always empty in production. Helper call retained so any future
+      // restoration is a single-method change.
       commands = await WebTestRequestBuilderService.stitchCommandsForTestCase(commands, intentCase, targetUrl);
     } else if (intentCase.replay_strategy === 'graph_extract' && Array.isArray(intentCase.graph_ref?.steps) && intentCase.graph_ref.steps.length > 0) {
       commands = intentCase.graph_ref.steps;
@@ -70,8 +70,7 @@ export class WebTestRequestBuilderService {
       // stitchPhases removed: setup_steps/teardown_steps columns are
       // deprecated and always empty in production. The stitch was a no-op
       // when both extras were empty, so dropping it is byte-identical to
-      // the prior behaviour for every existing test case. scenario_setup
-      // bindings deliver the prologue via runScenarioSetups in test-executor.
+      // the prior behaviour for every existing test case.
       //
       // Original code (preserved for Phase C rollback context):
       //   const { stitchPhases, normaliseIntentStep } = await import('./intent-step-dispatch.service');
@@ -109,8 +108,7 @@ export class WebTestRequestBuilderService {
 
     // Phase B (May 2026) — shared_steps resolver is deactivated. The
     // PlaywrightCommand `action: 'shared_steps'` mechanism never had a
-    // producer (UI, AI, importer) — see audit. scenario_setup resource
-    // bindings are the canonical reuse path. The block below is the
+    // producer (UI, AI, importer) — see audit. The block below is the
     // historical call; rolled back here as a one-liner pass-through.
     // Original code preserved verbatim to ease Phase C rollback if
     // any unexpected DB row turns up with the dead action type.
@@ -176,9 +174,7 @@ export class WebTestRequestBuilderService {
    * Originally bracketed pre-compiled `commands` / `graph_ref.steps` test
    * cases with setup_steps / teardown_steps converted on the fly. The
    * extras were always empty in production (no UI writer existed) so this
-   * was a no-op for every test in practice. scenario_setup bindings are
-   * the canonical reuse mechanism now and they run via runScenarioSetups
-   * in the executor, not via this helper.
+   * was a no-op for every test in practice.
    *
    * Now a pass-through. Original implementation preserved in commented
    * form for Phase C rollback context.

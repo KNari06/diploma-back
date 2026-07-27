@@ -543,8 +543,7 @@ export type SavedTestCaseWithSuggestions = IntentTestCaseWithSuggestions;
 
 // Phase B (May 2026) — SharedStepCommand type DEPRECATED.
 // The `action: 'shared_steps'` PlaywrightCommand was a planned-never-built
-// mechanism. No producer ever existed; scenario_setup test_resource bindings
-// own the "reuse steps across tests" use case now at the IntentStep layer.
+// mechanism. No producer ever existed.
 // Type kept here in commented form so that any historic JSONB row decoder
 // referencing this name can find the original shape during Phase C cleanup.
 //
