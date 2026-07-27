@@ -7,6 +7,7 @@ import { handleApiTest } from '@/api/chat/api_test/handler';
 import { handleClarificationRequest } from '@/api/chat/shared/clarification';
 import { checkWorkspace } from '@/api/chat/shared/validation';
 import { getOrCreateWorkspaceChat, normalizeUrl } from '@/api/chat/shared/utils';
+import { extractFirstUrl } from '@/utils/parsing/url-scope';
 import {
   generateOAuthState,
   buildJiraAuthUrl,
@@ -25,16 +26,22 @@ import {
   createJiraIssue,
   transitionJiraIssue,
   updateJiraIssueFields,
+  addJiraComment,
 } from '@/services/api/jira.service';
+// Barrel import — registers every TaskTrackerProvider as a side effect.
+import { TrackerRegistry } from '@/services/integrations/tracker';
 import { supabaseAdmin } from '@/db/supabase';
-import { JiraQaOrchestratorService } from '@/services/integrations/jira-qa-orchestrator.service';
+import { JiraQaOrchestratorService, type JiraQaAnalysisResult } from '@/services/integrations/jira-qa-orchestrator.service';
+import { HandoffService } from '@/services/testing/analysis/handoff.service';
+import { JiraWebhookService } from '@/services/integrations/jira-webhook-jira.service';
+import { suggestQaStatuses } from '@/services/integrations/qa-status-heuristic';
 import {
   AUDIT_EVENTS,
   WorkspaceAuditService,
   getAuditContext,
 } from '@/services/core/workspace-audit.service';
 import type { JiraIssueListItem } from '@/types';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes } from 'crypto';
 
 // In-memory store for OAuth states (in production, use Redis)
 const oauthStates = new Map<string, { userId?: string; expiresAt: number }>();
@@ -867,6 +874,57 @@ export interface JiraSyncSettings {
   doneStatusName?: string;
   /** Status to transition source issue to when test FAILS / has bugs (e.g. "In Progress", "Reopened") */
   failStatusName?: string;
+  /**
+   * Hybrid autonomy: when true, a READY ticket does NOT auto-run — the agent
+   * posts the handoff + branch options and waits for a human to pick a branch.
+   * Default false (fully autonomous).
+   */
+  requireApprovalBeforeRun?: boolean;
+  /**
+   * Auto-trigger statuses: when a ticket transitions INTO any of these Jira
+   * statuses, a webhook makes the agent auto-ASSESS it (never auto-runs). Each
+   * team picks from THEIR real board statuses, so names differ per team. Matched
+   * by stable status `id` (survives renames); `name` is kept for display + as a
+   * fallback match. Auto-assessment is active only when this is non-empty AND
+   * webhookSecret is set.
+   */
+  qaTriggerStatuses?: Array<{ id: string; name: string }>;
+  /**
+   * @deprecated Legacy single trigger-column NAME. Still read for back-compat
+   * (treated as one name-only entry) but new configs use qaTriggerStatuses.
+   */
+  qaColumnName?: string;
+  /**
+   * Per-project shared secret for verifying the Jira webhook (HMAC). Generated
+   * on demand; registered in the Jira webhook config alongside the URL.
+   */
+  webhookSecret?: string;
+}
+
+/**
+ * Read the effective trigger statuses from a stored jira settings blob,
+ * normalizing the new array shape and folding in the legacy `qaColumnName`
+ * (name-only, id unknown → empty id, matched by name fallback). De-duped.
+ */
+function normalizeTriggerStatuses(jira: any): Array<{ id: string; name: string }> {
+  const out: Array<{ id: string; name: string }> = [];
+  const seen = new Set<string>();
+  const push = (id: unknown, name: unknown) => {
+    const n = typeof name === 'string' ? name.trim() : '';
+    const i = typeof id === 'string' ? id.trim() : '';
+    if (!n && !i) return;
+    const key = i || n.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ id: i, name: n });
+  };
+  if (Array.isArray(jira?.qaTriggerStatuses)) {
+    for (const s of jira.qaTriggerStatuses) push(s?.id, s?.name);
+  }
+  if (typeof jira?.qaColumnName === 'string' && jira.qaColumnName.trim()) {
+    push('', jira.qaColumnName); // legacy name-only entry
+  }
+  return out;
 }
 
 /**
@@ -932,9 +990,16 @@ export const getJiraSettings = async (req: Request, res: Response): Promise<void
       reworkStatusName: jira.reworkStatusName || undefined,
       doneStatusName: jira.doneStatusName || undefined,
       failStatusName: jira.failStatusName || undefined,
+      requireApprovalBeforeRun: jira.requireApprovalBeforeRun === true,
+      qaTriggerStatuses: normalizeTriggerStatuses(jira),
+      webhookSecret: jira.webhookSecret || undefined,
     };
 
-    res.json({ success: true, data: settings, projectId: resolvedId });
+    // The URL to register in Jira's webhook config (System → WebHooks).
+    const base = (env.BACKEND_URL || `http://localhost:${env.PORT}`).replace(/\/api\/?$/, '').replace(/\/+$/, '');
+    const webhookUrl = `${base}/api/${env.API_VERSION}/jira/webhook`;
+
+    res.json({ success: true, data: settings, projectId: resolvedId, webhookUrl });
   } catch (error) {
     logger.error('Get Jira settings error:', error);
     res.status(500).json({ success: false, error: 'Failed to get Jira settings' });
@@ -949,7 +1014,7 @@ export const getJiraSettings = async (req: Request, res: Response): Promise<void
 export const updateJiraSettings = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
-    const { projectId, workspaceId, syncOnCreate, autoSyncIssues, projectKey, reworkStatusName, doneStatusName, failStatusName } = req.body;
+    const { projectId, workspaceId, syncOnCreate, autoSyncIssues, projectKey, reworkStatusName, doneStatusName, failStatusName, requireApprovalBeforeRun, qaTriggerStatuses, generateWebhookSecret } = req.body;
 
     const resolvedId = await resolveProjectId(
       userId,
@@ -984,6 +1049,22 @@ export const updateJiraSettings = async (req: Request, res: Response): Promise<v
     if (reworkStatusName !== undefined) updates.reworkStatusName = reworkStatusName ? String(reworkStatusName).trim() : undefined;
     if (doneStatusName !== undefined) updates.doneStatusName = doneStatusName ? String(doneStatusName).trim() : undefined;
     if (failStatusName !== undefined) updates.failStatusName = failStatusName ? String(failStatusName).trim() : undefined;
+    if (typeof requireApprovalBeforeRun === 'boolean') updates.requireApprovalBeforeRun = requireApprovalBeforeRun;
+    if (qaTriggerStatuses !== undefined) {
+      // Sanitize to [{id,name}] (both strings, at least one non-empty), cap 20.
+      const clean = Array.isArray(qaTriggerStatuses)
+        ? qaTriggerStatuses
+            .map((s: any) => ({ id: typeof s?.id === 'string' ? s.id.trim() : '', name: typeof s?.name === 'string' ? s.name.trim() : '' }))
+            .filter((s: { id: string; name: string }) => s.id || s.name)
+            .slice(0, 20)
+        : [];
+      updates.qaTriggerStatuses = clean;
+      // New config supersedes the legacy single-name field.
+      updates.qaColumnName = undefined;
+    }
+    // Secret is generated server-side (never accepted from the client). Client
+    // sends generateWebhookSecret:true to (re)issue it.
+    if (generateWebhookSecret === true) updates.webhookSecret = randomBytes(24).toString('hex');
 
     const newSettings = {
       ...currentSettings,
@@ -1015,6 +1096,166 @@ export const updateJiraSettings = async (req: Request, res: Response): Promise<v
   } catch (error) {
     logger.error('Update Jira settings error:', error);
     res.status(500).json({ success: false, error: 'Failed to update Jira settings' });
+  }
+};
+
+/**
+ * List a Jira project's statuses as [{id,name}] — powers the trigger-status
+ * picker in settings (so teams choose from their REAL columns, matched by id).
+ * GET /api/v1/jira/statuses?projectKey=...&cloudId=...
+ */
+export const getJiraStatusesForPicker = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const projectKey = (req.query.projectKey as string)?.trim();
+    const cloudId = (req.query.cloudId as string)?.trim() || undefined;
+
+    if (!projectKey || !JIRA_PROJECT_KEY_REGEX.test(projectKey)) {
+      res.status(400).json({ success: false, error: 'Valid projectKey is required' });
+      return;
+    }
+
+    const tokenData = await getJiraToken(userId, cloudId);
+    if (!tokenData) {
+      res.status(403).json({ success: false, error: 'Jira not connected' });
+      return;
+    }
+    const accessToken = await ensureValidToken(tokenData);
+    const cloudIdToUse = cloudId || tokenData.cloud_id;
+    if (!cloudIdToUse) {
+      res.status(400).json({ success: false, error: 'Cloud ID is required' });
+      return;
+    }
+
+    // Resolved through the tracker registry, not jira.service directly, so this
+    // endpoint is provider-agnostic the moment a second tracker registers.
+    const statuses = await TrackerRegistry.get('jira').listStatuses(
+      { accessToken, externalId: cloudIdToUse },
+      projectKey,
+    );
+    // Pre-select QA-like statuses so the picker feels smart; the user confirms.
+    const suggestedIds = suggestQaStatuses(statuses).map((s) => s.id);
+    res.json({ success: true, data: statuses, suggestedIds });
+  } catch (error) {
+    logger.error('Get Jira statuses error:', error);
+    res.status(500).json({ success: false, error: error instanceof Error ? error.message : 'Failed to get statuses' });
+  }
+};
+
+/**
+ * Jira webhook receiver — auto-ASSESS a ticket when it enters a project's QA
+ * column. Public (no Bearer): Atlassian posts a raw JSON body; the shared secret
+ * is passed in the URL (?secret=...). Verifies the secret + column transition,
+ * then runs the assessment core (assess-only — NEVER auto-runs a test). Always
+ * ACKs 200 fast and does the heavy work in the background; never throws.
+ * POST /api/v1/jira/webhook?secret=...
+ */
+export const handleJiraWebhook = async (req: Request, res: Response): Promise<void> => {
+  // Always ACK immediately so Jira doesn't retry/timeout.
+  res.status(200).json({ received: true });
+
+  if (!env.JIRA_WEBHOOK_ENABLED) return;
+
+  setImmediate(() => {
+    (async () => {
+      try {
+        // Raw body (express.raw) → JSON.
+        let payload: any;
+        try {
+          const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : req.body;
+          payload = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        } catch {
+          return; // unparseable body → drop silently
+        }
+
+        const providedSecret = typeof req.query.secret === 'string' ? req.query.secret : undefined;
+        const parsed = JiraWebhookService.parse(payload);
+        const trigger = await JiraWebhookService.resolveTrigger(parsed, providedSecret);
+        if (!trigger) return; // no match / bad secret / not the trigger column → no-op
+
+        // Cooldown: a Jira transition can fire several webhooks in a burst — only
+        // the first assesses this ticket+status within the window (saves LLM calls
+        // + avoids duplicate Jira comments).
+        const claimed = await JiraWebhookService.claimAssessment(
+          trigger.projectId, trigger.issueKey, trigger.matchedStatusId,
+        );
+        if (!claimed) {
+          logger.info('[JIRA_WEBHOOK] Skipped — assessed recently (cooldown)', {
+            issueKey: trigger.issueKey, projectId: trigger.projectId,
+          });
+          return;
+        }
+
+        logger.info('[JIRA_WEBHOOK] Auto-assess triggered', {
+          issueKey: trigger.issueKey, projectId: trigger.projectId, status: trigger.matchedStatus,
+        });
+
+        // Assess-only: readiness + handoff + Jira comment. NO test run.
+        const { analysis, issue, related } = await JiraQaOrchestratorService.assessReadiness({
+          issueKey: trigger.issueKey,
+          projectId: trigger.projectId,
+          userId: trigger.userId,
+          workspaceId: trigger.workspaceId,
+        });
+
+        // Resolve a chat session so the handoff surfaces in chat (best-effort).
+        let chatSessionId: string | undefined;
+        try {
+          const workspace_id = await checkWorkspace(trigger.userId, randomUUID());
+          chatSessionId = await getOrCreateWorkspaceChat(trigger.userId, workspace_id, randomUUID());
+        } catch { /* chat emit is optional; Jira comment still posts */ }
+
+        await HandoffService.buildAndPersist({
+          projectId: trigger.projectId,
+          issueKey: trigger.issueKey,
+          analysis,
+          issue,
+          related,
+          chatSessionId,
+        });
+
+        await postReadinessToJira(trigger.userId, trigger.issueKey, undefined, analysis);
+      } catch (err) {
+        logger.error('[JIRA_WEBHOOK] Background processing failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })().catch(() => { /* swallow — ACK already sent */ });
+  });
+};
+
+/**
+ * Get the QA handoff artifact for a ticket (structured readiness + status + gaps).
+ * GET /api/v1/jira/handoff?issueKey=...&projectId=... (or ?workspaceId=...)
+ * Access is checked server-side (owner OR workspace project) so the read is safe
+ * regardless of the table's owner-only RLS.
+ */
+export const getJiraHandoff = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const issueKey = (req.query.issueKey as string)?.trim();
+    const projectId = (req.query.projectId as string)?.trim();
+    const workspaceId = (req.query.workspaceId as string)?.trim();
+
+    if (!issueKey) {
+      res.status(400).json({ success: false, error: 'issueKey is required' });
+      return;
+    }
+    const resolvedId = await resolveProjectId(userId, projectId, workspaceId);
+    if (!resolvedId) {
+      res.status(400).json({ success: false, error: 'projectId or workspaceId is required' });
+      return;
+    }
+
+    const handoff = await HandoffService.read(resolvedId, issueKey);
+    if (!handoff) {
+      res.status(404).json({ success: false, error: 'No handoff found for this issue' });
+      return;
+    }
+    res.json({ success: true, data: handoff, projectId: resolvedId });
+  } catch (error) {
+    logger.error('Get Jira handoff error:', error);
+    res.status(500).json({ success: false, error: 'Failed to get Jira handoff' });
   }
 };
 
@@ -1113,14 +1354,6 @@ function createBackgroundResponse(meta: { sessionId?: string; tag: string }): Re
   return resLike as Response;
 }
 
-function extractFirstUrl(text: string): string | null {
-  if (!text) return null;
-  const abs = text.match(/\bhttps?:\/\/[^\s)]+/i);
-  if (abs?.[0]) return abs[0].replace(/[),.]+$/g, '');
-  const domain = text.match(/\b([a-z0-9.-]+\.[a-z]{2,})(\/[^\s)]*)?/i);
-  if (domain?.[0]) return normalizeUrl(domain[0].replace(/[),.]+$/g, ''));
-  return null;
-}
 
 function inferTicketType(body: any): JiraTicketType {
   const apiTest = body?.apiTest;
@@ -1128,6 +1361,68 @@ function inferTicketType(body: any): JiraTicketType {
   const url = typeof apiTest.url === 'string' ? apiTest.url.trim() : '';
   if (url.length > 0) return 'api';
   return 'web_ui';
+}
+
+/** Human-readable readiness gate message shown in chat when a ticket is not ready. */
+function buildReadinessClarification(analysis: JiraQaAnalysisResult): string {
+  const r = analysis.readiness;
+  const lines: string[] = [];
+  lines.push(`This task isn't ready to test yet${r ? ` (readiness ${r.readinessScore}/100)` : ''}.`);
+  if (r?.summary) lines.push(r.summary);
+
+  const questions = r?.blockingQuestions?.length ? r.blockingQuestions : (analysis.reworkQuestions || []);
+  if (questions.length) {
+    lines.push('\nPlease clarify:');
+    for (const q of questions) lines.push(`• ${q}`);
+  }
+
+  if (r?.coverageGaps?.length) {
+    lines.push('\nBefore running, also consider these cases:');
+    for (const g of r.coverageGaps) {
+      const ref = g.relatedTicket ? ` [${g.relatedTicket}]` : '';
+      lines.push(`• (${g.type}) ${g.title}${ref} — ${g.why}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+/** Post the readiness assessment (score + forgotten cases) back to the Jira issue. Best-effort. */
+async function postReadinessToJira(
+  userId: string,
+  issueKey: string,
+  cloudId: string | undefined,
+  analysis: JiraQaAnalysisResult,
+): Promise<void> {
+  try {
+    const r = analysis.readiness;
+    if (!r) return;
+    const tokenData = await getJiraToken(userId, cloudId);
+    if (!tokenData?.cloud_id) return;
+    const accessToken = await ensureValidToken(tokenData);
+    const cloudIdToUse = cloudId || tokenData.cloud_id;
+
+    const lines: string[] = [
+      `[QAI] Readiness: ${r.readinessScore}/100 — ${r.readyToTest ? 'ready to test' : 'NOT ready'}.`,
+    ];
+    if (r.summary) lines.push(r.summary);
+    if (!r.readyToTest && r.blockingQuestions.length) {
+      lines.push('\nBlocking questions:');
+      r.blockingQuestions.forEach((q) => lines.push(`• ${q}`));
+    }
+    if (r.coverageGaps.length) {
+      lines.push('\nForgotten cases to consider:');
+      r.coverageGaps.forEach((g) => {
+        const ref = g.relatedTicket ? ` [${g.relatedTicket}]` : '';
+        lines.push(`• (${g.type}) ${g.title}${ref}`);
+      });
+    }
+    await addJiraComment(accessToken, cloudIdToUse, issueKey, lines.join('\n'));
+  } catch (err) {
+    logger.warn('[JIRA_CONTROLLER] Failed to post readiness to Jira (non-fatal)', {
+      issueKey,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 /**
@@ -1153,7 +1448,7 @@ export const runFromJiraViaChat = async (req: Request, res: Response): Promise<v
     }
 
     const body = (req.body || {}) as any;
-    const { projectId, sessionId, conversationId, context, ticket, apiTest, issueKey } = body;
+    const { projectId, sessionId, conversationId, context, ticket, apiTest, issueKey, cloudId: bodyCloudId } = body;
 
     const summaryRaw = ticket?.summary ?? body?.summary;
     const descriptionRaw = ticket?.description ?? body?.description;
@@ -1267,6 +1562,80 @@ export const runFromJiraViaChat = async (req: Request, res: Response): Promise<v
         const bgReq = {} as Request;
 
         try {
+          // ── Readiness gate + handoff (feature-flagged) ──────────────────
+          // Before running: assess readiness + forgotten cases, persist a
+          // structured handoff, and gate the run.
+          //  - not ready (blocked)              → post blocking questions, STOP.
+          //  - ready + requireApprovalBeforeRun → post branch options, STOP.
+          //  - ready + autonomous               → fall through and run.
+          if (env.JIRA_READINESS_ASSESSMENT_ENABLED && issueKey && resolvedProjectId) {
+            try {
+              const trimmedKey = String(issueKey).trim();
+              const cloudIdTrimmed = typeof bodyCloudId === 'string' ? bodyCloudId.trim() : undefined;
+              const { analysis, issue: assessedIssue, related } = await JiraQaOrchestratorService.assessReadiness({
+                issueKey: trimmedKey,
+                projectId: resolvedProjectId,
+                userId,
+                cloudId: cloudIdTrimmed,
+                workspaceId: workspace_id,
+              });
+              const readiness = analysis.readiness;
+              logger.info('[JIRA_CONTROLLER] Readiness assessed', {
+                issueKey,
+                readyToTest: readiness?.readyToTest,
+                score: readiness?.readinessScore,
+                gaps: readiness?.coverageGaps?.length ?? 0,
+              });
+
+              // Build + persist the structured handoff and emit it to chat.
+              const handoff = await HandoffService.buildAndPersist({
+                projectId: resolvedProjectId,
+                issueKey: trimmedKey,
+                cloudId: cloudIdTrimmed,
+                analysis,
+                issue: assessedIssue,
+                related,
+                chatSessionId: chatSessionId || resolvedSessionId,
+              });
+
+              // Post the assessment (score + forgotten cases) back to Jira, best-effort.
+              await postReadinessToJira(userId, trimmedKey, bodyCloudId, analysis);
+
+              // Not ready → clarify + STOP.
+              if (handoff.status === 'blocked') {
+                await handleClarificationRequest(bgReq, bgRes, {
+                  parsedIntent: {
+                    intent: 'needs_clarification',
+                    confidence: 0.3,
+                    rawText: mergedMessage,
+                    clarificationQuestion: buildReadinessClarification(analysis),
+                    possibleIntents: ['platform_test', 'api_test', 'general_chat'],
+                    clarificationReason: 'Jira task not ready to test (readiness gate)',
+                    metadata: { source: 'jira_from_ticket', readiness },
+                  },
+                  userId,
+                  chatSessionId: chatSessionId || resolvedSessionId,
+                });
+                return;
+              }
+
+              // Hybrid autonomy: ready but the project requires human approval →
+              // post branch options and STOP (don't auto-run).
+              const jiraSettings = await JiraQaOrchestratorService.getProjectJiraQaSettings(resolvedProjectId, userId);
+              if (jiraSettings.requireApprovalBeforeRun) {
+                HandoffService.emitBranchChoice(chatSessionId || resolvedSessionId, handoff);
+                logger.info('[JIRA_CONTROLLER] Ready but approval required — awaiting branch choice', { issueKey });
+                return;
+              }
+            } catch (assessErr) {
+              // Assessment failure must NOT block the run — degrade to old behaviour.
+              logger.warn('[JIRA_CONTROLLER] Readiness assessment failed (non-fatal, proceeding to run)', {
+                issueKey,
+                error: assessErr instanceof Error ? assessErr.message : String(assessErr),
+              });
+            }
+          }
+
           if (ticketType === 'api') {
             const api = nextContext?.apiTest || apiTest;
             const apiUrl = typeof api?.url === 'string' ? api.url.trim() : '';
@@ -1285,6 +1654,10 @@ export const runFromJiraViaChat = async (req: Request, res: Response): Promise<v
               metadata: {
                 source: 'jira_from_ticket',
                 issueKey: nextContext?.jira?.issueKey || null,
+                // Tag the run so post-run feedback (incl. the fix-prompt) reaches
+                // the originating Jira issue — see sendJiraFeedback.
+                sourceJiraIssueKey: nextContext?.jira?.issueKey || undefined,
+                sourceJiraCloudId: typeof bodyCloudId === 'string' ? bodyCloudId.trim() : undefined,
               },
             };
 
@@ -1339,6 +1712,10 @@ export const runFromJiraViaChat = async (req: Request, res: Response): Promise<v
             metadata: {
               source: 'jira_from_ticket',
               issueKey: nextContext?.jira?.issueKey || null,
+              // Tag the run so post-run feedback (incl. the fix-prompt) reaches
+              // the originating Jira issue — see sendJiraFeedback.
+              sourceJiraIssueKey: nextContext?.jira?.issueKey || undefined,
+              sourceJiraCloudId: typeof bodyCloudId === 'string' ? bodyCloudId.trim() : undefined,
             },
           };
 

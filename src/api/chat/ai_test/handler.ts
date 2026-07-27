@@ -805,12 +805,22 @@ export async function handlePlatformTest(
 
       // Step L2: Create test request
       const resolvedContext = parsedIntent?.resolvedContext;
+      // Propagate Jira source so post-run feedback (incl. the developer
+      // fix-prompt) can be delivered back to the originating issue. Stored as
+      // tests.options.metadata by the creator; read by sendJiraFeedback.
+      const jiraSourceMeta = parsedIntent?.metadata?.sourceJiraIssueKey
+        ? {
+            sourceJiraIssueKey: parsedIntent.metadata.sourceJiraIssueKey,
+            sourceJiraCloudId: parsedIntent.metadata.sourceJiraCloudId,
+          }
+        : undefined;
       const testRequest = {
         url: extractedUrl.trim(),
         browsers: ['chrome' as const],
         projectId: project_id,
         userId,
         options: finalCredentials ? { credentials: finalCredentials } : {},
+        ...(jiraSourceMeta ? { metadata: jiraSourceMeta } : {}),
         commands: [], // Lite mode: no pre-defined commands, AI generates dynamically
         intent: finalScope,
         intelligentMode: true, // Always intelligent for Lite

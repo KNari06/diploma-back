@@ -229,6 +229,24 @@ const envSchema = z.object({
   // Telegram Bot
   TELEGRAM_BOT_TOKEN: z.string().optional(),
 
+  // Jira task-readiness assessment before auto-running a ticket. OFF by default —
+  // when off, runFromJiraViaChat behaves exactly as before (straight to the test).
+  // When on: fetch the full issue + related tickets, assess readiness, and HARD-GATE
+  // the run (not ready → post blocking questions + gaps, skip the auto-run).
+  JIRA_READINESS_ASSESSMENT_ENABLED: z.string().transform(v => v === 'true').default('false'),
+  // Developer fix-prompt: after a run finds a bug, generate a paste-ready markdown
+  // prompt (one LLM call) persisted to ai_summary.fixPrompt + attached to the Jira
+  // feedback comment. OFF by default.
+  DEVELOPER_FIX_PROMPT_ENABLED: z.string().transform(v => v === 'true').default('false'),
+  // Jira webhook auto-trigger: when a ticket enters a project's configured QA
+  // column, auto-ASSESS it (readiness + handoff) — never auto-runs the test.
+  // OFF by default; also gated per-project by qaColumnName + webhookSecret.
+  JIRA_WEBHOOK_ENABLED: z.string().transform(v => v === 'true').default('false'),
+  // Query-driven retrieval planning: before assessing a Jira ticket, a cheap LLM
+  // call expands it into search terms so context retrieval finds related work
+  // by meaning (not just literal ticket words). OFF → assessment uses the raw
+  // summary+description as the search query (current behavior).
+  JIRA_QUERY_PLANNER_ENABLED: z.string().transform(v => v === 'true').default('false'),
   // QAIT Tasker (Telegram task tracking). Feature-gated, OFF by default — when
   // off the webhook accepts-and-ignores and the sweep job doesn't start.
   TELEGRAM_TASKS_ENABLED: z.string().transform(v => v === 'true').default('false'),

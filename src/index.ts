@@ -279,6 +279,9 @@ app.post(
 app.use(`/api/${env.API_VERSION}/git-integrations/webhook`, express.raw({ type: 'application/json', limit: '10mb' }));
 // Fallback when reverse proxy strips /api (e.g. nginx proxy_pass with trailing slash)
 app.use(`/${env.API_VERSION}/git-integrations/webhook`, express.raw({ type: 'application/json', limit: '10mb' }));
+// Jira webhook: the controller JSON-parses the Buffer; secret verified from the URL.
+app.use(`/api/${env.API_VERSION}/jira/webhook`, express.raw({ type: 'application/json', limit: '5mb' }));
+app.use(`/${env.API_VERSION}/jira/webhook`, express.raw({ type: 'application/json', limit: '5mb' }));
 // QAIT Tasker Telegram webhook needs the raw body too (the controller JSON-parses
 // the Buffer). Public route (no auth) — auth is Telegram's secret-token header.
 app.use(`/api/${env.API_VERSION}/telegram-tasks/webhook`, express.raw({ type: 'application/json', limit: '1mb' }));

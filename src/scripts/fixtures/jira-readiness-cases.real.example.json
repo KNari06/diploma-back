@@ -1,0 +1,13 @@
+[
+  {
+    "_comment": "TEMPLATE for REAL tickets. Copy this to jira-readiness-cases.real.json (gitignored / not committed), paste anonymized tickets from your board, and set the expected labels by hand (what a QA lead would say). Then run: npx tsx src/scripts/eval-jira-readiness.ts src/scripts/fixtures/jira-readiness-cases.real.json --planner",
+    "name": "REAL — <short label>",
+    "summary": "<paste the real ticket summary, strip secrets/PII>",
+    "description": "<paste the real description, strip secrets/PII>",
+    "expected": {
+      "readyToTest": true,
+      "gapTypes": ["negative", "boundary", "related_flow", "error_state", "permission", "data_variation"],
+      "areas": ["<feature/page words a good retrieval should surface>"]
+    }
+  }
+]

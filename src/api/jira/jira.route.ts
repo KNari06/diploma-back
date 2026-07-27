@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { startJiraAuth, getConnectUrl, handleJiraCallback, getProjects, getBoards, getBoardConfigurationHandler, getIssues, createIssue, updateIssue, updateIssueStatus, getConnectionStatus, disconnectJira, getConnections, getJiraSettings, updateJiraSettings, qaAnalyze, runFromJiraViaChat } from './jira.controller';
+import { startJiraAuth, getConnectUrl, handleJiraCallback, getProjects, getBoards, getBoardConfigurationHandler, getIssues, createIssue, updateIssue, updateIssueStatus, getConnectionStatus, disconnectJira, getConnections, getJiraSettings, updateJiraSettings, getJiraStatusesForPicker, getJiraHandoff, handleJiraWebhook, qaAnalyze, runFromJiraViaChat } from './jira.controller';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { requireAuth, requireApproved } from '@/middleware/auth.middleware';
 
@@ -7,6 +7,10 @@ const router = Router();
 
 // OAuth callback must be public (Atlassian redirects with code/state, no Bearer token)
 router.get('/callback', asyncHandler(handleJiraCallback));
+
+// Webhook receiver must be public (Atlassian posts with a URL secret, no Bearer).
+// Raw-body parsing for this path is mounted in index.ts before express.json().
+router.post('/webhook', asyncHandler(handleJiraWebhook));
 
 // All other routes require auth and approved status
 router.use(requireAuth, requireApproved);
@@ -915,5 +919,57 @@ router.get('/settings', requireAuth, asyncHandler(getJiraSettings));
  *         description: Project not found
  */
 router.put('/settings', requireAuth, asyncHandler(updateJiraSettings));
+
+/**
+ * @swagger
+ * /api/v1/jira/statuses:
+ *   get:
+ *     summary: List a project's Jira statuses (id + name) for the trigger picker
+ *     tags: [Jira]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: query
+ *         name: projectKey
+ *         required: true
+ *         schema: { type: string }
+ *       - in: query
+ *         name: cloudId
+ *         required: false
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: "[{id,name}]" }
+ *       400: { description: projectKey required }
+ *       403: { description: Jira not connected }
+ */
+router.get('/statuses', requireAuth, asyncHandler(getJiraStatusesForPicker));
+
+/**
+ * @swagger
+ * /api/v1/jira/handoff:
+ *   get:
+ *     summary: Get the QA handoff artifact for a ticket
+ *     description: Structured readiness + honest status + coverage gaps + suggested branches for an issue.
+ *     tags: [Jira]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: issueKey
+ *         required: true
+ *         schema: { type: string }
+ *       - in: query
+ *         name: projectId
+ *         required: false
+ *         schema: { type: string, format: uuid }
+ *       - in: query
+ *         name: workspaceId
+ *         required: false
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200: { description: Handoff artifact }
+ *       400: { description: issueKey and projectId/workspaceId required }
+ *       404: { description: No handoff found }
+ */
+router.get('/handoff', requireAuth, asyncHandler(getJiraHandoff));
 
 export default router;
