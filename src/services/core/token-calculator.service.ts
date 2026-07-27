@@ -4,10 +4,17 @@ import { logger } from '@/utils/core/logger';
  * Token Calculator Service
  * Converts between tokens and credits for accurate billing
  *
- * PRICING MODEL: individual self-serve = Free (50) / Pro ($28.9, 1000 credits).
- * Team/Enterprise = the B2B tiers in WORKSPACE_PLANS below (granted by admin or
- * Stripe, credits belong to the USER's user_credits, not a workspace). The old
- * individual "ultra"/"Team" plan is retired. 1 credit = 562.5 tokens.
+ * PRICING MODEL — this file is NOT a source of truth for prices or grants.
+ * Pro is sold as three Stripe-backed tiers ($19/990, $49/7 000, $99/18 000), so
+ * no single price/credits pair can describe it. The authoritative sources are:
+ *   - Stripe                        → what the customer is charged
+ *   - `plans.credits_per_period`    → credits actually granted (by stripe_price_id)
+ *   - `pro_plan_options`            → the tier menu shown on the pricing page
+ * Only `INDIVIDUAL_PLANS.free` lives here, because the free grant is a product
+ * constant with no Stripe price behind it. Team/Enterprise = the B2B tiers in
+ * WORKSPACE_PLANS below (granted by admin or Stripe; credits belong to the
+ * USER's user_credits, not a workspace). The individual "ultra"/"Team" plan is
+ * retired. 1 credit = 562.5 tokens.
  */
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -15,10 +22,11 @@ import { logger } from '@/utils/core/logger';
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * How many tokens equals 1 credit
- * Calculated: $28.9/month = 1000 credits (Pro Plan)
- * AI budget: $4.50 / $0.008 per 1K tokens = 562,500 tokens
- * 562,500 tokens ÷ 1000 credits = 562.5 tokens per credit
+ * How many tokens equals 1 credit.
+ * Originally derived from a retired $28.9/1000-credit Pro plan:
+ * $4.50 AI budget ÷ $0.008 per 1K tokens = 562,500 tokens ÷ 1000 = 562.5.
+ * The ratio is now a fixed product constant — it defines how much work a credit
+ * buys, independent of what any tier charges for one.
  */
 export const TOKENS_PER_CREDIT = 562.5;
 
@@ -77,7 +85,6 @@ export const MOBILE_STEP_CREDIT_MULTIPLIER = 4;
  */
 export const INDIVIDUAL_PLANS = {
   free: { price: 0, credits: 50 },
-  pro: { price: 28.9, credits: 1000 },
 } as const;
 
 /**
@@ -92,12 +99,6 @@ export const WORKSPACE_PLANS = {
   enterprise: { price: 2_990, credits: 200_000, graceLimit: 20_000 },
 } as const;
 
-/** @deprecated Use INDIVIDUAL_PLANS + WORKSPACE_PLANS instead */
-export const SUBSCRIPTION_PLANS = {
-  pro: { price: 28.9, credits: 1000 },
-  ultra: { price: 43.9, credits: 1000 },
-  business: { price: 590, credits: 30000, maxEngineers: 5 },
-} as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TOKEN CALCULATOR SERVICE
@@ -245,26 +246,6 @@ export class TokenCalculatorService {
     }
 
     return credits.toLocaleString('en-US');
-  }
-
-  /**
-   * Get subscription plan by price
-   * @param price - Monthly price
-   * @returns Plan details or null
-   */
-  static getPlanByPrice(price: number): { price: number; credits: number } | null {
-    const plan = Object.values(SUBSCRIPTION_PLANS).find((p) => p.price === price);
-    return plan || null;
-  }
-
-  /**
-   * Get subscription plan by credits
-   * @param credits - Monthly credits
-   * @returns Plan details or null
-   */
-  static getPlanByCredits(credits: number): { price: number; credits: number } | null {
-    const plan = Object.values(SUBSCRIPTION_PLANS).find((p) => p.credits === credits);
-    return plan || null;
   }
 
   /**
