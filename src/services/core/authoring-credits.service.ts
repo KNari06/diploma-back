@@ -4,9 +4,11 @@ import { AuthoringCreditsFeature } from '@/config/features/authoring-credits';
 import type { LintResult } from '@/services/testing/ui/preview/preview.types';
 
 /**
- * Charges credits for an AI-assisted step-editor Apply.
+ * Charges credits for an AI-assisted step-editor Apply — web AND mobile, at the
+ * same rate.
  *
- * Only fires when the Apply actually used the LLM (resolverPath 'llm'/'vision');
+ * Only fires when the Apply actually used the LLM: web `resolverPath`
+ * 'llm'/'vision', mobile `resolvedVia` 'llm'/'vision'/'thinking';
  * identity / evidence / compiled resolves are free. Deduped per (session, step)
  * so tweaking-and-re-applying the same step in one editor session charges once
  * — the user pays for the AI resolve, not for each retry of it.
@@ -28,8 +30,8 @@ export class AuthoringCreditsService {
   }
 
   /**
-   * Charge for an apply if it used a paid resolver path and hasn't been charged
-   * yet this session. Call fire-and-forget after a successful applyStep.
+   * Charge for a WEB apply if it used a paid resolver path and hasn't been
+   * charged yet this session. Call fire-and-forget after a successful applyStep.
    */
   static async chargeForApply(params: {
     userId: string;
@@ -37,14 +39,61 @@ export class AuthoringCreditsService {
     stepId: string;
     resolverPath: LintResult['resolverPath'] | undefined;
   }): Promise<{ charged: boolean; credits: number; reason?: string }> {
-    const { userId, previewSessionId, stepId, resolverPath } = params;
+    const { resolverPath, ...rest } = params;
+    return this.charge({
+      ...rest,
+      paid: AuthoringCreditsFeature.isPaidResolverPath(resolverPath),
+      resolutionLabel: resolverPath,
+    });
+  }
+
+  /**
+   * Charge for a MOBILE apply. Same rate and same dedup as web — the only
+   * difference is the vocabulary: the runner reports `resolvedVia`, not the
+   * web `resolverPath`. Both mobile entry points (the REST
+   * `POST /mobile/sessions/:id/apply` controller and the mobile WS handler)
+   * call this, because `MobileStepApplyService` deliberately performs no side
+   * effects of its own — persistence, tracing and billing all belong to the
+   * caller.
+   */
+  static async chargeForMobileApply(params: {
+    userId: string;
+    previewSessionId: string;
+    stepId: string;
+    resolvedVia: string | undefined;
+  }): Promise<{ charged: boolean; credits: number; reason?: string }> {
+    const { resolvedVia, ...rest } = params;
+    return this.charge({
+      ...rest,
+      paid: AuthoringCreditsFeature.isPaidMobileResolvedVia(resolvedVia),
+      resolutionLabel: resolvedVia,
+    });
+  }
+
+  /** Shared gate → dedup → deduct core for both editors. */
+  private static async charge(params: {
+    userId: string;
+    previewSessionId: string;
+    stepId: string;
+    paid: boolean;
+    resolutionLabel: string | undefined;
+  }): Promise<{ charged: boolean; credits: number; reason?: string }> {
+    const { userId, previewSessionId, stepId, paid, resolutionLabel } = params;
 
     if (!AuthoringCreditsFeature.isEnabled()) {
       return { charged: false, credits: 0, reason: 'disabled' };
     }
-    if (!AuthoringCreditsFeature.isPaidResolverPath(resolverPath)) {
-      // identity / evidence / compiled / rule_fallback — no LLM ran, no charge.
+    if (!paid) {
+      // identity / evidence / compiled / rule_fallback (web), or a
+      // deterministic tree match (mobile) — no LLM ran, no charge.
       return { charged: false, credits: 0, reason: 'no_llm' };
+    }
+    if (!stepId) {
+      // Without a step id every step in the session would collapse onto the
+      // same dedup key and only the first would ever charge. Skip instead of
+      // silently under-billing the rest of the session.
+      logger.warn('[AUTHORING_CREDITS] Apply had no stepId — skipping charge', { previewSessionId, userId });
+      return { charged: false, credits: 0, reason: 'no_step_id' };
     }
 
     const credits = AuthoringCreditsFeature.getPerResolve();
@@ -67,7 +116,7 @@ export class AuthoringCreditsService {
       credits,
       costUSD: 0,
       testId: previewSessionId,
-      description: `AI element resolution (${resolverPath})`,
+      description: `AI element resolution (${resolutionLabel})`,
     });
 
     if (!result.success) {
@@ -81,7 +130,7 @@ export class AuthoringCreditsService {
       stepId,
       userId,
       credits,
-      resolverPath,
+      resolvedBy: resolutionLabel,
       newBalance: result.newBalance,
     });
     return { charged: true, credits };

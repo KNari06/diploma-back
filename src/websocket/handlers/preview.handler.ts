@@ -2604,6 +2604,28 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         timestamp: new Date().toISOString(),
       } as any);
 
+      // Charge credits for an AI-assisted mobile apply — same rate and dedup as
+      // the web path above. Only fires when the runner needed the LLM
+      // (resolvedVia 'llm'/'vision'/'thinking'); deterministic tree matches are
+      // free. Fire-and-forget: billing must never delay or fail the apply.
+      if (output.stepResult?.success) {
+        void import('@/services/core/authoring-credits.service')
+          .then(({ AuthoringCreditsService }) =>
+            AuthoringCreditsService.chargeForMobileApply({
+              userId: ensuredUserId,
+              previewSessionId: mobileSessionId,
+              stepId: stepDraft.id,
+              resolvedVia: output.stepResult?.resolvedVia,
+            }),
+          )
+          .catch((err) => {
+            logger.warn('[WebSocket] Mobile authoring credit charge failed (non-fatal)', {
+              mobileSessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+      }
+
       // Auto-persist to DB if intentTestCaseId provided and apply succeeded.
       // Matches the web preview:step:apply flow (line ~1329 above).
       if (output.stepResult?.success && intentTestCaseId && output.appliedStep) {
