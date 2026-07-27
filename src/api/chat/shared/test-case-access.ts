@@ -58,6 +58,12 @@ export interface TestCaseAccess {
    * silently to web chat.
    */
   platform: string | null;
+  /**
+   * Test case name. Free — it rides along in the row this check already
+   * reads. Lets a caller name the test case in user-facing copy (the editor
+   * save preview) without a second round-trip.
+   */
+  name: string | null;
 }
 
 /**
@@ -101,7 +107,7 @@ export async function assertCanAccessTestCase(
   // Step 1 — does the test case exist? Fetch ownership + project in one shot.
   const { data: tc, error: tcErr } = await supabaseAdmin
     .from('intent_test_cases')
-    .select('id, user_id, project_id, platform')
+    .select('id, user_id, project_id, platform, name')
     .eq('id', testCaseId)
     .maybeSingle();
 
@@ -120,6 +126,7 @@ export async function assertCanAccessTestCase(
   const testCaseOwnerId = (tc as any).user_id as string;
   const projectId = (tc as any).project_id as string;
   const platform = ((tc as any).platform as string | null) ?? null;
+  const name = ((tc as any).name as string | null) ?? null;
 
   if (!projectId) {
     // Defensive — the schema marks project_id NOT NULL, but if a stale row
@@ -143,7 +150,7 @@ export async function assertCanAccessTestCase(
       // Project gone but test case still exists — refuse rather than crash.
       throw new TestCaseNotFoundError(testCaseId);
     }
-    return { testCaseId, testCaseOwnerId, projectId, workspaceId, platform };
+    return { testCaseId, testCaseOwnerId, projectId, workspaceId, platform, name };
   }
 
   // Step 3 — non-owner: resolve workspace via project, check membership.
@@ -176,7 +183,7 @@ export async function assertCanAccessTestCase(
     throw new AccessDeniedError('Not a member of this workspace');
   }
 
-  return { testCaseId, testCaseOwnerId, projectId, workspaceId, platform };
+  return { testCaseId, testCaseOwnerId, projectId, workspaceId, platform, name };
 }
 
 /**

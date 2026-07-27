@@ -234,6 +234,14 @@ export interface AISummary {
    * === 'test_drift'. Undefined on passed tests or non-drift failures.
    */
   driftSignals?: DriftSignals | null;
+  /**
+   * Phase-2 addition: paste-ready developer fix prompt (markdown), added
+   * POST-analysis by DeveloperFixPromptService and stored in the persisted
+   * ai_summary JSONB — NOT produced by the analyzer LLM. Present only when the
+   * run found at least one bug. Consumed by the frontend run-report ("Copy fix
+   * prompt") and attached to the Jira feedback comment.
+   */
+  fixPrompt?: string;
 }
 
 export interface BugReport {

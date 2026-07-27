@@ -12,6 +12,7 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { PatternsQueryService } from '@/services/kb/patterns-query.service';
 import { CoverageGap, CoverageReport } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+import { normalizeCoverageUrl } from '@/utils/parsing/url-scope';
 
 // ============================================================================
 // CONSTANTS
@@ -453,19 +454,11 @@ ${gapSummary || 'No gaps identified.'}`;
   // ==========================================================================
 
   /**
-   * Normalize URL for comparison: strip query params, trailing slash, lowercase host
+   * Normalize URL for comparison: strip query params, trailing slash, lowercase host.
+   * Delegates to the shared `normalizeCoverageUrl` so readiness scoping keys URLs
+   * identically to this map (see critical-patterns.md #10).
    */
   private static normalizeUrl(rawUrl: string): string {
-    try {
-      // Handle URLs without protocol
-      const urlStr = rawUrl.includes('://') ? rawUrl : `https://${rawUrl}`;
-      const parsed = new URL(urlStr);
-      // Lowercase host, keep pathname, strip trailing slash and query
-      const path = parsed.pathname.replace(/\/+$/, '') || '/';
-      return `${parsed.protocol}//${parsed.host.toLowerCase()}${path}`;
-    } catch {
-      // If URL parsing fails, do basic normalization
-      return rawUrl.replace(/\?.*$/, '').replace(/\/+$/, '').toLowerCase();
-    }
+    return normalizeCoverageUrl(rawUrl);
   }
 }

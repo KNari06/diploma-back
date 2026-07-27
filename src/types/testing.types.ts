@@ -174,6 +174,94 @@ export interface CoverageReport {
 }
 
 // ============================================================================
+// TASK READINESS TYPES
+// ============================================================================
+
+/**
+ * Jira QA triage outcome. Lives here (not in the orchestrator) so shared
+ * consumers — e.g. TaskReadinessService — can reference it without importing
+ * the integrations layer.
+ */
+export type JiraQaOutcome = 'CAN_RUN_AUTO' | 'NEEDS_REWORK' | 'PREPARE_MANUAL';
+
+/**
+ * Category of a forgotten-scenario gap the agent spots while assessing a task.
+ * Distinct from CoverageGapType (which is URL/execution-level): these are
+ * scenario-level test cases a QA engineer might overlook for a given ticket.
+ */
+export type ReadinessGapType =
+  | 'negative'         // invalid / rejected input
+  | 'boundary'         // min / max / empty / overflow
+  | 'related_flow'     // a sibling feature this change could break
+  | 'error_state'      // server / network / timeout handling
+  | 'permission'       // role / authz variations
+  | 'data_variation';  // locale / currency / large dataset
+
+/**
+ * A single forgotten-scenario gap tied to a specific task.
+ */
+export interface ReadinessCoverageGap {
+  type: ReadinessGapType;
+  title: string;                 // short, e.g. "No test for the expired-card path"
+  why: string;                   // 1 sentence: why it matters for THIS ticket
+  priority: 'high' | 'medium' | 'low';
+  relatedTicket?: string;        // e.g. "PROJ-88" when the gap is drawn from a linked issue
+}
+
+/**
+ * Result of assessing whether a task is ready to test and what cases are missing.
+ * Attached (optionally) to the Jira QA analysis result and persisted into
+ * test_results.ai_summary.readiness (free-form JSONB — no migration).
+ */
+export interface TaskReadinessAssessment {
+  readinessScore: number;                 // 0-100
+  readyToTest: boolean;
+  blockingQuestions: string[];            // surfaced when NOT ready
+  coverageGaps: ReadinessCoverageGap[];
+  summary: string;                        // 1-2 sentence human readout
+}
+
+// ============================================================================
+// QA HANDOFF (honest statuses + structured artifact)
+// ============================================================================
+
+/**
+ * Honest status of a task in the QA pipeline. Modeled on the ARTIFACT (not the
+ * execution-path DB columns) so "couldn't run" and "nothing to run" stop merging:
+ * - ready:       assessed ready to test; a run can start.
+ * - empty:       nothing to test (no URL, no matched cases, no gaps, no scope).
+ * - blocked:     not ready (missing data) or a precondition/setup failure.
+ * - skipped:     a run happened but every execution was skipped (none ran).
+ * - in_progress: a run has been dispatched.
+ * - done:        the run finished (see the linked test result for pass/fail).
+ */
+export type QaHandoffStatus = 'ready' | 'empty' | 'blocked' | 'skipped' | 'in_progress' | 'done';
+
+/** Which execution branch(es) the analysis suggests for a task. */
+export type QaHandoffBranch = 'ui' | 'api' | 'manual' | 'stop';
+
+/**
+ * Structured hand-off artifact the next pipeline stage reads instead of parsing
+ * chat. Produced at assess-time (possibly before any run exists) and persisted
+ * in the `qa_handoffs` table, keyed by (project_id, issue_key).
+ */
+export interface QaHandoff {
+  taskRef: { issueKey: string; cloudId?: string; url?: string };
+  groundTruth: {
+    summary: string;
+    description?: string | null;
+    relatedTickets?: string[];            // e.g. ["PROJ-88: Payment refactor"]
+  };
+  readiness: TaskReadinessAssessment;
+  status: QaHandoffStatus;
+  suggestedBranches: QaHandoffBranch[];
+  testId?: string;                        // set once a run is dispatched
+  fixPromptRef?: string;                  // testId/resultId whose ai_summary carries the fix prompt
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+// ============================================================================
 // TEST PLATFORM
 // ============================================================================
 

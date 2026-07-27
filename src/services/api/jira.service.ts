@@ -564,6 +564,39 @@ export async function getProjectStatuses(
 }
 
 /**
+ * Get a project's statuses as {id,name}[] (unique by id) — for the trigger-status
+ * picker. Same endpoint as getProjectStatuses but keeps ids (stable across renames).
+ */
+export async function getProjectStatusesWithId(
+  accessToken: string,
+  cloudId: string,
+  projectKeyOrId: string
+): Promise<Array<{ id: string; name: string }>> {
+  const url = `${JIRA_API_URL}/ex/jira/${cloudId}/rest/api/3/project/${encodeURIComponent(projectKeyOrId)}/statuses`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+  });
+  if (!response.ok) {
+    logger.warn('Failed to get project statuses (with id)', { status: response.status });
+    return [];
+  }
+  const data = (await response.json()) as Array<{ statuses?: Array<{ id?: string; name?: string }> }>;
+  const seen = new Set<string>();
+  const out: Array<{ id: string; name: string }> = [];
+  for (const item of data || []) {
+    for (const s of item.statuses || []) {
+      const id = (s?.id || '').trim();
+      const name = (s?.name || '').trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push({ id, name });
+    }
+  }
+  return out;
+}
+
+/**
  * Get all Jira statuses (GET /rest/api/3/status) for id → name mapping
  */
 export async function getJiraStatuses(
@@ -728,24 +761,78 @@ interface JiraSearchIssueRaw {
   };
 }
 
+/**
+ * Convert an Atlassian Document Format (ADF) node — or a plain string — to
+ * readable plain text. Single source of truth for ADF extraction (both the
+ * issue-list `description` mapping and single-issue reads go through this), so
+ * the two paths can never diverge. Unlike the old shallow extractor it folds
+ * lists, tables, code blocks, and inline links (where a testable URL often
+ * hides) instead of silently dropping them.
+ *
+ * `maxChars` bounds the output so a huge description/table can't blow the LLM
+ * token budget downstream.
+ */
+export function adfToPlainText(node: unknown, maxChars = 4000): string {
+  if (node == null) return '';
+  if (typeof node === 'string') return node;
+
+  const walk = (n: any): string => {
+    if (!n || typeof n !== 'object') return '';
+
+    switch (n.type) {
+      case 'text': {
+        const txt = typeof n.text === 'string' ? n.text : '';
+        // Link marks live on text nodes — surface the href (often the testable URL).
+        if (txt && Array.isArray(n.marks)) {
+          const link = n.marks.find((m: any) => m?.type === 'link' && m?.attrs?.href);
+          if (link) return `${txt} (${link.attrs.href})`;
+        }
+        return txt;
+      }
+      case 'hardBreak':
+        return '\n';
+      case 'mention':
+        return n.attrs?.text ? `@${String(n.attrs.text).replace(/^@/, '')}` : '';
+      case 'inlineCard':
+      case 'blockCard':
+        return typeof n.attrs?.url === 'string' ? n.attrs.url : '';
+      case 'codeBlock': {
+        const code = Array.isArray(n.content) ? n.content.map(walk).join('') : '';
+        return code ? `\n${code}\n` : '';
+      }
+      case 'listItem': {
+        const inner = Array.isArray(n.content) ? n.content.map(walk).join('') : '';
+        return `- ${inner.trim()}\n`;
+      }
+      case 'table': {
+        const rows = Array.isArray(n.content) ? n.content.map(walk) : [];
+        return rows.join('');
+      }
+      case 'tableRow': {
+        const cells: string[] = Array.isArray(n.content) ? n.content.map(walk) : [];
+        return `${cells.map((c) => c.trim()).join(' | ')}\n`;
+      }
+      default: {
+        const inner = Array.isArray(n.content) ? n.content.map(walk).join('') : '';
+        // Block-level nodes get a trailing newline so paragraphs/headings/list
+        // wrappers separate cleanly; inline/unknown nodes just pass through.
+        const isBlock = n.type === 'paragraph' || n.type === 'heading'
+          || n.type === 'blockquote' || n.type === 'bulletList' || n.type === 'orderedList';
+        return inner + (isBlock && inner ? '\n' : '');
+      }
+    }
+  };
+
+  const text = walk(node).replace(/\n{3,}/g, '\n\n').trim();
+  return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+}
+
 function mapDescription(v: string | unknown): string | null {
   if (v == null) return null;
   if (typeof v === 'string') return v;
-  // Map Jira "description" (ADF or legacy) to plain text.
-  // Handles rich Atlassian Document Format ("doc") as seen in cloud REST APIs.
+  // Map Jira "description" (ADF or legacy) to plain text via the shared extractor.
   if (typeof v === 'object' && v && (v as any).type === 'doc' && Array.isArray((v as any).content)) {
-    // Collapse all text nodes recursively
-    const extractText = (node: any): string => {
-      if (!node) return '';
-      if (typeof node === 'string') return node;
-      if (node.text) return node.text;
-      // Recursively walk content array
-      if (Array.isArray(node.content)) {
-        return node.content.map(extractText).join('');
-      }
-      return '';
-    };
-    return extractText(v).trim() || null;
+    return adfToPlainText(v) || null;
   }
   return '';
 }
@@ -1065,21 +1152,44 @@ export async function getJiraIssue(
     logger.error('Jira get issue failed', { status: response.status, error: errorText, issueKey });
     throw new Error(`Jira get issue failed: ${response.status} ${errorText}`);
   }
-  const raw = (await response.json()) as { key: string; id: string; fields?: Record<string, unknown> };
+  const raw = (await response.json()) as JiraSingleIssueRaw;
+  return mapSingleIssue(raw);
+}
+
+/** Raw single-issue GET shape, incl. the related-context fields we now request. */
+interface JiraSingleIssueRaw {
+  key: string;
+  id: string;
+  fields?: Record<string, unknown> & {
+    parent?: { key?: string; fields?: { summary?: string; issuetype?: { name?: string } } };
+    subtasks?: Array<{ key?: string; fields?: { summary?: string; status?: { name?: string } } }>;
+    issuelinks?: Array<{
+      type?: { inward?: string; outward?: string };
+      inwardIssue?: { key?: string; fields?: { summary?: string; status?: { name?: string } } };
+      outwardIssue?: { key?: string; fields?: { summary?: string; status?: { name?: string } } };
+    }>;
+    comment?: { comments?: Array<{ author?: { displayName?: string }; created?: string; body?: unknown }> };
+  };
+}
+
+/** Related tickets / subtasks / parent / recent comments around one issue. */
+export interface JiraRelatedContext {
+  parent?: { key: string; summary: string; issuetype?: string } | null;
+  subtasks: Array<{ key: string; summary: string; status?: string }>;
+  links: Array<{ type: string; direction: 'inward' | 'outward'; key: string; summary: string; status?: string }>;
+  comments: Array<{ author?: string; created?: string; text: string }>;
+}
+
+/** Map a raw single-issue payload to the shared JiraIssueListItem shape. */
+function mapSingleIssue(raw: JiraSingleIssueRaw): JiraIssueListItem {
   const f = raw.fields || {};
   const status = f.status as { id?: string; name?: string; statusCategory?: Record<string, unknown> } | undefined;
   const project = f.project as { id?: string; key?: string; name?: string } | undefined;
-  const desc = f.description;
-  let description: string | null = null;
-  if (typeof desc === 'string') description = desc;
-  else if (desc && typeof desc === 'object' && 'content' in (desc as any))
-    description = extractPlainTextFromADF(desc as { content?: unknown[] });
-
   return {
     id: raw.id,
     key: raw.key,
     summary: (f.summary as string) ?? '',
-    description,
+    description: mapDescription(f.description),
     status: {
       id: status?.id ?? '',
       name: status?.name ?? 'Unknown',
@@ -1091,7 +1201,7 @@ export async function getJiraIssue(
     assignee: (f.assignee as JiraIssueListItem['assignee']) ?? null,
     created: (f.created as string) ?? '',
     updated: (f.updated as string) ?? '',
-    labels: Array.isArray(f.labels) ? f.labels : [],
+    labels: Array.isArray(f.labels) ? (f.labels as string[]) : [],
     project: {
       id: project?.id ?? '',
       key: project?.key ?? '',
@@ -1100,19 +1210,97 @@ export async function getJiraIssue(
   };
 }
 
-function extractPlainTextFromADF(adf: { content?: unknown[] }): string {
-  if (!adf.content || !Array.isArray(adf.content)) return '';
-  const parts: string[] = [];
-  for (const node of adf.content) {
-    const n = node as { type?: string; content?: unknown[]; text?: string };
-    if (n.type === 'paragraph' && Array.isArray(n.content)) {
-      for (const c of n.content) {
-        const t = c as { type?: string; text?: string };
-        if (t.text) parts.push(t.text);
-      }
-    } else if (n.type === 'text' && n.text) parts.push(n.text);
+/**
+ * Get a single Jira issue PLUS its related context (parent/epic, subtasks,
+ * linked issues, recent comments) for deeper QA analysis. One GET with a
+ * widened `fields` list — parent/subtasks/links carry their own `summary`
+ * inline, so no follow-up calls are made (a rare summary-less link is skipped
+ * silently). Never throws: on failure returns the issue with empty related
+ * context so callers can degrade gracefully.
+ */
+export async function getJiraIssueWithContext(
+  accessToken: string,
+  cloudId: string,
+  issueKey: string,
+  opts?: { maxComments?: number; maxLinks?: number; maxSubtasks?: number },
+): Promise<{ issue: JiraIssueListItem; related: JiraRelatedContext }> {
+  const maxComments = opts?.maxComments ?? 5;
+  const maxLinks = opts?.maxLinks ?? 10;
+  const maxSubtasks = opts?.maxSubtasks ?? 10;
+
+  const fields = [
+    'summary', 'description', 'status', 'priority', 'issuetype', 'reporter',
+    'assignee', 'created', 'updated', 'labels', 'project',
+    'issuelinks', 'subtasks', 'parent', 'comment',
+  ].join(',');
+  const url = `${JIRA_API_URL}/ex/jira/${cloudId}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=${fields}`;
+
+  const empty: JiraRelatedContext = { parent: null, subtasks: [], links: [], comments: [] };
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    logger.error('Jira get issue with context failed', { status: response.status, error: errorText, issueKey });
+    throw new Error(`Jira get issue failed: ${response.status} ${errorText}`);
   }
-  return parts.join(' ');
+
+  const raw = (await response.json()) as JiraSingleIssueRaw;
+  const issue = mapSingleIssue(raw);
+  const f = raw.fields || {};
+
+  let related: JiraRelatedContext = empty;
+  try {
+    const parent = f.parent?.key
+      ? {
+          key: f.parent.key,
+          summary: f.parent.fields?.summary ?? '',
+          issuetype: f.parent.fields?.issuetype?.name,
+        }
+      : null;
+
+    const subtasks = (f.subtasks || [])
+      .filter((s) => s?.key)
+      .slice(0, maxSubtasks)
+      .map((s) => ({ key: s.key!, summary: s.fields?.summary ?? '', status: s.fields?.status?.name }));
+
+    const links = (f.issuelinks || [])
+      .map((l) => {
+        const inward = l.inwardIssue;
+        const outward = l.outwardIssue;
+        if (inward?.key) {
+          return { type: l.type?.inward ?? 'relates to', direction: 'inward' as const, key: inward.key, summary: inward.fields?.summary ?? '', status: inward.fields?.status?.name };
+        }
+        if (outward?.key) {
+          return { type: l.type?.outward ?? 'relates to', direction: 'outward' as const, key: outward.key, summary: outward.fields?.summary ?? '', status: outward.fields?.status?.name };
+        }
+        return null;
+      })
+      .filter((x): x is NonNullable<typeof x> => x !== null && x.summary.length > 0)
+      .slice(0, maxLinks);
+
+    const allComments = f.comment?.comments || [];
+    const comments = allComments
+      .slice(-maxComments) // most recent
+      .map((c) => ({
+        author: c.author?.displayName,
+        created: c.created,
+        text: adfToPlainText(c.body, 300),
+      }))
+      .filter((c) => c.text.length > 0);
+
+    related = { parent, subtasks, links, comments };
+  } catch (err) {
+    logger.warn('[JIRA] Failed to map related context (non-fatal)', {
+      issueKey,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    related = empty;
+  }
+
+  return { issue, related };
 }
 
 /**

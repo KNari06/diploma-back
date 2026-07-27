@@ -2786,6 +2786,19 @@ export async function handleGetAgentHealth(
 // WRITE TOOLS (require confirm=true from agent after user approval)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * The single shape every write tool's confirm gate returns.
+ *
+ * `needsConfirmation` is the machine-readable half: a two-phase-confirm caller
+ * has to tell "this call was refused pending approval" apart from "this call
+ * failed", and the prose below is written FOR THE MODEL — it gets reworded, so
+ * matching on it is not a contract. Every gate goes through here so the flag
+ * can never be set on some refusals and forgotten on others.
+ */
+function confirmationRequired(message: string): SkillResult {
+  return { success: false, message, displayToUser: false, needsConfirmation: true };
+}
+
 /** Allowed IntentStep action types — reject anything else.
  *  Exported so step-validator-agent can reuse instead of hardcoding. */
 export const VALID_STEP_TYPES = new Set([
@@ -2859,11 +2872,9 @@ export async function handleUpdateTestCaseSteps(
 
   // Gate: agent must explicitly set confirm=true after user approval
   if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+    );
   }
 
   // Validate step structure
@@ -3048,11 +3059,9 @@ export async function handleUpdateTestCase(
 
   // Gate: confirm required
   if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+    );
   }
 
   // Validate at least one updatable field is provided
@@ -3183,11 +3192,9 @@ export async function handleRunTest(
   }
 
   if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. You MUST first describe what will be run to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'WRITE operation requires confirmation. You MUST first describe what will be run to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+    );
   }
 
   try {
@@ -3648,6 +3655,40 @@ export async function handleCreateTestCase(
   const name = args.name as string | undefined;
   const confirm = args.confirm === true;
 
+  // ── Test-case scope: "save" must land on the OPEN test case ──
+  //
+  // The executor prompt already forbids creating here, and the model still did
+  // it: a live editor session on test case 7ee865c6 answered "save" with two
+  // qa_create_test_case calls under invented names. Had they gone through, the
+  // user would have got a duplicate test case while the row they were looking
+  // at stayed at steps=0 — a silent wrong-target write.
+  //
+  // A prompt rule the model can ignore is not an enforcement point, so the
+  // server refuses instead. Refuse rather than silently rewrite the call to an
+  // update: the model may genuinely have meant a new test, and rewriting would
+  // put words in the user's mouth. `new_separate_test` is the explicit opt-out
+  // — the model has to restate that the user asked for a SEPARATE test case,
+  // which "save" never does.
+  if (
+    context.storeKind === 'testcase'
+    && context.testCaseId
+    && args.new_separate_test !== true
+  ) {
+    logger.info('[QA_TOOLS] Blocked qa_create_test_case in test-case scope', {
+      testCaseId: context.testCaseId,
+      chatSessionId: context.chatSessionId,
+    });
+    return {
+      success: false,
+      message:
+        `You are editing test case ${context.testCaseId}. Creating a test case here would leave that one unchanged and add a duplicate. ` +
+        `To save/update what the user is looking at, call qa_update_test_case_steps with test_case_id="${context.testCaseId}" ` +
+        `(omit "steps" if the steps came from qa_author_test_iteratively — the server persists its own copy). ` +
+        `ONLY if the user explicitly asked for a NEW, separate, additional test case, call qa_create_test_case again with new_separate_test=true.`,
+      displayToUser: false,
+    };
+  }
+
   // Same fallback as the update path: `qa_author_test_iteratively` keeps its
   // steps server-side and hands the model only a count, so on "save" the model
   // has nothing to pass. Requiring it here forced the same failure — invent
@@ -3683,11 +3724,9 @@ export async function handleCreateTestCase(
   }
 
   if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. You MUST first describe the test case you will create to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'WRITE operation requires confirmation. You MUST first describe the test case you will create to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+    );
   }
 
   // Validate step structure
@@ -3881,11 +3920,9 @@ export async function handleManageRegressionPlan(
   }
 
   if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+    );
   }
 
   try {
@@ -4068,11 +4105,9 @@ export async function handleManageSchedule(
   }
 
   if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+    );
   }
 
   try {
@@ -4323,11 +4358,9 @@ export async function handleDeleteTestCase(
   }
 
   if (!confirm) {
-    return {
-      success: false,
-      message: 'DESTRUCTIVE operation: permanently deletes test case. Cannot be undone. You MUST first warn the user about permanent deletion, wait for their explicit approval ("yes", "delete it", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'DESTRUCTIVE operation: permanently deletes test case. Cannot be undone. You MUST first warn the user about permanent deletion, wait for their explicit approval ("yes", "delete it", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+    );
   }
 
   try {
@@ -4412,11 +4445,9 @@ export async function handleManageFixture(
   }
 
   if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+    );
   }
 
   try {
@@ -4541,11 +4572,9 @@ export async function handleManageModule(
   }
 
   if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+    );
   }
 
   try {
@@ -4667,11 +4696,9 @@ export async function handleManageFlow(
   }
 
   if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+    );
   }
 
   try {
@@ -4831,11 +4858,9 @@ export async function handleBulkTag(
   }
 
   if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+    );
   }
 
   try {
@@ -5342,11 +5367,9 @@ export async function handleCancelRun(
   }
 
   if (!confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. Describe the cancellation to the user, wait for approval, then call with confirm=true.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'WRITE operation requires confirmation. Describe the cancellation to the user, wait for approval, then call with confirm=true.',
+    );
   }
 
   try {
@@ -5448,11 +5471,9 @@ export async function handleManageAutomationAction(
 
   // list does not require confirmation
   if (action !== 'list' && !confirm) {
-    return {
-      success: false,
-      message: 'WRITE operation requires confirmation. Describe the exact changes to the user, wait for approval, then call with confirm=true.',
-      displayToUser: false,
-    };
+    return confirmationRequired(
+      'WRITE operation requires confirmation. Describe the exact changes to the user, wait for approval, then call with confirm=true.',
+    );
   }
 
   try {
@@ -5715,14 +5736,11 @@ export async function handleAuthorTestIteratively(
     const credentialNote = credentialBinding?.ok
       ? ` This test will use the saved login "${credentialBinding.resourceName.slice(0, 80)}" — its stored values are injected for the live run and frozen as {{secrets.*}} in the saved steps, so you never type or see them.`
       : '';
-    return {
-      success: false,
-      message:
-        'WRITE operation requires confirmation. You MUST first describe the test you will build to the user (the goal + that you will execute steps live on the preview), wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.' +
+    return confirmationRequired(
+      'WRITE operation requires confirmation. You MUST first describe the test you will build to the user (the goal + that you will execute steps live on the preview), wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.' +
         credentialNote +
         ' State ONLY what this message confirms — do not tell the user a saved login is usable unless the sentence above says it resolved.',
-      displayToUser: false,
-    };
+    );
   }
 
   // 5. Drive build-by-executing on the live preview.

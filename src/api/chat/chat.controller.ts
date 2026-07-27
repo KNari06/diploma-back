@@ -31,6 +31,11 @@ import { handlePendingExplorationConfirmation } from './shared/exploration-confi
 import { handlePendingManageConfirmation } from './regression/shared/manage-confirmation';
 import { handlePendingRunExistingConfirmation } from './shared/run-existing-confirmation';
 import {
+  clearPendingEditorConfirmation,
+  handlePendingEditorConfirmation,
+} from './shared/editor-confirmation';
+import { handleEditorSaveRequest, isEditorSaveRequest } from './shared/editor-save';
+import {
   beginCompound,
   clearPendingCompound,
   completeStep,
@@ -538,6 +543,29 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // STEP 4.6: CHECK PENDING EDITOR (TEST-CASE) CONFIRMATION
+    // ═══════════════════════════════════════════════════════════════════════
+    // The editor half of the same two-phase confirm. Without this, a "yes"
+    // answering a write tool's preview is ordinary free text: the executor
+    // re-plans and the save is silently never issued (observed live — see
+    // shared/editor-confirmation.ts). Runs before intent parsing so the
+    // approval reaches the SAME cached call, not a freshly re-planned one.
+    //
+    // Scoped to test-case chats for the mirror-image reason the block above is
+    // scoped to global: the pending op can only have been cached by an editor
+    // turn, so reading it from a global turn would let one surface's "yes"
+    // trigger the other's pending write.
+    if (chatStore.kind === 'testcase' && chatSessionId) {
+      const editorHandled = await handlePendingEditorConfirmation(
+        res, message, chatSessionId, userId,
+      );
+      if (editorHandled) {
+        if (requestKey) await registryUnregister(requestKey, userId);
+        return;
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // STEP 4.65 (Phase 3): COMPOUND CONTINUATION
     // ═══════════════════════════════════════════════════════════════════════
     // A compound request ("test A and B, then save as a plan") runs one step
@@ -707,6 +735,45 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
       // Check if request was cancelled
       checkRequestAbortedWithLogging(abortSignal);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 5.2: DETERMINISTIC EDITOR SAVE
+    // ═══════════════════════════════════════════════════════════════════════
+    // "save" in an open test case means one thing: persist what was just
+    // authored onto THIS test case. Leaving that to general_chat's model made
+    // it optional — twice in one live session it answered "Saved…" having
+    // called no tool at all, while the row stayed at 0 steps. The server
+    // issues the write itself; the user still approves it (the write goes
+    // through the same confirm gate, and their "yes" is replayed by the
+    // interceptor at STEP 4.6). Falls through when there is nothing authored
+    // to save — general_chat answers "save what?" better than a canned line.
+    if (
+      chatStore.kind === 'testcase'
+      && chatSessionId
+      && testCaseId
+      && isEditorSaveRequest(effectiveMessage, !!parsedIntent?.metadata?.editorSaveRequested)
+    ) {
+      const editorSaveHandled = await handleEditorSaveRequest(
+        res,
+        effectiveMessage,
+        chatSessionId,
+        testCaseId,
+        testCaseAccess?.name ?? undefined,
+        {
+          userId,
+          workspaceId: workspace_id,
+          chatSessionId,
+          projectId: testCaseAccess?.projectId,
+          mode: 'editor',
+          storeKind: 'testcase',
+          testCaseId,
+        },
+      );
+      if (editorSaveHandled) {
+        if (requestKey) await registryUnregister(requestKey, userId);
+        return;
+      }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1005,8 +1072,11 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     }
 
     // Abandon any pending compound on error — a mid-flow failure must not leave
-    // a stuck queue that hijacks the user's next message.
+    // a stuck queue that hijacks the user's next message. Same reasoning for a
+    // pending editor write: the turn that would have described it to the user
+    // died, so a later "yes" must not silently execute it.
     await clearPendingCompound(chatSessionId);
+    await clearPendingEditorConfirmation(chatSessionId);
 
     // Flush logs before handling error
     await functionLogger.flushSync();

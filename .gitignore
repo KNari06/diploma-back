@@ -274,3 +274,6 @@ id_ed25519*
 # broad "public" ignore rule above).
 !src/api/chat/public/
 !src/api/chat/public/**
+
+# Real Jira eval fixtures (contain ticket text — keep local, use .example as template)
+src/scripts/fixtures/jira-readiness-cases.real.json

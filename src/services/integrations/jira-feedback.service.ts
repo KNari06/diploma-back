@@ -19,6 +19,8 @@ export interface JiraFeedbackParams {
   summary: string;
   confidence: number;
   testUrl?: string;
+  /** Paste-ready developer fix prompt (markdown), appended to the comment when present. */
+  fixPrompt?: string;
 }
 
 export class JiraFeedbackService {
@@ -61,7 +63,7 @@ export class JiraFeedbackService {
   }
 
   private static buildFeedbackComment(params: JiraFeedbackParams): string {
-    const { testId, testPassed, bugs, summary, confidence, testUrl } = params;
+    const { testId, testPassed, bugs, summary, confidence, testUrl, fixPrompt } = params;
 
     const criticalCount = bugs.filter(b => b.severity === 'critical').length;
     const highCount = bugs.filter(b => b.severity === 'high').length;
@@ -97,6 +99,12 @@ export class JiraFeedbackService {
     lines.push(`Confidence: ${pct}%`);
     lines.push(`Test ID: ${testId}`);
     if (testUrl) lines.push(`URL tested: ${testUrl}`);
+
+    if (fixPrompt) {
+      lines.push('');
+      lines.push('--- Developer fix prompt (paste into your AI coding tool) ---');
+      lines.push(fixPrompt.slice(0, 8000));
+    }
 
     return lines.join('\n');
   }

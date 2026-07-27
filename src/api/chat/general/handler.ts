@@ -1244,6 +1244,11 @@ You are inside the editor for the test case currently open in the preview. The
             // sees zero progress events while sub-agents work.
             testCaseId,
             testCaseName,
+            // Scope marker for every SkillContext the pipeline builds — see
+            // PipelineContext.storeKind. The monolithic loop below already
+            // passes it; the sub-agent path did not, which left skill-level
+            // scope gates reading `undefined`.
+            storeKind: store.kind,
           });
 
           // Extract the user content from the last message (may be multimodal array with images)
@@ -1893,12 +1898,11 @@ You are inside the editor for the test case currently open in the preview. The
       const credits = await UserCreditsService.getUserCredits(userId);
       const planInfo = await PricingPlansService.getUserPlanInfo(userId);
 
+      // credits_balance is the authoritative remaining balance. The former
+      // dailyRemaining/monthlyRemaining came from a plan-quota computation whose
+      // usage counter is never incremented, so they always reported the full
+      // allotment — see PricingPlansService.UserPlanInfo.
       response.creditsRemaining = credits?.credits_balance || 0;
-
-      if (planInfo) {
-        response.dailyRemaining = planInfo.daily_remaining;
-        response.monthlyRemaining = planInfo.monthly_remaining;
-      }
     } catch (error) {
       logger.warn('[GENERAL_CHAT] Failed to get credits info', { error, userId });
     }

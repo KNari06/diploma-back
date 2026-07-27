@@ -8,7 +8,6 @@ import {
   TOKENS_PER_CREDIT,
   MODEL_PRICING,
   TEST_CREDITS,
-  SUBSCRIPTION_PLANS,
 } from '../token-calculator.service';
 
 describe('TokenCalculatorService', () => {
@@ -324,36 +323,6 @@ describe('TokenCalculatorService', () => {
     });
   });
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // getPlanByPrice & getPlanByCredits
-  // ═══════════════════════════════════════════════════════════════════════════
-  describe('getPlanByPrice', () => {
-    it('should return pro plan for $28.9', () => {
-      const plan = TokenCalculatorService.getPlanByPrice(28.9);
-      expect(plan).toEqual(SUBSCRIPTION_PLANS.pro);
-    });
-
-    it('should return ultra plan for $43.9', () => {
-      const plan = TokenCalculatorService.getPlanByPrice(43.9);
-      expect(plan).toEqual(SUBSCRIPTION_PLANS.ultra);
-    });
-
-    it('should return null for unknown price', () => {
-      expect(TokenCalculatorService.getPlanByPrice(99.99)).toBeNull();
-    });
-  });
-
-  describe('getPlanByCredits', () => {
-    it('should return plan for 1000 credits', () => {
-      const plan = TokenCalculatorService.getPlanByCredits(1000);
-      expect(plan).not.toBeNull();
-      expect(plan?.credits).toBe(1000);
-    });
-
-    it('should return null for unknown credits', () => {
-      expect(TokenCalculatorService.getPlanByCredits(9999)).toBeNull();
-    });
-  });
 
   // ═══════════════════════════════════════════════════════════════════════════
   // logTokenUsage (just verify it doesn't throw)

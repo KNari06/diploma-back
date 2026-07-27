@@ -49,7 +49,14 @@ export const BLOCKED_IN_TEST_CASE_SCOPE: ReadonlySet<string> = new Set([
   'run_by_tag',
   'create_plan',
   'add_to_plan',
-  'save_test',      // we ARE the test case — nowhere to save TO
+  // 'save_test' stays blocked from the WORKSPACE save handler (which creates a
+  // new test case somewhere else), but it is NOT dropped: in test-case scope it
+  // is re-routed to the deterministic editor save below. The old comment here
+  // read "we ARE the test case — nowhere to save TO", which had it backwards —
+  // the open test case IS the target, and collapsing "save" to general_chat
+  // handed the highest-value action to the model, which then reported success
+  // without calling any tool (observed live, twice, 2026-07-27).
+  'save_test',
   // Management ops are workspace/project-level, not per-test-case.
   'manage_schedule',
   'manage_module',
@@ -674,6 +681,14 @@ export async function parseIntent(
             blockedIntent: parsedIntent.intent,
           });
           parsedIntent.intent = 'general_chat';
+        }
+        // "save" is the one blocked intent that still has a real target here —
+        // the open test case. Flag it so the controller can run the
+        // deterministic editor save instead of letting general_chat's model
+        // decide whether to call a save tool at all (it decided "no", twice,
+        // while telling the user it had saved). See shared/editor-save.ts.
+        if (blocked && rawIntent === 'save_test') {
+          parsedIntent.metadata = { ...(parsedIntent.metadata ?? {}), editorSaveRequested: true };
         }
         // Trace the classification decision into test_logs/chat_test/.
         if (chatSessionId) {

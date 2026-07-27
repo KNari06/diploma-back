@@ -109,6 +109,27 @@ export const CHITCHAT: MultiLangList = {
 };
 
 /**
+ * "Persist what we just built" ("save", "сохрани", "сақта").
+ *
+ * Used ONLY in per-test-case editor scope, and only as the second of two
+ * signals — the LLM's `save_test` classification is the first. It needs both
+ * because the classifier is not stable here: the SAME bare "save", in the same
+ * surface, classified as `save_test` on 2026-07-26 and as `general_chat` on
+ * 2026-07-27. Whichever signal fires, the save still only runs when there is
+ * an authored draft to persist, so a stray match cannot write anything.
+ *
+ * Anchored via `toBoundaryRegex`, so it matches a message that OPENS with the
+ * word ("save", "save it") and not one that merely mentions it ("I don't want
+ * to save yet") — deliberately conservative, since a miss just falls back to
+ * the model.
+ */
+export const SAVE_REQUEST: MultiLangList = {
+  en: ['save', 'save it', 'save this', 'persist', 'store it'],
+  ru: ['сохрани', 'сохранить', 'сохраните', 'сохрани это', 'запиши'],
+  kk: ['сақта', 'сақтау', 'сақтаңыз', 'сақта осыны'],
+};
+
+/**
  * Substrings that mark an assistant message as a pending yes/no question
  * ("shall I run this?"). Matched with `includes()` against the last AI message,
  * so these are phrase fragments, not whole-word tokens.
