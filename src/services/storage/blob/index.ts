@@ -90,6 +90,31 @@ export function getBlobStore(): BlobStore {
   return cached;
 }
 
+/**
+ * Blob store for WRITES of mobile app binaries.
+ *
+ * APK/IPA binaries are Azure-only by policy: Supabase still serves reads for
+ * objects uploaded before the cutover (that is what the dual-read fallback is
+ * for), but must never receive a NEW binary. `MOBILE_APP_STORAGE_PROVIDER`
+ * still defaults to `supabase`, so without this gate an environment that
+ * simply forgets the variable writes binaries to the banned store silently —
+ * and nothing surfaces until something tries to read them from the store they
+ * were never in.
+ *
+ * Reads, deletes and prunes intentionally keep using {@link getBlobStore} —
+ * they must still reach legacy Supabase objects.
+ */
+export function getBlobStoreForWrite(): BlobStore {
+  const store = getBlobStore();
+  if (store.provider !== 'azure') {
+    throw new Error(
+      `Refusing to write a mobile app binary to '${store.provider}': APK/IPA storage is Azure-only. ` +
+        'Set MOBILE_APP_STORAGE_PROVIDER=azure (and AZURE_STORAGE_ACCOUNT) for this environment.',
+    );
+  }
+  return store;
+}
+
 /** Test seam — override / reset the cached store. */
 export function __setBlobStoreForTests(store: BlobStore | null): void {
   cached = store;

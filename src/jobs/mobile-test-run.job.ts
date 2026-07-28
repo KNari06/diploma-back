@@ -28,6 +28,7 @@ import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { sanitizeMobileAppPackageSteps } from '@/services/testing/regression/intent-step-dispatch.service';
 import { describeDeviceError, type DeviceFailureCategory } from '@/services/testing/regression/device-error-catalog';
+import { classifyJobErrorCode } from '@/services/testing/regression/job-error-code';
 import { MobileRunnerClient, type IMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { CompanionRunnerClient } from '@/services/mobile/companion/companion-runner-client';
 import { getSessionRunnerBinding } from '@/services/mobile/session-runner-routing';
@@ -1319,7 +1320,7 @@ export class MobileTestRunJobHandler {
 
       // ── Error handling ──────────────────────────────────────────
       const errorMessage = error instanceof Error ? error.message : String(error);
-      const errorCode = error instanceof MobileRunnerError ? error.code : 'UNKNOWN';
+      const errorCode = classifyJobErrorCode(error);
 
       logger.error('[MOBILE-TEST] Job failed', {
         testId,
@@ -1724,7 +1725,7 @@ export class MobileTestRunJobHandler {
   ): Promise<string | null> {
     try {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      const errorCode = error instanceof MobileRunnerError ? error.code : 'UNKNOWN';
+      const errorCode = classifyJobErrorCode(error);
       // mobile_test_results.browser is the DEVICE platform, not the framework
       // (CHECK: 'mobile-android' | 'mobile-ios'). See createTestResult for why.
       const deviceBrowser = browser === 'mobile-ios' ? 'mobile-ios' : 'mobile-android';

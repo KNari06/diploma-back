@@ -125,6 +125,21 @@ const CATALOG: Record<string, DeviceErrorInfo> = {
     remediation: 'Uploading the app build to the runner failed. Re-upload the build and retry.',
     category: 'environment',
   },
+
+  // Backend-side storage failure, NOT a runner code: the app binary the run
+  // resolved to is absent from blob storage, so the download in
+  // `MobileAppPrepService` threw before the runner was ever asked to install
+  // anything. Mapped explicitly because the generic UNKNOWN entry tells the
+  // user to "check the runner logs", which hold nothing — the runner never
+  // saw this run. Common causes: the build was uploaded through an
+  // environment on a different `MOBILE_APP_STORAGE_PROVIDER`, or the object
+  // was pruned/deleted while its `mobile_app_builds` row survived.
+  APP_BINARY_MISSING: {
+    label: 'App build is missing',
+    remediation:
+      "The app build this run resolved to is no longer in storage, so it couldn't be installed. Re-upload the app under Settings → Mobile app, then retry.",
+    category: 'environment',
+  },
   DISABLED: {
     label: 'Mobile testing disabled',
     remediation: 'Mobile testing is turned off for this environment. Enable it, then retry.',
