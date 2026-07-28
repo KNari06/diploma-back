@@ -3,19 +3,22 @@
 ## CLAUDE.md hierarchy
 
 The repo has a layered navigation map:
-- `/CLAUDE.md` — root map. Always loaded. ~300 lines, points to subfolders.
+- `/CLAUDE.md` — root map. Always loaded. **Under 20 KB**, points to subfolders. It is a router, not a reference.
 - `<hot folder>/CLAUDE.md` — auto-loaded when working in that folder. Detailed file table, flows, invariants.
 
 Current per-folder docs:
 - `src/services/testing/ui/preview/CLAUDE.md` — editor / preview / replay / recording (navigation map)
 - `src/services/testing/ui/preview/api/<service>.md` — per-service API reference (one file per major service)
+- `src/jobs/CLAUDE.md` — background replay (web + mobile), scheduler bundle, 24h sweeps
+- `src/api/chat/CLAUDE.md` — intent router, interceptors, 23 intents, chat invariants (long form)
+- `src/services/core/CLAUDE.md` — plans, credits, referrals, self-serve, transactional email
+- `src/services/integrations/CLAUDE.md` — Jira, Stripe, Telegram, Allure, Git webhooks
+- `src/services/test-resource/CLAUDE.md` — resource adapters
 
 Folders that should get a CLAUDE.md when next touched (>8 files, frequent edits):
-- `src/agent/core/lite/` — LiteEngine + multi-agent
 - `src/services/ai/` — LLM clients + intent + cost
 - `src/ai/prompts/` — prompt builders
-- `src/jobs/` — BullMQ handlers
-- `src/api/` — REST controllers
+- `src/api/` — REST controllers (the `chat/` subtree already has one)
 - `src/websocket/` — WS handlers
 
 ## When to update a CLAUDE.md
@@ -48,7 +51,8 @@ If unsure — err on the side of updating. A wrong doc is worse than a thin one 
 
 ## Format rules for CLAUDE.md files
 
-- **Per-folder file** caps at ~400 lines. Past that, split into sub-folder CLAUDE.md files.
+- **Size is measured in BYTES, not lines.** Root map under 20 KB; per-folder file under 25 KB. Past that, split into sub-folder CLAUDE.md files. Line counts lie here — these files run ~180 chars/line (wide tables, dense flow lines), so "300 lines" was silently costing 3× what it implied. Check with `wc -c CLAUDE.md`, not `wc -l`.
+- **A cheat-sheet or map table cell is a POINTER, not a paragraph.** One line, ending in a file or folder link. If a cell needs three sentences of context, that context belongs in the target folder's CLAUDE.md.
 - **File tables**: `| file | purpose | key exports |`. One line per file. No prose paragraphs replacing tables.
 - **Flows**: pseudocode with `→` arrows. No code blocks longer than ~15 lines.
 - **Invariants**: numbered list. State the rule first, then *why* in the same sentence.
