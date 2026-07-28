@@ -1590,6 +1590,181 @@ function runThinkAloud(
  * "whitelist and converter are out of sync" message (guarded by a unit
  * test in __tests__/tools.to-runner-command.test.ts).
  */
+/**
+ * True when a foreground activity name identifies a WebView HOST activity —
+ * i.e. the screen's content is HTML inside a WebView, not native widgets.
+ *
+ * Why a name match and not a capability probe: the runner only reports the
+ * activity string, and the draft-lint below has to decide at AUTHORING time,
+ * often with no live WebView attached (the agent never switched context — that
+ * is precisely the case the lint exists to catch). Naming is the only signal
+ * available at that moment, and WebView hosts name themselves consistently:
+ * AndroidX/Chrome (`WebViewActivity`), Cordova/Ionic (`CordovaActivity`),
+ * Capacitor (`BridgeActivity`), React Native WebView screens, and Flutter
+ * plugin hosts like Jaña Post's `com.eq.jana_webview.view.WebViewActivity`.
+ *
+ * Deliberately conservative — a false NEGATIVE just restores today's behaviour
+ * (the step is authored natively and fails at replay, as it does now), whereas
+ * a false POSITIVE would block a legitimate native step. So match only on
+ * unambiguous host names, never on a bare "web" substring.
+ */
+export function isWebViewHostActivity(activity: string | undefined | null): boolean {
+  if (typeof activity !== 'string' || !activity.trim()) return false;
+  return /(?:^|[.\w/])(?:web_?view|cordova|bridge|inappbrowser|chromeclient)\w*activity\b/i.test(
+    activity,
+  );
+}
+
+/**
+ * Best-known foreground activity for a snapshot.
+ *
+ * The legacy top-level `activity` field is frequently ABSENT — verified live
+ * against the runner on a Flutter session, where `GET /api/sessions/:id/ui-state`
+ * returned no `activity` key at all while
+ * `actualForeground.primary.activityName` held
+ * `com.aitan.inexport/com.eq.jana_webview.view.WebViewActivity`. Reading only
+ * `activity` therefore meant the WebView lint could never fire on exactly the
+ * app class it exists for, AND the LLM header never printed an activity line,
+ * which is a large part of why the agent never knew it was in a WebView.
+ *
+ * `actualForeground` is dumpsys-derived device truth, so prefer it when the
+ * legacy field is missing.
+ */
+export function resolveForegroundActivity(
+  snap: { activity?: string; actualForeground?: { primary?: { activityName?: string | null } | null } } | null | undefined,
+): string | undefined {
+  if (!snap) return undefined;
+  const legacy = typeof snap.activity === 'string' && snap.activity.trim() ? snap.activity : undefined;
+  const fresh = snap.actualForeground?.primary?.activityName;
+  return legacy ?? (typeof fresh === 'string' && fresh.trim() ? fresh : undefined);
+}
+
+/**
+ * Native interaction step types that CANNOT reach WebView content on replay.
+ * The runner starts every replay in NATIVE context, so these resolve against
+ * the native a11y tree and hit nothing when the target is HTML.
+ *
+ * Assertions are intentionally absent: a screenshot-sourced `ai_check` reads
+ * pixels and works fine over a WebView (verified live on JanaPost TC-30 and
+ * TC-31). Only INTERACTION is broken — see
+ * `.claude/deferred/20260727-mobile-agent-authors-native-steps-for-webview-content.md`.
+ */
+const NATIVE_INTERACTION_STEP_TYPES = new Set<string>([
+  'click', 'tap', 'double_tap', 'long_press', 'hover',
+  'type', 'type_text', 'input_text',
+  'select', 'check', 'uncheck', 'toggle',
+  'drag',
+]);
+
+/**
+ * One-line identity of a step for diffing two drafts. Compares the fields a
+ * reader would call "the step": what it does, to what, and what it asserts.
+ * Deliberately ignores `id` (the model renumbers positionally between drafts,
+ * so ids would report every step as changed) and `options`.
+ */
+function draftStepIdentity(s: MobileIntentStep): string {
+  return [s.type, s.description ?? '', s.value ?? '', s.assertionText ?? ''].join('␟');
+}
+
+/**
+ * Human-readable summary of what a re-emitted draft changed versus the one it
+ * replaces, appended to the tool result so a silent drop becomes visible in the
+ * chat instead of only in the step values nobody re-reads.
+ *
+ * This is a REPORT, not a gate: the model is free to restructure a draft, and
+ * legitimate revisions add and remove steps. What it removes is the *silence* —
+ * "1 removed" next to a reply that claims nothing was removed is a
+ * contradiction the user can see without diffing seven inputs by hand.
+ *
+ * Multiset comparison on identity, not positional: moving a step is not a
+ * change, and duplicate identical steps still count correctly.
+ */
+export function summariseDraftChange(
+  previous: MobileIntentStep[] | undefined,
+  next: MobileIntentStep[],
+): string {
+  if (!previous || previous.length === 0) return '';
+
+  const counts = new Map<string, number>();
+  for (const s of previous) {
+    const k = draftStepIdentity(s);
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  let kept = 0;
+  for (const s of next) {
+    const k = draftStepIdentity(s);
+    const n = counts.get(k) ?? 0;
+    if (n > 0) {
+      kept++;
+      counts.set(k, n - 1);
+    }
+  }
+  const added = next.length - kept;
+  const removed = previous.length - kept;
+  if (added === 0 && removed === 0) return ' (identical to the previous draft)';
+
+  const parts: string[] = [];
+  if (added > 0) parts.push(`${added} added/changed`);
+  if (removed > 0) parts.push(`${removed} removed/changed`);
+  return (
+    ` Compared with your previous ${previous.length}-step draft: ${parts.join(', ')}` +
+    ` (${kept} unchanged).` +
+    (removed > 0
+      ? ` If you did not intend to drop ${removed === 1 ? 'a step' : 'steps'}, re-emit the draft` +
+        ` with ${removed === 1 ? 'it' : 'them'} restored, and tell the user what changed.`
+      : '')
+  );
+}
+
+/** The `web_*` step each native type should become inside a WebView. */
+/** `web_*` step types whose target must be a CSS selector, not a description. */
+const WEB_SELECTOR_STEP_TYPES = new Set<string>([
+  'web_click', 'web_type', 'web_assert_element', 'web_assert_text',
+]);
+
+/**
+ * True when a `web_*` step's selector is prose (an a11y-style description)
+ * rather than a CSS selector.
+ *
+ * Getting the step TYPE right is not enough: the agent authored a correct
+ * `web_click` whose `bindingHints.selector` was the literal string
+ * `Pinduoduo marketplace card`. CDP then does `document.querySelector(...)`
+ * with that, matches nothing, and the step fails at replay with
+ * "element not found" — the same dead end as a native tap, one layer down.
+ * The prompt already says "do NOT put an a11y-style description there"; this
+ * is the enforcement point for it.
+ *
+ * Heuristic, biased AWAY from false positives (a false positive blocks a valid
+ * selector): flag only a multi-word string that carries NO CSS syntax at all
+ * and whose tokens are not all HTML tag names. `div span` (a real descendant
+ * combinator) survives; `Pinduoduo marketplace card` does not.
+ */
+export function looksLikeProseNotCssSelector(selector: string): boolean {
+  const s = selector.trim();
+  if (!s) return false;
+  if (!/\s/.test(s)) return false; // single token — assume a selector
+  if (/[.#[\]()>+~*=|^$"']/.test(s)) return false; // any CSS syntax at all
+  if (/^:{1,2}/.test(s)) return false; // pseudo-selector
+  const HTML_TAGS = new Set([
+    'a', 'abbr', 'article', 'aside', 'audio', 'b', 'body', 'button', 'canvas',
+    'caption', 'code', 'col', 'div', 'em', 'fieldset', 'figure', 'footer',
+    'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'html', 'i', 'iframe',
+    'img', 'input', 'label', 'li', 'main', 'nav', 'ol', 'option', 'p', 'picture',
+    'pre', 'section', 'select', 'small', 'span', 'strong', 'summary', 'svg',
+    'table', 'tbody', 'td', 'textarea', 'tfoot', 'th', 'thead', 'tr', 'ul',
+    'video',
+  ]);
+  return !s.split(/\s+/).every((t) => HTML_TAGS.has(t.toLowerCase()));
+}
+
+const WEB_EQUIVALENT_STEP: Record<string, string> = {
+  click: 'web_click', tap: 'web_click', double_tap: 'web_click',
+  long_press: 'web_click', hover: 'web_click',
+  type: 'web_type', type_text: 'web_type', input_text: 'web_type',
+  select: 'web_click', check: 'web_click', uncheck: 'web_click',
+  toggle: 'web_click', drag: 'web_click',
+};
+
 export const ACCEPTED_STEP_TYPES = new Set<string>([
   // canonical (mirror of MobileIntentActionType — mobile-runner.types.ts:42-62)
   'click', 'type', 'scroll', 'press', 'hover',
@@ -1697,7 +1872,125 @@ async function runMobileRunDraftSteps(
       }
     }
 
+    // Placeholder-assertion guard: an assertionText that is ENTIRELY a
+    // `{{param_*}}` placeholder verifies nothing. `{{param_*}}` is the
+    // sanitizer's mask for a genuine secret in a step's `value`; it has no
+    // meaning in an assertion, and at replay `resolvePlaceholders` finds no
+    // such key in `parameters_schema` (the sanitizer only registers params it
+    // created itself), so the checker is handed the literal placeholder or an
+    // empty expectation — a check that cannot fail. Observed live: the model
+    // emitted `{{param_secret}}` in place of a seven-marketplace assertion and
+    // it survived into the saved test. See
+    // `.claude/deferred/20260727-placeholder-accepted-as-ai-check-assertion-text.md`.
+    //
+    // Scoped to the `param_` namespace and to a WHOLE-string match on purpose:
+    // `{{secrets.*}}` / `{{env.*}}` / `{{extracted.*}}` embedded in surrounding
+    // text are legitimate in an assertion (e.g. `Welcome back,
+    // {{secrets.login_email}}`) and MUST keep working — see
+    // `containsBoundSecretPlaceholder` in redact-step.ts.
+    const at = typeof step.assertionText === 'string' ? step.assertionText.trim() : '';
+    if (at && /^\{\{param_[a-zA-Z0-9_]+\}\}$/.test(at)) {
+      return {
+        ok: false,
+        content:
+          `Step #${i + 1} (${id}) has "${at}" as its entire assertion text. ` +
+          `A {{param_*}} placeholder is the mask for a secret in a step's \`value\` — ` +
+          `it is never valid as an assertion, because nothing resolves it at replay, ` +
+          `so the check would silently pass forever. ` +
+          `Replace it with the concrete text you expect to see on screen.`,
+      };
+    }
+
+    // A `web_*` step targets the DOM, so its selector must BE a CSS selector.
+    // Authoring the right step type with a prose target fails at replay the
+    // same way a native tap does — see `looksLikeProseNotCssSelector`.
+    if (WEB_SELECTOR_STEP_TYPES.has(type)) {
+      const hints = step.bindingHints as { selector?: unknown } | undefined;
+      const sel = typeof hints?.selector === 'string' ? hints.selector : '';
+      if (!sel.trim()) {
+        return {
+          ok: false,
+          content:
+            `Step #${i + 1} (${id}) is a \`${type}\` with no ` +
+            `\`bindingHints.selector\`. A web step targets the DOM — it needs a CSS ` +
+            `selector taken from what \`observe_mobile_page\` returned while you were ` +
+            `switched into the WebView.`,
+        };
+      }
+      if (looksLikeProseNotCssSelector(sel)) {
+        return {
+          ok: false,
+          content:
+            `Step #${i + 1} (${id}) is a \`${type}\` whose ` +
+            `\`bindingHints.selector\` is "${sel}" — that is an element DESCRIPTION, ` +
+            `not a CSS selector. At replay this becomes ` +
+            `document.querySelector("${sel}"), which matches nothing and fails with ` +
+            `"element not found".\n` +
+            `Switch into the WebView (\`switch_to_webview\`), read the DOM with ` +
+            `\`observe_mobile_page\`, and use a real selector from it — e.g. ` +
+            `\`a[href*="pinduoduo"]\`, \`.marketplace-card:nth-of-type(2)\`, ` +
+            `\`#lesson-list li\`. If several debuggable WebViews exist, call ` +
+            `\`list_webview_contexts\` first and switch to the right one.`,
+        };
+      }
+    }
+
     steps.push(step);
+  }
+
+  // WebView interaction ADVISORY — deliberately a warning, not a rejection.
+  //
+  // A native tap on a WebView screen is UNRELIABLE, not impossible. The runner
+  // has a real path for it (`executeCommand`'s early-WebView branch): on a
+  // WebView screen it resolves the step's intent text against the DOM over CDP
+  // and then taps the element's rendered device pixel with a genuine `adb tap`
+  // — deliberately a native OS touch, because CDP-injected input was proven not
+  // to reach the JanaPost React micro-app's handlers. `/run-steps` dispatches
+  // through `executeCommand`, so that path is live for replay.
+  //
+  // So when TC-30's `Астана city chip` and TC-31's `Pinduoduo marketplace card`
+  // died with "finder found nothing and no coordinate fallback", the DOM
+  // resolve of that description MISSED — a resolution-quality failure, not an
+  // architectural impossibility. Hard-blocking native interaction here would
+  // foreclose a route the runner intends to support, on a premise that is
+  // false. Warn instead, and let the author decide.
+  //
+  // The hard rejections in this tool are reserved for things that are
+  // DEFINITIONALLY broken — a `{{param_*}}` assertion, and a `web_*` step whose
+  // selector is prose (`querySelector` on prose can never match).
+  //
+  // Note the observation header already carries `CONTENT TYPE: WebView` for
+  // this screen, and live testing showed THAT is what actually steers the agent
+  // (it declined a native tap before emitting any draft, i.e. before this code
+  // could run). This block is the belt to that suspenders.
+  const draftActivity = resolveForegroundActivity(bb.getSnapshot());
+  let webViewAdvisory = '';
+  if (bb.getWebContext() !== 'WEB' && isWebViewHostActivity(draftActivity)) {
+    const nativeOnWebView = steps
+      .map((s, i) => ({ i, s }))
+      .filter(({ s }) => NATIVE_INTERACTION_STEP_TYPES.has(s.type));
+    if (nativeOnWebView.length > 0) {
+      webViewAdvisory =
+        `\n\n⚠️ The foreground activity is \`${draftActivity}\` — a WebView host, so this ` +
+        `screen's content is HTML. ${nativeOnWebView.length} step(s) use a native ` +
+        `interaction:\n` +
+        nativeOnWebView
+          .map(({ i, s }) => `  Step #${i + 1} (${s.id}) "${s.type}"`)
+          .join('\n') +
+        `\nThose CAN work — the runner resolves the description against the DOM and taps ` +
+        `the element's real pixel — but only if the description resolves. When it does not, ` +
+        `they fail with "finder found nothing and no coordinate fallback".\n` +
+        `More reliable: \`switch_context\` (\`options.context:"WEB"\`) → ` +
+        nativeOnWebView
+          .map(({ s }) => `\`${WEB_EQUIVALENT_STEP[s.type] ?? 'web_click'}\``)
+          .filter((v, idx, arr) => arr.indexOf(v) === idx)
+          .join(' / ') +
+        ` with a CSS selector in \`bindingHints.selector\` (take it from the DOM ` +
+        `\`observe_mobile_page\` returns while switched in) → \`switch_context\` ` +
+        `(\`options.context:"NATIVE"\`).\n` +
+        `Assertions need none of this: an \`ai_check\` with ` +
+        `\`options.aiCheckSource:"screenshot"\` reads pixels and works over a WebView.`;
+    }
   }
 
   // Persist draft in the cache BEFORE running. If the run errors out
@@ -1708,6 +2001,17 @@ async function runMobileRunDraftSteps(
     typeof args.suggestedName === 'string' && args.suggestedName.trim()
       ? args.suggestedName.trim()
       : undefined;
+  // Snapshot the PREVIOUS draft before overwriting it, so a revision can be
+  // diffed. Revision re-emits the whole array — it is really "re-author from
+  // memory" — so steps the model loses fall out with nothing to notice them by.
+  // Observed live across two sessions: a required navigation step vanished, the
+  // strongest assertion was replaced, and once the reply claimed "steps 1,2,3,5,
+  // 6,7 kept as-is" while every one of them had changed. See
+  // `.claude/deferred/20260727-mobile-agent-revision-drops-and-reuses-one-frame.md`.
+  const previousDraftSteps = bb.chatSessionId
+    ? MobileDraftStepsCache.get(bb.chatSessionId)?.steps
+    : undefined;
+
   if (bb.chatSessionId) {
     MobileDraftStepsCache.set(bb.chatSessionId, {
       steps,
@@ -1777,7 +2081,9 @@ async function runMobileRunDraftSteps(
       content:
         `Drafted ${steps.length} step(s)${suggestedName ? ` for "${suggestedName}"` : ''}. ` +
         `They are shown in the chat as editable steps — the user can adjust them, ` +
-        `then confirm in the UI to run on the device.`,
+        `then confirm in the UI to run on the device.` +
+        summariseDraftChange(previousDraftSteps, steps) +
+        webViewAdvisory,
       data: draftStepsPayload,
     };
   }
@@ -3673,7 +3979,25 @@ function formatSnapshotForLlm(
   const header = [
     `platform: ${snap.platform}`,
     snap.app ? `app: ${snap.app}` : null,
-    snap.activity ? `activity: ${snap.activity}` : null,
+    // Resolve via actualForeground too — the legacy `activity` field is often
+    // absent (confirmed live on a Flutter session), which silently dropped the
+    // activity line from this header entirely.
+    resolveForegroundActivity(snap) ? `activity: ${resolveForegroundActivity(snap)}` : null,
+    // Make the WebView-ness of the screen EXPLICIT, not something the model has
+    // to infer from an activity name it may not recognise. The authoring rule
+    // in prompts.ts is conditioned on knowing the content is inside a WebView,
+    // and the model can read this whole screen from pixels without ever calling
+    // switch_to_webview — in which case that precondition silently never
+    // becomes true and it authors native steps that cannot replay (observed on
+    // JanaPost TC-31 Education). Stating it here is what makes the rule
+    // reachable; the draft lint is the backstop for when it is ignored.
+    isWebViewHostActivity(resolveForegroundActivity(snap))
+      ? 'CONTENT TYPE: WebView (HTML) — this screen is hosted by a WebView activity. ' +
+        'Native tap/type steps CANNOT reach this content on replay: author ' +
+        'switch_context(WEB) + web_click/web_type with a CSS selector in ' +
+        'bindingHints.selector, then switch_context(NATIVE). Screenshot-sourced ' +
+        'ai_check DOES work over it.'
+      : null,
     `screen: ${snap.screenSize.width}x${snap.screenSize.height}`,
     snap.windowInfo?.keyboardVisible ? 'keyboard: visible' : null,
     snap.windowInfo?.hasDialog ? 'dialog: visible' : null,
