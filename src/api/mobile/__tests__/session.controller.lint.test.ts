@@ -135,7 +135,10 @@ describe('lintSession editor-trace contract', () => {
 
     await lintSession(makeReq('extract_text'), makeRes());
 
-    expect(lintElement).toHaveBeenCalledWith('sess-1', 'Order', 'extract_text', undefined, { userId: 'user-1' });
+    expect(lintElement).toHaveBeenCalledWith('sess-1', 'Order', 'extract_text', undefined, {
+      userId: 'user-1',
+      useScreenshotOnly: false,
+    });
   });
 
   it('still defaults an unmapped step kind to tap', async () => {
@@ -143,7 +146,33 @@ describe('lintSession editor-trace contract', () => {
 
     await lintSession(makeReq('some_future_kind'), makeRes());
 
-    expect(lintElement).toHaveBeenCalledWith('sess-1', 'Order', 'tap', undefined, { userId: 'user-1' });
+    expect(lintElement).toHaveBeenCalledWith('sess-1', 'Order', 'tap', undefined, {
+      userId: 'user-1',
+      useScreenshotOnly: false,
+    });
+  });
+
+  /**
+   * "Use screenshot to find element" lives on the draft's options. The editor
+   * sends it on every Find, but the controller used to read only description /
+   * actionType / bindingHints — so the toggle was inert on mobile and a Find
+   * kept resolving by text.
+   */
+  it('forwards the draft option that forces vision-only resolution', async () => {
+    lintElement.mockResolvedValue({ status: 'resolved', boundingBox: { x: 0, y: 0, width: 10, height: 10 } });
+
+    const req = makeReq('click');
+    req.body.stepDraft.options = { useScreenshotOnly: true };
+
+    await lintSession(req, makeRes());
+
+    expect(lintElement).toHaveBeenCalledWith(
+      'sess-1',
+      'Order',
+      'tap',
+      undefined,
+      expect.objectContaining({ useScreenshotOnly: true }),
+    );
   });
 
   it('does NOT write an orphan result when the throw precedes the request event', async () => {
