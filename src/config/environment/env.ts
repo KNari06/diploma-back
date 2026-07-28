@@ -510,6 +510,15 @@ const envSchema = z.object({
   // classifier-only routing.
   API_FLOW_FORCE_ROUTE: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
 
+  // When `true` (default), a mobile-agent turn whose REPLY claims a step-level
+  // draft revision ("changed step 5", "kept steps 1-3") while emitting NO draft
+  // gets one forced extra tool round to actually emit it. Without this the
+  // chat's changelog and the draft card disagree, and Save persists the card —
+  // so a user who reads the reply saves the OLD steps believing they saved the
+  // new ones. Costs at most one extra LLM round per turn, and only on a turn
+  // that already made the claim. Set to `false` to disable the extra round.
+  MOBILE_DRAFT_CLAIM_RECONCILE: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
+
   // Phase B2-B4: mobile-editor eager snapshot inject. When `true`
   // (default), the mobile_agent handler eagerly fetches the runner's
   // `/ui-state` snapshot BEFORE the first LLM call and injects it as a
