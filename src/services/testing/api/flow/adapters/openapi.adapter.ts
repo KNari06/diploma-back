@@ -20,6 +20,14 @@ import type {
   UnsupportedEndpoint,
 } from '../flow.types';
 
+// SSRF guard: never follow EXTERNAL `$ref`s. A user-supplied spec can point a
+// `$ref` at an internal host (`http://169.254.169.254/…`) or an arbitrary URL,
+// and swagger-parser would fetch it server-side during parse. `external: false`
+// keeps internal (`#/…`) refs resolving while blocking every off-document fetch;
+// the http timeout bounds the one intended fetch (the spec URL itself) so a slow
+// host can't hang/leak the request. Applied to every SwaggerParser entry point.
+const SAFE_PARSE_OPTS: SwaggerParser.Options = { resolve: { external: false, http: { timeout: 10000 } } };
+
 /**
  * Deep-clone an object while replacing circular references with null.
  * Prevents JSON.stringify crashes throughout the pipeline.
@@ -251,13 +259,13 @@ export async function parseOpenApiSpec(
     if ('url' in input) {
       logger.info('[OPENAPI_ADAPTER] Fetching and parsing spec from URL', { url: input.url });
       try {
-        doc = await SwaggerParser.dereference(input.url) as OpenAPI.Document;
+        doc = await SwaggerParser.dereference(input.url, SAFE_PARSE_OPTS) as OpenAPI.Document;
       } catch (derefErr: any) {
         // Broken $ref — fallback to parse without dereference
         logger.warn('[OPENAPI_ADAPTER] Dereference failed, falling back to parse()', {
           error: derefErr.message?.slice(0, 200),
         });
-        doc = await SwaggerParser.parse(input.url) as OpenAPI.Document;
+        doc = await SwaggerParser.parse(input.url, SAFE_PARSE_OPTS) as OpenAPI.Document;
       }
     } else {
       logger.info('[OPENAPI_ADAPTER] Parsing spec from file content', {
@@ -266,7 +274,7 @@ export async function parseOpenApiSpec(
       });
       const rawObj = await parseRawContent(input.content);
       try {
-        doc = await SwaggerParser.dereference(rawObj) as OpenAPI.Document;
+        doc = await SwaggerParser.dereference(rawObj, SAFE_PARSE_OPTS) as OpenAPI.Document;
       } catch (derefErr: any) {
         // Broken $ref — fallback to raw parsed object
         logger.warn('[OPENAPI_ADAPTER] Dereference failed, using raw parsed spec', {

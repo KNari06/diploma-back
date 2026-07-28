@@ -11,6 +11,9 @@ import {
   lastPathSegment,
   isReferenceIdField,
   isSnakeIdVar,
+  isVerifyStep,
+  isSendStep,
+  isSessionTeardown,
 } from '../wiring-policy';
 
 describe('wiring-policy predicates', () => {
@@ -95,6 +98,34 @@ describe('wiring-policy predicates', () => {
       expect(isReferenceIdField('name')).toBe(false);
       expect(isSnakeIdVar('country_id')).toBe(true);
       expect(isSnakeIdVar('countryId')).toBe(false);
+    });
+  });
+
+  // #7 — send/verify/teardown vocabulary must cover real-world naming, not just
+  // logout + verify.
+  describe('send / verify / teardown steps', () => {
+    it('recognises verify AND submit/complete as verify steps', () => {
+      expect(isVerifyStep('/auth/otp/verify')).toBe(true);
+      expect(isVerifyStep('/auth/mfa/submit')).toBe(true); // was neither send nor verify
+      expect(isVerifyStep('/auth/registration/complete')).toBe(true);
+      expect(isVerifyStep('/auth/login')).toBe(false);
+    });
+
+    it('recognises send / request steps', () => {
+      expect(isSendStep('/auth/mfa/send')).toBe(true);
+      expect(isSendStep('/auth/otp/request')).toBe(true);
+      expect(isSendStep('/auth/otp/verify')).toBe(false);
+    });
+
+    it('recognises revoke / terminate / end-session as teardowns', () => {
+      expect(isSessionTeardown('/auth/logout')).toBe(true);
+      expect(isSessionTeardown('/token/revoke')).toBe(true);
+      expect(isSessionTeardown('/session/revoke')).toBe(true);
+      expect(isSessionTeardown('/sessions/terminate')).toBe(true);
+      expect(isSessionTeardown('/auth/end-session')).toBe(true);
+      expect(isSessionTeardown('/session/invalidate')).toBe(true);
+      expect(isSessionTeardown('/auth/login')).toBe(false);
+      expect(isSessionTeardown('/users/{id}')).toBe(false);
     });
   });
 });

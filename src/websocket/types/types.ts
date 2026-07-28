@@ -11,6 +11,7 @@ import type {
   TargetFingerprint,
   LintStatus,
 } from '@/services/testing/ui/preview/preview.types';
+import type { FlowInputQuestion } from '@/services/testing/api/flow/flow.types';
 
 // ============================================================================
 // CLIENT → SERVER EVENTS
@@ -645,6 +646,7 @@ export interface ServerToClientEvents {
   'api:flow:step-complete': (data: ApiFlowStepCompletePayload) => void;
   'api:flow:step-skipped': (data: ApiFlowStepSkippedPayload) => void;
   'api:flow:step-retrying': (data: ApiFlowStepRetryingPayload) => void;
+  'api:flow:needs-input': (data: ApiFlowNeedsInputPayload) => void;
   'api:flow:variable-extracted': (data: ApiFlowVariableExtractedPayload) => void;
   'api:flow:completed': (data: ApiFlowCompletedPayload) => void;
   'api:flow:failed': (data: ApiFlowFailedPayload) => void;
@@ -2980,7 +2982,7 @@ export interface ApiFlowStepSkippedPayload {
   // Drives the node's visual state. The `blocked` reasons mean we never sent a
   // valid request (unbound variable / destructive call without consent) — that is
   // OUR gap, not an API failure, and must not render as one.
-  reason: 'unsupported' | 'dependency_failed' | 'cancelled' | 'unbound_variable' | 'destructive_not_consented';
+  reason: 'unsupported' | 'dependency_failed' | 'cancelled' | 'disabled' | 'unbound_variable' | 'destructive_not_consented';
   // frontend renders the node as this status verbatim
   status: 'skipped' | 'cancelled' | 'blocked';
   message?: string;
@@ -2996,6 +2998,21 @@ export interface ApiFlowStepRetryingPayload {
   attempt: number; // current retry attempt (1-based)
   maxRetries: number;
   reason: 'rate_limited' | 'auth_refresh';
+  timestamp: string;
+}
+
+/**
+ * The run has paused because it needs values it could not obtain itself (an
+ * out-of-band OTP just sent, a secret, an auth token whose login failed). The
+ * client shows a dialog and answers via POST …/runs/:runId/provide-input, which
+ * resumes execution. If unanswered within the input timeout the run fails.
+ */
+export interface ApiFlowNeedsInputPayload {
+  flowSpecId: string;
+  flowRunId: string;
+  sessionId: string;
+  nodeId?: string; // node the run is paused before (for highlight), if any
+  questions: FlowInputQuestion[];
   timestamp: string;
 }
 

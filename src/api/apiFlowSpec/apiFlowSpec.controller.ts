@@ -8,6 +8,8 @@ import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { FlowBuilderService } from '@/services/testing/api/flow/flow-builder.service';
 import { FlowExecutorService, cancelFlowRun, createFlowRun } from '@/services/testing/api/flow/flow-executor.service';
+import { provideFlowInput } from '@/services/testing/api/flow/flow-input-gate';
+import { deriveSpecBaseUrl, resolveRunBaseUrl, BASE_URL_VAR } from '@/services/testing/api/flow/base-url';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import type { ParseSpecRequest, RunFlowRequest } from '@/services/testing/api/flow/flow.types';
 
@@ -53,7 +55,7 @@ export const parseSpec = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const { source, url, content, fileName, projectId, environmentId, chatSessionId, analysisId, userAnswers, probe } = req.body;
+    const { source, url, content, fileName, projectId, environmentId, chatSessionId, analysisId, userAnswers, probe, apiGroup } = req.body;
 
     if (!projectId) {
       res.status(400).json({ success: false, error: 'projectId is required' });
@@ -83,6 +85,7 @@ export const parseSpec = async (req: Request, res: Response): Promise<void> => {
       analysisId,
       userAnswers,
       probe: probe === true,
+      apiGroup,
     };
 
     logger.info('[FLOW_SPEC_CONTROLLER] Parsing spec', { source, url, projectId, userId, probe: probe === true });
@@ -133,6 +136,21 @@ export const parseSpec = async (req: Request, res: Response): Promise<void> => {
         isMultiSpec: true,
         data: {
           specGroups: error.specGroups, // [{ url, name }]
+          message: error.message,
+        },
+      });
+      return;
+    }
+
+    // Large single spec — return API-group choices so the frontend can show a
+    // selector; the user picks one and re-parses the SAME source with `apiGroup`.
+    if (error.isLargeSpec && error.apiGroups) {
+      res.json({
+        success: true,
+        needsInput: true,
+        isLargeSpec: true,
+        data: {
+          apiGroups: error.apiGroups, // [{ name, endpointCount }]
           message: error.message,
         },
       });
@@ -192,9 +210,13 @@ export const getById = async (req: Request, res: Response): Promise<void> => {
     // Rebuild visualization from stored DAG
     const visualization = FlowBuilderService.buildVisualizationFromDag(flowSpec.executionDag);
 
+    // Computed (not persisted): the base URL runs will use. '' means the spec has
+    // no absolute server — the client surfaces a {{base_url}} field in the run dialog.
+    const resolvedBaseUrl = deriveSpecBaseUrl(flowSpec.rawSpec, flowSpec.sourceUrl);
+
     res.json({
       success: true,
-      data: { flowSpec, visualization },
+      data: { flowSpec: { ...flowSpec, resolvedBaseUrl }, visualization },
     });
   } catch (error: any) {
     logger.error('[FLOW_SPEC_CONTROLLER] Get failed', { error: error.message });
@@ -284,6 +306,25 @@ export const runFlow = async (req: Request, res: Response): Promise<void> => {
 
     logger.info('[FLOW_SPEC_CONTROLLER] Starting flow run', { flowSpecId: id, userId });
 
+    // Validate the base URL BEFORE charging. Without an absolute base URL the
+    // executor blocks every node (0 requests) — deducting first would charge in
+    // full for a run that does nothing, and the refund path only covers a
+    // catastrophic throw, not an all-blocked run. Mirror the executor's override
+    // precedence: this run's `{{base_url}}` wins over a saved chain value.
+    const chainBase = (flowSpec.variableChain as Record<string, unknown> | undefined)?.[BASE_URL_VAR];
+    const initBase = (initialVariables as Record<string, unknown> | undefined)?.[BASE_URL_VAR];
+    const baseUrlOverride = initBase !== undefined && initBase !== null && initBase !== '' ? initBase : chainBase;
+    const resolvedBaseUrl = resolveRunBaseUrl(flowSpec.rawSpec, flowSpec.sourceUrl, baseUrlOverride);
+    if (!resolvedBaseUrl) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing base URL',
+        code: 'MISSING_BASE_URL',
+        message: 'This flow has no absolute base URL. Provide {{base_url}} in the run dialog before running.',
+      });
+      return;
+    }
+
     // Credit check: 1 credit per endpoint in the flow
     const creditCost = flowSpec.executionDag?.nodes?.length || 1;
     const hasCredits = await UserCreditsService.hasCredits(userId, creditCost);
@@ -371,13 +412,18 @@ export const stopFlow = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Verify the requesting user owns this run
+    // Verify the requesting user owns this run. A missing row must FAIL closed —
+    // `run && …` would skip the check entirely when the run doesn't exist.
     const { data: run } = await supabaseAdmin
       .from('api_flow_runs')
       .select('user_id')
       .eq('id', runId)
       .maybeSingle();
-    if (run && run.user_id !== userId) {
+    if (!run) {
+      res.status(404).json({ success: false, error: 'Run not found' });
+      return;
+    }
+    if (run.user_id !== userId) {
       res.status(403).json({ success: false, error: 'Not authorized to stop this run' });
       return;
     }
@@ -386,6 +432,58 @@ export const stopFlow = async (req: Request, res: Response): Promise<void> => {
     res.json({ success: true, cancelled });
   } catch (error: any) {
     res.status(500).json({ success: false, error: 'Failed to stop flow' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/v1/api-flow-spec/:id/runs/:runId/provide-input
+// Supply values a paused run asked for (OTP, secret, auth token) → resumes it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const provideRunInput = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
+    const { runId } = req.params;
+    const { values } = req.body ?? {};
+    if (!runId) { res.status(400).json({ success: false, error: 'runId is required' }); return; }
+    if (!values || typeof values !== 'object' || Array.isArray(values)) {
+      res.status(400).json({ success: false, error: 'values object is required' });
+      return;
+    }
+
+    // Verify the requesting user owns this run (mirrors stopFlow). A missing row
+    // must FAIL closed — `run && …` would skip the check when run is null.
+    const { data: run } = await supabaseAdmin
+      .from('api_flow_runs')
+      .select('user_id')
+      .eq('id', runId)
+      .maybeSingle();
+    if (!run) {
+      res.status(404).json({ success: false, error: 'Run not found' });
+      return;
+    }
+    if (run.user_id !== userId) {
+      res.status(403).json({ success: false, error: 'Not authorized to resume this run' });
+      return;
+    }
+
+    // The run context stores string values — coerce and drop empties.
+    const stringValues: Record<string, string> = {};
+    for (const [k, v] of Object.entries(values as Record<string, unknown>)) {
+      if (v !== undefined && v !== null && String(v) !== '') stringValues[k] = String(v);
+    }
+
+    const resumed = provideFlowInput(runId, stringValues);
+    if (!resumed) {
+      // Not currently awaiting input — already answered, timed out, or finished.
+      res.status(409).json({ success: false, error: 'Run is not awaiting input' });
+      return;
+    }
+    res.json({ success: true, resumed: true });
+  } catch (error: any) {
+    logger.error('[FLOW_SPEC_CONTROLLER] Provide input failed', { error: error?.message });
+    res.status(500).json({ success: false, error: 'Failed to provide input' });
   }
 };
 
