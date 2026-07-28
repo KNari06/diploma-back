@@ -23,7 +23,10 @@ import type {
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
+import { env } from '@/config/environment/env';
 import { MobileBlackboard } from './blackboard';
+import { MobileDraftStepsCache } from '@/services/testing/mobile/mobile-draft-steps-cache';
+import { DRAFT_CLAIM_NUDGE, replyClaimsStepRevision } from './draft-claim-reconciliation';
 import { buildMobileAgentSystemPrompt } from './prompts';
 import { MOBILE_AGENT_TOOLS, executeTool } from './tools';
 import {
@@ -110,6 +113,17 @@ export interface MobileDraftStepsMeta {
    * on regression replay. Absent when no value was parameterised.
    */
   parametersSchema?: Record<string, unknown>;
+  /**
+   * What this draft changed versus the one it replaces, when there was one.
+   * Rendered on the card so a silently dropped step is visible to the USER —
+   * the same counts already reach the model via the tool result.
+   */
+  changeCounts?: {
+    previousCount: number;
+    added: number;
+    removed: number;
+    kept: number;
+  };
 }
 
 export interface RunMobileAgentPipelineOpts {
@@ -227,6 +241,23 @@ export async function runMobileAgentPipeline(
   // draft this turn. Lifted onto the reply so the chat renders editable steps.
   let draftSteps: MobileIntentStep[] | undefined;
   let draftMeta: MobileDraftStepsMeta | undefined;
+  // At most one draft-claim nudge per turn (see the exit branch below).
+  let draftClaimNudged = false;
+  // Is there anything to REVISE — i.e. an artifact a step-level claim could
+  // contradict? Either a draft is cached for this chat, or the editor is scoped
+  // to a saved test case that already has steps (`buildOpenTestCaseBlock`
+  // returns null at 0 steps). Both matter: `mobile_create_test_case` consumes
+  // the cache entry (it re-sets it right after, but a 30-min TTL expiry or a
+  // process restart still leaves it cold), and a user revising a SAVED test
+  // case may never have had a cached draft in this session at all.
+  //
+  // Be honest about how much this filters: with a saved test case open — the
+  // common case — it is true for every turn. It rules out the fresh-workspace
+  // chat where the agent is describing a plan rather than revising anything;
+  // the rest of the precision comes from `replyClaimsStepRevision`.
+  const hasRevisableDraft =
+    (!!blackboard.chatSessionId && !!MobileDraftStepsCache.get(blackboard.chatSessionId)) ||
+    !!opts?.openTestCaseBlock;
 
   while (round < MAX_TOOL_ROUNDS) {
     round++;
@@ -254,6 +285,38 @@ export async function runMobileAgentPipeline(
           sessionId: blackboard.mobileSessionId,
           round,
         });
+      }
+
+      // The reply claims a step-level revision but no draft was emitted this
+      // turn — the chat and the draft card would disagree, and only the card
+      // ships. Give the model exactly one more round to emit it.
+      //
+      // Bounded to ONE retry per turn: without the bound a model that keeps
+      // describing instead of emitting would burn every remaining round. A
+      // false positive therefore costs one LLM call, and the nudge explicitly
+      // lets the model restate without the claim.
+      if (
+        env.MOBILE_DRAFT_CLAIM_RECONCILE &&
+        !draftClaimNudged &&
+        !draftSteps &&
+        reply &&
+        hasRevisableDraft &&
+        replyClaimsStepRevision(reply)
+      ) {
+        draftClaimNudged = true;
+        logger.warn('[MOBILE_AGENT_PIPELINE] Reply claims a step revision with no draft emitted', {
+          sessionId: blackboard.mobileSessionId,
+          chatSessionId: blackboard.chatSessionId,
+          round,
+          replyPreview: reply.slice(0, 200),
+        });
+        // The assistant's TEXT reply was never appended to `messages` — only
+        // tool-call assistant messages are (below). Push it first, or the nudge
+        // refers to something the model cannot see and the extra round is a
+        // blind retry of the same user turn.
+        messages.push({ role: 'assistant', content: reply });
+        messages.push({ role: 'system', content: DRAFT_CLAIM_NUDGE });
+        continue;
       }
       // Final "wrapping up" pulse so the UI shows the indicator approaching
       // 95% before the HTTP response lands. The WebSocket event arrives a
@@ -433,6 +496,17 @@ export async function runMobileAgentPipeline(
   // Same null-safety as the in-loop reply — closing call may also return
   // null content.
   const closingReply = (closing.content ?? '').trim();
+  // Same inconsistency the in-loop exit nudges on, but there is no round budget
+  // left to spend here — record it so the case is visible in the logs rather
+  // than silently shipping a reply the draft card contradicts.
+  if (!draftSteps && hasRevisableDraft && replyClaimsStepRevision(closingReply)) {
+    logger.warn('[MOBILE_AGENT_PIPELINE] Claimed step revision with no draft (rounds exhausted)', {
+      sessionId: blackboard.mobileSessionId,
+      chatSessionId: blackboard.chatSessionId,
+      toolCallsMade,
+      replyPreview: closingReply.slice(0, 200),
+    });
+  }
   return {
     reply: closingReply || fallbackEmptyReply(),
     toolCallsMade,

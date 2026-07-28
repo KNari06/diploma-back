@@ -3,38 +3,45 @@
  *
  * Security boundary: this gates external CI runs. The risks it must close are
  * (a) accepting a malformed / missing / wrong key, (b) leaking through on a DB
- * error, and (c) attaching the wrong project. Each rejection path returns 401
- * (or 500 on DB error), and only an exact stored-hash match authenticates.
+ * error, (c) attaching the wrong project, and (d) honouring a key whose owning
+ * account is soft-deleted or un-approved — the two gates a JWT caller gets from
+ * `requireAuth` + `requireApproved` that a CI caller historically never did.
  *
- * supabaseAdmin + logger are mocked; crypto is real so the SHA-256 hashing and
- * timing-safe compare are exercised for real.
+ * The `db/` sublayer is the mock boundary (not `supabaseAdmin` — see
+ * .claude/rules/testing.md); crypto is real, so SHA-256 hashing is exercised
+ * for real.
  */
 
 import { requireCiApiKey, hashApiKey } from '../api-key.middleware';
-import { supabaseAdmin } from '@/db/supabase';
+import {
+  CiKeyLookupError,
+  findProjectByCiKeyHash,
+  getCiOwnerAuthState,
+} from '@/services/mobile/db/ci-auth.db';
 import type { Request, Response, NextFunction } from 'express';
 
-jest.mock('@/db/supabase', () => ({ supabaseAdmin: { from: jest.fn() } }));
+jest.mock('@/services/mobile/db/ci-auth.db', () => {
+  class CiKeyLookupError extends Error {}
+  return {
+    CiKeyLookupError,
+    findProjectByCiKeyHash: jest.fn(),
+    getCiOwnerAuthState: jest.fn(),
+  };
+});
 jest.mock('@/utils/core/logger', () => ({
   logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
 }));
 
-const mockFrom = supabaseAdmin.from as jest.Mock;
-
-/** Build the awaitable query chain from('projects').select().not().limit(). */
-function mockQuery(result: { data: unknown; error: unknown }) {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const chain: any = {
-    select: jest.fn(() => chain),
-    not: jest.fn(() => chain),
-    limit: jest.fn(() => Promise.resolve(result)),
-  };
-  mockFrom.mockReturnValue(chain);
-  return chain;
-}
+const mockFind = findProjectByCiKeyHash as jest.Mock;
+const mockOwner = getCiOwnerAuthState as jest.Mock;
 
 function mockReq(authorization?: string): Request {
-  return { headers: authorization ? { authorization } : {}, path: '/ci/run', method: 'POST' } as Request;
+  return {
+    headers: authorization ? { authorization } : {},
+    path: '/run',
+    method: 'POST',
+    ip: '10.0.0.1',
+  } as Request;
 }
 
 function mockRes() {
@@ -45,14 +52,24 @@ function mockRes() {
 }
 
 const VALID_KEY = 'qai_ci_abcdef1234567890';
+const PROJECT = {
+  id: 'proj-1',
+  user_id: 'owner-9',
+  workspace_id: 'w1',
+  settings: { ciApiKey: { hash: 'stored' } },
+};
+const APPROVED = { ok: true, owner: { deletedAt: null, status: 'approved' } };
 
-beforeEach(() => jest.clearAllMocks());
+beforeEach(() => {
+  jest.clearAllMocks();
+  mockOwner.mockResolvedValue(APPROVED);
+});
 
 describe('hashApiKey', () => {
   it('is a deterministic 64-char hex SHA-256', () => {
     const h = hashApiKey('qai_ci_test');
     expect(h).toMatch(/^[0-9a-f]{64}$/);
-    expect(hashApiKey('qai_ci_test')).toBe(h); // deterministic
+    expect(hashApiKey('qai_ci_test')).toBe(h);
   });
 
   it('differs for different inputs', () => {
@@ -67,35 +84,52 @@ describe('requireCiApiKey — rejection paths (no DB hit)', () => {
     await requireCiApiKey(mockReq(), res, next as NextFunction);
     expect(res.status).toHaveBeenCalledWith(401);
     expect(next).not.toHaveBeenCalled();
-    expect(mockFrom).not.toHaveBeenCalled();
+    expect(mockFind).not.toHaveBeenCalled();
   });
 
   it('401 when the scheme is not Bearer', async () => {
     const res = mockRes();
     await requireCiApiKey(mockReq('Basic xyz'), res, jest.fn());
     expect(res.status).toHaveBeenCalledWith(401);
-    expect(mockFrom).not.toHaveBeenCalled();
+    expect(mockFind).not.toHaveBeenCalled();
   });
 
   it('401 when the key lacks the qai_ci_ prefix', async () => {
     const res = mockRes();
     await requireCiApiKey(mockReq('Bearer wrong_prefix_1234567890'), res, jest.fn());
     expect(res.status).toHaveBeenCalledWith(401);
-    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ error: expect.stringMatching(/Invalid API key format/) }));
-    expect(mockFrom).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ error: expect.stringMatching(/Invalid API key format/) }),
+    );
+    expect(mockFind).not.toHaveBeenCalled();
   });
 
   it('401 when the key is too short (< 20 chars)', async () => {
     const res = mockRes();
     await requireCiApiKey(mockReq('Bearer qai_ci_x'), res, jest.fn());
     expect(res.status).toHaveBeenCalledWith(401);
-    expect(mockFrom).not.toHaveBeenCalled();
+    expect(mockFind).not.toHaveBeenCalled();
   });
 });
 
 describe('requireCiApiKey — lookup paths', () => {
-  it('500 when the project query errors (fails closed, no next)', async () => {
-    mockQuery({ data: null, error: { message: 'db down' } });
+  it('looks the key up by its SHA-256 hash, never by the raw key', async () => {
+    mockFind.mockResolvedValue(PROJECT);
+    await requireCiApiKey(mockReq(`Bearer ${VALID_KEY}`), mockRes(), jest.fn());
+    expect(mockFind).toHaveBeenCalledWith(hashApiKey(VALID_KEY));
+    expect(mockFind).not.toHaveBeenCalledWith(VALID_KEY);
+  });
+
+  it('does not depend on how many CI-keyed projects exist (single indexed lookup)', async () => {
+    mockFind.mockResolvedValue(PROJECT);
+    await requireCiApiKey(mockReq(`Bearer ${VALID_KEY}`), mockRes(), jest.fn());
+    // Regression for the old ".limit(100) then scan in Node" lookup, which
+    // 401'd valid keys once a customer had >100 CI-keyed projects.
+    expect(mockFind).toHaveBeenCalledTimes(1);
+  });
+
+  it('500 when the key lookup errors (fails closed, no next)', async () => {
+    mockFind.mockRejectedValue(new CiKeyLookupError('db down'));
     const res = mockRes();
     const next = jest.fn();
     await requireCiApiKey(mockReq(`Bearer ${VALID_KEY}`), res, next as NextFunction);
@@ -104,10 +138,7 @@ describe('requireCiApiKey — lookup paths', () => {
   });
 
   it('401 when no project hash matches', async () => {
-    mockQuery({
-      data: [{ id: 'p1', settings: { ciApiKey: { hash: hashApiKey('qai_ci_some_other_key_value') } } }],
-      error: null,
-    });
+    mockFind.mockResolvedValue(null);
     const res = mockRes();
     const next = jest.fn();
     await requireCiApiKey(mockReq(`Bearer ${VALID_KEY}`), res, next as NextFunction);
@@ -115,25 +146,8 @@ describe('requireCiApiKey — lookup paths', () => {
     expect(next).not.toHaveBeenCalled();
   });
 
-  it('401 when a project has no stored hash / non-string hash', async () => {
-    mockQuery({
-      data: [{ id: 'p1', settings: {} }, { id: 'p2', settings: { ciApiKey: { hash: 12345 } } }],
-      error: null,
-    });
-    const res = mockRes();
-    await requireCiApiKey(mockReq(`Bearer ${VALID_KEY}`), res, jest.fn());
-    expect(res.status).toHaveBeenCalledWith(401);
-  });
-
-  it('authenticates and attaches ciProject/ciUserId on an exact hash match', async () => {
-    const project = {
-      id: 'proj-1',
-      user_id: 'owner-9',
-      workspace_id: 'w1',
-      settings: { ciApiKey: { hash: hashApiKey(VALID_KEY) } },
-    };
-    mockQuery({ data: [{ id: 'other', settings: { ciApiKey: { hash: hashApiKey('qai_ci_nope_nope_nope') } } }, project], error: null });
-
+  it('authenticates and attaches ciProject/ciUserId on a hash match', async () => {
+    mockFind.mockResolvedValue(PROJECT);
     const req = mockReq(`Bearer ${VALID_KEY}`);
     const res = mockRes();
     const next = jest.fn();
@@ -141,18 +155,74 @@ describe('requireCiApiKey — lookup paths', () => {
 
     expect(next).toHaveBeenCalledTimes(1);
     expect(res.status).not.toHaveBeenCalled();
-    expect(req.ciProject).toEqual(project);
+    expect(req.ciProject).toEqual(PROJECT);
     expect(req.ciUserId).toBe('owner-9');
   });
 
-  it('401 (fails closed) when the query throws unexpectedly', async () => {
-    mockFrom.mockImplementation(() => {
-      throw new Error('unexpected');
-    });
+  it('401 (fails closed) when the lookup throws unexpectedly', async () => {
+    mockFind.mockRejectedValue(new Error('unexpected'));
     const res = mockRes();
     const next = jest.fn();
     await requireCiApiKey(mockReq(`Bearer ${VALID_KEY}`), res, next as NextFunction);
     expect(res.status).toHaveBeenCalledWith(401);
     expect(next).not.toHaveBeenCalled();
+  });
+});
+
+describe('requireCiApiKey — owning-account gates', () => {
+  beforeEach(() => mockFind.mockResolvedValue(PROJECT));
+
+  it('401 ACCOUNT_DELETED when the owning account is soft-deleted', async () => {
+    mockOwner.mockResolvedValue({
+      ok: true,
+      owner: { deletedAt: '2026-07-01T00:00:00Z', status: 'approved' },
+    });
+    const res = mockRes();
+    const next = jest.fn();
+    await requireCiApiKey(mockReq(`Bearer ${VALID_KEY}`), res, next as NextFunction);
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'ACCOUNT_DELETED' }),
+    );
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('401 OWNER_NOT_APPROVED when the owning account is not approved', async () => {
+    mockOwner.mockResolvedValue({
+      ok: true,
+      owner: { deletedAt: null, status: 'pending_approval' },
+    });
+    const res = mockRes();
+    const next = jest.fn();
+    await requireCiApiKey(mockReq(`Bearer ${VALID_KEY}`), res, next as NextFunction);
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'OWNER_NOT_APPROVED' }),
+    );
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('401 OWNER_NOT_FOUND when the owning account row is gone', async () => {
+    mockOwner.mockResolvedValue({ ok: true, owner: null });
+    const res = mockRes();
+    const next = jest.fn();
+    await requireCiApiKey(mockReq(`Bearer ${VALID_KEY}`), res, next as NextFunction);
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'OWNER_NOT_FOUND' }),
+    );
+  });
+
+  it('fails OPEN when the owner lookup itself is unavailable', async () => {
+    // A Supabase blip must not 401 every customer's pipeline — same trade-off
+    // requireAuth makes for its deleted_at check.
+    mockOwner.mockResolvedValue({ ok: false });
+    const req = mockReq(`Bearer ${VALID_KEY}`);
+    const res = mockRes();
+    const next = jest.fn();
+    await requireCiApiKey(req, res, next as NextFunction);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.status).not.toHaveBeenCalled();
+    expect(req.ciProject).toEqual(PROJECT);
   });
 });

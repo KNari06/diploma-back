@@ -437,3 +437,55 @@ describe('toRunnerCommand — assertions route so the expected value is verified
     if (r.ok) expect(r.command.type).toBe('assert_visible');
   });
 });
+
+describe('toRunnerCommand — switch_context carries preferText to the right WebView', () => {
+  it('forwards options.preferText on a WEB switch', () => {
+    const r = toRunnerCommand(
+      step({
+        type: 'switch_context',
+        description: 'enter the lessons WebView',
+        options: { context: 'WEB', preferText: 'Lessons for you' } as any,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.command.type).toBe('switch_context');
+      expect(r.command.params).toMatchObject({ context: 'WEB', preferText: 'Lessons for you' });
+    }
+  });
+
+  it('omits preferText when switching back to NATIVE, where it is meaningless', () => {
+    const r = toRunnerCommand(
+      step({
+        type: 'switch_context',
+        description: 'back to native',
+        options: { context: 'NATIVE', preferText: 'Lessons for you' } as any,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.command.params).toEqual({ context: 'NATIVE' });
+    }
+  });
+
+  // The runner validates this batch with `command.schema.ts`, whose preferText
+  // is z.string().min(1) — forwarding "" would 400 the WHOLE batch, not just
+  // this step. Blank must be dropped, not passed through.
+  it('drops a blank / whitespace-only preferText rather than sending it', () => {
+    const r = toRunnerCommand(
+      step({
+        type: 'switch_context',
+        description: 'enter webview',
+        options: { context: 'WEB', preferText: '   ' } as any,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.command.params).toEqual({ context: 'WEB' });
+  });
+
+  it('still maps a bare WEB switch with no options', () => {
+    const r = toRunnerCommand(step({ type: 'switch_context', description: 'switch to web' }));
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.command.params).toEqual({ context: 'WEB' });
+  });
+});

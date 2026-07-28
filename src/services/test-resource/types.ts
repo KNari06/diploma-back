@@ -23,7 +23,6 @@ export type ResourceKind =
   | 'network'
   | 'file'
   | 'oauth_token'
-  | 'scenario_setup'
   | 'variables';
 
 export type ResourceStatus = 'active' | 'stale' | 'broken';
@@ -174,9 +173,8 @@ export interface ApplyContext {
   context?: BrowserContext;
   /**
    * Run-scoped key/value store. Adapters write into it so downstream
-   * adapters can read (e.g. `scenario_setup` composes values from
-   * children, `variables` seeds initial state, `secret` exposes values
-   * for `{{secrets.X}}` interpolation in steps).
+   * adapters can read (e.g. `variables` seeds initial state, `secret`
+   * exposes values for `{{secrets.X}}` interpolation in steps).
    */
   runVariables: Map<string, unknown>;
 }

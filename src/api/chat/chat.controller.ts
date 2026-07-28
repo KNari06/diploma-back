@@ -25,6 +25,7 @@ import { routeToHandler } from './shared/routing';
 import { isApiFlowRequest } from './api_flow/handler';
 import type { ChatAttachment } from './chat.types';
 import { parseMobileContext } from './mobile_agent/shared';
+import { installScopeRefusalTelemetry } from './shared/scope-refusal-telemetry';
 import { incCounter } from '@/utils/core/mobile-chat-metrics';
 import { checkWorkspace, manageChatSession, validateInput } from './shared/validation';
 import { handlePendingExplorationConfirmation } from './shared/exploration-confirmation';
@@ -640,13 +641,28 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     const forceRouteIntent = mobileForceRoute ?? apiFlowForceRoute;
 
     // Backstop for the force-route: a chat scoped to a MOBILE test case whose
-    // request carries no mobileEditorMode flag at all. The current frontend
-    // always sends the flag from the mobile editor, so landing here means a
-    // stale/broken client build — the classifier will treat the message as
-    // web chat and no mobile tool can fire. We can't conjure a device
-    // session, but we must not degrade silently: log + count it, and tag the
-    // outgoing response with `metadata.mobileContextMissing` so the client /
-    // support can see WHY the reply came back generic.
+    // request carries no mobileEditorMode flag at all — a stale client build,
+    // or (the common case) an editor whose runner session died, since the
+    // frontend only sends the flags alongside a live `mobileSessionId`.
+    //
+    // This used to log + tag and then let the message fall through to the
+    // classifier, which sends it to WEB general_chat: a surface with no device,
+    // no open test case, and no authoring tools, but the SAME scope-guard block.
+    // An authoring request landing there gets a generic answer at best, and the
+    // user has no way to tell that a dead device session is the reason.
+    //
+    // NOTE: this is NOT the mechanism behind the filed scope-guard misfires —
+    // that theory was refuted live on 2026-07-28, when the telemetry showed a
+    // refusal with `mobileEditorMode: true, hasMobileSessionId: true`, i.e. the
+    // mobile agent's own guard firing. Keep the two fixes separate in your head:
+    // this one closes a real misroute, the prompt amendment closes the refusal.
+    //
+    // So force-route it instead. We still cannot conjure a device session, but
+    // `mobile_agent` answers with its own NO_SESSION_REPLY ("start a device in
+    // the editor"), which tells the user exactly what to do. Keep the counter,
+    // the log line, and the `mobileContextMissing` tag — support still wants to
+    // know the client sent no flags.
+    let mobileBackstopRoute: ReturnType<typeof decideForceRoute> = null;
     if (
       !forceRouteIntent &&
       chatStore.kind === 'testcase' &&
@@ -659,6 +675,10 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         testCaseId,
         platform: testCaseAccess.platform,
       });
+      mobileBackstopRoute = decideForceRoute(
+        { ...(parseMobileContext(context) ?? {}), mobileEditorMode: true },
+        env.MOBILE_EDITOR_FORCE_ROUTE,
+      );
       const originalJson = res.json.bind(res);
       res.json = (body: unknown) =>
         originalJson(
@@ -674,16 +694,20 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         );
     }
 
+    // The backstop resolves to the same shape as the primary force-route, so
+    // everything downstream (counters, logging, routing) treats them alike.
+    const effectiveMobileRoute = mobileForceRoute ?? mobileBackstopRoute;
+
     let parsedIntent: Awaited<ReturnType<typeof parseIntent>>;
-    if (mobileForceRoute) {
-      parsedIntent = mobileForceRoute as Awaited<ReturnType<typeof parseIntent>>;
+    if (effectiveMobileRoute) {
+      parsedIntent = effectiveMobileRoute as Awaited<ReturnType<typeof parseIntent>>;
       // Phase B7: count force-route hits so ops can verify the path is
       // actually firing on real Mobile-Editor traffic. `applied_no_session`
       // marks the degraded case (mobile editor sent no live session id, so
       // mobile_agent will answer with NO_SESSION_REPLY).
       incCounter(
         'mobile_chat.force_route',
-        mobileForceRoute.metadata.missingSession ? 'applied_no_session' : 'applied',
+        effectiveMobileRoute.metadata.missingSession ? 'applied_no_session' : 'applied',
       );
       logger.info('[CHAT] mobileEditorMode force-route → mobile_agent', {
         chatSessionId,
@@ -692,7 +716,10 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         // be absent (missingSession case) — mobile_agent handles that with
         // NO_SESSION_REPLY.
         mobileSessionId: parseMobileContext(context)?.mobileSessionId ?? null,
-        missingSession: mobileForceRoute.metadata.missingSession === true,
+        missingSession: effectiveMobileRoute.metadata.missingSession === true,
+        // Distinguishes the flag-driven route from the mobile-test-case
+        // backstop, so the two are separable in the logs.
+        viaBackstop: !mobileForceRoute,
         messagePreview: message.slice(0, 60),
       });
       // Same abort guard the classifier path runs immediately after
@@ -945,6 +972,30 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         return originalJson(body);
       };
     }
+
+    // Diagnostics: log the routing facts whenever a scope-guard refusal reaches
+    // the user. That pairing is what distinguishes "the mobile agent refused"
+    // from "the message never reached the mobile agent" — see
+    // scope-refusal-telemetry.ts, which also covers why this does not conflict
+    // with Hard invariant #13.
+    installScopeRefusalTelemetry(res, () => {
+      const mobileCtx = parseMobileContext(context);
+      return {
+        chatSessionId,
+        userId,
+        testCaseId,
+        intent: parsedIntent.intent,
+        routingSource:
+          (parsedIntent as { metadata?: { routingSource?: string } }).metadata
+            ?.routingSource ?? 'classifier',
+        viaMobileBackstop: !!mobileBackstopRoute,
+        storeKind: chatStore.kind,
+        mobileEditorMode: mobileCtx?.mobileEditorMode === true,
+        hasMobileSessionId: !!mobileCtx?.mobileSessionId,
+        testCasePlatform: testCaseAccess?.platform ?? null,
+        message: effectiveMessage,
+      };
+    });
 
     const routeToHandlerWithLogging = withFunctionLogging(routeToHandler, 'routeToHandler', functionLogger);
     // ACTIVE watchdog: race the handler against a real timer. The passive

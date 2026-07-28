@@ -130,7 +130,14 @@ export class AzureBlobStore implements BlobStore {
   async createSignedUploadUrl(storagePath: string): Promise<SignedUploadTarget> {
     // Create + write so the client can PUT a new block blob directly.
     const uploadUrl = await this.sign(storagePath, BlobSASPermissions.parse('cw'), UPLOAD_SAS_TTL_SECONDS);
-    return { uploadUrl, token: '', storagePath };
+    // MANDATORY on a block-blob PUT — without it Azure answers
+    // `400 MissingRequiredHeader` and the upload fails with no useful hint.
+    return {
+      uploadUrl,
+      token: '',
+      storagePath,
+      requiredHeaders: { 'x-ms-blob-type': 'BlockBlob' },
+    };
   }
 
   /** Fetch (or reuse) a user-delegation key that covers `coversUntil`. */

@@ -32,6 +32,7 @@ import {
 } from '@/services/storage/mobile-app-storage.service';
 import type { MobileAppsByPlatform, MobileAppVariantEntry } from '@/services/mobile/project-mobile-app.helper';
 import { MobileAppParserService, type ParsedAppInfo } from '@/services/mobile/mobile-app-parser.service';
+import { evaluateBuildContract, type BuildContractCode } from '@/services/mobile/flutter-build-contract';
 import type { FlutterHostPlatform, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { logger } from '@/utils/core/logger';
 
@@ -51,6 +52,7 @@ export type MobileAppError =
   | { kind: 'object_empty' }
   | { kind: 'package_name_required' }
   | { kind: 'build_record_failed'; code?: string; message?: string }
+  | { kind: 'build_contract_rejected'; code: BuildContractCode; error: string; remediation: string }
   | { kind: 'app_not_uploaded' }
   | { kind: 'no_app_to_delete'; platform?: MobilePlatform }
   | { kind: 'variant_limit'; max: number; platform: MobilePlatform }
@@ -104,6 +106,8 @@ export interface CreateUploadUrlOutput {
   uploadUrl: string;
   token: string;
   storagePath: string;
+  /** Headers the direct PUT must carry — provider-specific, see `SignedUploadTarget`. */
+  requiredHeaders: Record<string, string>;
 }
 
 /**
@@ -153,6 +157,7 @@ export async function createMobileAppUploadUrl(
     uploadUrl: signed.uploadUrl,
     token: signed.token,
     storagePath: signed.storagePath,
+    requiredHeaders: signed.requiredHeaders,
   };
 }
 
@@ -175,6 +180,21 @@ export interface FinalizeUploadInput {
   ciRunId?: string;
   /** Target variant lane; absent/blank → the default lane. */
   variantLabel?: string;
+  /**
+   * Which entry point produced this build. Recorded on the `mobile_app_builds`
+   * row so the audit trail distinguishes an editor upload from a pipeline
+   * publish. Defaults to `'manual'` (the editor).
+   */
+  source?: 'manual' | 'ci';
+  /**
+   * Enforce the build contract (§ `flutter-build-contract.ts`) and REJECT a
+   * build QAIT cannot automate, instead of accepting it with advisory UI.
+   *
+   * Set by the CI publish path only. Turning it on also forces the binary
+   * parse — validation needs the parse even when the client supplied full
+   * version identity, which is exactly the case the parse normally skips.
+   */
+  enforceBuildContract?: boolean;
 }
 
 export interface FinalizeUploadOutput {
@@ -220,6 +240,8 @@ export async function finalizeMobileAppUpload(
     ciRunId,
   } = input;
   const variantLabel = normaliseVariantLabel(input.variantLabel);
+  const source = input.source ?? 'manual';
+  const enforceBuildContract = input.enforceBuildContract ?? false;
 
   const project = await ProjectService.getProject(projectId, userId);
   if (!project) return { kind: 'project_not_found' };
@@ -252,11 +274,35 @@ export async function finalizeMobileAppUpload(
 
   // Version identity waterfall: client → parsed → timestamp fallback.
   // Parser runs only when at least one identity field is missing — this
-  // avoids a 5-15s Supabase download on fully-populated CI uploads.
+  // avoids a 5-15s download on fully-populated CI uploads. The build-contract
+  // gate needs the parse regardless, so it forces one.
   let parsed: ParsedAppInfo = {};
   const needsParse = !clientVersionName || clientVersionCode === undefined || !clientPackageName;
-  if (needsParse) {
+  if (needsParse || enforceBuildContract) {
     parsed = await MobileAppParserService.parseFromStorage(storagePath, platform);
+  }
+
+  // Gate BEFORE anything is written. Rejecting after `recordBuild` would leave
+  // an audit row and a settings pointer for a build we just refused.
+  if (enforceBuildContract) {
+    const verdict = evaluateBuildContract(parsed);
+    if (!verdict.ok) {
+      logger.warn('[MOBILE_APP_SERVICE] Build rejected by contract', {
+        projectId,
+        platform,
+        storagePath,
+        code: verdict.code,
+        framework: parsed.framework ?? null,
+        flutterBuildMode: parsed.flutterBuildMode ?? null,
+        driverExtension: parsed.driverExtension ?? null,
+      });
+      return {
+        kind: 'build_contract_rejected',
+        code: verdict.code,
+        error: verdict.error,
+        remediation: verdict.remediation,
+      };
+    }
   }
 
   const mergedVersionName = clientVersionName ?? parsed.versionName;
@@ -313,7 +359,7 @@ export async function finalizeMobileAppUpload(
   // at a binary with no audit-trail row.
   const recorded = await MobileAppStorageService.recordBuild(
     metadata,
-    { branch, commitSha, buildNumber, ciRunId, source: 'manual' },
+    { branch, commitSha, buildNumber, ciRunId, source },
     { projectId, workspaceId: project.workspace_id, uploadedBy: userId, variantLabel },
   );
   if ('error' in recorded) {
@@ -335,6 +381,7 @@ export async function finalizeMobileAppUpload(
     projectId,
     platform,
     variantLabel,
+    source,
     detectedFramework: parsed.framework ?? null,
     buildId: buildRow.id,
     storagePath: metadata.storagePath,

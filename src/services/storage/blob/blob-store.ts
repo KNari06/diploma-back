@@ -28,6 +28,16 @@ export interface SignedUploadTarget {
    */
   token: string;
   storagePath: string;
+  /**
+   * Headers the direct PUT to `uploadUrl` MUST carry for this provider.
+   *
+   * Azure rejects a block-blob PUT without `x-ms-blob-type` with
+   * `400 MissingRequiredHeader`; Supabase uses `x-upsert` to refuse an
+   * overwrite. The provider that minted the URL is the only thing that knows
+   * which applies, so it says so here — a caller (the web client, a customer's
+   * CI job) must never have to infer it from the URL's hostname.
+   */
+  requiredHeaders: Record<string, string>;
 }
 
 export interface BlobStore {

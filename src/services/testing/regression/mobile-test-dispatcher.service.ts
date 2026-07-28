@@ -214,10 +214,8 @@ export class MobileTestDispatcherService {
     // JSONB round-trip — see intent-step-dispatch.service.ts).
     //
     // Phase B (May 2026) — stitchPhases removed: setup_steps/teardown_steps
-    // were a never-used column duplicate. The compiler in
-    // resource-step-compiler.service.ts already prepends scenario_setup
-    // resource bindings as setup-phase steps before the mobile runner
-    // sees them. No work to do here beyond normalisation.
+    // were a never-used column duplicate, always empty in production. No
+    // work to do here beyond normalisation.
     //
     // Original code (preserved for Phase C rollback context):
     //   const { stitchPhases, normaliseIntentStep } = await import('./intent-step-dispatch.service');

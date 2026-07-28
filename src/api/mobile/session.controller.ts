@@ -1779,7 +1779,15 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
 
     // Use the dedicated lint endpoint — fast, non-destructive, returns bounding box.
     // This replaces the old runSteps(assert_visible) approach which was 3-5x slower.
-    const lintResult = await client.lintElement(sessionId, description, actionType, bindingHints, { userId: req.user.id });
+    // "Use screenshot to find element" — forces vision-only resolution. The
+    // editor sends it on the draft's options; without forwarding it here the
+    // toggle is inert on mobile Find (the runner would text-resolve anyway).
+    const useScreenshotOnly = stepDraft?.options?.useScreenshotOnly === true;
+
+    const lintResult = await client.lintElement(sessionId, description, actionType, bindingHints, {
+      userId: req.user.id,
+      useScreenshotOnly,
+    });
 
     // Log the result for debugging element resolution issues
     trace.writeMobileLintResult({
@@ -2668,7 +2676,13 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
         // Only for steps WITHOUT a compiled plan (first run / manual adds).
         if (!hasCompiled && description && LINT_TYPES.has(rawType)) {
           const lintActionType = ACTION_TYPE_MAP[rawType] || 'tap';
-          const lintResult = await client.lintElement(sessionId, description, lintActionType, undefined, { userId });
+          // Forward the step's screenshot-only flag — this lint IS the
+          // resolution for an uncompiled step on this run path, so dropping it
+          // here silently text-resolves a step the user marked vision-only.
+          const lintResult = await client.lintElement(sessionId, description, lintActionType, undefined, {
+            userId,
+            useScreenshotOnly: (step as any).options?.useScreenshotOnly === true,
+          });
 
           if (lintResult.status === 'resolved' && lintResult.boundingBox) {
             const bb = lintResult.boundingBox;

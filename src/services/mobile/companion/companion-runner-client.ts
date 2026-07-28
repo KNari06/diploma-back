@@ -352,7 +352,18 @@ export class CompanionRunnerClient implements IMobileRunnerClient {
     intent: string,
     actionType: string = 'tap',
     bindingHints?: Record<string, unknown>,
-    opts?: { userId?: string },
+    /**
+     * Mirrors MobileRunnerClient.lintElement — `useScreenshotOnly` forces
+     * vision-only resolution. Kept structurally identical because
+     * `IMobileRunnerClient` is a `Pick<MobileRunnerClient, …>` and
+     * session-runner-routing returns this class as that type.
+     *
+     * NOTE (companion): a companion bundles its own runner, so an older
+     * companion silently ignores this field and text-resolves instead — the
+     * failure mode being fixed, just invisible. `forcedVision` is echoed back
+     * on the result so callers can tell whether it was honoured.
+     */
+    opts?: { userId?: string; useScreenshotOnly?: boolean },
   ): Promise<{
     status: 'resolved' | 'not_found' | 'low_confidence' | 'error';
     boundingBox?: { x: number; y: number; width: number; height: number };
@@ -375,11 +386,15 @@ export class CompanionRunnerClient implements IMobileRunnerClient {
     }>;
     intentWords?: string[];
     framework?: 'android' | 'ios' | 'flutter';
+    forcedVision?: boolean;
   }> {
     return this.request('POST', `/api/commands/${sessionId}/lint`, {
-      body: bindingHints && Object.keys(bindingHints).length > 0
-        ? { intent, actionType, bindingHints }
-        : { intent, actionType },
+      body: {
+        intent,
+        actionType,
+        ...(bindingHints && Object.keys(bindingHints).length > 0 ? { bindingHints } : {}),
+        ...(opts?.useScreenshotOnly ? { useScreenshotOnly: true } : {}),
+      },
       timeoutMs: 18_000,
       userId: opts?.userId,
     });

@@ -18,6 +18,10 @@ import {
   DetectedFramework,
   FlutterBuildMode,
 } from '@/services/mobile/archive-platform-detect';
+import {
+  detectFlutterDriverExtension,
+  type DriverExtensionDetection,
+} from '@/services/mobile/flutter-driver-static-detect';
 import { logger } from '@/utils/core/logger';
 import crypto from 'crypto';
 import fs from 'fs/promises';
@@ -35,9 +39,14 @@ export interface ParsedAppInfo {
   /**
    * Framework discriminator read from the archive itself — independent of
    * the user-selected `platform` field on the upload form, which is just
-   * "android" vs "ios" based on file extension. Lets the finalize handler
-   * promote `platform='android'` uploads to `platform='flutter'` when the
-   * binary clearly contains a Flutter engine.
+   * "android" vs "ios" based on file extension.
+   *
+   * It is stored as `detectedFramework` metadata and drives UI advice and the
+   * CI build contract. It does NOT promote `platform`: finalize records the
+   * `platform` it was given. A Flutter Android build IS a plain `.apk` and is
+   * deliberately stored under `android` (`variantStoragePlatform` maps
+   * `flutter → android`), because there is no separate Flutter binary — the
+   * `'flutter'` platform value describes test cases and runs, not build storage.
    *
    * `undefined` means detection failed or the archive is unsupported —
    * NEVER let parser failures block the upload.
@@ -55,6 +64,17 @@ export interface ParsedAppInfo {
    * debug build on the Android side — orthogonal to `flutterBuildMode`.
    */
   debuggable?: boolean;
+  /**
+   * Whether the Flutter driver extension is compiled into this build — read
+   * statically from the Dart kernel blob (see `flutter-driver-static-detect.ts`).
+   *
+   * Computed ONLY when `framework === 'flutter' && flutterBuildMode === 'debug'`;
+   * `undefined` for every other archive, because the question is meaningless
+   * there (an AOT build has no kernel blob at all). `'unverifiable'` means the
+   * scan itself failed and is kept distinct from `'absent'` so a scanner
+   * problem never reads as a customer problem.
+   */
+  driverExtension?: DriverExtensionDetection;
 }
 
 function coerceVersionCode(raw: unknown): number | undefined {
@@ -179,6 +199,24 @@ export async function parseFromStorage(
       flutterBuildMode = undefined;
     }
 
+    // Driver-extension scan reuses the SAME temp file — no extra download.
+    // Only meaningful for a Flutter debug build: an AOT build ships no kernel
+    // blob, and a non-Flutter app needs no driver extension at all. Isolated
+    // like the detector above so a regression here cannot break the version /
+    // packageName result the finalize flow critically depends on.
+    let driverExtension: DriverExtensionDetection | undefined;
+    if (framework === 'flutter' && flutterBuildMode === 'debug') {
+      try {
+        driverExtension = await detectFlutterDriverExtension(tempPath);
+      } catch (err) {
+        logger.debug('[MOBILE_APP_PARSER] driver-extension scan threw — swallowing', {
+          storagePath,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        driverExtension = 'unverifiable';
+      }
+    }
+
     logger.info('[MOBILE_APP_PARSER] Parsed binary', {
       storagePath,
       platform,
@@ -188,8 +226,9 @@ export async function parseFromStorage(
       framework: framework ?? null,
       flutterBuildMode: flutterBuildMode ?? null,
       debuggable: fields.debuggable ?? null,
+      driverExtension: driverExtension ?? null,
     });
-    return { ...fields, framework, flutterBuildMode };
+    return { ...fields, framework, flutterBuildMode, driverExtension };
   } catch (err) {
     logger.warn('[MOBILE_APP_PARSER] Parse failed — returning empty result', {
       storagePath,

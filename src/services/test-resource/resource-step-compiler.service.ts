@@ -18,8 +18,6 @@
  *   - device        → 'geolocation' step when lat/lng set, else skipped
  *   - data_fixture  → 'store' per entry under `fixtures.<KEY>` scratchpad
  *                     name; values are plaintext (no encryption for slice 1).
- *   - scenario_setup → NOT expanded here; the bundle's children must be
- *                     bound explicitly (same as web today).
  *
  * Secrets travel as plaintext inside step.value. TLS on the wire + redaction
  * hooks in the runner's scratchpad logger are the defense layers. Storing
@@ -47,7 +45,6 @@ import type {
   ResourceStatus,
 } from './types';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
-import { expandScenarioSetupRecursively } from './runtime/scenario-setup-expander';
 import type { AuthMobileSnapshot } from './adapters/auth.adapter';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -383,26 +380,7 @@ export class ResourceStepCompilerService {
       let compiledSteps: CompiledResourceStep[] = [];
       let compileErr: string | undefined;
       try {
-        // scenario_setup needs async pre-expansion (nested `use_setup`
-        // references walk the DB). We mutate a SHALLOW COPY of the
-        // resource so the downstream sync `compileByKind` sees a flat
-        // `config.steps` array. The original DB row is untouched —
-        // mutating the loadDecrypted result would silently propagate
-        // resolved steps into the adapter's apply() call too.
-        let resourceForCompile = resource;
-        if (resource.kind === 'scenario_setup') {
-          const flatSteps = await expandScenarioSetupRecursively(
-            resource,
-            userId,
-            new Set<string>(),
-            0,
-          );
-          resourceForCompile = {
-            ...resource,
-            config: { ...resource.config, steps: flatSteps },
-          };
-        }
-        compiledSteps = compileByKind(resourceForCompile);
+        compiledSteps = compileByKind(resource);
       } catch (err) {
         compileErr = errMsg(err);
         logger.error('[RESOURCE_STEP_COMPILER] Compile failed', {
@@ -567,14 +545,6 @@ function compileByKind(
       // `${fixtures.EMAIL}` resolve at dispatch time. See
       // compileDataFixture for the unwrap (`config.data` envelope).
       return compileDataFixture(resource);
-    case 'scenario_setup':
-      // Reusable IntentStep prologue. `compileScenarioSetup` is called
-      // BEFORE this switch by `compileForMobile` so nested `use_setup`
-      // references are already expanded and persisted on the resource
-      // copy we receive here. By the time we land in this branch the
-      // resource.config.steps is a flat array of plain steps ready to
-      // render. See `expandScenarioSetupRecursively` for the unwrap.
-      return compileScenarioSetup(resource);
     default:
       // Future kinds: fail loud so we notice when schema adds something
       // we haven't mapped.
@@ -759,34 +729,6 @@ function compileDataFixture(resource: DecryptedResource): CompiledResourceStep[]
 }
 
 /**
- * Scenario setup: pre-recorded sequence of IntentSteps that puts the app
- * into a known state before the test body runs. The resource arrives here
- * with `use_setup` references ALREADY expanded by
- * `expandScenarioSetupRecursively` (async pre-pass) — this function
- * therefore only emits the steps verbatim, tagging them as setup-phase.
- *
- * We deliberately mirror `normaliseRecipeStep` so a single normalisation
- * contract governs every IntentStep injected into the runner.
- */
-function compileScenarioSetup(
-  resource: DecryptedResource,
-): CompiledResourceStep[] {
-  const config = (resource.config ?? {}) as Record<string, unknown>;
-  const rawSteps = config.steps;
-  if (!Array.isArray(rawSteps) || rawSteps.length === 0) {
-    logger.warn(
-      '[RESOURCE_STEP_COMPILER] scenario_setup has no steps after expansion — emitting nothing',
-      { resourceId: resource.id, name: resource.name },
-    );
-    return [];
-  }
-
-  return rawSteps.map((raw, index) =>
-    normaliseRecipeStep(raw, resource, index),
-  );
-}
-
-/**
  * OAuth token is a single sensitive field — emit one store step under a
  * predictable key so test authors can reference `${oauth_<resourceName>}`
  * or a user-chosen alias in config.tokenAlias.
@@ -961,7 +903,6 @@ function rank(kind: string): number {
   if (kind === 'device' || kind === 'network') return 1;
   if (kind === 'auth' || kind === 'oauth_token') return 2;
   if (kind === 'data_fixture' || kind === 'file') return 3;
-  if (kind === 'scenario_setup') return 4;
   return 5;
 }
 

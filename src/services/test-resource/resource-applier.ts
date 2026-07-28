@@ -114,14 +114,12 @@ export async function applyBindingsToContext(params: {
   }
 
   // Topological-ish sort: non-browser kinds first so auth can read env/secrets.
-  // `scenario_setup` goes last because it may orchestrate the others.
   const ordered = [...params.bindings].sort((a, b) => {
     const rank = (k: string): number => {
       if (k === 'secret' || k === 'environment' || k === 'variables') return 0;
       if (k === 'device' || k === 'network') return 1;
       if (k === 'auth' || k === 'oauth_token') return 2;
       if (k === 'data_fixture' || k === 'file') return 3;
-      if (k === 'scenario_setup') return 4;
       return 5;
     };
     return rank(a.kind) - rank(b.kind);
@@ -252,11 +250,10 @@ export async function teardownAppliedResources(params: {
     runVariables: params.runVariables,
   };
 
-  // Reverse of apply order — scenario_setup first, auth last. Same rank
+  // Reverse of apply order — fixture/file first, auth last. Same rank
   // function, just inverted.
   const entries = Array.from(params.resources.values()).sort((a, b) => {
     const rank = (k: ResourceKind): number => {
-      if (k === 'scenario_setup') return 0;
       if (k === 'data_fixture' || k === 'file') return 1;
       if (k === 'auth' || k === 'oauth_token') return 2;
       if (k === 'device' || k === 'network') return 3;

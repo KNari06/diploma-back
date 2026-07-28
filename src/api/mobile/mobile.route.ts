@@ -11,7 +11,6 @@
 
 import { requireAuth, requirePaidPlan } from '@/middleware/auth.middleware';
 import { PAID_FEATURE_LABELS } from '@/config/features/feature-labels';
-import { requireCiApiKey } from '@/middleware/api-key.middleware';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { logger } from '@/utils/core/logger';
 import { Router, type NextFunction, type Request, type Response } from 'express';
@@ -31,7 +30,6 @@ import {
   setProjectPermissionPolicy,
 } from './mobile.controller';
 import { generateCiKey, revokeCiKey, getCiKeyStatus } from './ci-key.controller';
-import { triggerCiRun, getCiRunStatus } from './ci.controller';
 import { warmupSession, destroySession, tapSession, swipeSession, goHomeSession, goBackSession, typeSession, keySession, lintSession, applySession, commandSession, runTestCaseOnSession, explorationReadiness, startMobileExploration } from './session.controller';
 
 // ── Routes ───────────────────────────────────────────────────────
@@ -455,32 +453,11 @@ router.delete(
 );
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CI/CD RUN ENDPOINTS (requires project API key, no JWT)
+// CI/CD RUN ENDPOINTS — moved to ci.route.ts
 // ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * POST /api/v1/mobile/ci/run
- * Trigger a mobile test run from CI/CD pipeline
- *
- * Auth: Authorization: Bearer qai_ci_<key>
- * Body: { savedTestCaseIds?, planId?, appUrl?, callbackUrl?, platform? }
- */
-router.post(
-  '/ci/run',
-  requireCiApiKey,
-  asyncHandler(triggerCiRun),
-);
-
-/**
- * GET /api/v1/mobile/ci/run/:runId/status
- * Poll for CI run results
- *
- * Auth: Authorization: Bearer qai_ci_<key>
- */
-router.get(
-  '/ci/run/:runId/status',
-  requireCiApiKey,
-  asyncHandler(getCiRunStatus),
-);
+// They live in `./ci.route.ts`, mounted at /api/v1/mobile/ci BEFORE this
+// router. This router sits behind `requireAuth, requireApproved`, which 401s a
+// `qai_ci_<hex>` key before `requireCiApiKey` can run. Do NOT add a `/ci/...`
+// route here — the CI mount's terminal 404 makes it unreachable.
 
 export default router;
