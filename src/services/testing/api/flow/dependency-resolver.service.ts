@@ -27,6 +27,11 @@ import {
   isReferenceIdField,
   isSnakeIdVar,
   isItemPath,
+  isVerifyStep,
+  isSendStep,
+  isSessionTeardown,
+  teardownSeverity,
+  parentPathKey,
 } from './wiring/wiring-policy';
 import { seedNodesFromSpec } from './wiring/spec-seed';
 import { coerceBodyToSchema, missingRequiredFields } from './wiring/body-validator';
@@ -44,6 +49,7 @@ import type {
   ParsedApiSpec,
   ParsedEndpoint,
   UnsupportedEndpoint,
+  UnverifiedLink,
   VariableInjection,
 } from './flow.types';
 
@@ -305,6 +311,121 @@ async function runEnricher(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * A verify/confirm step (OTP verify, email confirm) consumes a code delivered
+ * OUT OF BAND by its send/request sibling — never present in the send's response,
+ * so no producer→consumer pass can catch the ordering. Match a verify to the
+ * send/request under the SAME resource prefix (`…/otp/request` → `…/otp/verify`)
+ * and add the ordering edge. Runs BEFORE the auth passes so the send lands in the
+ * auth-bootstrap closure (a pre-session ancestor of the token producer, so it is
+ * never itself ordered-after / injected with the token it precedes).
+ */
+function autoWireSendBeforeVerify(nodes: DAGNode[]): DAGNode[] {
+  if (!nodes.some(n => isVerifyStep(n.path, n.id))) return nodes;
+
+  const nodeById = new Map(nodes.map(n => [n.id, n]));
+  const depsOf = (id: string): Iterable<string> => nodeById.get(id)?.dependsOn ?? [];
+
+  let wired = 0;
+  const result = nodes.map(node => {
+    if (!isVerifyStep(node.path, node.id)) return node;
+    const parent = parentPathKey(node.path);
+
+    const sendIds = nodes
+      .filter(cand =>
+        cand.id !== node.id &&
+        !isVerifyStep(cand.path, cand.id) &&
+        parentPathKey(cand.path) === parent &&
+        isSendStep(cand.path, cand.id),
+      )
+      .map(s => s.id)
+      .filter(sid => !node.dependsOn.includes(sid) && !wouldCreateCycle(node.id, sid, depsOf));
+
+    if (sendIds.length === 0) return node;
+    wired += sendIds.length;
+    return { ...node, dependsOn: [...node.dependsOn, ...sendIds] };
+  });
+
+  if (wired > 0) {
+    logger.info('[DEPENDENCY_RESOLVER] Auto-wired send→verify ordering', { edgesAdded: wired });
+  }
+  return result;
+}
+
+/**
+ * Session-teardown endpoints (logout, logout-all-devices) invalidate the session
+ * every other authenticated step relies on. Left unordered they run in the same
+ * group as — or before — the endpoints that need the session and 401 them. Order
+ * each teardown AFTER every other session consumer that SHARES its auth producer
+ * (so unrelated realms stay independent), and a broader teardown (all-devices)
+ * after a narrower one. Runs AFTER the auth passes so the session-consumer edges
+ * already exist to key the realm off.
+ */
+function autoWireSessionTeardownLast(nodes: DAGNode[]): DAGNode[] {
+  const teardownIds = new Set(nodes.filter(n => isSessionTeardown(n.path, n.id)).map(n => n.id));
+  if (teardownIds.size === 0) return nodes;
+
+  const nodeById = new Map(nodes.map(n => [n.id, n]));
+  const depsOf = (id: string): Iterable<string> => nodeById.get(id)?.dependsOn ?? [];
+  const authProducerIds = new Set(
+    nodes
+      .filter(n => n.isAuthEndpoint || n.variableExtractions.some(e => isAuthTokenVar(e.variableName)))
+      .map(n => n.id),
+  );
+
+  // Auth producers reachable from a node = its "session realm" signature. A
+  // teardown and a consumer belong to the same session iff these sets overlap.
+  const authAncestors = (start: DAGNode): Set<string> => {
+    const found = new Set<string>();
+    const seen = new Set<string>();
+    const stack = [...start.dependsOn];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (authProducerIds.has(id)) found.add(id);
+      const dep = nodeById.get(id);
+      if (dep) stack.push(...dep.dependsOn);
+    }
+    return found;
+  };
+  const ancestorsOf = new Map(nodes.map(n => [n.id, authAncestors(n)]));
+  const shareRealm = (a: string, b: string): boolean => {
+    const A = ancestorsOf.get(a);
+    const B = ancestorsOf.get(b);
+    if (!A || !B) return false;
+    for (const x of A) if (B.has(x)) return true;
+    return false;
+  };
+
+  let wired = 0;
+  const result = nodes.map(node => {
+    if (!teardownIds.has(node.id)) return node;
+    const add: string[] = [];
+    for (const other of nodes) {
+      if (other.id === node.id) continue;
+      const shouldPrecede = teardownIds.has(other.id)
+        ? teardownSeverity(other.path) < teardownSeverity(node.path) && shareRealm(node.id, other.id)
+        : shareRealm(node.id, other.id);
+      if (
+        shouldPrecede &&
+        !node.dependsOn.includes(other.id) &&
+        !wouldCreateCycle(node.id, other.id, depsOf)
+      ) {
+        add.push(other.id);
+      }
+    }
+    if (add.length === 0) return node;
+    wired += add.length;
+    return { ...node, dependsOn: [...node.dependsOn, ...add] };
+  });
+
+  if (wired > 0) {
+    logger.info('[DEPENDENCY_RESOLVER] Auto-wired session-teardown ordering', { edgesAdded: wired });
+  }
+  return result;
+}
+
+/**
  * Auto-wire auth dependencies: ensure every node that injects an auth variable
  * has a dependsOn edge to the node that extracts it.
  * Also ensures auth nodes (isAuthEndpoint) have no spurious dependencies.
@@ -433,6 +554,14 @@ function autoWireRequiredAuth(nodes: DAGNode[], spec: ParsedApiSpec): DAGNode[] 
     return count;
   };
   const isRefreshEndpoint = (n: DAGNode) => /refresh/i.test(n.path) || /refresh/i.test(n.id);
+  // `register`/`signup` CREATE an account — a poor primary auth producer for a
+  // smoke run: it 400s the moment the account already exists, and then every
+  // protected endpoint that depends on it is starved of a token. Prefer an
+  // endpoint that AUTHENTICATES an existing account (login / otp verify / token).
+  const isRegisterEndpoint = (n: DAGNode) => /register|sign[-_]?up/i.test(n.path) || /register|sign[-_]?up/i.test(n.id);
+  const isLoginEndpoint = (n: DAGNode) =>
+    /(login|sign[-_]?in|authenticate|token|otp\/?verify|verify[-_]?otp)/i.test(n.path) ||
+    /(login|sign[-_]?in|authenticate|token|verifyotp|otpverify)/i.test(n.id);
 
   // Partition producers into REALMS by the path prefix before the auth segment
   // (e.g. `/api/v1/admin/auth/login` → realm `/api/v1/admin`; `/api/v1/auth/register`
@@ -464,7 +593,15 @@ function autoWireRequiredAuth(nodes: DAGNode[], spec: ParsedApiSpec): DAGNode[] 
     // real login needs. Fall back to cookie only when no bearer producer exists.
     const bearer = base.filter(n => !isCookieProducer(n));
     const pool = bearer.length ? bearer : base;
-    const producer = pool.reduce((best, n) => (countAuthAncestors(n) > countAuthAncestors(best) ? n : best), pool[0]);
+    // Rank producers. Auth-chain DEPTH dominates: a producer that transitively
+    // depends on other auth steps is the terminal session establisher (e.g. a
+    // register that depends on verifyOtp) and must win — the ×1000 keeps that
+    // invariant untouched. Only AMONG same-depth producers do we tie-break:
+    // demote `register` (creates an account → 400 once it exists) and prefer an
+    // explicit login/verify, so an independent register+login realm picks login.
+    const rank = (n: DAGNode): number =>
+      countAuthAncestors(n) * 1000 + (isRegisterEndpoint(n) ? 0 : 100) + (isLoginEndpoint(n) ? 50 : 0);
+    const producer = pool.reduce((best, n) => (rank(n) > rank(best) ? n : best), pool[0]);
     const ext = authTokenExt(producer);
     return { prefix, producer, authVar: ext!.variableName, cookieMode: !!ext?.headerSource && /cookie/i.test(ext.headerSource) };
   };
@@ -1258,6 +1395,42 @@ function validateVariableChain(nodes: DAGNode[], executionOrder: string[]): DAGN
 }
 
 /**
+ * Structural links the builder cannot fully verify — surfaced so a flow that
+ * LOOKS connected doesn't silently 401/blocked at run time. Currently emits
+ * `no_producer`: an injection references a variable NOTHING in the flow extracts
+ * (auth_token with no login, api_key, base_url…). Runs AFTER validateVariableChain,
+ * so only injections that survived the repair are considered — i.e. the ones the
+ * user can actually satisfy at run time (dropped orphans resurface as `blocked`).
+ *
+ * Multi-producer auth realms (register/login/refresh all extracting `auth_token`)
+ * are intentional and NOT flagged as collisions — binding-by-reference keeps them
+ * apart — so this deliberately does not emit `name_collision`.
+ */
+function computeUnverifiedLinks(nodes: DAGNode[]): UnverifiedLink[] {
+  const producedVars = new Set<string>();
+  for (const n of nodes) for (const e of n.variableExtractions || []) producedVars.add(e.variableName);
+
+  const links: UnverifiedLink[] = [];
+  const seen = new Set<string>();
+  for (const n of nodes) {
+    for (const inj of n.variableInjections || []) {
+      if (producedVars.has(inj.variableName)) continue;
+      const key = `${inj.variableName}:${n.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      links.push({
+        kind: 'no_producer',
+        variableName: inj.variableName,
+        consumerNodeId: n.id,
+        injectAs: inj.injectAs,
+        targetKey: inj.targetKey,
+      });
+    }
+  }
+  return links;
+}
+
+/**
  * The variables the USER supplies at run time — the scorer's `providedVars`.
  *
  * Only two things qualify: vars we decided to ask for (`requiredVars`), and the
@@ -1428,6 +1601,10 @@ export class DependencyResolverService {
     // Safety-net: auto-wire dependencies that AI should have set but missed.
     // These functions only ADD edges — they never remove AI decisions.
     // If they fire, it means the prompt needs improvement for this API pattern.
+    // Order a verify/confirm step after the send/request that issued its code —
+    // an out-of-band dependency no producer→consumer pass sees. Before the auth
+    // passes so the send joins the token producer's bootstrap closure.
+    nodes = autoWireSendBeforeVerify(nodes);
     const preAuthCount = nodes.reduce((sum, n) => sum + n.dependsOn.length, 0);
     nodes = autoWireAuthDependencies(nodes);
     // Coverage net: wire EVERY spec-declared auth-required endpoint to the auth
@@ -1458,6 +1635,10 @@ export class DependencyResolverService {
         edgesAdded: postCrudCount - preCrudCount,
       });
     }
+
+    // Session teardown (logout / logout-all-devices) runs LAST — after the auth &
+    // CRUD passes so every session-consumer edge exists to order it behind.
+    nodes = autoWireSessionTeardownLast(nodes);
 
     // Validate dependencies exist
     const nodeIds = new Set(nodes.map(n => n.id));
@@ -1535,6 +1716,16 @@ export class DependencyResolverService {
     // user-provided) and injections whose producer runs after the consumer.
     nodes = validateVariableChain(nodes, executionOrder);
 
+    // Surface what survives the repair but still has no producer (auth_token with
+    // no login, api_key, base_url…) so the pre-run UI can warn "provide this".
+    const unverifiedLinks = computeUnverifiedLinks(nodes);
+    if (unverifiedLinks.length > 0) {
+      logger.info('[DEPENDENCY_RESOLVER] Unverified variable links', {
+        count: unverifiedLinks.length,
+        variables: [...new Set(unverifiedLinks.map(l => l.variableName))],
+      });
+    }
+
     // Parallel groups + priority assignment
     const parallelGroups = buildParallelGroups(nodes, executionOrder);
     const levelMap = new Map<string, number>();
@@ -1560,6 +1751,7 @@ export class DependencyResolverService {
         summary: `API flow with ${nodes.length} endpoints`,
         totalEndpoints: endpoints.length + spec.unsupportedEndpoints.length,
         unsupportedEndpoints: spec.unsupportedEndpoints as UnsupportedEndpoint[],
+        unverifiedLinks,
       },
       requiredVars: referenceRequiredVars,
       qualityScore,
@@ -1569,6 +1761,8 @@ export class DependencyResolverService {
 
 /** Internal helpers exposed for unit testing only. */
 export const __testables = {
+  autoWireSendBeforeVerify,
+  autoWireSessionTeardownLast,
   autoWireRequiredAuth,
   autoWireAuthDependencies,
   autoWireVariableDependencies,
@@ -1577,5 +1771,6 @@ export const __testables = {
   topologicalSort,
   buildParallelGroups,
   validateVariableChain,
+  computeUnverifiedLinks,
   runtimeProvidedVars,
 };

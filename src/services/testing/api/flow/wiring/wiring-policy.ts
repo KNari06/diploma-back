@@ -102,6 +102,42 @@ export const isItemPath = (p: string): boolean => {
   return !!parts[parts.length - 1]?.startsWith('{');
 };
 
+// ── Send→verify + session-teardown ordering ──────────────────────────────────
+// Two ordering relationships the spec never encodes as a variable dependency, so
+// no producer→consumer pass catches them:
+//   • a verify/confirm step runs AFTER the send that issued the code it confirms;
+//   • a logout/teardown runs AFTER every step that uses the session it destroys.
+
+const pathSegments = (p: string): string[] => p.split('/').filter(Boolean);
+
+/** Path with its last segment dropped — the resource prefix a send/verify pair shares. */
+export const parentPathKey = (p: string): string => pathSegments(p).slice(0, -1).join('/');
+
+const finalSegment = (p: string): string => pathSegments(p).pop() || '';
+
+/** A confirm/verify step — consumes a code delivered out of band, so it must run AFTER its send. */
+export const isVerifyStep = (path: string, id = ''): boolean =>
+  /^(verify|confirm|validate|activate|submit|complete)$/i.test(finalSegment(path)) ||
+  /(?:^|[_-])(verify|confirm|submit)/i.test(id);
+
+/** A send/request step that ISSUES the code a verify step later confirms. */
+export const isSendStep = (path: string, id = ''): boolean =>
+  /^(request|send|resend|start|init|initiate|generate|challenge)$/i.test(finalSegment(path)) ||
+  /(?:^|[_-])(request|send|resend)/i.test(id);
+
+/**
+ * Session-teardown endpoint — invalidates the session/token, so it must run LAST.
+ * Covers logout/signout AND credential-revocation naming (`/token/revoke`,
+ * `/sessions/terminate`, `/auth/end-session`, `/session/invalidate`).
+ */
+export const isSessionTeardown = (path: string, id = ''): boolean =>
+  /(^|\/)(logout|log-out|signout|sign-out|revoke|terminate|end-session|end_session|invalidate|deauthenticate)(-[a-z0-9_-]*)?(\/|$)/i.test(path) ||
+  /(?:^|[_-])(logout|signout|revoke|terminate|end[_-]?session|invalidate)/i.test(id);
+
+/** Higher = tears down MORE (all-devices / global) → runs after a narrower logout. */
+export const teardownSeverity = (path: string): number =>
+  /(all|global|everywhere|other|devices|sessions)/i.test(path) ? 2 : 1;
+
 /** A path param naming no entity of its own (`{id}`, `{_id}`) — only its path says what it identifies. */
 export const isGenericIdParam = (name: string): boolean => /^_?id$/.test(toSnakeCase(name));
 
