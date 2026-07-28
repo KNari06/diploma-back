@@ -303,13 +303,24 @@ export class MobileStepApplyService {
     // which beats a 200-500ms lintElement round-trip.
     const hasCompiled = !!(stepDraft.intentStep?.compiled || stepDraft.compiled);
 
+    // "Use screenshot to find element" — forces vision-only resolution.
+    // The editor's Apply AND its Run loop both come through here, and for an
+    // uncompiled step the lint below IS the resolution, so this is the hop that
+    // decides whether the toggle has any effect on a tap. Dropping it here is
+    // what made the toggle inert (a gear icon resolved by text to the language
+    // button beside it).
+    const useScreenshotOnly = stepDraft.options?.useScreenshotOnly === true;
+
     // ── Fast path: lint first, execute by coordinates ───────────────────
     // Only for steps WITHOUT a compiled plan (first apply / manual adds).
     if (!hasCompiled && description && LINT_TYPES.has(rawStepType)) {
       const lintActionType = LINT_ACTION_TYPE_MAP[rawStepType] || 'tap';
 
       try {
-        const lintResult = await client.lintElement(sessionId, description, lintActionType, undefined, { userId });
+        const lintResult = await client.lintElement(sessionId, description, lintActionType, undefined, {
+          userId,
+          useScreenshotOnly,
+        });
 
         if (lintResult.status === 'resolved' && lintResult.boundingBox) {
           const bb = lintResult.boundingBox;
@@ -353,10 +364,21 @@ export class MobileStepApplyService {
           };
           if (coordsConfidence !== undefined) coordParams.coordsConfidence = coordsConfidence;
 
+          // A forced-vision lint always reports `visionMode`, so the demotion
+          // above drops coordsConfidence below the trust threshold and the
+          // runner re-resolves before tapping. That re-resolve must stay
+          // vision-led: without this flag smartResolve would fall back to the
+          // text pipeline and re-select the very element the user turned the
+          // toggle on to avoid. `_useScreenshotOnly` is the runner's own
+          // command-level switch (mobile-runner.ts `forceVision`).
+          const visionFlag: Record<string, unknown> = useScreenshotOnly
+            ? { _useScreenshotOnly: true }
+            : {};
+
           const commands: Array<{ type: string; params: Record<string, unknown> }> = [];
 
           if (rawStepType === 'type' || rawStepType === 'fill') {
-            commands.push({ type: 'tap', params: { ...coordParams } });
+            commands.push({ type: 'tap', params: { ...coordParams }, ...visionFlag });
             if (stepDraft.value) {
               commands.push({
                 type: 'type_text',
@@ -376,13 +398,14 @@ export class MobileStepApplyService {
                   // ('instant'), or applies its heuristic ('auto'/undefined).
                   ...(stepDraft.options?.typeMode ? { typeMode: stepDraft.options.typeMode } : {}),
                 },
+                ...visionFlag,
               });
               if (stepDraft.options?.pressEnter) {
                 commands.push({ type: 'press_key', params: { keycode: 'KEYCODE_ENTER' } });
               }
             }
           } else {
-            commands.push({ type: RAW_CMD_MAP[rawStepType] || 'tap', params: { ...coordParams } });
+            commands.push({ type: RAW_CMD_MAP[rawStepType] || 'tap', params: { ...coordParams }, ...visionFlag });
           }
 
           await client.executeBatchCommands(sessionId, commands, { userId });

@@ -799,7 +799,15 @@ export class MobileRunnerClient {
      * Optional: runners older than 2026-04-23 ignore the field.
      */
     bindingHints?: Record<string, unknown>,
-    opts?: { userId?: string },
+    /**
+     * `useScreenshotOnly` forces vision-only resolution for this lint — the
+     * runner skips the text-match fast path, Phase A, and the text fallback,
+     * and answers purely from a screenshot (or not at all). Sourced from the
+     * step's `options.useScreenshotOnly`; the editor's Find, Apply and Run all
+     * funnel through this call, so it is the single seam that carries the
+     * toggle to mobile resolution. Runners older than 2026-07-28 ignore it.
+     */
+    opts?: { userId?: string; useScreenshotOnly?: boolean },
   ): Promise<{
     status: 'resolved' | 'not_found' | 'low_confidence' | 'error';
     boundingBox?: { x: number; y: number; width: number; height: number };
@@ -842,14 +850,29 @@ export class MobileRunnerClient {
      * reads it to badge which trigger fired. Absent otherwise.
      */
     triggerFired?: import('./mobile-runner.types').Trigger & { matchedText?: string };
+    /**
+     * Echoed by the runner when it actually honoured `useScreenshotOnly`.
+     * Absent from an older runner that ignored the flag — which is the point:
+     * it lets a caller distinguish "vision ran and found nothing" from "this
+     * runner never forced vision at all".
+     */
+    forcedVision?: boolean;
   }> {
     return this.request('POST', `/api/commands/${sessionId}/lint`, {
       // Only attach bindingHints when we actually have some — keeps the wire
       // payload quiet for steps that carry no hints, and matches how
       // existing fields (screenshot, compiledPlan) avoid empty emissions.
-      body: bindingHints && Object.keys(bindingHints).length > 0
-        ? { intent, actionType, bindingHints }
-        : { intent, actionType },
+      body: {
+        intent,
+        actionType,
+        // Only attach bindingHints when we actually have some — keeps the wire
+        // payload quiet for steps that carry no hints, and matches how
+        // existing fields (screenshot, compiledPlan) avoid empty emissions.
+        ...(bindingHints && Object.keys(bindingHints).length > 0 ? { bindingHints } : {}),
+        // Same rule: only sent when actually forcing vision, so an unforced
+        // lint's payload is byte-identical to what it was before.
+        ...(opts?.useScreenshotOnly ? { useScreenshotOnly: true } : {}),
+      },
       // Must exceed the runner's lint phase budget (RUN_LINT_PHASE_BUDGET_MS,
       // default 16s) so the runner's own budget-abort wins and returns a clean
       // phase-named error, instead of this client cutting the connection first.
