@@ -328,12 +328,16 @@ const SWITCH_TO_WEBVIEW_TOOL: ChatCompletionTool = {
     parameters: {
       type: 'object',
       properties: {
-        contextId: {
+        preferText: {
           type: 'string',
           description:
-            'Optional. The id from `list_webview_contexts`. Omit to let the ' +
-            'runner pick the most-likely-foreground WebView. Useful when ' +
-            'multiple WebViews are visible.',
+            'Optional. A distinctive string visible on the page you want (a ' +
+            'section heading works well). Attaches to the WebView whose DOM ' +
+            'contains it instead of letting the runner auto-pick the ' +
+            'most-likely-foreground one. Use it when `list_webview_contexts` ' +
+            'reports several debuggable WebViews, or after an "element not ' +
+            'found" that names a wrong auto-pick. The same value belongs in ' +
+            '`options.preferText` on the authored `switch_context` step.',
         },
       },
       additionalProperties: false,
@@ -1666,24 +1670,26 @@ function draftStepIdentity(s: MobileIntentStep): string {
   return [s.type, s.description ?? '', s.value ?? '', s.assertionText ?? ''].join('␟');
 }
 
+/** Counts behind the summary, so the chat CARD can show them too. */
+export interface DraftChangeCounts {
+  previousCount: number;
+  added: number;
+  removed: number;
+  kept: number;
+}
+
 /**
- * Human-readable summary of what a re-emitted draft changed versus the one it
- * replaces, appended to the tool result so a silent drop becomes visible in the
- * chat instead of only in the step values nobody re-reads.
+ * Multiset diff of two drafts on step identity. Undefined when there is no
+ * previous draft to compare against (a first draft changed nothing).
  *
- * This is a REPORT, not a gate: the model is free to restructure a draft, and
- * legitimate revisions add and remove steps. What it removes is the *silence* —
- * "1 removed" next to a reply that claims nothing was removed is a
- * contradiction the user can see without diffing seven inputs by hand.
- *
- * Multiset comparison on identity, not positional: moving a step is not a
- * change, and duplicate identical steps still count correctly.
+ * Comparison is on identity, not position: moving a step is not a change, and
+ * duplicate identical steps still count correctly.
  */
-export function summariseDraftChange(
+export function diffDraftSteps(
   previous: MobileIntentStep[] | undefined,
   next: MobileIntentStep[],
-): string {
-  if (!previous || previous.length === 0) return '';
+): DraftChangeCounts | undefined {
+  if (!previous || previous.length === 0) return undefined;
 
   const counts = new Map<string, number>();
   for (const s of previous) {
@@ -1699,15 +1705,38 @@ export function summariseDraftChange(
       counts.set(k, n - 1);
     }
   }
-  const added = next.length - kept;
-  const removed = previous.length - kept;
+  return {
+    previousCount: previous.length,
+    added: next.length - kept,
+    removed: previous.length - kept,
+    kept,
+  };
+}
+
+/**
+ * Human-readable summary of what a re-emitted draft changed versus the one it
+ * replaces, appended to the tool result so a silent drop becomes visible in the
+ * chat instead of only in the step values nobody re-reads.
+ *
+ * This is a REPORT, not a gate: the model is free to restructure a draft, and
+ * legitimate revisions add and remove steps. What it removes is the *silence* —
+ * "1 removed" next to a reply that claims nothing was removed is a
+ * contradiction the user can see without diffing seven inputs by hand.
+ */
+export function summariseDraftChange(
+  previous: MobileIntentStep[] | undefined,
+  next: MobileIntentStep[],
+): string {
+  const diff = diffDraftSteps(previous, next);
+  if (!diff) return '';
+  const { added, removed, kept, previousCount } = diff;
   if (added === 0 && removed === 0) return ' (identical to the previous draft)';
 
   const parts: string[] = [];
   if (added > 0) parts.push(`${added} added/changed`);
   if (removed > 0) parts.push(`${removed} removed/changed`);
   return (
-    ` Compared with your previous ${previous.length}-step draft: ${parts.join(', ')}` +
+    ` Compared with your previous ${previousCount}-step draft: ${parts.join(', ')}` +
     ` (${kept} unchanged).` +
     (removed > 0
       ? ` If you did not intend to drop ${removed === 1 ? 'a step' : 'steps'}, re-emit the draft` +
@@ -2011,6 +2040,9 @@ async function runMobileRunDraftSteps(
   const previousDraftSteps = bb.chatSessionId
     ? MobileDraftStepsCache.get(bb.chatSessionId)?.steps
     : undefined;
+  // Computed from the RAW steps (same basis as the model-facing summary) so the
+  // card's counts and the tool result's sentence can never disagree.
+  const draftChangeCounts = diffDraftSteps(previousDraftSteps, steps);
 
   if (bb.chatSessionId) {
     MobileDraftStepsCache.set(bb.chatSessionId, {
@@ -2063,6 +2095,13 @@ async function runMobileRunDraftSteps(
       ...(Object.keys(draftParametersSchema).length > 0
         ? { parametersSchema: draftParametersSchema }
         : {}),
+      // What this draft changed versus the one it replaces. The same counts
+      // already reach the MODEL through the tool result; putting them on the
+      // card is what makes them reach the USER. A revision that silently drops
+      // a step ("3 removed" next to a reply claiming nothing was removed) is
+      // otherwise invisible without diffing every input by hand — and the card
+      // is the only thing Save acts on.
+      ...(draftChangeCounts ? { changeCounts: draftChangeCounts } : {}),
     },
   };
 
@@ -2994,17 +3033,33 @@ function toRunnerCommandInner(step: MobileIntentStep): Record<string, unknown> {
     // Saved test cases recorded in WebView context store these step
     // types in steps_json; replay maps them back to runner commands.
     case 'switch_context': {
-      // The LLM authoring path uses our switch_to_webview / switch_to_native
-      // tools, which never emit a `switch_context` step. But pre-existing
-      // test cases (from explorer / manual recording) might. Honour both.
-      const opts = step.options as { context?: 'NATIVE' | 'WEB'; target?: string } | undefined;
+      // Emitted by the LLM authoring path (the WebView authoring block tells it
+      // to bracket web_* steps with switch_context), by the explorer, and by
+      // manual recording. Honour every shape.
+      const opts = step.options as
+        | { context?: 'NATIVE' | 'WEB'; target?: string; preferText?: unknown }
+        | undefined;
       const ctx: 'NATIVE' | 'WEB' =
         opts?.context === 'WEB' || opts?.context === 'NATIVE'
           ? opts.context
           : step.value === 'WEB' || step.description?.toLowerCase().includes('web')
           ? 'WEB'
           : 'NATIVE';
-      return { type: 'switch_context', params: { context: ctx } };
+      // `preferText` names WHICH WebView to attach to when several are
+      // debuggable. Trimming and dropping blanks is required, not cosmetic:
+      // the runner validates this batch with `command.schema.ts`, whose
+      // `preferText` is `z.string().min(1)` — an empty string 400s the WHOLE
+      // batch rather than being ignored. Never sent on a NATIVE switch, where
+      // it is meaningless (mirrors the runner's own converter).
+      const preferText =
+        typeof opts?.preferText === 'string' ? opts.preferText.trim() : '';
+      return {
+        type: 'switch_context',
+        params: {
+          context: ctx,
+          ...(ctx === 'WEB' && preferText ? { preferText } : {}),
+        },
+      };
     }
 
     case 'web_navigate':
@@ -3469,7 +3524,7 @@ async function runListWebviewContexts(
 }
 
 async function runSwitchToWebview(
-  _args: Record<string, unknown>,
+  args: Record<string, unknown>,
   bb: MobileBlackboard,
   opts?: { abortSignal?: AbortSignal },
 ): Promise<ToolResult> {
@@ -3480,6 +3535,11 @@ async function runSwitchToWebview(
       content: 'Already in WebView context. Use observe_mobile_page to read the DOM.',
     };
   }
+
+  // Which WebView to attach to when several are debuggable. Blank is dropped
+  // rather than forwarded — the runner's `command.schema.ts` declares
+  // `preferText: z.string().min(1)`, so an empty string rejects the batch.
+  const preferText = typeof args.preferText === 'string' ? args.preferText.trim() : '';
 
   const client = await getMobileRunnerClientForSession(bb.mobileSessionId);
   try {
@@ -3493,14 +3553,19 @@ async function runSwitchToWebview(
     // success gate runWebEvaluate already uses.)
     const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
-      [{ type: 'switch_context', params: { context: 'WEB' } }],
+      [
+        {
+          type: 'switch_context',
+          params: { context: 'WEB', ...(preferText ? { preferText } : {}) },
+        },
+      ],
       { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
     );
     const switchResult = results?.[0] as { success?: boolean; error?: string } | undefined;
     if (!switchResult?.success) {
       bb.recordToolCall({
         tool: 'switch_to_webview',
-        args: {},
+        args: preferText ? { preferText } : {},
         ok: false,
         error: switchResult?.error || 'switch_context returned no success',
         durationMs: Date.now() - startedAt,
@@ -3533,7 +3598,7 @@ async function runSwitchToWebview(
 
     bb.recordToolCall({
       tool: 'switch_to_webview',
-      args: {},
+      args: preferText ? { preferText } : {},
       ok: true,
       durationMs: Date.now() - startedAt,
       at: startedAt,
@@ -3548,7 +3613,7 @@ async function runSwitchToWebview(
   } catch (err) {
     bb.recordToolCall({
       tool: 'switch_to_webview',
-      args: {},
+      args: preferText ? { preferText } : {},
       ok: false,
       error: err instanceof Error ? err.message : String(err),
       durationMs: Date.now() - startedAt,
