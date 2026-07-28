@@ -12,7 +12,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import type { FlutterHostPlatform, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { detectBuildInfoFromBuffer } from '@/services/mobile/archive-platform-detect';
 import { DEFAULT_VARIANT_LABEL, getDefaultVariantLabel, getFlutterDefaultHost, variantStoragePlatform } from '@/services/mobile/project-mobile-app.helper';
-import { getBlobStore, getBlobStoreForWrite } from './blob';
+import { getBlobStore, getBlobStoreForWrite, type SignedUploadTarget } from './blob';
 import { logger } from '@/utils/core/logger';
 import path from 'path';
 
@@ -322,7 +322,7 @@ export class MobileAppStorageService {
     platform: MobilePlatform;
     originalName: string;
     variantLabel?: string;
-  }): Promise<{ uploadUrl: string; token: string; storagePath: string }> {
+  }): Promise<SignedUploadTarget> {
     const { storagePath } = this.buildStoragePath(params);
 
     // Write path — Azure-only by policy. See getBlobStoreForWrite.

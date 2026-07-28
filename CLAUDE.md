@@ -61,6 +61,7 @@ Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 | [src/services/ai/](src/services/ai/) | LLM clients (OpenAI/Gemini), intent parser, cost tracking, embeddings, memory. | ⏳ TODO |
 | [src/ai/prompts/](src/ai/prompts/) | All prompt builders. Intent, chat, test plan, API flow, intelligent testing. | ⏳ TODO |
 | [src/api/](src/api/) | 50+ REST controllers, grouped by domain. | ⏳ TODO |
+| [src/api/mobile/](src/api/mobile/) | Mobile REST surface — editor + sessions (JWT) and CI/CD (project API key, separate mount). | ✅ |
 | [src/websocket/](src/websocket/) | Socket.IO server + handlers. Most events live in `handlers/preview.handler.ts`. | ⏳ TODO |
 | [src/services/testing/](src/services/testing/) | Non-preview testing (regression, plans, results, executions, fixtures, exploration). | — |
 | [src/services/integrations/](src/services/integrations/) | Jira, Stripe, Telegram, Allure, Git webhooks. | ✅ |
@@ -96,7 +97,8 @@ Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 | …resolve a descriptor ("payment tests","smoke") → test IDs | `src/services/testing/resolver/test-query-resolver.service.ts`; consumed via `chat/shared/intent-target-resolution.ts` |
 | …add/change a yes-no / cancel / approval keyword (ru/en/kk) | `src/config/testing/intent-keywords.ts` (single source — NEVER inline). See Invariant #17 |
 | …add/modify a BullMQ job | `src/jobs/<name>.job.ts`, register in `src/worker/index.ts` — see [jobs/CLAUDE.md](src/jobs/CLAUDE.md) |
-| …add a REST route | `src/api/<domain>/` (route + controller + service), wire in `src/index.ts` |
+| …add a REST route | `src/api/<domain>/` (route + controller + service), wire in `src/index.ts`. **Mount order matters** — a router with its own auth mounts BEFORE any broader `requireAuth` prefix (`/mobile/ci` before `/mobile`, `/chat/public` before `/chat`) |
+| …add or change a CI/CD endpoint (project API key, no JWT) | [api/mobile/CLAUDE.md](src/api/mobile/CLAUDE.md) — `ci.route.ts`, NOT `mobile.route.ts` |
 | …add a WS event | `src/websocket/handlers/<handler>.ts`. Preview events go in `preview.handler.ts` |
 | …invalidate the test-suites editor's caches on a CRUD mutation | Emit `project:{testcase,flow,module}:mutated` to the `project:<id>` room via [project-mutation-emit.ts](src/websocket/helpers/project-mutation-emit.ts). Client joins via `subscribe:project` (fail-closed: owner OR active workspace member) |
 | …run something on a schedule | `src/scheduler/` — see [jobs/CLAUDE.md](src/jobs/CLAUDE.md) § Scheduled cron |

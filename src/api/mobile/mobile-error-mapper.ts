@@ -215,6 +215,19 @@ export function sendMobileAppError(res: Response, err: MobileAppError): void {
       return;
     }
 
+    case 'build_contract_rejected':
+      // CI-only — the editor upload never sets `enforceBuildContract`.
+      // `remediation` carries the snippet + build command so the body reads as
+      // an instruction in the pipeline's log, not just an error.
+      res.status(400).json({
+        success: false,
+        error: err.error,
+        code: err.code,
+        message: err.error,
+        remediation: err.remediation,
+      });
+      return;
+
     case 'app_not_uploaded':
       res.status(404).json({
         success: false,

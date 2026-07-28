@@ -79,6 +79,9 @@ export async function createMobileAppUploadUrl(req: Request, res: Response): Pro
     uploadUrl: result.uploadUrl,
     token: result.token,
     storagePath: result.storagePath,
+    // Provider-specific PUT headers. The web client currently derives these by
+    // sniffing the URL hostname; it can switch to this and stop guessing.
+    requiredHeaders: result.requiredHeaders,
   });
 }
 

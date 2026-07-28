@@ -86,6 +86,13 @@ export class SupabaseBlobStore implements BlobStore {
     if (error || !data?.signedUrl || !data?.token) {
       throw new Error(`Failed to create signed upload URL: ${error?.message || 'Unknown error'}`);
     }
-    return { uploadUrl: data.signedUrl, token: data.token, storagePath };
+    // `x-upsert: false` refuses an overwrite. The backend always mints a unique
+    // timestamped path, so this is belt-and-braces against a replayed URL.
+    return {
+      uploadUrl: data.signedUrl,
+      token: data.token,
+      storagePath,
+      requiredHeaders: { 'x-upsert': 'false' },
+    };
   }
 }

@@ -13,6 +13,7 @@ Current per-folder docs:
 - `src/api/chat/CLAUDE.md` — intent router, interceptors, 23 intents, chat invariants (long form)
 - `src/services/core/CLAUDE.md` — plans, credits, referrals, self-serve, transactional email
 - `src/services/integrations/CLAUDE.md` — Jira, Stripe, Telegram, Allure, Git webhooks
+- `src/api/mobile/CLAUDE.md` — mobile REST surface: the two routers (JWT vs CI key), CI build publish
 - `src/services/test-resource/CLAUDE.md` — resource adapters
 
 Folders that should get a CLAUDE.md when next touched (>8 files, frequent edits):

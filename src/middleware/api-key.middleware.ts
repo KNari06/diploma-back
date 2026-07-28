@@ -12,7 +12,11 @@
  *   - req.ciUserId   (project.user_id — the system actor for CI operations)
  */
 
-import { supabaseAdmin } from '@/db/supabase';
+import {
+  CiKeyLookupError,
+  findProjectByCiKeyHash,
+  getCiOwnerAuthState,
+} from '@/services/mobile/db/ci-auth.db';
 import { logger } from '@/utils/core/logger';
 import crypto from 'crypto';
 import { NextFunction, Request, Response } from 'express';
@@ -45,17 +49,6 @@ export function hashApiKey(key: string): string {
   return crypto.createHash('sha256').update(key, 'utf8').digest('hex');
 }
 
-/**
- * Timing-safe comparison of two hex strings.
- * Pattern from: src/services/integrations/git-webhook.service.ts
- */
-function timingSafeCompare(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  const bufA = Buffer.from(a, 'hex');
-  const bufB = Buffer.from(b, 'hex');
-  return crypto.timingSafeEqual(bufA, bufB);
-}
-
 // ── Middleware ─────────────────────────────────────────────────────
 
 /**
@@ -63,9 +56,10 @@ function timingSafeCompare(a: string, b: string): boolean {
  *
  * Authorization: Bearer qai_ci_<hex>
  *
- * Looks up projects where settings->'ciApiKey'->>'hash' matches.
- * For MVP this scans all projects with a CI key set — acceptable at
- * low scale. At scale, move to a dedicated `project_api_keys` table.
+ * Resolves the project by an indexed lookup on settings->'ciApiKey'->>'hash'
+ * (see `ci-auth.db.ts`), then applies the two gates a JWT caller gets from
+ * `requireAuth` + `requireApproved` but a CI caller never did: the owning
+ * account must not be soft-deleted and must be `approved`.
  */
 export const requireCiApiKey = async (
   req: Request,
@@ -99,33 +93,30 @@ export const requireCiApiKey = async (
     const incomingHash = hashApiKey(apiKey);
 
     // ── Lookup project by hash ──────────────────────────────────
-    // Query projects that have a ciApiKey set (JSONB filter)
-    const { data: projects, error } = await supabaseAdmin
-      .from('projects')
-      .select('*')
-      .not('settings->ciApiKey', 'is', null)
-      .limit(100);
-
-    if (error) {
-      logger.error('[CI_API_KEY] Failed to query projects', { error });
-      res.status(500).json({
-        success: false,
-        error: 'Internal error during authentication',
-      });
-      return;
+    let matchedProject;
+    try {
+      matchedProject = await findProjectByCiKeyHash(incomingHash);
+    } catch (lookupError) {
+      if (lookupError instanceof CiKeyLookupError) {
+        logger.error('[CI_API_KEY] Failed to query projects', {
+          error: lookupError.message,
+        });
+        res.status(500).json({
+          success: false,
+          error: 'Internal error during authentication',
+        });
+        return;
+      }
+      throw lookupError;
     }
 
-    // Find the project whose stored hash matches
-    const matchedProject = projects?.find((p: any) => {
-      const storedHash = p.settings?.ciApiKey?.hash;
-      if (!storedHash || typeof storedHash !== 'string') return false;
-      return timingSafeCompare(incomingHash, storedHash);
-    });
-
     if (!matchedProject) {
-      logger.debug('[CI_API_KEY] No project matched for API key', {
+      // WARN, not debug: at the default log level a key being probed or a
+      // customer's pipeline silently 401ing left no visible trace at all.
+      logger.warn('[CI_API_KEY] No project matched for API key', {
         path: req.path,
         method: req.method,
+        ip: req.ip,
       });
       res.status(401).json({
         success: false,
@@ -135,8 +126,63 @@ export const requireCiApiKey = async (
       return;
     }
 
+    // ── Owner account gates ─────────────────────────────────────
+    // A CI key outlives its owner's account state: the key keeps working
+    // after the owner soft-deletes or is un-approved unless we check here.
+    // On a lookup failure we fail OPEN (same trade-off as `requireAuth`'s
+    // deleted_at check) — one Supabase blip must not 401 every pipeline.
+    const ownerLookup = await getCiOwnerAuthState(matchedProject.user_id);
+    if (ownerLookup.ok) {
+      const owner = ownerLookup.owner;
+      if (!owner) {
+        logger.warn('[CI_API_KEY] Owning account not found', {
+          projectId: matchedProject.id,
+          userId: matchedProject.user_id,
+        });
+        res.status(401).json({
+          success: false,
+          error: 'Unauthorized: Invalid API key',
+          code: 'OWNER_NOT_FOUND',
+          message: 'The project owning this API key has no active owner',
+        });
+        return;
+      }
+      if (owner.deletedAt) {
+        logger.warn('[CI_API_KEY] Owning account is deleted', {
+          projectId: matchedProject.id,
+          userId: matchedProject.user_id,
+        });
+        res.status(401).json({
+          success: false,
+          error: 'Account deleted',
+          code: 'ACCOUNT_DELETED',
+          message: 'The account owning this API key has been scheduled for deletion.',
+        });
+        return;
+      }
+      if (owner.status !== 'approved') {
+        logger.warn('[CI_API_KEY] Owning account is not approved', {
+          projectId: matchedProject.id,
+          userId: matchedProject.user_id,
+          status: owner.status,
+        });
+        res.status(401).json({
+          success: false,
+          error: 'Account pending approval',
+          code: 'OWNER_NOT_APPROVED',
+          message: 'The account owning this API key is not approved.',
+        });
+        return;
+      }
+    } else {
+      logger.warn('[CI_API_KEY] Owner state unavailable — failing open', {
+        projectId: matchedProject.id,
+        userId: matchedProject.user_id,
+      });
+    }
+
     // ── Attach to request ───────────────────────────────────────
-    req.ciProject = matchedProject as any;
+    req.ciProject = matchedProject;
     req.ciUserId = matchedProject.user_id;
 
     logger.debug('[CI_API_KEY] Authentication successful', {
