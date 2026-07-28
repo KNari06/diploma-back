@@ -50,6 +50,7 @@ import platformsRoutes from '@/api/platforms/platforms.route';
 import playwrightRoutes from '@/api/playwright/playwright.route';
 import previewRoutes from '@/api/preview/preview.route';
 import mobileRoutes, { logWarmupOutcome } from '@/api/mobile/mobile.route';
+import ciRoutes from '@/api/mobile/ci.route';
 import companionRoutes from '@/api/mobile/companion.route';
 import projectRoutes from '@/api/project/project.routes';
 import regressionPlansRoutes from '@/api/regression-plans/plans.route';
@@ -1386,6 +1387,16 @@ app.use(`/api/${env.API_VERSION}/client-logs`, clientLogsRoutes);
 app.use(`/api/${env.API_VERSION}/analytics`, requireAuth, requireApproved, analyticsRoutes);
 app.use(`/api/${env.API_VERSION}/dashboard`, requireAuth, requireApproved, dashboardRoutes);
 app.use(`/api/${env.API_VERSION}/projects`, requireAuth, requireApproved, projectRoutes);
+// CI/CD endpoints authenticate with a project API key (`qai_ci_<hex>`), NOT a
+// Supabase JWT. They MUST be mounted BEFORE the JWT-gated /mobile mount below:
+// Express matches mounts in order, so inside mobileRoutes `requireAuth` 401s a
+// CI key before `requireCiApiKey` ever runs — which is exactly why /ci/run had
+// never worked. Express matches a mount only at a segment boundary, so this
+// claims /mobile/ci/* and leaves /mobile/projects/:id/ci-key to the authed
+// router. ciRoutes ends in a terminal 404 so an unmatched /mobile/ci/* does not
+// fall through here and answer a baffling "401 No token provided". Same
+// ordering hazard as /chat/public below.
+app.use(`/api/${env.API_VERSION}/mobile/ci`, ciRoutes);
 // logWarmupOutcome runs BEFORE requireAuth/requireApproved so the editor's
 // "start session" outcome is recorded even when a gate rejects it (expired-token
 // 401, not-approved 403, paid-plan 403) — those middlewares only log at debug.

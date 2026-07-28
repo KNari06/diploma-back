@@ -225,10 +225,22 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
           size: buffer.length,
         } as Express.Multer.File;
 
+        // Resolve the lane ONCE and use it for the storage path, the build
+        // row and the prune. This branch used to hardcode the literal
+        // 'default' lane while the RESOLVE branch below honours
+        // `getProjectDefaultVariant` — so a project that promoted a named
+        // variant (say `Production`) wrote every CI upload into `default` and
+        // then resolved from `Production`, never seeing its own CI builds.
+        const uploadVariantLabel = await MobileAppStorageService.getProjectDefaultVariant(
+          projectId,
+          platform,
+        );
+
         const metadata = await MobileAppStorageService.uploadApp(multerLikeFile, {
           workspaceId,
           projectId,
           platform,
+          variantLabel: uploadVariantLabel,
         });
         // Attach version identity onto the metadata so recordBuild +
         // the legacy slot both carry it. uploadApp doesn't know about
@@ -242,7 +254,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
         const recorded = await MobileAppStorageService.recordBuild(
           metadata,
           { branch, commitSha, buildNumber, ciRunId, source: 'ci' },
-          { projectId, workspaceId, uploadedBy: userId },
+          { projectId, workspaceId, uploadedBy: userId, variantLabel: uploadVariantLabel },
         );
         if ('error' in recorded) {
           await redisConnection.del(lockKey);
@@ -283,12 +295,14 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
 
         // Fire-and-forget prune — must not block CI response, must not
         // throw. Trims storage to BUILD_HISTORY_LIMIT newest per
-        // (project, platform); `ON DELETE SET NULL` keeps execution
-        // history rows intact.
-        MobileAppStorageService.pruneOldBuilds(projectId, platform).catch((err) => {
+        // (project, platform, variant); `ON DELETE SET NULL` keeps execution
+        // history rows intact. MUST use the same lane the build landed in, or
+        // it prunes a lane this upload never wrote to.
+        MobileAppStorageService.pruneOldBuilds(projectId, platform, uploadVariantLabel).catch((err) => {
           logger.warn('[CI] pruneOldBuilds failed (non-fatal)', {
             projectId,
             platform,
+            variant: uploadVariantLabel,
             error: err instanceof Error ? err.message : String(err),
           });
         });
@@ -574,7 +588,7 @@ async function fetchTestCaseSteps(
 ): Promise<Array<{ id: string; name: string; hostPlatform?: string | null; intentSteps: MobileIntentStep[]; metadata?: MobileTestMetadata }>> {
   const { data: rows, error } = await supabaseAdmin
     .from('intent_test_cases')
-    .select('id, name, description, expected_result, priority, tags, goal, platform, host_platform, steps_json, commands, graph_ref, replay_strategy')
+    .select('id, name, description, expected_result, priority, tags, platform, host_platform, steps_json, commands, graph_ref, replay_strategy')
     .in('id', testCaseIds)
     .eq('project_id', projectId)
     .in('platform', ['mobile_android', 'mobile_ios', 'mobile_flutter']);
@@ -598,7 +612,6 @@ async function fetchTestCaseSteps(
 /** Build metadata object from DB row, omitting undefined/null fields */
 function buildTestMetadata(row: any): MobileTestMetadata | undefined {
   const m: MobileTestMetadata = {};
-  if (row.goal) m.goal = row.goal;
   if (row.description) m.description = row.description;
   if (row.expected_result) m.expectedResult = row.expected_result;
   if (row.priority) m.priority = row.priority;
@@ -614,7 +627,7 @@ async function fetchAllProjectTestCases(
 ): Promise<Array<{ id: string; name: string; hostPlatform?: string | null; intentSteps: MobileIntentStep[]; metadata?: MobileTestMetadata }>> {
   const { data: rows, error } = await supabaseAdmin
     .from('intent_test_cases')
-    .select('id, name, description, expected_result, priority, tags, goal, platform, host_platform, steps_json, commands, graph_ref, replay_strategy')
+    .select('id, name, description, expected_result, priority, tags, platform, host_platform, steps_json, commands, graph_ref, replay_strategy')
     .eq('project_id', projectId)
     .in('platform', ['mobile_android', 'mobile_ios', 'mobile_flutter'])
     .neq('status', 'archived')

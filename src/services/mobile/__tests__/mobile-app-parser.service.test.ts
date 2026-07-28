@@ -9,6 +9,9 @@ jest.mock('@/services/storage/mobile-app-storage.service', () => ({
 jest.mock('@/services/mobile/archive-platform-detect', () => ({
   detectBuildInfoFromArchive: jest.fn(),
 }));
+jest.mock('@/services/mobile/flutter-driver-static-detect', () => ({
+  detectFlutterDriverExtension: jest.fn(),
+}));
 jest.mock('fs/promises', () => ({
   writeFile: jest.fn(),
   unlink: jest.fn(),
@@ -25,17 +28,20 @@ jest.mock('app-info-parser', () => {
 import { parseFromStorage } from '../mobile-app-parser.service';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { detectBuildInfoFromArchive } from '@/services/mobile/archive-platform-detect';
+import { detectFlutterDriverExtension } from '@/services/mobile/flutter-driver-static-detect';
 import fs from 'fs/promises';
 
 const parseMock = (require('app-info-parser') as any).parseMock as jest.Mock;
 const downloadMock = MobileAppStorageService.downloadApp as jest.Mock;
 const detectMock = detectBuildInfoFromArchive as jest.Mock;
+const driverDetectMock = detectFlutterDriverExtension as jest.Mock;
 const writeMock = fs.writeFile as unknown as jest.Mock;
 const unlinkMock = fs.unlink as unknown as jest.Mock;
 
 beforeEach(() => {
   downloadMock.mockResolvedValue(Buffer.from('binary'));
   detectMock.mockResolvedValue(undefined);
+  driverDetectMock.mockResolvedValue('present');
   parseMock.mockResolvedValue({});
   writeMock.mockResolvedValue(undefined);
   unlinkMock.mockResolvedValue(undefined);
@@ -83,7 +89,70 @@ describe('parseFromStorage — Android (apk/aab)', () => {
       packageName: 'com.f',
       framework: 'flutter',
       flutterBuildMode: 'debug',
+      driverExtension: 'present',
     });
+  });
+});
+
+describe('parseFromStorage — driver-extension scan', () => {
+  it('scans the SAME temp file the parser already downloaded, not a fresh download', async () => {
+    detectMock.mockResolvedValue({ framework: 'flutter', flutterBuildMode: 'debug' });
+    await parseFromStorage('apps/app.apk', 'android');
+
+    expect(downloadMock).toHaveBeenCalledTimes(1);
+    // The temp path, not the storage path.
+    expect(driverDetectMock).toHaveBeenCalledWith(expect.stringContaining('mobile-app-parse-'));
+  });
+
+  it.each([['present'], ['absent'], ['unverifiable']] as const)(
+    'passes through a %s verdict',
+    async (verdict) => {
+      detectMock.mockResolvedValue({ framework: 'flutter', flutterBuildMode: 'debug' });
+      driverDetectMock.mockResolvedValue(verdict);
+      const result = await parseFromStorage('apps/app.apk', 'android');
+      expect(result.driverExtension).toBe(verdict);
+    },
+  );
+
+  it('does not scan an AOT Flutter build — it has no kernel blob at all', async () => {
+    detectMock.mockResolvedValue({ framework: 'flutter', flutterBuildMode: 'aot' });
+    const result = await parseFromStorage('apps/app.apk', 'android');
+
+    expect(driverDetectMock).not.toHaveBeenCalled();
+    expect(result.driverExtension).toBeUndefined();
+  });
+
+  it.each([['android'], ['react-native']] as const)(
+    'does not scan a %s build — it needs no driver extension',
+    async (framework) => {
+      detectMock.mockResolvedValue({ framework });
+      const result = await parseFromStorage('apps/app.apk', 'android');
+
+      expect(driverDetectMock).not.toHaveBeenCalled();
+      expect(result.driverExtension).toBeUndefined();
+    },
+  );
+
+  it('does not scan when framework detection failed', async () => {
+    detectMock.mockResolvedValue(undefined);
+    const result = await parseFromStorage('apps/app.apk', 'android');
+
+    expect(driverDetectMock).not.toHaveBeenCalled();
+    expect(result.driverExtension).toBeUndefined();
+  });
+
+  it('degrades to unverifiable — never breaks the version result — if the scan throws', async () => {
+    // The finalize flow critically depends on versionName/packageName; the
+    // driver verdict is secondary and must not be able to take them down.
+    detectMock.mockResolvedValue({ framework: 'flutter', flutterBuildMode: 'debug' });
+    driverDetectMock.mockRejectedValue(new Error('scanner exploded'));
+    parseMock.mockResolvedValue({ versionName: '1.0', package: 'com.f' });
+
+    const result = await parseFromStorage('apps/app.apk', 'android');
+
+    expect(result.driverExtension).toBe('unverifiable');
+    expect(result.versionName).toBe('1.0');
+    expect(result.packageName).toBe('com.f');
   });
 });
 

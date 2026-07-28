@@ -105,6 +105,15 @@ describe('AzureBlobStore', () => {
     expect(target.uploadUrl).toContain('?sig=abc');
   });
 
+  it('declares x-ms-blob-type as a required PUT header', async () => {
+    // Azure answers 400 MissingRequiredHeader without it. Callers (the web
+    // client, a customer's CI job) read this instead of inferring the provider
+    // from the URL hostname.
+    const store = new AzureBlobStore();
+    const target = await store.createSignedUploadUrl(CANONICAL);
+    expect(target.requiredHeaders).toEqual({ 'x-ms-blob-type': 'BlockBlob' });
+  });
+
   it('reuses one user-delegation key across multiple signings', async () => {
     const store = new AzureBlobStore();
     await store.createSignedDownloadUrl(CANONICAL, 600);
