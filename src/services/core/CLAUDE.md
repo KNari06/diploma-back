@@ -45,18 +45,50 @@ gate. The `subscription_plan` slug union lives once in
 
 [referral.service.ts](referral.service.ts) + [db/referral.db.ts](db/referral.db.ts).
 Feature-gated `REFERRALS_ENABLED` (default off). Migrations `20260713_referrals.sql`
-+ `20260714_referral_revenue_share.sql`.
++ `20260714_referral_revenue_share.sql` + `20260728_referral_user_bonus_index.sql`.
 
 **Attribution** is first-touch set-once (DB-enforced), applied in `auth.controller`
-verify/login/OAuth + `POST /referrals/attribute`.
+verify/login/OAuth + `POST /referrals/attribute`. A captured code waits in Redis keyed
+by email for `PENDING_TTL_SECONDS` (30 days — a verification mail sitting in spam used
+to cost the partner the referral). When a code reaches us but does NOT stick,
+`attributeAtAuth` logs a `warn`: every cause is actionable, and without it a systemic
+loss is invisible.
 
-**Reward is a revenue share** — `ReferralsFeature` `REFERRAL_REWARD_RATE` (0.70) × the
-real invoice amount, for the referred user's first `REFERRAL_REWARD_MONTHS` (2)
+**The referral is TWO-SIDED — both sides come out of ONE margin.** Change one side and
+the other must move with it.
+
+**Partner side — a revenue share.** `ReferralsFeature` `REFERRAL_REWARD_RATE` (0.50) ×
+the real invoice amount, for the referred user's first `REFERRAL_REWARD_MONTHS` (2)
 payments, then 0%. `rewardOnPayment` fires from
 [../../api/stripe/stripe.controller.ts](../../api/stripe/stripe.controller.ts) on EVERY
 paid invoice (window enforced by COUNTING prior reward rows, not billing reason),
 per-invoice-idempotent via `partner_reward_transactions.stripe_invoice_id`
-(append-only ledger, `amount` = cents).
+(append-only ledger, `amount` = cents). The rate is 0.50 rather than the original 0.70
+precisely because the user side below now costs us too.
+
+**User side — a per-plan credit bonus on the SAME price.** `REFERRAL_USER_BONUS_PLANS`
+(`<planCode>:<multiplier>:<payments>`, default `pro_19:2:inf,pro_49:1.5:2,pro_99:1.25:2`;
+`inf` = every invoice while subscribed). The multiplier SHRINKS as the plan grows: 2× on
+pro_99 would be 18 000 free credits on an invoice we already share 50% of. It is
+unbounded on pro_19 because a bounded bonus would visibly DROP at renewal
+(`resetToPlanCredits`), reading to the user as a takeaway. A plan absent from the map
+gets NO bonus, so a new plan is opt-in rather than silently expensive; B2B plans are
+credited per workspace and never reach this path.
+
+`ReferralService.resolveInvoiceCredits` runs BEFORE the grant in `stripe.controller.ts`
+(it changes the amount — unlike the fire-and-forget `rewardOnPayment`) and **degrades to
+base credits on ANY fault**, so a referral bug can never withhold paid-for credits.
+Idempotency + the per-plan window are counted from `credit_transactions` metadata markers
+(`referral_bonus_invoice` / `referral_bonus_plan`) — the welcome-bonus marker pattern, no
+new table. The purchase email sends the GRANTED credits, not the plan base. `/auth/me`
+returns `referral{isReferred, planBonuses}` so the paywall renders each plan's bonus
+without hardcoding multipliers that would drift from what the webhook grants.
+
+> **Invariant — the `.not(…,'is',null)` clause in `countUserBonusGrants` /
+> `hasBonusForInvoice` is load-bearing, not redundant.** The supporting partial indexes
+> use an `IS NOT NULL` predicate, and Postgres only uses a partial index when the query
+> proves the predicate holds. Dropping the clause silently degrades both reads to a
+> sequential scan over every credit transaction ever written — on the Stripe webhook path.
 
 **Partnership is DECOUPLED from `role`.** A partner login is a normal `role='user'`
 product user (gets a workspace + trial credits) who ALSO has a linked

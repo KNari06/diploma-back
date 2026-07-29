@@ -136,9 +136,13 @@ export interface DAGNode {
   hasFileUpload: boolean;
   isUnsupported: boolean;
   unsupportedReason?: string;
+  // User toggled this request off in the editor — skipped at run time (distinct
+  // from `isUnsupported`, which means the endpoint can't be run at all).
+  disabled?: boolean;
   canRunParallel: boolean; // can run in parallel with siblings at same priority level
   sampleRequestBody?: any; // AI-generated fake data for testing
   sampleQueryParams?: Record<string, string>;
+  sampleHeaders?: Record<string, string>; // user-set request headers (applied at run time, {{vars}} interpolated)
   expectedStatusCodes: number[];
   // Case Matrix (Group 5): when present, this endpoint is tested with N cases
   // (happy / boundary / negative …) run in parallel, each with its own body +
@@ -181,6 +185,20 @@ export interface UnverifiedLink {
   producerNodeId?: string;
   injectAs?: string;
   targetKey?: string;
+}
+
+/**
+ * A single value the platform could not obtain on its own and must pause the run
+ * to ask the user for — an out-of-band OTP after it was just sent, a secret that
+ * no endpoint produces, or an auth token whose login failed. `name` is the run
+ * context key the answer is injected under; `kind` drives UI copy and masking.
+ */
+export interface FlowInputQuestion {
+  name: string;
+  label: string;
+  reason: string;
+  kind: 'otp' | 'otp_target' | 'secret' | 'auth_token' | 'variable';
+  secret?: boolean;
 }
 
 export interface ExecutionDAG {
@@ -394,6 +412,10 @@ export interface ParseSpecRequest {
   // Opt-in probe phase: with consent, call SAFE endpoints (GET reads, login) during
   // build to observe real response shapes and correct extraction jsonPaths.
   probe?: boolean;
+  // Large-spec narrowing: when a spec exceeds the endpoint threshold the builder
+  // returns group choices instead of rejecting; the client re-parses the SAME
+  // source with the chosen group name here to restrict the flow to that group.
+  apiGroup?: string;
 }
 
 export interface RunFlowRequest {

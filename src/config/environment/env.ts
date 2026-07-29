@@ -311,13 +311,36 @@ const envSchema = z.object({
   // routes return 404. Migration 20260713_referrals.sql is independent of the
   // flag (safe to apply first; tables stay empty until the flag flips on).
   // Reward is a time-windowed revenue share: the partner earns
-  // REFERRAL_REWARD_RATE (0.70 = 70%) of the REAL amount a referred user pays,
+  // REFERRAL_REWARD_RATE (0.50 = 50%) of the REAL amount a referred user pays,
   // for their first REFERRAL_REWARD_MONTHS (2) monthly payments, then 0%.
   // Owed balance accrues in the paid invoice's currency (cents).
+  //
+  // The rate is 50% (not the original 70%) because the referred USER now also
+  // gets a benefit — the credit bonus below — so the margin covers both sides.
+  //
+  // REFERRAL_USER_BONUS_PLANS: the user-side benefit, per plan code. A referred
+  // user's paid invoice grants `multiplier` × the plan's credits — same price,
+  // more credits, which reads to the user as a price cut per credit. Format:
+  //   <planCode>:<multiplier>:<payments>,...
+  // `payments` is how many of that user's invoices get the multiplier;
+  // `inf` = every invoice while they stay subscribed.
+  //
+  // The multiplier DECREASES with plan size on purpose: 2x on pro_19 is ~990
+  // bonus credits, but 2x on pro_99 would be 18 000 — and we pay the partner
+  // 50% of that same invoice. The bonus is unbounded on pro_19 (cheap, and a
+  // bounded bonus would visibly DROP at renewal, reading as a takeaway) and
+  // capped at 2 invoices on the larger plans, matching the partner window.
+  //
+  // A plan absent from this map gets no bonus, so a new plan is opt-in rather
+  // than silently expensive. Empty string disables the user-side benefit.
+  // B2B plans never reach this path (credited per workspace, not per user).
   // ──────────────────────────────────────────────────────────────────
   REFERRALS_ENABLED: z.string().transform(v => v === 'true').default('false'),
-  REFERRAL_REWARD_RATE: z.string().transform(Number).default('0.7'),
+  REFERRAL_REWARD_RATE: z.string().transform(Number).default('0.5'),
   REFERRAL_REWARD_MONTHS: z.string().transform(Number).default('2'),
+  REFERRAL_USER_BONUS_PLANS: z
+    .string()
+    .default('pro_19:2:inf,pro_49:1.5:2,pro_99:1.25:2'),
 
   // Mobile Runner (qait-mobile-runner microservice)
   MOBILE_RUNNER_URL: z.string().url().optional().default('http://localhost:4100'),
