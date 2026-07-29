@@ -23,6 +23,22 @@ jest.mock('@/config/features/referrals', () => ({
       !Number.isFinite(paid) || paid <= 0
         ? 0
         : Math.round(paid * (rate ?? (ReferralsFeature.getRewardRate() as unknown as number))),
+    // User-side bonus: stubbed per-plan config + the real credit formula, so
+    // these tests cover the SERVICE's gating (idempotency, degrade) rather than
+    // re-testing the arithmetic already pinned in the feature's own suite.
+    getUserBonusForPlan: jest.fn(),
+    computeUserCredits: (
+      planCredits: number,
+      opts: { isReferred: boolean; planCode: string; priorBonusPayments: number }
+    ) => {
+      const bonus = ReferralsFeature.getUserBonusForPlan(opts.planCode) as unknown as {
+        multiplier: number;
+        payments: number;
+      } | null;
+      if (!opts.isReferred || !bonus) return Math.floor(planCredits);
+      if (opts.priorBonusPayments >= bonus.payments) return Math.floor(planCredits);
+      return Math.floor(planCredits * bonus.multiplier);
+    },
   },
 }));
 jest.mock('@/utils/core/redis-cache', () => ({
@@ -222,6 +238,82 @@ describe('ReferralService.rewardOnPayment', () => {
   it('never throws on a db error (payment path must not fail)', async () => {
     db.getUserRewardConfig.mockRejectedValue(new Error('db down'));
     await expect(ReferralService.rewardOnPayment(payment)).resolves.toBe(false);
+  });
+});
+
+describe('ReferralService.resolveInvoiceCredits', () => {
+  const invoice = { userId: 'u1', invoiceId: 'in_1', planCode: 'pro_19', planCredits: 990 };
+  const base = { credits: 990, bonusApplied: false, multiplier: 1 };
+
+  beforeEach(() => {
+    feature.isEnabled.mockReturnValue(true);
+    feature.getUserBonusForPlan.mockReturnValue({ multiplier: 2, payments: Infinity });
+    db.getUserReferralPartnerId.mockResolvedValue('p1');
+    db.hasBonusForInvoice.mockResolvedValue(false);
+    db.countUserBonusGrants.mockResolvedValue(0);
+  });
+
+  it('doubles the credits for a referred user on a bonused plan', async () => {
+    expect(await ReferralService.resolveInvoiceCredits(invoice)).toEqual({
+      credits: 1980,
+      bonusApplied: true,
+      multiplier: 2,
+    });
+  });
+
+  it('returns base credits when the feature is off', async () => {
+    feature.isEnabled.mockReturnValue(false);
+    expect(await ReferralService.resolveInvoiceCredits(invoice)).toEqual(base);
+    expect(db.getUserReferralPartnerId).not.toHaveBeenCalled();
+  });
+
+  it('returns base credits for a user with no referral partner', async () => {
+    db.getUserReferralPartnerId.mockResolvedValue(null);
+    expect(await ReferralService.resolveInvoiceCredits(invoice)).toEqual(base);
+  });
+
+  it('returns base credits for a plan with no configured bonus', async () => {
+    feature.getUserBonusForPlan.mockReturnValue(null);
+    expect(await ReferralService.resolveInvoiceCredits(invoice)).toEqual(base);
+    // Cheap check first — no db round-trip for an unbonused plan.
+    expect(db.getUserReferralPartnerId).not.toHaveBeenCalled();
+  });
+
+  it('does NOT re-bonus a Stripe webhook retry of the same invoice', async () => {
+    db.hasBonusForInvoice.mockResolvedValue(true);
+    expect(await ReferralService.resolveInvoiceCredits(invoice)).toEqual(base);
+    expect(db.countUserBonusGrants).not.toHaveBeenCalled();
+  });
+
+  it('stops bonusing once the plan window is spent', async () => {
+    feature.getUserBonusForPlan.mockReturnValue({ multiplier: 1.25, payments: 2 });
+    db.countUserBonusGrants.mockResolvedValue(2);
+    expect(
+      await ReferralService.resolveInvoiceCredits({ ...invoice, planCode: 'pro_99', planCredits: 18000 })
+    ).toEqual({ credits: 18000, bonusApplied: false, multiplier: 1 });
+  });
+
+  it('counts the window PER PLAN so an upgrade does not inherit a spent window', async () => {
+    feature.getUserBonusForPlan.mockReturnValue({ multiplier: 1.5, payments: 2 });
+    db.countUserBonusGrants.mockResolvedValue(0); // fresh count for pro_49
+    const result = await ReferralService.resolveInvoiceCredits({
+      ...invoice,
+      planCode: 'pro_49',
+      planCredits: 7000,
+    });
+    expect(db.countUserBonusGrants).toHaveBeenCalledWith('u1', 'pro_49');
+    expect(result.credits).toBe(10_500);
+  });
+
+  it('degrades to base credits on a db error — never withholds what was paid for', async () => {
+    db.countUserBonusGrants.mockRejectedValue(new Error('db down'));
+    await expect(ReferralService.resolveInvoiceCredits(invoice)).resolves.toEqual(base);
+  });
+
+  it('returns base credits when the invoice id is missing (cannot dedupe)', async () => {
+    expect(
+      await ReferralService.resolveInvoiceCredits({ ...invoice, invoiceId: '' })
+    ).toEqual(base);
   });
 });
 

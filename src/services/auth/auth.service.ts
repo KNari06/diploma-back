@@ -1087,12 +1087,37 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
       isPartner = false;
     }
 
+    // A referred user gets extra credits per plan on the same price. The
+    // multipliers are served from here rather than duplicated in the frontend —
+    // a hardcoded copy would silently disagree with what the webhook grants the
+    // moment the config changes, promising credits we don't deliver.
+    // `isReferred` alone is not enough for the paywall: it needs the per-plan
+    // numbers to render each plan's bonus. Best-effort, like isPartner.
+    let referral: { isReferred: boolean; planBonuses: Record<string, number> } = {
+      isReferred: false,
+      planBonuses: {},
+    };
+    try {
+      const { getUserReferralPartnerId } = await import('@/services/core/db/referral.db');
+      const { ReferralsFeature } = await import('@/config/features/referrals');
+      if (ReferralsFeature.isEnabled() && (await getUserReferralPartnerId(userId))) {
+        const planBonuses: Record<string, number> = {};
+        for (const [code, cfg] of ReferralsFeature.parseUserBonusPlans()) {
+          if (cfg.multiplier > 1 && cfg.payments > 0) planBonuses[code] = cfg.multiplier;
+        }
+        referral = { isReferred: true, planBonuses };
+      }
+    } catch {
+      referral = { isReferred: false, planBonuses: {} };
+    }
+
     return {
       id: userId,
       email: userEmail,
       name: userData.name,
       role: userData.role || 'user',
       isPartner,
+      referral,
       status: resolveEffectiveStatus(userData.status),
       avatar: userData.avatar_url,
       credits: creditsBalance,
