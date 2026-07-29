@@ -765,20 +765,51 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
   const isPeriodReset =
     billingReason === 'subscription_cycle' || billingReason === 'subscription_update';
 
-  if (creditsPerPeriod > 0 && !isBusinessPlanCode) {
+  // Referred users get a per-plan credit bonus on the SAME money (2x on pro_19,
+  // less on the larger plans). Resolved BEFORE the grant because it changes the
+  // amount — unlike the partner reward below, which is fire-and-forget. Degrades
+  // to `creditsPerPeriod` on any fault, so a referral fault never withholds the
+  // credits the user paid for. The `referral_bonus_*` metadata below is what
+  // makes the per-plan window count work — dropping it re-bonuses forever.
+  const bonus = invoice.id && creditsPerPeriod > 0 && !isBusinessPlanCode
+    ? await ReferralService.resolveInvoiceCredits({
+        userId: user.id,
+        invoiceId: invoice.id,
+        planCode,
+        planCredits: creditsPerPeriod,
+      })
+    : { credits: creditsPerPeriod, bonusApplied: false, multiplier: 1 };
+
+  const creditsToGrant = bonus.credits;
+
+  if (creditsToGrant > 0 && !isBusinessPlanCode) {
+    const grantMetadata: Record<string, unknown> = {
+      invoice_id: invoice.id,
+      event_type: event.type,
+      ...(bonus.bonusApplied
+        ? {
+            referral_bonus_invoice: invoice.id,
+            referral_bonus_plan: planCode,
+            referral_bonus_multiplier: bonus.multiplier,
+            referral_base_credits: creditsPerPeriod,
+          }
+        : {}),
+    };
+    const bonusSuffix = bonus.bonusApplied ? ` (referral ${bonus.multiplier}x)` : '';
+
     const result = isPeriodReset
       ? await UserCreditsService.resetToPlanCredits(
           user.id,
-          creditsPerPeriod,
-          `Subscription renewal - ${planCode} plan`,
-          { invoice_id: invoice.id, event_type: event.type }
+          creditsToGrant,
+          `Subscription renewal - ${planCode} plan${bonusSuffix}`,
+          grantMetadata
         )
       : await UserCreditsService.addCredits(
           user.id,
-          creditsPerPeriod,
+          creditsToGrant,
           'purchase',
-          `Subscription payment - ${planCode} plan`,
-          { invoice_id: invoice.id, event_type: event.type }
+          `Subscription payment - ${planCode} plan${bonusSuffix}`,
+          grantMetadata
         );
 
     // On failure THROW so handleWebhook returns 500 and Stripe retries; the
@@ -786,14 +817,16 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     if (!result.success) {
       logger.error('[STRIPE_WEBHOOK] Credit grant failed — throwing for Stripe retry', {
         userId: user.id,
-        credits: creditsPerPeriod,
+        credits: creditsToGrant,
         invoiceId: invoice.id,
       });
       throw new Error(`Credit grant failed for invoice ${invoice.id}`);
     }
     logger.info('[STRIPE_WEBHOOK] Credits granted', {
       userId: user.id,
-      credits: creditsPerPeriod,
+      credits: creditsToGrant,
+      baseCredits: creditsPerPeriod,
+      referralBonus: bonus.bonusApplied,
       newBalance: result.newBalance,
       invoiceId: invoice.id,
       mode: isPeriodReset ? 'reset' : 'add',
@@ -927,7 +960,9 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
       planName: subscriptionPlanLabel,
       amountCents: transactionData.amount,
       currency: transactionData.currency,
-      creditsIncluded: creditsPerPeriod || undefined,
+      // The GRANTED amount, not the plan's base — a referred user's receipt must
+      // match the credits actually in their balance.
+      creditsIncluded: creditsToGrant || undefined,
       frontendUrl: env.FRONTEND_URL || 'http://localhost:3000',
     })
       .then((result) => {

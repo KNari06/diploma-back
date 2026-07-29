@@ -5,8 +5,13 @@ import * as referralDb from '@/services/core/db/referral.db';
 import type { PartnerRow } from '@/services/core/db/referral.db';
 import type { Partner, PartnerStats, ReferredUser } from '@/types/referral.types';
 
-/** How long a captured ?ref code waits (keyed by email) for the user's first auth. */
-const PENDING_TTL_SECONDS = 24 * 60 * 60; // 24h — covers email-verification delay
+/**
+ * How long a captured ?ref code waits (keyed by email) for the user's first auth.
+ * 30 days, not 24h: the wait spans email verification, and a verification mail
+ * that sits in spam for two days used to silently cost the partner the referral.
+ * The stored value is just email → code, so a long TTL is cheap.
+ */
+const PENDING_TTL_SECONDS = 30 * 24 * 60 * 60;
 const pendingKey = (email: string) => `qait:referral:pending:${email.trim().toLowerCase()}`;
 
 /**
@@ -60,6 +65,7 @@ export class ReferralService {
     if (!userId) return false;
 
     let code = explicitCode?.trim() || null;
+    const hadExplicitCode = !!code;
     if (!code && email) {
       try {
         code = (await cache.get<string>(pendingKey(email))) || null;
@@ -67,9 +73,23 @@ export class ReferralService {
         code = null;
       }
     }
+    // No code at all is the normal organic signup — not worth a log line.
     if (!code) return false;
 
     const didSet = await this.attributeUser(userId, code);
+
+    // Attribution telemetry: a code REACHED us but did not stick. Every cause is
+    // actionable (unknown/disabled code, self-referral, already attributed), and
+    // without this line a systemic loss is invisible — we'd hear it from the
+    // partner rather than from our own logs. `warn`, because a code arriving and
+    // not landing is an anomaly; a signup with no code at all is not.
+    if (!didSet) {
+      logger.warn('[REFERRAL] Referral code present but attribution did not apply', {
+        userId,
+        source: hadExplicitCode ? 'explicit' : 'pending_store',
+      });
+    }
+
     // Clear the pending entry once consumed (whether or not it set — the code
     // has been used for this user's first auth; a stale entry would linger).
     if (email) {
@@ -206,6 +226,68 @@ export class ReferralService {
         userId,
       });
       return false;
+    }
+  }
+
+  /**
+   * Resolve how many credits a paid invoice should grant, applying the referred
+   * user's per-plan bonus. Returns `{ credits: planCredits }` unchanged for a
+   * non-referred user, a plan with no bonus, a spent window, an already-bonused
+   * invoice (Stripe retry), or ANY failure — so the caller can use the result
+   * unconditionally and a bookkeeping fault degrades to a normal purchase rather
+   * than blocking the credits the user paid for.
+   *
+   * `bonusApplied` distinguishes a real bonus from base credits, so the caller
+   * can stamp the marker metadata that makes the count above work. Without that
+   * marker the next invoice would re-bonus forever.
+   */
+  static async resolveInvoiceCredits(input: {
+    userId: string;
+    invoiceId: string;
+    planCode: string;
+    planCredits: number;
+  }): Promise<{ credits: number; bonusApplied: boolean; multiplier: number }> {
+    const { userId, invoiceId, planCode, planCredits } = input;
+    const base = { credits: planCredits, bonusApplied: false, multiplier: 1 };
+
+    if (!ReferralsFeature.isEnabled()) return base;
+    if (!userId || !invoiceId || !planCode || planCredits <= 0) return base;
+
+    const bonus = ReferralsFeature.getUserBonusForPlan(planCode);
+    if (!bonus) return base;
+
+    try {
+      const partnerId = await referralDb.getUserReferralPartnerId(userId);
+      if (!partnerId) return base;
+
+      // Stripe retries the same invoice; a retry must not re-count or re-grant.
+      if (await referralDb.hasBonusForInvoice(userId, invoiceId)) return base;
+
+      const priorBonusPayments = await referralDb.countUserBonusGrants(userId, planCode);
+      const credits = ReferralsFeature.computeUserCredits(planCredits, {
+        isReferred: true,
+        planCode,
+        priorBonusPayments,
+      });
+      if (credits <= planCredits) return base;
+
+      logger.info('[REFERRAL] Applying referred-user credit bonus', {
+        userId,
+        planCode,
+        planCredits,
+        credits,
+        multiplier: bonus.multiplier,
+        paymentNumber: priorBonusPayments + 1,
+      });
+      return { credits, bonusApplied: true, multiplier: bonus.multiplier };
+    } catch (error) {
+      // Degrade to base credits: the user still gets everything they paid for.
+      logger.warn('[REFERRAL] resolveInvoiceCredits failed — granting base credits', {
+        error: errMsg(error),
+        userId,
+        planCode,
+      });
+      return base;
     }
   }
 
