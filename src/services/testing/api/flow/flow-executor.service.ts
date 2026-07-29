@@ -624,7 +624,10 @@ export class FlowExecutorService {
 
     // Set up total timeout. `let` so a needs-input pause can suspend it — the
     // user's typing time must not count against the flow's execution budget.
-    let totalTimer = setTimeout(() => abortController.abort(), config.totalTimeoutMs);
+    // `timedOut` lets the skip labeler tell a time-limit abort apart from a
+    // genuine user cancel (both trip abortController).
+    let timedOut = false;
+    let totalTimer = setTimeout(() => { timedOut = true; abortController.abort(); }, config.totalTimeoutMs);
 
     // Producers per variable + vars already asked this run — drive the mid-run
     // "needs input" pause (OTP after send, secret, unobtainable auth token).
@@ -1021,24 +1024,39 @@ export class FlowExecutorService {
       groups = dag.executionOrder.map(id => [id]);
     }
 
-    const markRemainingCancelled = (fromGroupIdx: number): void => {
+    // Mark every not-yet-run node in the remaining groups as not-attempted, with a
+    // label that reflects WHY the run stopped — a user cancel, a time-limit abort,
+    // or an earlier failure under stop-on-error — instead of always "Cancelled by
+    // user". A stop-on-error halt is a SKIP (the run moved on without it), not a
+    // cancel; only a real user cancel is "Cancelled by user".
+    const REMAINING_SKIP: Record<
+      'user_cancel' | 'timeout' | 'stopped_on_error',
+      { status: 'skipped' | 'cancelled'; reason: 'cancelled' | 'dependency_failed'; message: string }
+    > = {
+      user_cancel: { status: 'cancelled', reason: 'cancelled', message: 'Cancelled by user' },
+      timeout: { status: 'cancelled', reason: 'cancelled', message: 'Not attempted: the run reached its time limit before this step.' },
+      stopped_on_error: { status: 'skipped', reason: 'dependency_failed', message: "Not attempted: an earlier step failed and 'Stop on error' is on." },
+    };
+    const markRemaining = (fromGroupIdx: number, cause: keyof typeof REMAINING_SKIP): void => {
+      const { status, reason, message } = REMAINING_SKIP[cause];
       for (let g = fromGroupIdx; g < groups.length; g++) {
         for (const id of groups[g]) {
           if (skippedNodes.has(id) || failedNodes.has(id)) continue;
           const n = nodeMap.get(id);
           if (!n) continue;
           if (stepResults.some(r => r.nodeId === id)) continue;
-          skippedRow(n, stepIndexOf.get(id) ?? 0, 'cancelled', 'cancelled', 'Cancelled by user');
+          skippedRow(n, stepIndexOf.get(id) ?? 0, status, reason, message);
         }
       }
     };
 
     try {
       for (let groupIdx = 0; groupIdx < groups.length; groupIdx++) {
-        // Cancellation — stop launching groups; mark this + later groups cancelled.
+        // Abort (user cancel or time limit) — stop launching groups; mark this +
+        // later groups not-attempted with the matching reason.
         if (abortController.signal.aborted) {
-          logger.info('[FLOW_EXECUTOR] Flow cancelled', { flowRunId });
-          markRemainingCancelled(groupIdx);
+          logger.info('[FLOW_EXECUTOR] Run aborted', { flowRunId, cause: timedOut ? 'timeout' : 'user_cancel' });
+          markRemaining(groupIdx, timedOut ? 'timeout' : 'user_cancel');
           break;
         }
 
@@ -1120,15 +1138,16 @@ export class FlowExecutorService {
               // Timeout → nobody answered, abort. Cancellation already aborted via cancelFlowRun.
               if (err instanceof FlowInputTimeoutError) {
                 logger.warn('[FLOW_EXECUTOR] Input wait timed out — aborting run', { flowRunId });
+                timedOut = true; // a no-answer pause is a time-limit abort, not a user cancel
                 abortController.abort();
               }
             } finally {
               if (!abortController.signal.aborted) {
-                totalTimer = setTimeout(() => abortController.abort(), config.totalTimeoutMs);
+                totalTimer = setTimeout(() => { timedOut = true; abortController.abort(); }, config.totalTimeoutMs);
               }
             }
             if (abortController.signal.aborted) {
-              markRemainingCancelled(groupIdx);
+              markRemaining(groupIdx, timedOut ? 'timeout' : 'user_cancel');
               break;
             }
           }
@@ -1144,9 +1163,10 @@ export class FlowExecutorService {
         }
 
         // stop_on_failure: if anything failed in (or before) this group, stop
-        // launching later groups and mark them cancelled.
+        // launching later groups and mark them skipped (the run halted after a
+        // failure — not a user cancel).
         if (config.errorStrategy === 'stop_on_failure' && failedNodes.size > 0) {
-          markRemainingCancelled(groupIdx + 1);
+          markRemaining(groupIdx + 1, 'stopped_on_error');
           break;
         }
       }
