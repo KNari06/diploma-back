@@ -24,6 +24,13 @@ import { executeApiTest } from '../apiTest.service';
 import { ApiTestStorageService } from '../api-test-storage.service';
 import { FlowBuilderService } from './flow-builder.service';
 import { CookieJar } from './cookie-jar';
+import { computeGroupNeedsInput, buildProducersByVar } from './flow-needs-input';
+import {
+  requestFlowInput,
+  cancelFlowInput,
+  FlowInputTimeoutError,
+  DEFAULT_INPUT_TIMEOUT_MS,
+} from './flow-input-gate';
 import { redactWithValues } from '@/utils/interpolation/redact-secrets';
 import type {
   ApiFlowSpec,
@@ -41,6 +48,7 @@ import type {
   VariableExtraction,
   VariableInjection,
 } from './flow.types';
+import { BASE_URL_VAR, resolveRunBaseUrl } from './base-url';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DEFAULTS
@@ -274,8 +282,12 @@ function buildResolvedRequest(
 } {
   const variablesInjected: string[] = [];
   const unboundVariables: string[] = [];
+  // Header precedence (low → high): Content-Type default < node.sampleHeaders
+  // (user-set in the editor, {{vars}} interpolated) < per-run nodeOverride <
+  // variableInjections (applied in the loop below, e.g. Authorization).
   const resolvedHeaders: Record<string, string> = {
     'Content-Type': 'application/json',
+    ...(node.sampleHeaders ? interpolateObject({ ...node.sampleHeaders }, ctx) : {}),
     ...(nodeOverride?.headers || {}),
   };
   const queryParams: Record<string, string> = { ...(nodeOverride?.queryParams || {}) };
@@ -486,6 +498,9 @@ export function cancelFlowRun(runId: string): boolean {
   const controller = activeRuns.get(runId);
   if (!controller) return false;
   controller.abort();
+  // If the run is paused waiting for user input, unblock that await too —
+  // aborting the signal alone won't wake a promise parked in the input gate.
+  cancelFlowInput(runId, 'Flow cancelled by user');
   return true;
 }
 
@@ -607,8 +622,17 @@ export class FlowExecutorService {
     let variablesResolved = 0;
     let authNodeId: string | undefined = dag.nodes.find(n => n.isAuthEndpoint)?.id;
 
-    // Set up total timeout
-    const totalTimer = setTimeout(() => abortController.abort(), config.totalTimeoutMs);
+    // Set up total timeout. `let` so a needs-input pause can suspend it — the
+    // user's typing time must not count against the flow's execution budget.
+    // `timedOut` lets the skip labeler tell a time-limit abort apart from a
+    // genuine user cancel (both trip abortController).
+    let timedOut = false;
+    let totalTimer = setTimeout(() => { timedOut = true; abortController.abort(); }, config.totalTimeoutMs);
+
+    // Producers per variable + vars already asked this run — drive the mid-run
+    // "needs input" pause (OTP after send, secret, unobtainable auth token).
+    const producersByVar = buildProducersByVar(dag.nodes);
+    const askedVars = new Set<string>();
 
     const emit = (event: string, payload: any) => {
       if (!chatSessionId) return;
@@ -620,16 +644,23 @@ export class FlowExecutorService {
     const stepIndexOf = new Map<string, number>();
     dag.executionOrder.forEach((id, i) => stepIndexOf.set(id, i));
 
-    const baseUrl = flowSpec.rawSpec?.servers?.[0]?.url
-      || (flowSpec.rawSpec?.host
-        ? `${(flowSpec.rawSpec.schemes?.[0] || 'https')}://${flowSpec.rawSpec.host}${flowSpec.rawSpec.basePath || ''}`
-        : '');
+    // A run-dialog / environment `{{base_url}}` override wins, else the spec's
+    // own server (or, for a URL import, its origin). Empty here → no absolute URL
+    // is derivable; the per-node guard below blocks the run with a clear ask
+    // instead of firing requests at a relative path that throws "Invalid URL format".
+    const baseUrl = resolveRunBaseUrl(flowSpec.rawSpec, flowSpec.sourceUrl, ctx[BASE_URL_VAR]);
+    if (!baseUrl) {
+      logger.warn('[FLOW_EXECUTOR] No base URL — every node will be blocked', {
+        flowSpecId: flowSpec.id,
+        sourceType: flowSpec.sourceType,
+      });
+    }
 
     const skippedRow = (
       node: DAGNode,
       stepIndex: number,
       status: 'skipped' | 'cancelled' | 'blocked',
-      reason: 'unsupported' | 'dependency_failed' | 'cancelled' | FlowStepBlockedReason,
+      reason: 'unsupported' | 'dependency_failed' | 'cancelled' | 'disabled' | FlowStepBlockedReason,
       message: string,
     ): void => {
       skippedNodes.add(node.id);
@@ -993,24 +1024,39 @@ export class FlowExecutorService {
       groups = dag.executionOrder.map(id => [id]);
     }
 
-    const markRemainingCancelled = (fromGroupIdx: number): void => {
+    // Mark every not-yet-run node in the remaining groups as not-attempted, with a
+    // label that reflects WHY the run stopped — a user cancel, a time-limit abort,
+    // or an earlier failure under stop-on-error — instead of always "Cancelled by
+    // user". A stop-on-error halt is a SKIP (the run moved on without it), not a
+    // cancel; only a real user cancel is "Cancelled by user".
+    const REMAINING_SKIP: Record<
+      'user_cancel' | 'timeout' | 'stopped_on_error',
+      { status: 'skipped' | 'cancelled'; reason: 'cancelled' | 'dependency_failed'; message: string }
+    > = {
+      user_cancel: { status: 'cancelled', reason: 'cancelled', message: 'Cancelled by user' },
+      timeout: { status: 'cancelled', reason: 'cancelled', message: 'Not attempted: the run reached its time limit before this step.' },
+      stopped_on_error: { status: 'skipped', reason: 'dependency_failed', message: "Not attempted: an earlier step failed and 'Stop on error' is on." },
+    };
+    const markRemaining = (fromGroupIdx: number, cause: keyof typeof REMAINING_SKIP): void => {
+      const { status, reason, message } = REMAINING_SKIP[cause];
       for (let g = fromGroupIdx; g < groups.length; g++) {
         for (const id of groups[g]) {
           if (skippedNodes.has(id) || failedNodes.has(id)) continue;
           const n = nodeMap.get(id);
           if (!n) continue;
           if (stepResults.some(r => r.nodeId === id)) continue;
-          skippedRow(n, stepIndexOf.get(id) ?? 0, 'cancelled', 'cancelled', 'Cancelled by user');
+          skippedRow(n, stepIndexOf.get(id) ?? 0, status, reason, message);
         }
       }
     };
 
     try {
       for (let groupIdx = 0; groupIdx < groups.length; groupIdx++) {
-        // Cancellation — stop launching groups; mark this + later groups cancelled.
+        // Abort (user cancel or time limit) — stop launching groups; mark this +
+        // later groups not-attempted with the matching reason.
         if (abortController.signal.aborted) {
-          logger.info('[FLOW_EXECUTOR] Flow cancelled', { flowRunId });
-          markRemainingCancelled(groupIdx);
+          logger.info('[FLOW_EXECUTOR] Run aborted', { flowRunId, cause: timedOut ? 'timeout' : 'user_cancel' });
+          markRemaining(groupIdx, timedOut ? 'timeout' : 'user_cancel');
           break;
         }
 
@@ -1024,6 +1070,17 @@ export class FlowExecutorService {
           if (!node) continue;
           const stepIndex = stepIndexOf.get(id) ?? 0;
 
+          if (!baseUrl) {
+            skippedRow(
+              node, stepIndex, 'blocked', 'unbound_variable',
+              'Not attempted: this flow has no base URL. The imported spec declares no absolute server, so requests have nowhere to go. Set {{base_url}} in the run dialog (e.g. https://api.example.com) or link an environment.',
+            );
+            continue;
+          }
+          if (node.disabled) {
+            skippedRow(node, stepIndex, 'skipped', 'disabled', 'Disabled — turned off in the editor');
+            continue;
+          }
           if (node.isUnsupported) {
             skippedRow(node, stepIndex, 'skipped', 'unsupported', `Unsupported: ${node.unsupportedReason}`);
             continue;
@@ -1043,6 +1100,59 @@ export class FlowExecutorService {
           runnable.push(node);
         }
 
+        // Pause & ask for anything the platform can't obtain itself (an OTP just
+        // sent, a secret, an auth token whose login failed) BEFORE running the
+        // nodes that need it — rather than firing doomed requests that 401 and
+        // cascade-block the rest of the flow. Only possible with a WS channel to
+        // ask over; headless runs fall through and fail as before.
+        if (runnable.length > 0 && chatSessionId && !abortController.signal.aborted) {
+          const needed = computeGroupNeedsInput(runnable, {
+            ctx,
+            producersByVar,
+            isFailedOrSkipped: id => failedNodes.has(id) || skippedNodes.has(id),
+            alreadyAsked: askedVars,
+          });
+          if (needed.length > 0) {
+            emit('emitApiFlowNeedsInput', {
+              flowSpecId: flowSpec.id,
+              flowRunId,
+              sessionId: chatSessionId,
+              nodeId: runnable[0]?.id,
+              questions: needed,
+              timestamp: new Date().toISOString(),
+            });
+            clearTimeout(totalTimer); // don't bill the user's typing time to the run budget
+            try {
+              const provided = await requestFlowInput(flowRunId, needed, { timeoutMs: DEFAULT_INPUT_TIMEOUT_MS });
+              for (const [k, v] of Object.entries(provided)) {
+                if (v !== undefined && v !== null && String(v) !== '') {
+                  ctx[k] = String(v);
+                  // Mark asked ONLY once actually answered — a blank/skipped value
+                  // stays askable, so a later group that needs it can re-prompt
+                  // (a mistyped-then-cleared OTP isn't permanently locked out).
+                  askedVars.add(k);
+                }
+              }
+              logger.info('[FLOW_EXECUTOR] Resumed after user input', { flowRunId, provided: Object.keys(provided) });
+            } catch (err) {
+              // Timeout → nobody answered, abort. Cancellation already aborted via cancelFlowRun.
+              if (err instanceof FlowInputTimeoutError) {
+                logger.warn('[FLOW_EXECUTOR] Input wait timed out — aborting run', { flowRunId });
+                timedOut = true; // a no-answer pause is a time-limit abort, not a user cancel
+                abortController.abort();
+              }
+            } finally {
+              if (!abortController.signal.aborted) {
+                totalTimer = setTimeout(() => { timedOut = true; abortController.abort(); }, config.totalTimeoutMs);
+              }
+            }
+            if (abortController.signal.aborted) {
+              markRemaining(groupIdx, timedOut ? 'timeout' : 'user_cancel');
+              break;
+            }
+          }
+        }
+
         // Run the group concurrently (bounded). One node's throw doesn't tear
         // down its siblings — we let the group finish, then decide.
         if (runnable.length > 0) {
@@ -1053,9 +1163,10 @@ export class FlowExecutorService {
         }
 
         // stop_on_failure: if anything failed in (or before) this group, stop
-        // launching later groups and mark them cancelled.
+        // launching later groups and mark them skipped (the run halted after a
+        // failure — not a user cancel).
         if (config.errorStrategy === 'stop_on_failure' && failedNodes.size > 0) {
-          markRemainingCancelled(groupIdx + 1);
+          markRemaining(groupIdx + 1, 'stopped_on_error');
           break;
         }
       }

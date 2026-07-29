@@ -57,6 +57,7 @@ import {
   ApiFlowStepCompletePayload,
   ApiFlowStepSkippedPayload,
   ApiFlowStepRetryingPayload,
+  ApiFlowNeedsInputPayload,
   ApiFlowVariableExtractedPayload,
   ApiFlowCompletedPayload,
   ApiFlowFailedPayload,
@@ -1268,6 +1269,19 @@ class WebSocketService {
         const io = getIO();
         const room = createRoomName('chat', sessionId);
         io.to(room).emit('api:flow:step-retrying', payload);
+      },
+      { sessionId }
+    );
+  }
+
+  emitApiFlowNeedsInput(sessionId: string, payload: ApiFlowNeedsInputPayload): void {
+    this.emitWithFallback(
+      'api:flow:needs-input',
+      payload,
+      () => {
+        const io = getIO();
+        const room = createRoomName('chat', sessionId);
+        io.to(room).emit('api:flow:needs-input', payload);
       },
       { sessionId }
     );

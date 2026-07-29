@@ -16,6 +16,12 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { SpecParserService } from './spec-parser.service';
 import { DependencyResolverService, type ResolveResult } from './dependency-resolver.service';
 import { detectRequiredInputs } from './required-inputs';
+import {
+  LARGE_SPEC_ENDPOINT_THRESHOLD,
+  groupEndpointsForSelection,
+  subgroupForSelection,
+  filterSpecByGroup,
+} from './spec-grouping';
 import { runProbe } from './probe-runner.service';
 import { callAiWithRetry, extractJson } from './ai-json.util';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
@@ -730,12 +736,57 @@ export class FlowBuilderService {
       sourceType: spec.sourceType,
     });
 
-    // Guard: reject specs that are too large for reliable AI processing
-    if (spec.endpoints.length > 300) {
+    // Large-spec handling: rather than hard-reject, narrow the spec to one group.
+    // If the caller already picked a group, restrict to it and proceed at any size
+    // (an explicit choice trumps the size gate). Otherwise, if the spec is over the
+    // threshold, offer group choices for the frontend to present a selector.
+    if (request.apiGroup) {
+      spec = filterSpecByGroup(spec, request.apiGroup);
+      if (spec.endpoints.length === 0) {
+        throw new Error(`API group "${request.apiGroup}" has no supported endpoints to build a flow from.`);
+      }
+      // Re-apply the threshold AFTER filtering — an explicit choice narrows the
+      // spec but must still be bounded. A group with 400 endpoints is no more
+      // analyzable than the whole spec, so offer a sub-group (or reject) rather
+      // than silently handing back an equally large flow.
+      if (spec.endpoints.length > LARGE_SPEC_ENDPOINT_THRESHOLD) {
+        const { groups } = subgroupForSelection(spec, request.apiGroup);
+        if (groups.length > 1) {
+          const subGroupError: any = new Error(
+            `Group "${request.apiGroup}" still has ${spec.endpoints.length} endpoints — ` +
+            `too many to analyze reliably. Pick a narrower sub-group.`,
+          );
+          subGroupError.isLargeSpec = true;
+          subGroupError.apiGroups = groups;
+          throw subGroupError;
+        }
+        throw new Error(
+          `Group "${request.apiGroup}" has ${spec.endpoints.length} endpoints and can't be split ` +
+          `into smaller sub-groups automatically. Please upload a smaller spec.`,
+        );
+      }
+      emit('parsing', 36, `Restricted to "${request.apiGroup}" — ${spec.endpoints.length} endpoints`);
+      logger.info('[FLOW_BUILDER] Spec restricted to group', {
+        apiGroup: request.apiGroup,
+        endpoints: spec.endpoints.length,
+      });
+    } else if (spec.endpoints.length > LARGE_SPEC_ENDPOINT_THRESHOLD) {
+      const { groups } = groupEndpointsForSelection(spec);
+      if (groups.length > 1) {
+        // Surfaced by the controller as a group-selection prompt (like MULTI_SPEC).
+        const groupSelectError: any = new Error(
+          `This API has ${spec.endpoints.length} endpoints — too many to analyze reliably as one flow. ` +
+          `Pick an API group to focus on.`,
+        );
+        groupSelectError.isLargeSpec = true;
+        groupSelectError.apiGroups = groups;
+        throw groupSelectError;
+      }
+      // Can't split into meaningful groups (no tags, single path prefix) — reject.
       throw new Error(
-        `This API has ${spec.endpoints.length} endpoints — too many for reliable analysis. ` +
-        `Please select a specific API group (e.g., "Admin API" or "Student API") instead of "All API". ` +
-        `Most Swagger UIs let you pick a group from the dropdown at the top.`
+        `This API has ${spec.endpoints.length} endpoints — too many for reliable analysis, ` +
+        `and it can't be split into smaller groups automatically. ` +
+        `Please upload a smaller spec or a specific API group.`,
       );
     }
 

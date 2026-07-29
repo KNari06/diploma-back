@@ -11,6 +11,7 @@
  * POST   /api/v1/api-flow-spec/:id/reparse        — Re-fetch spec and rebuild DAG
  * GET    /api/v1/api-flow-spec/:id/runs            — List execution history
  * GET    /api/v1/api-flow-spec/:id/runs/:runId     — Get specific run details
+ * POST   /api/v1/api-flow-spec/:id/runs/:runId/provide-input — Resume a paused run with user values
  */
 
 import { Router } from 'express';
@@ -22,6 +23,7 @@ import {
   deleteSpec,
   runFlow,
   stopFlow,
+  provideRunInput,
   getRuns,
   getRunById,
   reparseSpec,
@@ -58,5 +60,7 @@ router.put('/:id/nodes/:nodeId/cases', saveNodeCases);
 // Run history
 router.get('/:id/runs', getRuns);
 router.get('/:id/runs/:runId', getRunById);
+// Resume a paused run (needs-input) with user-provided values
+router.post('/:id/runs/:runId/provide-input', provideRunInput);
 
 export default router;

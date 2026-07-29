@@ -103,7 +103,7 @@ hard-rejects a build QAIT cannot drive, with a remediation snippet in the body.
 Android test needs no driver extension and a user may legitimately upload a
 release build to inspect it. Enforcing it also **forces the binary parse**, which
 the CI path would otherwise skip whenever the pipeline supplied full version
-identity. See [DECISIONS.md ADR-0024](../../../DECISIONS.md).
+identity. See the ADR: [CI auth via a separate router + upload-time build contract](../../../.claude/decisions/20260727-ci-auth-via-separate-router-and-upload-time-build-contract.md).
 
 ---
 

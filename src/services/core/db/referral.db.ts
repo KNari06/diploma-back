@@ -246,6 +246,55 @@ interface PartnerRewardCols {
   reward_window_count: number | null;
 }
 
+// ── user-side credit bonus ───────────────────────────────────────────────────
+
+/**
+ * How many bonused invoices a referred user already had ON THIS PLAN. Counted
+ * per plan because each plan carries its own window (pro_19 unbounded, the
+ * larger plans 2 invoices), so an upgrade must not inherit the old plan's
+ * spent window.
+ *
+ * The count comes from `credit_transactions` metadata rather than a dedicated
+ * table — the same marker pattern the welcome bonus uses.
+ *
+ * The `not(...,'is',null)` clause is REQUIRED, not redundant: the supporting
+ * index is PARTIAL (`WHERE metadata ? 'referral_bonus_plan'`, migration
+ * 20260728), and Postgres only uses a partial index when the query proves the
+ * predicate holds. Without it this degrades to a sequential scan over every
+ * credit transaction ever written — on the Stripe webhook path.
+ */
+export async function countUserBonusGrants(userId: string, planCode: string): Promise<number> {
+  const { count, error } = await supabaseAdmin
+    .from('credit_transactions')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .not('metadata->>referral_bonus_plan', 'is', null)
+    .eq('metadata->>referral_bonus_plan', planCode);
+
+  if (error) throw error;
+  return count ?? 0;
+}
+
+/**
+ * Has this invoice already been bonused? Stripe retries webhooks, so without
+ * this a retry would re-count and re-grant. Keyed on the invoice id we stamp
+ * into the grant's metadata. See `countUserBonusGrants` for why the null-check
+ * clause is load-bearing.
+ */
+export async function hasBonusForInvoice(userId: string, invoiceId: string): Promise<boolean> {
+  const { data, error } = await supabaseAdmin
+    .from('credit_transactions')
+    .select('id')
+    .eq('user_id', userId)
+    .not('metadata->>referral_bonus_invoice', 'is', null)
+    .eq('metadata->>referral_bonus_invoice', invoiceId)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data !== null;
+}
+
 // ── reward ledger ────────────────────────────────────────────────────────────
 
 /**
