@@ -120,7 +120,7 @@ describe('flow executor — skipped emissions', () => {
     );
   });
 
-  test('stop_on_failure cancels the downstream group after a failure', async () => {
+  test('stop_on_failure skips the downstream group after a failure (not "cancelled by user")', async () => {
     const spec = makeSpec([node('a'), node('b', { dependsOn: ['a'] })]);
     jest.spyOn(FlowExecutorService as any, 'executeStep').mockImplementation(async (n: any) => ({
       status: n.id === 'a' ? 'failed' : 'passed',
@@ -130,10 +130,10 @@ describe('flow executor — skipped emissions', () => {
 
     await FlowExecutorService.execute(spec, 'u1', { chatSessionId: 'chat1' }, 'run1');
 
-    // Run halted → 'b' is cancelled (not merely skipped).
-    expect(skippedCalls()).toContainEqual(
-      expect.objectContaining({ nodeId: 'b', reason: 'cancelled', status: 'cancelled' }),
-    );
+    // Run halted by stop-on-error → 'b' is a SKIP, not a user cancel.
+    const b = skippedCalls().find(s => s.nodeId === 'b');
+    expect(b).toMatchObject({ reason: 'dependency_failed', status: 'skipped' });
+    expect(b?.message).not.toMatch(/cancelled by user/i);
   });
 });
 
@@ -148,8 +148,10 @@ describe('flow executor — cancellation', () => {
 
     const summary = await FlowExecutorService.execute(spec, 'u1', { chatSessionId: 'chat1' }, 'run1');
 
-    const cancelled = skippedCalls().filter(s => s.status === 'cancelled').map(s => s.nodeId);
-    expect(cancelled).toEqual(expect.arrayContaining(['b', 'c']));
+    const cancelled = skippedCalls().filter(s => s.status === 'cancelled');
+    expect(cancelled.map(s => s.nodeId)).toEqual(expect.arrayContaining(['b', 'c']));
+    // A genuine user cancel is the ONE case that reads "Cancelled by user".
+    expect(cancelled.find(s => s.nodeId === 'b')?.message).toBe('Cancelled by user');
     expect(summary.status).toBe('cancelled');
   });
 });
@@ -221,9 +223,9 @@ describe('flow executor — real parallelism (Group 3)', () => {
 
     const summary = await FlowExecutorService.execute(spec, 'u1', { chatSessionId: 'chat1' }, 'run1');
 
-    // 'b' (same group as 'a') still ran; 'c' (next group) is cancelled, not executed.
+    // 'b' (same group as 'a') still ran; 'c' (next group) is skipped, not executed.
     const cId = summary.stepResults.find(r => r.nodeId === 'c');
-    expect(cId?.status).toBe('cancelled');
+    expect(cId?.status).toBe('skipped');
     expect(summary.status).toBe('failed');
     // Report stays ordered by stepIndex (ascending, no gaps) despite out-of-order completion.
     const indices = summary.stepResults.map(r => r.stepIndex);
@@ -316,8 +318,8 @@ describe('flow executor — case matrix (Group 5)', () => {
     expect(caseRows).toHaveLength(2);
     expect(caseRows.find(r => r.caseId === 'broken')?.status).toBe('failed');
     expect(caseRows.find(r => r.caseId === 'happy')?.status).toBe('passed');
-    // parent 'auth' failed → 'next' (downstream group) cancelled, run failed
-    expect(summary.stepResults.find(r => r.nodeId === 'next')?.status).toBe('cancelled');
+    // parent 'auth' failed → 'next' (downstream group) skipped, run failed
+    expect(summary.stepResults.find(r => r.nodeId === 'next')?.status).toBe('skipped');
     expect(summary.status).toBe('failed');
   });
 });
