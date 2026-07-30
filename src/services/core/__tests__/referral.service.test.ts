@@ -442,3 +442,115 @@ describe('maskEmail', () => {
     expect(maskEmail('@nope.com')).toBe('***');
   });
 });
+
+/**
+ * Refund reversal. The ledger is append-only, so a refunded payment can only be
+ * corrected by a negative counter-entry — without it a partner keeps commission
+ * on money the customer took back.
+ */
+describe('ReferralService.reverseRewardOnRefund', () => {
+  const originalRow = {
+    partner_id: 'p1',
+    referred_user_id: 'u1',
+    amount: 950, // $9.50 — 50% of a $19.00 invoice
+    currency: 'usd',
+  };
+
+  beforeEach(() => {
+    feature.isEnabled.mockReturnValue(true);
+    db.findRewardByInvoice.mockResolvedValue(originalRow);
+    db.insertRewardReversalIfAbsent.mockResolvedValue(true);
+  });
+
+  it('reverses the FULL reward when the whole invoice is refunded', async () => {
+    const ok = await ReferralService.reverseRewardOnRefund({
+      invoiceId: 'in_1',
+      refundedAmountMinorUnits: 1900,
+      originalAmountMinorUnits: 1900,
+    });
+
+    expect(ok).toBe(true);
+    expect(db.insertRewardReversalIfAbsent).toHaveBeenCalledWith(
+      expect.objectContaining({ partnerId: 'p1', referredUserId: 'u1', amount: 950 })
+    );
+  });
+
+  it('reverses PROPORTIONALLY on a partial refund', async () => {
+    // Half the invoice back → half the commission back.
+    await ReferralService.reverseRewardOnRefund({
+      invoiceId: 'in_1',
+      refundedAmountMinorUnits: 950,
+      originalAmountMinorUnits: 1900,
+    });
+
+    expect(db.insertRewardReversalIfAbsent).toHaveBeenCalledWith(
+      expect.objectContaining({ amount: 475 })
+    );
+  });
+
+  it('never reverses MORE than was credited, even on an over-refund', async () => {
+    await ReferralService.reverseRewardOnRefund({
+      invoiceId: 'in_1',
+      refundedAmountMinorUnits: 5000, // more than the invoice
+      originalAmountMinorUnits: 1900,
+    });
+
+    expect(db.insertRewardReversalIfAbsent).toHaveBeenCalledWith(
+      expect.objectContaining({ amount: 950 })
+    );
+  });
+
+  it('mirrors the ORIGINAL row instead of recomputing from the current rate', async () => {
+    // Rates are captured per-row and may have changed since; recomputing would
+    // reverse a different figure than was actually credited.
+    db.findRewardByInvoice.mockResolvedValue({ ...originalRow, amount: 1330, currency: 'eur' });
+
+    await ReferralService.reverseRewardOnRefund({
+      invoiceId: 'in_1',
+      refundedAmountMinorUnits: 1900,
+      originalAmountMinorUnits: 1900,
+    });
+
+    expect(db.insertRewardReversalIfAbsent).toHaveBeenCalledWith(
+      expect.objectContaining({ amount: 1330, currency: 'eur' })
+    );
+  });
+
+  it('no-ops when no reward was ever written for that invoice', async () => {
+    db.findRewardByInvoice.mockResolvedValue(null);
+
+    await expect(
+      ReferralService.reverseRewardOnRefund({
+        invoiceId: 'in_unknown',
+        refundedAmountMinorUnits: 1900,
+        originalAmountMinorUnits: 1900,
+      })
+    ).resolves.toBe(false);
+    expect(db.insertRewardReversalIfAbsent).not.toHaveBeenCalled();
+  });
+
+  it('no-ops when the feature is off', async () => {
+    feature.isEnabled.mockReturnValue(false);
+
+    await expect(
+      ReferralService.reverseRewardOnRefund({
+        invoiceId: 'in_1',
+        refundedAmountMinorUnits: 1900,
+        originalAmountMinorUnits: 1900,
+      })
+    ).resolves.toBe(false);
+    expect(db.findRewardByInvoice).not.toHaveBeenCalled();
+  });
+
+  it('never throws on a db error (the refund webhook must not fail)', async () => {
+    db.findRewardByInvoice.mockRejectedValue(new Error('db down'));
+
+    await expect(
+      ReferralService.reverseRewardOnRefund({
+        invoiceId: 'in_1',
+        refundedAmountMinorUnits: 1900,
+        originalAmountMinorUnits: 1900,
+      })
+    ).resolves.toBe(false);
+  });
+});

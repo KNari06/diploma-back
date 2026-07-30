@@ -6,11 +6,18 @@ import {
   createPartner,
   getMyReferrals,
   getMyStats,
+  getPublicBonuses,
   listPartners,
   updatePartner,
 } from './referrals.controller';
 
 const router = Router();
+
+// Public — the referred-user credit multipliers, so the pricing page can show
+// the bonus BEFORE signup (a visitor on a partner link has no token yet, so
+// /auth/me is not an option). Returns the public offer only: no user data, no
+// partner data. Mounted before the authenticated routes below.
+router.get('/bonuses', asyncHandler(getPublicBonuses));
 
 // Partner-scoped — the authenticated partner's OWN data only (partner id is
 // derived from the token in the service, never from the request → no IDOR).

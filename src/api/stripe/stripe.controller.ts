@@ -289,6 +289,9 @@ export const handleWebhook = async (req: Request, res: Response): Promise<void> 
       'customer.subscription.deleted',
       'invoice.payment_succeeded',
       'invoice.payment_failed',
+      // Refunds reverse the referral reward — without this a partner keeps the
+      // commission on money the customer took back.
+      'charge.refunded',
     ]);
 
     if (!handledEventTypes.has(event.type)) {
@@ -308,6 +311,9 @@ export const handleWebhook = async (req: Request, res: Response): Promise<void> 
         break;
       case 'invoice.payment_failed':
         await handleInvoicePaymentFailed(event);
+        break;
+      case 'charge.refunded':
+        await handleChargeRefunded(event);
         break;
       default:
         logger.info('[STRIPE_WEBHOOK] Event type ignored', { type: event.type });
@@ -938,18 +944,33 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     !billingReason || billingReason === 'subscription_create' || billingReason === 'manual' || billingReason === 'subscription_update';
 
   // Referral reward — revenue share: the referring partner earns a % (default
-  // 70%) of the REAL amount paid, for the referred user's first N monthly
-  // payments (default 2), then 0%. Fires on EVERY paid invoice (first charge AND
-  // renewals — personal OR B2B, all reach here); the window is enforced inside
-  // the service by COUNTING prior reward rows, not by the billing reason, and
-  // per-invoice idempotency is the ledger's ON CONFLICT on stripe_invoice_id.
+  // 50%) of the REAL amount paid, for the referred user's first N monthly
+  // payments (default 2), then 0%. Fires on every paid B2C invoice (first charge
+  // AND renewals); the window is enforced inside the service by COUNTING prior
+  // reward rows, not by the billing reason, and per-invoice idempotency is the
+  // ledger's ON CONFLICT on stripe_invoice_id.
+  //
+  // B2B is EXCLUDED. The 50% rate was sized against B2C tickets ($19–$99, so at
+  // most ~$99 per referral over the window); the same rate on an enterprise
+  // invoice is ~$1,495/month — an order of magnitude outside what the referral
+  // economics were set for. It also matches the user-side bonus above, which
+  // already skips business plans. A B2B referral should be a deliberate,
+  // separately-priced arrangement, not an accident of this percentage.
   // Best-effort: never fails the webhook (service swallows). No-op unless enabled.
-  if (invoice.id && (invoice.amount_paid ?? 0) > 0) {
+  if (invoice.id && (invoice.amount_paid ?? 0) > 0 && !isBusinessPlanCode) {
     void ReferralService.rewardOnPayment({
       userId: user.id,
       invoiceId: invoice.id,
       amountPaidMinorUnits: invoice.amount_paid ?? 0,
       currency: invoice.currency || 'usd',
+    });
+  } else if (invoice.id && (invoice.amount_paid ?? 0) > 0 && isBusinessPlanCode) {
+    // Log rather than drop silently: if a partner ever does bring a B2B customer
+    // we want it visible, not invisible.
+    logger.info('[STRIPE_WEBHOOK] B2B invoice — referral reward intentionally skipped', {
+      userId: user.id,
+      planCode,
+      invoiceId: invoice.id,
     });
   }
 
@@ -982,6 +1003,38 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
         })
       );
   }
+}
+
+/**
+ * A charge was refunded (fully or partially) — reverse the referral reward for
+ * the invoice behind it.
+ *
+ * Only the referral ledger is touched here. Credits are deliberately NOT clawed
+ * back: they may already be spent, and a negative balance is a worse failure
+ * than an unearned grant. The partner's owed balance, by contrast, is money we
+ * have not paid out yet, so correcting it is both possible and right.
+ *
+ * Delegates to the service, which reverses proportionally and is idempotent per
+ * refund. Best-effort — a refund must never fail the webhook.
+ */
+async function handleChargeRefunded(event: Stripe.Event): Promise<void> {
+  const charge = event.data.object as Stripe.Charge;
+  const invoiceId = typeof charge.invoice === 'string' ? charge.invoice : charge.invoice?.id;
+
+  if (!invoiceId) {
+    // A charge with no invoice is a one-off payment outside the subscription
+    // flow — no reward was ever written for it.
+    logger.info('[STRIPE_WEBHOOK] Refunded charge has no invoice — nothing to reverse', {
+      chargeId: charge.id,
+    });
+    return;
+  }
+
+  await ReferralService.reverseRewardOnRefund({
+    invoiceId,
+    refundedAmountMinorUnits: charge.amount_refunded ?? 0,
+    originalAmountMinorUnits: charge.amount ?? 0,
+  });
 }
 
 async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {

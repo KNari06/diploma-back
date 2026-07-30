@@ -60,11 +60,26 @@ the other must move with it.
 **Partner side — a revenue share.** `ReferralsFeature` `REFERRAL_REWARD_RATE` (0.50) ×
 the real invoice amount, for the referred user's first `REFERRAL_REWARD_MONTHS` (2)
 payments, then 0%. `rewardOnPayment` fires from
-[../../api/stripe/stripe.controller.ts](../../api/stripe/stripe.controller.ts) on EVERY
-paid invoice (window enforced by COUNTING prior reward rows, not billing reason),
+[../../api/stripe/stripe.controller.ts](../../api/stripe/stripe.controller.ts) on every
+paid **B2C** invoice (window enforced by COUNTING prior reward rows, not billing reason),
 per-invoice-idempotent via `partner_reward_transactions.stripe_invoice_id`
 (append-only ledger, `amount` = cents). The rate is 0.50 rather than the original 0.70
 precisely because the user side below now costs us too.
+
+**B2B is EXCLUDED from the reward** (`!isBusinessPlanCode`, matching the user-side
+bonus). The 50% rate was sized against B2C tickets — at most ~$99 per referral over the
+window — and the same rate on an enterprise invoice is ~$1,495/month. A B2B referral
+should be a deliberate, separately-priced arrangement. Skipped B2B invoices are logged,
+not dropped silently.
+
+**Refunds reverse the reward** — `reverseRewardOnRefund`, wired to `charge.refunded`.
+The ledger is append-only, so a refund cannot edit the original row: it writes a NEGATIVE
+counter-entry keyed `refund:<invoiceId>` (own unique key → idempotent under Stripe
+retries, never collides with the reward row). It mirrors the ORIGINAL row rather than
+recomputing — rates are captured per-row and may have changed since — reverses
+proportionally on a partial refund, and is capped so an over-refund can't reverse more
+than was credited. **Credits are deliberately NOT clawed back:** they may already be
+spent, and a negative balance is a worse failure than an unearned grant.
 
 **User side — a per-plan credit bonus on the SAME price.** `REFERRAL_USER_BONUS_PLANS`
 (`<planCode>:<multiplier>:<payments>`, default `pro_19:2:inf,pro_49:1.5:2,pro_99:1.25:2`;
@@ -83,6 +98,13 @@ Idempotency + the per-plan window are counted from `credit_transactions` metadat
 new table. The purchase email sends the GRANTED credits, not the plan base. `/auth/me`
 returns `referral{isReferred, planBonuses}` so the paywall renders each plan's bonus
 without hardcoding multipliers that would drift from what the webhook grants.
+
+**`GET /referrals/bonuses` is PUBLIC** (no auth) and serves the same map. A visitor who
+just arrived on a partner link has no token, so `/auth/me` is unavailable — without this
+the pricing page shows them ordinary credit counts and the benefit stays invisible until
+*after* signup, the wrong side of the buying decision. The frontend calls it only when a
+first-touch code is stored and there is no session. Response carries no user or partner
+data, only the public offer.
 
 > **Invariant — the `.not(…,'is',null)` clause in `countUserBonusGrants` /
 > `hasBonusForInvoice` is load-bearing, not redundant.** The supporting partial indexes

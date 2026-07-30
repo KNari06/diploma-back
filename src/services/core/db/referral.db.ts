@@ -348,6 +348,68 @@ export async function insertRewardIfAbsent(input: {
   return (data?.length ?? 0) > 0;
 }
 
+/**
+ * The reward row written for a given invoice, or null. Used by the refund path
+ * to learn what was actually credited — the reversal must mirror the original
+ * row's partner, user, amount and currency rather than recomputing them, because
+ * the rate may have changed since (rates are captured per-row, forward-only).
+ */
+export async function findRewardByInvoice(stripeInvoiceId: string): Promise<{
+  partner_id: string;
+  referred_user_id: string;
+  amount: number;
+  currency: string;
+} | null> {
+  const { data, error } = await supabaseAdmin
+    .from('partner_reward_transactions')
+    .select('partner_id, referred_user_id, amount, currency')
+    .eq('stripe_invoice_id', stripeInvoiceId)
+    .eq('event_type', 'paid_conversion')
+    .maybeSingle();
+
+  if (error) throw error;
+  return (data as { partner_id: string; referred_user_id: string; amount: number; currency: string } | null) ?? null;
+}
+
+/**
+ * Write a NEGATIVE ledger row that cancels a previous reward. The ledger is
+ * append-only (UPDATE/DELETE are blocked by triggers), so a refund cannot edit
+ * the original row — it is reversed by a counter-entry, which also keeps the
+ * audit trail intact.
+ *
+ * Keyed on `refund:<invoiceId>` in `stripe_invoice_id` so the per-invoice unique
+ * index makes this idempotent too: Stripe retries the refund webhook, and the
+ * original reward row (keyed on the bare invoice id) is never collided with.
+ * Returns true only when this call wrote the reversal.
+ */
+export async function insertRewardReversalIfAbsent(input: {
+  partnerId: string;
+  referredUserId: string;
+  amount: number;
+  currency: string;
+  stripeInvoiceId: string;
+  metadata?: Record<string, unknown>;
+}): Promise<boolean> {
+  const { data, error } = await supabaseAdmin
+    .from('partner_reward_transactions')
+    .upsert(
+      {
+        partner_id: input.partnerId,
+        referred_user_id: input.referredUserId,
+        event_type: 'adjustment' as PartnerRewardEvent,
+        amount: -Math.abs(input.amount),
+        currency: input.currency,
+        stripe_invoice_id: `refund:${input.stripeInvoiceId}`,
+        metadata: input.metadata ?? {},
+      },
+      { onConflict: 'stripe_invoice_id', ignoreDuplicates: true }
+    )
+    .select('id');
+
+  if (error) throw error;
+  return (data?.length ?? 0) > 0;
+}
+
 // ── stats reads (batched — no N+1) ───────────────────────────────────────────
 
 /** All referred users' ids + paid flag + referred_at for a partner. One query. */

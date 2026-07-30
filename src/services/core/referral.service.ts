@@ -291,6 +291,79 @@ export class ReferralService {
     }
   }
 
+  /**
+   * Reverse a partner reward after the underlying payment was refunded.
+   *
+   * Without this the partner keeps the commission on money the customer took
+   * back — the ledger is append-only, so there is no other way to correct it.
+   * The reversal is a NEGATIVE counter-entry mirroring the original row, which
+   * preserves the audit trail (both the credit and its cancellation stay
+   * visible) and makes the owed balance self-correcting.
+   *
+   * Reads the original row rather than recomputing the amount: the rate is
+   * captured per-row and may have changed since, so recomputation could reverse
+   * a different figure than was credited.
+   *
+   * A PARTIAL refund reverses proportionally — refunding half the invoice
+   * cancels half the reward.
+   *
+   * Idempotent (unique index on the `refund:<invoiceId>` key), best-effort,
+   * never throws — it runs on the Stripe webhook path.
+   */
+  static async reverseRewardOnRefund(input: {
+    invoiceId: string;
+    refundedAmountMinorUnits: number;
+    originalAmountMinorUnits: number;
+  }): Promise<boolean> {
+    if (!ReferralsFeature.isEnabled()) return false;
+    const { invoiceId, refundedAmountMinorUnits, originalAmountMinorUnits } = input;
+    if (!invoiceId || refundedAmountMinorUnits <= 0) return false;
+
+    try {
+      const original = await referralDb.findRewardByInvoice(invoiceId);
+      if (!original) return false;
+
+      // Proportion of the invoice that was returned, capped at 1 so an
+      // over-refund can never reverse more than was credited.
+      const ratio =
+        originalAmountMinorUnits > 0
+          ? Math.min(1, refundedAmountMinorUnits / originalAmountMinorUnits)
+          : 1;
+      const reversal = Math.round(Number(original.amount) * ratio);
+      if (reversal <= 0) return false;
+
+      const reversed = await referralDb.insertRewardReversalIfAbsent({
+        partnerId: original.partner_id,
+        referredUserId: original.referred_user_id,
+        amount: reversal,
+        currency: original.currency,
+        stripeInvoiceId: invoiceId,
+        metadata: {
+          source: 'stripe:refund',
+          originalReward: Number(original.amount),
+          refundedAmount: refundedAmountMinorUnits,
+          originalAmount: originalAmountMinorUnits,
+          ratio,
+        },
+      });
+      if (reversed) {
+        logger.info('[REFERRAL] Partner reward reversed after refund', {
+          partnerId: original.partner_id,
+          invoiceId,
+          reversal,
+          ratio,
+        });
+      }
+      return reversed;
+    } catch (error) {
+      logger.warn('[REFERRAL] reverseRewardOnRefund failed (non-critical)', {
+        error: errMsg(error),
+        invoiceId,
+      });
+      return false;
+    }
+  }
+
   // ── partner-scoped reads (product frontend) ────────────────────────────────
 
   /**

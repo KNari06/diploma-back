@@ -19,6 +19,35 @@ function featureOff(res: Response): boolean {
   return false;
 }
 
+// ── public ───────────────────────────────────────────────────────────────────
+
+/**
+ * The per-plan credit multipliers a referred user receives. PUBLIC on purpose:
+ * a visitor who arrived on a partner link has not signed up yet, so `/auth/me`
+ * (which also carries these) is unavailable — yet the pricing page must show the
+ * bonus at exactly the moment they decide whether to buy. Without this endpoint
+ * the benefit is invisible until after signup, which is the wrong side of the
+ * decision.
+ *
+ * Serving it rather than hardcoding the map in the frontend keeps ONE source of
+ * truth: the same config the Stripe webhook reads when it actually grants the
+ * credits. A hardcoded copy would drift the moment the config changes and we
+ * would advertise credits we do not deliver.
+ *
+ * Contains no user data and no partner data — only the public offer, which is
+ * already implied by any partner's marketing.
+ */
+export const getPublicBonuses = async (_req: Request, res: Response): Promise<void> => {
+  if (featureOff(res)) return;
+
+  const planBonuses: Record<string, number> = {};
+  for (const [code, cfg] of ReferralsFeature.parseUserBonusPlans()) {
+    if (cfg.multiplier > 1 && cfg.payments > 0) planBonuses[code] = cfg.multiplier;
+  }
+
+  res.json({ success: true, data: { planBonuses } });
+};
+
 // ── partner-scoped (the authenticated partner's OWN data only) ───────────────
 
 /**
