@@ -219,7 +219,7 @@ export interface UserRewardConfig {
 export async function getUserRewardConfig(userId: string): Promise<UserRewardConfig | null> {
   const { data, error } = await supabaseAdmin
     .from('users')
-    .select('referred_by_partner_id, partners:referred_by_partner_id (reward_rate, reward_window_count)')
+    .select('referred_by_partner_id, partners:referred_by_partner_id (status, reward_rate, reward_window_count)')
     .eq('id', userId)
     .maybeSingle();
 
@@ -234,6 +234,13 @@ export async function getUserRewardConfig(userId: string): Promise<UserRewardCon
   // Supabase types an embedded relation as an array; a to-one FK yields 0..1 rows.
   const rel = row?.partners;
   const partner = Array.isArray(rel) ? rel[0] ?? null : rel ?? null;
+
+  // A partner disabled AFTER their referrals signed up must stop earning.
+  // Attribution already refuses a disabled code, but that gate only runs at
+  // signup — without this check a partner disabled for cause keeps collecting on
+  // every renewal of everyone they had already referred.
+  if (partner?.status && partner.status !== 'active') return null;
+
   return {
     partnerId,
     rewardRate: partner?.reward_rate ?? null,
@@ -242,6 +249,7 @@ export async function getUserRewardConfig(userId: string): Promise<UserRewardCon
 }
 
 interface PartnerRewardCols {
+  status: string | null;
   reward_rate: number | null;
   reward_window_count: number | null;
 }
@@ -306,7 +314,12 @@ export async function countRewardsForUser(referredUserId: string): Promise<numbe
   const { count, error } = await supabaseAdmin
     .from('partner_reward_transactions')
     .select('id', { count: 'exact', head: true })
-    .eq('referred_user_id', referredUserId);
+    .eq('referred_user_id', referredUserId)
+    // Only actual rewards consume the window. The ledger also holds
+    // 'adjustment' rows (refund reversals), and counting those would close the
+    // window early — a refunded first payment would eat a slot AND leave a
+    // negative row, costing the partner twice for one cancelled payment.
+    .eq('event_type', 'paid_conversion');
 
   if (error) throw error;
   return count ?? 0;
@@ -448,16 +461,23 @@ export async function getCreditsUsedForUsers(userIds: string[]): Promise<Map<str
 }
 
 /** Sum of owed reward balance for a partner. One aggregate read. */
-export async function getOwedBalance(partnerId: string): Promise<number> {
+export async function getOwedBalance(partnerId: string): Promise<Record<string, number>> {
   const { data, error } = await supabaseAdmin
     .from('partner_reward_transactions')
-    .select('amount')
+    .select('amount, currency')
     .eq('partner_id', partnerId);
 
   if (error) throw error;
-  let sum = 0;
-  for (const row of (data as { amount: number | null }[] | null) ?? []) {
-    sum += Number(row.amount) || 0;
+
+  // Grouped BY CURRENCY, never summed across it. `amount` is minor units of the
+  // invoice's own currency, so adding 100 (¥1) to 100 ($1.00) produces a number
+  // that means nothing — and the dashboard would render it with a single symbol,
+  // silently showing the partner a figure they are not owed. Negative rows
+  // (refund reversals) net off within their own currency.
+  const byCurrency: Record<string, number> = {};
+  for (const row of (data as { amount: number | null; currency: string | null }[] | null) ?? []) {
+    const code = (row.currency || 'usd').toLowerCase();
+    byCurrency[code] = (byCurrency[code] ?? 0) + (Number(row.amount) || 0);
   }
-  return sum;
+  return byCurrency;
 }
