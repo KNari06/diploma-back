@@ -380,13 +380,22 @@ export class ReferralService {
   static async getStatsForPartner(partnerId: string, code: string): Promise<PartnerStats> {
     const referred = await referralDb.getReferredUsers(partnerId);
     const userIds = referred.map((r) => r.id);
-    const [creditsMap, owedBalance] = await Promise.all([
+    const [creditsMap, owedByCurrency] = await Promise.all([
       referralDb.getCreditsUsedForUsers(userIds),
       referralDb.getOwedBalance(partnerId),
     ]);
 
     let creditsUsedByReferred = 0;
     for (const id of userIds) creditsUsedByReferred += creditsMap.get(id) ?? 0;
+
+    // Headline figure = the currency the partner is owed MOST in. Picking one
+    // rather than summing keeps the number meaningful: minor units of different
+    // currencies are not addable, and a single rendered symbol would misstate
+    // what they are actually owed. `owedByCurrency` carries the full picture.
+    const entries = Object.entries(owedByCurrency);
+    const [owedCurrency, owedBalance] = entries.length
+      ? entries.reduce((max, e) => (e[1] > max[1] ? e : max))
+      : ['usd', 0];
 
     return {
       partnerId,
@@ -395,6 +404,8 @@ export class ReferralService {
       paidUsers: referred.filter((r) => r.plan_status === 'paid').length,
       creditsUsedByReferred,
       owedBalance,
+      owedCurrency,
+      owedByCurrency,
     };
   }
 

@@ -331,7 +331,7 @@ describe('ReferralService.getStatsForPartner', () => {
         ['c', 0],
       ])
     );
-    db.getOwedBalance.mockResolvedValue(1000);
+    db.getOwedBalance.mockResolvedValue({ usd: 1000 });
 
     const stats = await ReferralService.getStatsForPartner('p1', 'acme');
     expect(stats).toEqual({
@@ -341,6 +341,8 @@ describe('ReferralService.getStatsForPartner', () => {
       paidUsers: 1,
       creditsUsedByReferred: 750,
       owedBalance: 1000,
+      owedCurrency: 'usd',
+      owedByCurrency: { usd: 1000 },
     });
   });
 });
@@ -552,5 +554,93 @@ describe('ReferralService.reverseRewardOnRefund', () => {
         originalAmountMinorUnits: 1900,
       })
     ).resolves.toBe(false);
+  });
+});
+
+/**
+ * Guards that only matter once a referral has existed for a while: a partner
+ * disabled after their referrals signed up, and refund rows in the same ledger
+ * the reward window counts.
+ */
+describe('ReferralService.rewardOnPayment — long-lived referral guards', () => {
+  const payment = {
+    userId: 'u1',
+    invoiceId: 'in_9',
+    amountPaidMinorUnits: 1900,
+    currency: 'usd',
+  };
+
+  it('stops rewarding a partner disabled AFTER the referral signed up', async () => {
+    // Attribution refuses a disabled code, but that gate only runs at signup —
+    // without a check here a partner disabled for cause keeps collecting on every
+    // renewal of everyone they already referred. getUserRewardConfig returns null
+    // for a non-active partner, which is what this asserts.
+    db.getUserRewardConfig.mockResolvedValue(null);
+
+    expect(await ReferralService.rewardOnPayment(payment)).toBe(false);
+    expect(db.insertRewardIfAbsent).not.toHaveBeenCalled();
+  });
+
+  it('does not let a refund reversal consume a reward-window slot', async () => {
+    // countRewardsForUser must count 'paid_conversion' rows only. If refund
+    // 'adjustment' rows counted too, a refunded first payment would eat a slot
+    // AND leave a negative row — charging the partner twice for one cancellation.
+    db.getUserRewardConfig.mockResolvedValue(defaultRewardConfig);
+    db.countRewardsForUser.mockResolvedValue(1); // one real reward, refund excluded
+    db.insertRewardIfAbsent.mockResolvedValue(true);
+
+    expect(await ReferralService.rewardOnPayment(payment)).toBe(true);
+    expect(db.insertRewardIfAbsent).toHaveBeenCalledWith(
+      expect.objectContaining({ metadata: expect.objectContaining({ paymentNumber: 2 }) })
+    );
+  });
+});
+
+describe('ReferralService.getStatsForPartner — multi-currency owed balance', () => {
+  beforeEach(() => {
+    db.getReferredUsers.mockResolvedValue([
+      { id: 'a', email: 'a@x.com', referred_at: '2026-07-01', plan_status: 'paid' },
+    ]);
+    db.getCreditsUsedForUsers.mockResolvedValue(new Map([['a', 0]]));
+  });
+
+  it('NEVER adds unlike currencies together', async () => {
+    // 10000 minor units of JPY (¥10,000) and 5000 of USD ($50.00) are not
+    // addable. Summing them gives 15000, which the dashboard would render as
+    // "$150.00" — a figure the partner is not owed in any currency.
+    db.getOwedBalance.mockResolvedValue({ usd: 5000, jpy: 10000 });
+
+    const stats = await ReferralService.getStatsForPartner('p1', 'acme');
+
+    expect(stats.owedBalance).not.toBe(15000);
+    expect(stats.owedByCurrency).toEqual({ usd: 5000, jpy: 10000 });
+  });
+
+  it('headlines the currency the partner is owed MOST in', async () => {
+    db.getOwedBalance.mockResolvedValue({ usd: 5000, eur: 9000 });
+
+    const stats = await ReferralService.getStatsForPartner('p1', 'acme');
+
+    expect(stats.owedCurrency).toBe('eur');
+    expect(stats.owedBalance).toBe(9000);
+  });
+
+  it('reports a zero USD balance when nothing is owed', async () => {
+    db.getOwedBalance.mockResolvedValue({});
+
+    const stats = await ReferralService.getStatsForPartner('p1', 'acme');
+
+    expect(stats).toMatchObject({ owedBalance: 0, owedCurrency: 'usd', owedByCurrency: {} });
+  });
+
+  it('nets refund reversals off within their own currency', async () => {
+    // A $9.50 reward followed by its reversal leaves nothing owed — and must not
+    // leak into another currency's total.
+    db.getOwedBalance.mockResolvedValue({ usd: 0, eur: 2000 });
+
+    const stats = await ReferralService.getStatsForPartner('p1', 'acme');
+
+    expect(stats.owedCurrency).toBe('eur');
+    expect(stats.owedByCurrency.usd).toBe(0);
   });
 });

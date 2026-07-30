@@ -72,6 +72,20 @@ window — and the same rate on an enterprise invoice is ~$1,495/month. A B2B re
 should be a deliberate, separately-priced arrangement. Skipped B2B invoices are logged,
 not dropped silently.
 
+**A disabled partner stops earning.** `getUserRewardConfig` selects `partners.status`
+and returns null unless active — the `attributeUser` status gate only runs at signup, so
+without this a partner disabled for cause keeps collecting on every renewal of everyone
+they had already referred.
+
+**The owed balance is grouped BY CURRENCY, never summed across it.** `amount` is minor
+units of the paid invoice's own currency, so adding ¥100 to $1.00 yields a number that
+means nothing — and a dashboard rendering one symbol would show a figure the partner is
+not owed. `getOwedBalance` returns `Record<currency, minorUnits>`; `PartnerStats` carries
+`owedBalance` + `owedCurrency` (the largest, for the headline) and `owedByCurrency` (the
+full picture, which both dashboards render as a secondary line). `countRewardsForUser`
+counts `paid_conversion` rows ONLY — refund `adjustment` rows would otherwise close the
+reward window early, charging the partner twice for one cancelled payment.
+
 **Refunds reverse the reward** — `reverseRewardOnRefund`, wired to `charge.refunded`.
 The ledger is append-only, so a refund cannot edit the original row: it writes a NEGATIVE
 counter-entry keyed `refund:<invoiceId>` (own unique key → idempotent under Stripe

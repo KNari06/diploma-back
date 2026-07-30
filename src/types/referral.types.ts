@@ -35,7 +35,20 @@ export interface PartnerStats {
   registrations: number;
   paidUsers: number;
   creditsUsedByReferred: number;
+  /**
+   * Owed amount in the partner's PRIMARY currency (the one they are owed most
+   * in), in minor units. Kept as a single number so existing consumers keep
+   * working; read `owedCurrency` alongside it rather than assuming USD.
+   */
   owedBalance: number;
+  /** ISO code `owedBalance` is denominated in. */
+  owedCurrency: string;
+  /**
+   * Every currency the partner is owed in, minor units. Normally one entry —
+   * this exists so a multi-currency partner is never shown a single figure that
+   * silently adds unlike currencies together.
+   */
+  owedByCurrency: Record<string, number>;
 }
 
 /** Reward-event kinds recorded in partner_reward_transactions. */
