@@ -125,6 +125,37 @@ export const errorHandler = (
     return;
   }
 
+  // Handle multer upload errors (size / count / field limits).
+  // These are client mistakes, but with no branch here they fell through to the
+  // 500 below — and in production the message is replaced with a generic
+  // 'Internal server error', so a user uploading an oversized file was told the
+  // backend broke. `chat` / `workspace` / `playwright` catch this in their own
+  // route handlers; `preview`, `kb` and `allure-import` do not, so handling it
+  // centrally covers them and any future multer route.
+  // Matched by `name` rather than `instanceof multer.MulterError` to keep the
+  // core error handler free of a route-layer dependency.
+  if (error.name === 'MulterError') {
+    const code = (error as Error & { code?: string }).code;
+    const messages: Record<string, string> = {
+      LIMIT_FILE_SIZE: 'File too large.',
+      LIMIT_FILE_COUNT: 'Too many files.',
+      LIMIT_PART_COUNT: 'Too many parts in the upload.',
+      LIMIT_FIELD_KEY: 'Field name too long.',
+      LIMIT_FIELD_VALUE: 'Field value too long.',
+      LIMIT_FIELD_COUNT: 'Too many fields in the upload.',
+      LIMIT_UNEXPECTED_FILE: 'Unexpected file field.',
+    };
+    res.status(400).json({
+      success: false,
+      // Keep multer's own message as the fallback — it is already user-safe
+      // ('File too large', 'Unexpected field') and never leaks internals.
+      error: (code && messages[code]) || error.message || 'Upload rejected.',
+      code: code || 'UPLOAD_ERROR',
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
   // Handle validation errors
   if (error.name === 'ValidationError') {
     res.status(400).json({
