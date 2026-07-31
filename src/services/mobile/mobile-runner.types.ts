@@ -191,6 +191,14 @@ export interface MobileIntentStepOptions {
   /** Swipe distance hint (0-1 normalised). Forwarded by the editor. */
   distance?: number;
   continueOnError?: boolean;
+  /**
+   * Author-time "step is switched off" toggle. `false` = the runner skips this
+   * step without dispatching it; absent / `true` = execute. Mirrors the web
+   * `StepOptions.enabled`. The runner declares it in `run.schema.ts` too —
+   * without that entry Zod strips it at the HTTP boundary and the toggle
+   * becomes a silent no-op on mobile.
+   */
+  enabled?: boolean;
   // App management
   activityName?: string;
   clearData?: boolean;
@@ -330,6 +338,14 @@ export interface MobileStepResult {
   error?: string;
   screenshot?: string; // base64
   resolvedVia?: 'compiled' | 'exact_label' | 'exact_text' | 'partial' | 'coordinates' | 'llm' | 'vision' | 'thinking' | 'soft_score' | 'passthrough' | 'skipped' | 'unresolved' | 'low_confidence';
+  /**
+   * Why the step was not executed. `resolvedVia: 'skipped'` is ambiguous — six
+   * producers share it (client abort, run timeout, unsupported step, `store`
+   * meta-steps, the stopOnFailure tail-fill, and an author-disabled step).
+   * `'disabled'` means the AUTHOR switched the step off, which is what billing
+   * and the run report key off to avoid charging for it or calling it a pass.
+   */
+  skipReason?: 'disabled';
   /**
    * Set by the runner when a FAILED ai-check could not produce a trustworthy
    * verdict (circuit_breaker_open / inconclusive / empty_tree / low_confidence /
@@ -533,6 +549,13 @@ export interface MobileRunStepsResponse {
   passedSteps: number;
   failedSteps: number;
   skippedSteps: number;
+  /**
+   * Steps the AUTHOR switched off, counted apart from `skippedSteps` ("meant to
+   * run, couldn't"). Billing subtracts these so a step that never reached the
+   * device isn't charged (×4 on mobile). Absent on runners predating the
+   * flag — treat as 0.
+   */
+  userSkippedSteps?: number;
   passRate: number;
   steps: MobileStepResult[];
   durationMs: number;

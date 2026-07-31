@@ -8,15 +8,18 @@ import { supabaseAdmin } from '@/db/supabase';
 // ── resolve-test-case-priority ────────────────────────────────────────────────
 
 /**
- * 2-hop join: test_executions.test_id → intent_test_cases.priority.
+ * 2-hop join: test_executions.result->>'testId' → intent_test_cases.priority.
  * Returns the raw priority string, or null when not found.
  * Throws on DB/network error — the caller wraps this in try/catch.
+ *
+ * `test_executions` has NO `test_id` column — the UI test id lives inside the
+ * `result` JSONB (indexed by `idx_test_executions_result_test_id`).
  */
 export async function fetchPriorityByTestId(testId: string): Promise<string | null> {
   const { data: exec } = await supabaseAdmin
     .from('test_executions')
     .select('test_case_id')
-    .eq('test_id', testId)
+    .eq('result->>testId', testId)
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();

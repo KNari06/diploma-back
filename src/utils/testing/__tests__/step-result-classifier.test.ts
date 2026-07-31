@@ -205,4 +205,71 @@ describe('classifyStepResults', () => {
       expect(result.aggregateMismatch).toBe(false);
     });
   });
+
+  describe('author-disabled steps (options.enabled === false)', () => {
+    const disabledIntent = (id: string): MobileIntentStep =>
+      ({ id, type: 'tap' as any, description: id, options: { enabled: false } } as MobileIntentStep);
+
+    // What the runner actually sends for a disabled step: a real stepId,
+    // success:true so it can't fail the run, and skipReason to mark it.
+    const disabledResult = (stepId: string): MobileStepResult =>
+      ({ stepId, success: true, resolvedVia: 'skipped', skipReason: 'disabled', durationMs: 0 } as MobileStepResult);
+
+    it('passes the test when the only non-executed step was disabled by the author', () => {
+      const result = classifyStepResults(
+        [step('s1', true), disabledResult('s2')],
+        [intent('s1'), disabledIntent('s2')],
+        'passed',
+      );
+      expect(result.testPassed).toBe(true);
+      expect(result.mandatoryFailures).toHaveLength(0);
+      expect(result.incompleteRun).toBe(false);
+    });
+
+    it('treats a disabled step as tolerable so an older runner reporting it as failed cannot fail the test', () => {
+      // Defense in depth: a runner predating `skipReason` may send success:false.
+      const result = classifyStepResults(
+        [step('s1', true), step('s2', false, 'Skipped')],
+        [intent('s1'), disabledIntent('s2')],
+        'passed',
+      );
+      expect(result.isTolerableFailure('s2')).toBe(true);
+      expect(result.mandatoryFailures).toHaveLength(0);
+      expect(result.testPassed).toBe(true);
+    });
+
+    it('still fails the test when a step that WAS enabled fails alongside a disabled one', () => {
+      const result = classifyStepResults(
+        [step('s1', false, 'boom'), disabledResult('s2')],
+        [intent('s1'), disabledIntent('s2')],
+        'failed',
+      );
+      expect(result.testPassed).toBe(false);
+      expect(result.mandatoryFailures).toHaveLength(1);
+      expect(result.mandatoryFailures[0].stepId).toBe('s1');
+    });
+
+    it('flags an incomplete run when a disabled step is omitted from the results entirely', () => {
+      // Regression guard: the runner MUST push a row for a disabled step.
+      // Omitting it makes the run look truncated and force-fails the test.
+      const result = classifyStepResults(
+        [step('s1', true)],
+        [intent('s1'), disabledIntent('s2')],
+        'passed',
+      );
+      expect(result.incompleteRun).toBe(true);
+      expect(result.missingStepIds).toEqual(['s2']);
+      expect(result.testPassed).toBe(false);
+    });
+
+    it('passes a run in which every step is disabled', () => {
+      const result = classifyStepResults(
+        [disabledResult('s1'), disabledResult('s2')],
+        [disabledIntent('s1'), disabledIntent('s2')],
+        'passed',
+      );
+      expect(result.testPassed).toBe(true);
+      expect(result.aggregateMismatch).toBe(false);
+    });
+  });
 });

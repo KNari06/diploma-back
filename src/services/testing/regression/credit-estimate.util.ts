@@ -18,6 +18,18 @@ export interface UiStepCountRow {
 }
 
 /**
+ * Count steps that will actually execute, i.e. excluding the ones the author
+ * switched off (`options.enabled === false`). A disabled step is dropped before
+ * dispatch and never billed, so counting it here would gate a run on credits it
+ * cannot spend. Loose shape: these arrays are raw JSONB.
+ */
+function countEnabled(steps: unknown[]): number {
+  return steps.filter(
+    (s) => (s as { options?: { enabled?: boolean } } | null)?.options?.enabled !== false,
+  ).length;
+}
+
+/**
  * Pure credit estimate for the UI test cases in a regression run.
  *
  * Web steps cost 1 credit each; MOBILE steps cost MOBILE_STEP_CREDIT_MULTIPLIER×
@@ -61,20 +73,23 @@ export function computeUiStepCredits(
   for (const row of rows) {
     let stepCount = 0;
     if (row.replay_strategy === 'commands' && Array.isArray(row.commands)) {
-      stepCount = row.commands.length;
+      stepCount = countEnabled(row.commands);
     } else if (row.replay_strategy === 'graph_extract' && row.graph_ref?.steps) {
-      stepCount = Array.isArray(row.graph_ref.steps) ? row.graph_ref.steps.length : 0;
+      stepCount = Array.isArray(row.graph_ref.steps) ? countEnabled(row.graph_ref.steps) : 0;
     } else if (Array.isArray(row.steps_json)) {
       // Step editor test cases: count steps_json (+ 1 for initial goto),
       // expanded for any same-platform link_test_case step it contains.
-      const rawLength = expandedLengthById?.get(row.id) ?? row.steps_json.length;
+      // Both sides exclude disabled steps: the link expansion skips them while
+      // walking (see LinkResolutionService.expandLinkedStepCounts) and the
+      // un-expanded fallback filters here.
+      const rawLength = expandedLengthById?.get(row.id) ?? countEnabled(row.steps_json);
       stepCount = rawLength + 1;
     }
     // Phase 3: setup_steps / teardown_steps are prepended / appended at dispatch
     // time by stitchPhases(). The user is billed for what runs, so count those
     // too. Empty arrays (default for pre-Phase-3 rows) contribute 0.
-    const setupCount = Array.isArray(row.setup_steps) ? row.setup_steps.length : 0;
-    const teardownCount = Array.isArray(row.teardown_steps) ? row.teardown_steps.length : 0;
+    const setupCount = Array.isArray(row.setup_steps) ? countEnabled(row.setup_steps) : 0;
+    const teardownCount = Array.isArray(row.teardown_steps) ? countEnabled(row.teardown_steps) : 0;
     stepCount += setupCount + teardownCount;
     // Minimum 1 step per test case even if steps can't be counted.
     uiStepCredits += Math.max(stepCount, 1) * creditsPerStepFor(row.id);

@@ -331,7 +331,12 @@ export class MobileTestRunJobHandler {
       // to a real value (possibly 0 if compile produced no prologue).
       // Order matters: this must happen BEFORE prepend, while
       // `intentSteps` still represents the user-authored body only.
-      tlm.testStepCount = intentSteps.length;
+      // Author-disabled steps never execute, so they must not inflate the
+      // step-count telemetry — this column is the denominator operators read
+      // against `test_steps_ms`, and it surfaces as a step count in reports.
+      tlm.testStepCount = intentSteps.filter(
+        (s: any) => s?.options?.enabled !== false,
+      ).length;
 
       // ── Track 5: Compile shared resources into setup steps ──
       // MUST run inside the main try block — otherwise a compile throw
@@ -804,9 +809,17 @@ export class MobileTestRunJobHandler {
       // MULTIPLIER× a web step (emulator COGS). Best-effort: a failed
       // deduction must never fail the run the user already received.
       if (userId) {
+        // Author-disabled steps are subtracted: they still occupy a row in
+        // `runResult.steps` (the backend's coverage check needs their stepId,
+        // see step-result-classifier) but they never reached the device, so
+        // charging for them would bill the user MOBILE_STEP_CREDIT_MULTIPLIER
+        // credits each for work that did not happen. Prefer the runner's own
+        // count and fall back to counting `skipReason` for older runners.
+        const userSkippedSteps = runResult.userSkippedSteps
+          ?? (runResult.steps?.filter((s) => s.skipReason === 'disabled').length ?? 0);
         const billableSteps = Math.max(
           0,
-          (runResult.steps?.length ?? 0) - (tlm.scenarioStepCount ?? 0),
+          (runResult.steps?.length ?? 0) - (tlm.scenarioStepCount ?? 0) - userSkippedSteps,
         );
         const mobileCredits = billableSteps * MOBILE_STEP_CREDIT_MULTIPLIER;
         if (mobileCredits > 0) {
@@ -994,17 +1007,24 @@ export class MobileTestRunJobHandler {
           // verdict computation built earlier (line ~575) so per-step UI
           // semantics match the run-level verdict.
           const isSkipped = stepResult.resolvedVia === 'skipped';
+          // An author-disabled step is reported with `success: true` (so it
+          // can't fail the run), which would otherwise fall into the
+          // `'executed'` branch below and render a green check on a step that
+          // never ran. It has to be tested BEFORE `success`.
+          const isDisabled = stepResult.skipReason === 'disabled';
           const isSoftFailure =
             !stepResult.success
             && !isSkipped
             && isTolerableFailure(stepResult.stepId);
-          const runtimeStatus = stepResult.success
-            ? 'executed'
-            : isSkipped
-              ? 'skipped'
-              : isSoftFailure
-                ? 'soft-failed'
-                : 'failed';
+          const runtimeStatus = isDisabled
+            ? 'skipped'
+            : stepResult.success
+              ? 'executed'
+              : isSkipped
+                ? 'skipped'
+                : isSoftFailure
+                  ? 'soft-failed'
+                  : 'failed';
 
           // Audit (Loki): a mobile AI-check could NOT produce a trustworthy
           // verdict — the runner sets `aiCheckSkippedReason` ONLY on a check

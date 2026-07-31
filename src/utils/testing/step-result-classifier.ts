@@ -64,7 +64,15 @@ export function classifyStepResults(
 
   for (const s of intentSteps) {
     knownStepIds.add(s.id);
-    if (s.options?.continueOnError === true || s.isAutoInjected === true) {
+    if (
+      s.options?.continueOnError === true
+      || s.isAutoInjected === true
+      // Author-disabled step: it was never meant to run, so it can never be
+      // the reason a test fails. The runner already reports these with
+      // `success: true`, but excusing them here keeps the verdict correct even
+      // if a runner predating `skipReason` reports the skip as a failure.
+      || s.options?.enabled === false
+    ) {
       tolerableFailureStepIds.add(s.id);
     }
   }

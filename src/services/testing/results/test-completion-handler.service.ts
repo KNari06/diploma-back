@@ -1644,12 +1644,13 @@ export class TestCompletionHandlerService {
       return;
     }
 
-    // 4. Get test_case_ids for flaky tests (via test_executions)
+    // 4. Get test_case_ids for flaky tests (via test_executions).
+    // The test id lives in the `result` JSONB, not a `test_id` column.
     const { data: flakyExecs } = await supabaseAdmin
       .from('test_executions')
       .select('test_case_id')
       .eq('run_id', run.id)
-      .in('test_id', flakyTestIds);
+      .in('result->>testId', flakyTestIds);
 
     const flakyTestCaseIds = [...new Set((flakyExecs || []).map((e: any) => e.test_case_id))];
 

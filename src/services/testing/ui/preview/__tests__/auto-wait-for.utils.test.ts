@@ -245,4 +245,63 @@ describe('injectAutoWaitForSteps', () => {
       expect(injected.options?.urlMatcher?.timeoutMs).toBe(5000);
     });
   });
+
+  describe('author-disabled steps (options.enabled === false)', () => {
+    const disable = (step: IntentStep): IntentStep => ({
+      ...step,
+      options: { ...(step.options || {}), enabled: false },
+    });
+
+    it('does not inject after a disabled step', () => {
+      // The wait would carry `changedFrom` = the URL of a step that never runs.
+      const steps: IntentStep[] = [
+        disable(createStep('1', 'click', 'https://example.com/page1')),
+        createStep('2', 'type', 'https://example.com/page2'),
+      ];
+      const result = injectAutoWaitForSteps(steps);
+      expect(result).toHaveLength(2);
+      expect(result.some((s) => s.isAutoInjected)).toBe(false);
+    });
+
+    it('does not inject before a disabled step', () => {
+      const steps: IntentStep[] = [
+        createStep('1', 'click', 'https://example.com/page1'),
+        disable(createStep('2', 'type', 'https://example.com/page2')),
+      ];
+      const result = injectAutoWaitForSteps(steps);
+      expect(result).toHaveLength(2);
+      expect(result.some((s) => s.isAutoInjected)).toBe(false);
+    });
+
+    it('still injects between two enabled steps that surround nothing disabled', () => {
+      const steps: IntentStep[] = [
+        createStep('1', 'click', 'https://example.com/page1'),
+        createStep('2', 'type', 'https://example.com/page2'),
+      ];
+      const result = injectAutoWaitForSteps(steps);
+      expect(result).toHaveLength(3);
+      expect(result[1].isAutoInjected).toBe(true);
+    });
+
+    it('keeps the disabled step itself in the array — it is only skipped, not deleted', () => {
+      const steps: IntentStep[] = [
+        createStep('1', 'click', 'https://example.com/page1'),
+        disable(createStep('2', 'type', 'https://example.com/page2')),
+        createStep('3', 'click', 'https://example.com/page3'),
+      ];
+      const result = injectAutoWaitForSteps(steps);
+      expect(result.map((s) => s.id)).toContain('2');
+      // No wait around the disabled step; step 2→3 also spans it.
+      expect(result.filter((s) => s.isAutoInjected)).toHaveLength(0);
+    });
+
+    it('treats a step with enabled:true or no flag as injectable', () => {
+      const steps: IntentStep[] = [
+        { ...createStep('1', 'click', 'https://example.com/page1'), options: { enabled: true } },
+        createStep('2', 'type', 'https://example.com/page2'),
+      ];
+      const result = injectAutoWaitForSteps(steps);
+      expect(result).toHaveLength(3);
+    });
+  });
 });
