@@ -5592,6 +5592,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
         // Always use stepsJson from DB — it's already in the format the mobile runner expects
         const steps = (testCase.stepsJson || []) as any[];
+        // Author-disabled steps are dispatched (the runner needs a result row per
+        // step id so the coverage check can't read the run as truncated) but they
+        // never execute, so every count reported to the editor must exclude them:
+        // otherwise the progress bar sticks short of 100% and the failure path
+        // below reports a step the user switched off as "failed".
+        const runnableStepCount = steps.filter((s: any) => s?.options?.enabled !== false).length;
 
         if (!steps.length) {
           socket.emit('error', {
@@ -5705,7 +5711,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         // Emit started AFTER session is validated
         webSocketService.emitToUser(userId, 'preview:run:started', {
           previewSessionId,
-          totalSteps: steps.length,
+          totalSteps: runnableStepCount,
           startUrl: testCase.startUrl || testCase.url || '',
           timestamp: new Date().toISOString(),
         });
@@ -5802,9 +5808,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           // Emit completed with failure so frontend exits running state
           webSocketService.emitToUser(userId, 'preview:run:completed', {
             previewSessionId,
-            totalSteps: steps.length,
+            totalSteps: runnableStepCount,
             passedSteps: 0,
-            failedSteps: steps.length,
+            failedSteps: runnableStepCount,
             skippedSteps: 0,
             cancelled: false,
             duration: 0,

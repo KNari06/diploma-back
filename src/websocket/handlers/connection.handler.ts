@@ -22,6 +22,7 @@ import {
 } from '@/services/mobile/mobile-idle.service';
 import { cancelIdle as cancelPreviewIdle } from '@/services/testing/ui/preview/preview-idle.service';
 import { getMobileRunnerClientForSession } from '@/services/mobile/session-runner-routing';
+import { hasInFlight } from '@/services/mobile/session-inflight.registry';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
 
@@ -43,7 +44,39 @@ const disconnectGraceTimers = new Map<string, NodeJS.Timeout>();
  */
 async function performDisconnectCleanup(userId: string, disconnectReason?: string): Promise<void> {
   try {
-    const sessionIds = await getUserWarmupSessionIds(userId);
+    const allSessionIds = await getUserWarmupSessionIds(userId);
+
+    // ── Never destroy a session that is mid-step ──────────────────────────
+    // The editor's run loop drives steps over REST while the session's
+    // lifetime is governed by this WebSocket. Those channels fail
+    // independently: a Socket.IO `ping timeout` (the most common teardown
+    // cause — 59 in trace_files between 2026-06-23 and 2026-07-31) kills the
+    // socket while the REST run is still healthy. Destroying the session here
+    // left the in-flight apply with nothing to answer it, so it hung until the
+    // browser gave up with `TypeError: Failed to fetch` — which the UI then
+    // blamed on a step that had already passed.
+    //
+    // Such sessions are DEFERRED, not skipped: re-scheduling keeps the
+    // eventual cleanup (the user really may be gone) instead of leaking an
+    // emulator until the runner's own TTL reclaims it.
+    //
+    // Partition in ONE pass. `hasInFlight` evicts stale entries as a side
+    // effect, so calling it twice per session could return different answers
+    // and drop a session out of both lists — never destroyed, never deferred.
+    const busy: string[] = [];
+    const sessionIds: string[] = [];
+    for (const sid of allSessionIds) {
+      (hasInFlight(sid) ? busy : sessionIds).push(sid);
+    }
+
+    if (busy.length > 0) {
+      logger.info('[WebSocket] Deferring cleanup — session has work in flight', {
+        userId: userId.substring(0, 8) + '...',
+        busySessions: busy.length,
+        retryInMs: DISCONNECT_GRACE_MS,
+      });
+      scheduleDisconnectCleanup(userId, disconnectReason);
+    }
 
     if (sessionIds.length > 0) {
       await Promise.allSettled(
@@ -97,6 +130,19 @@ async function performDisconnectCleanup(userId: string, disconnectReason?: strin
       );
     }
 
+    // Redis-key deletion and the idle timers are per-USER, not per-session, so
+    // running them while a deferred session is still executing would strip the
+    // warmup binding out from under the live run — defeating the deferral
+    // above. Hold them back until the retry finds nothing in flight.
+    if (busy.length > 0) {
+      logger.info('[WebSocket] Partial cleanup — kept Redis keys + idle timers for busy session', {
+        userId: userId.substring(0, 8) + '...',
+        destroyedSessions: sessionIds.length,
+        deferredSessions: busy.length,
+      });
+      return;
+    }
+
     const deletedKeys = await deleteUserMobileKeys(userId);
     cancelIdle(userId);
     // Web preview has its own per-user idle timer driven by the same socket
@@ -115,6 +161,26 @@ async function performDisconnectCleanup(userId: string, disconnectReason?: strin
       error: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+/**
+ * Arm (or re-arm) the grace timer that destroys this user's mobile sessions.
+ *
+ * Shared by the `disconnect` handler and by `performDisconnectCleanup`'s
+ * deferral path, so a session that was mid-step gets re-checked one grace
+ * window later instead of being abandoned. A fresh connect still cancels it via
+ * `cancelDisconnectGrace`, so a user who comes back never pays a re-warmup.
+ */
+function scheduleDisconnectCleanup(userId: string, disconnectReason?: string): void {
+  const existing = disconnectGraceTimers.get(userId);
+  if (existing) clearTimeout(existing);
+
+  const timer = setTimeout(() => {
+    disconnectGraceTimers.delete(userId);
+    void performDisconnectCleanup(userId, disconnectReason);
+  }, DISCONNECT_GRACE_MS);
+
+  disconnectGraceTimers.set(userId, timer);
 }
 
 /** Cancel a pending grace timer (e.g. user reconnects). */
@@ -258,20 +324,12 @@ export const handleConnection = async (socket: TypedSocket): Promise<void> => {
 
     // Last socket gone — schedule cleanup. Replaces any prior pending
     // timer (shouldn't exist, but defensive).
-    const existing = disconnectGraceTimers.get(uid);
-    if (existing) clearTimeout(existing);
-
     logger.info('[WebSocket] Last socket for user gone — scheduling cleanup', {
       userId: uid.substring(0, 8) + '...',
       graceMs: DISCONNECT_GRACE_MS,
     });
 
-    const timer = setTimeout(() => {
-      disconnectGraceTimers.delete(uid);
-      void performDisconnectCleanup(uid, reason);
-    }, DISCONNECT_GRACE_MS);
-
-    disconnectGraceTimers.set(uid, timer);
+    scheduleDisconnectCleanup(uid, reason);
   });
 
   // Handle errors

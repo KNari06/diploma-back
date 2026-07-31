@@ -1211,6 +1211,21 @@ export interface StepOptions {
    * runner's `options.continueOnError` (see step-result-classifier.ts).
    */
   continueOnError?: boolean;
+  /**
+   * Author-time "step is switched off" toggle. `false` = every executor skips
+   * this step without running it; absent / `true` = execute. Only an explicit
+   * `false` disables, so steps saved before the flag existed keep running.
+   *
+   * Deliberately lives on `options` rather than the step body: `options` is
+   * forwarded wholesale by `normaliseIntentStep` (the JSONB whitelist) and by
+   * the frontend's `buildStepResolutionOptions`, whereas a new top-level field
+   * would be silently dropped by both — and then ERASED from `steps_json` by
+   * the post-run writeback, which merges the runtime step as its base.
+   *
+   * A skipped step is neither billed nor counted as passed; see
+   * `step-result-classifier.ts` for why it still needs a result row.
+   */
+  enabled?: boolean;
   /** Iframe configuration for actions within iframes */
   iframe?: IframeConfig;
   /**

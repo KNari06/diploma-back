@@ -100,11 +100,25 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
       },
       // Connection options
       // ⚠️ pingInterval affects polling frequency. Lower = more requests
-      // (~6/min/client) but faster dead-connection detection (~10–20s).
-      // We need fast detection so the editor's session-cleanup logic
-      // (Fix A: destroy mobile emulator on browser close, with 15s grace)
-      // and the per-user idle timer reach the user promptly.
-      pingTimeout: 10000, // 10s — disconnect window after a missed pong
+      // (~6/min/client) but faster dead-connection detection.
+      // Fast detection matters because the editor's session-cleanup logic
+      // (destroy the mobile emulator on browser close, with 15s grace) and the
+      // per-user idle timer key off the disconnect.
+      //
+      // `pingTimeout` is back at Socket.IO's 20s default. At 10s a QA engineer
+      // on mobile tethering or a VPN tripped it routinely: a lapsed heartbeat
+      // declared the socket dead, and 15s later the grace cleanup destroyed a
+      // live emulator session. That was the most common teardown cause in
+      // `trace_files` — 59 `ping timeout` events between 2026-06-23 and
+      // 2026-07-31, 13 on 2026-07-30 alone.
+      //
+      // The correctness risk that motivated the tighter window (destroying a
+      // session mid-step) is now handled properly by the in-flight guard in
+      // `connection.handler.ts` — a busy session is deferred, not destroyed —
+      // so this only needs to be forgiving of a flaky network, not a backstop.
+      // `pingInterval` stays at 10s: the heartbeat cadence drives polling
+      // frequency, and only the tolerance for a MISSED pong needed widening.
+      pingTimeout: 20000, // 20s — disconnect window after a missed pong
       pingInterval: 10000, // 10s — heartbeat cadence
       connectTimeout: 45000, // 45 seconds
       // Transport options

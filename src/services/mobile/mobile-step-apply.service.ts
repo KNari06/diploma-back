@@ -472,7 +472,14 @@ export class MobileStepApplyService {
       value: stepDraft.value,
       assertionText: stepDraft.assertionText,
       appPackage: stepDraft.appPackage,
-      options: stepDraft.options,
+      // `enabled` is deliberately dropped: this is the single-step "Apply"
+      // button, an explicit request to run THIS step now. Forwarding the flag
+      // would make the runner skip it and report success, so the user would
+      // click Apply on a disabled step and get a silent green no-op. The
+      // author's off-switch governs full runs, not a manual one-shot.
+      options: stepDraft.options?.enabled === false
+        ? { ...stepDraft.options, enabled: undefined }
+        : stepDraft.options,
       // Priority: top-level `stepDraft.bindingHints` (edited by the user in
       // the inspector) > `stepDraft.intentStep.bindingHints` (recorded
       // snapshot). The frontend `buildStepDraft` already applies the same

@@ -552,12 +552,23 @@ export function convertIntentStepToCommand(
  * @returns Array of IntentPlaywrightCommands ready for execution
  */
 export function convertIntentStepsToCommands(
-  steps: IntentStep[],
+  allSteps: IntentStep[],
   startUrl: string,
   intentTestCaseId?: string
 ): IntentPlaywrightCommand[] {
+  // Author-disabled steps (options.enabled === false) never become commands.
+  // Dropping them HERE rather than skipping inside the executor loop keeps
+  // every downstream index honest: the executor's step counter feeds credit
+  // memos, screenshot filenames, `executed_steps` rows and its own
+  // `commands[currentStepIndex]` lookahead, so a mid-loop `continue` would
+  // leave a hole in the persisted sequence. Only an explicit `false` disables,
+  // so steps saved before the flag existed are unaffected.
+  const steps = allSteps.filter((s) => s.options?.enabled !== false);
+  const disabledCount = allSteps.length - steps.length;
+
   logger.info('[INTENT_STEP_CONVERTER] Converting intent steps', {
     stepsCount: steps.length,
+    ...(disabledCount > 0 ? { disabledStepsSkipped: disabledCount } : {}),
     startUrl,
     intentTestCaseId,
   });

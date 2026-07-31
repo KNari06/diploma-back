@@ -191,14 +191,18 @@ export class RegressionDoctorJobHandler {
    * — it's not Doctor's concern.
    *
    * Data source — we go through `test_executions` because that's the table
-   * that actually carries the (run_id → test_id) relationship; then JOIN
+   * that actually carries the (run_id → test id) relationship; then JOIN
    * to `test_results` for the ai_summary payload.
+   *
+   * The test id is NOT a column — it lives inside the `result` JSONB as
+   * `result->>'testId'`. Rows without it (e.g. mobile runs, which write to
+   * `mobile_test_results`) simply drop out and are not Doctor's concern.
    */
   private static async fetchDriftFailures(runId: string): Promise<DriftFailureInput[]> {
-    // 1. Find all test_executions in this run (gives us test_ids).
+    // 1. Find all test_executions in this run (gives us test ids).
     const { data: executions, error: exErr } = await dbAdminService.supabaseAdmin
       .from('test_executions')
-      .select('test_id, status')
+      .select('result, status')
       .eq('run_id', runId);
 
     if (exErr) {
@@ -208,8 +212,8 @@ export class RegressionDoctorJobHandler {
 
     const failedTestIds = executions
       .filter((e) => e.status === 'failed' || e.status === 'timeout')
-      .map((e) => e.test_id as string)
-      .filter(Boolean);
+      .map((e) => (e.result as { testId?: string } | null)?.testId)
+      .filter((id): id is string => Boolean(id));
 
     if (failedTestIds.length === 0) return [];
 

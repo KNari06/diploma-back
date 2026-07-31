@@ -61,7 +61,12 @@ export class WebTestRequestBuilderService {
       // restoration is a single-method change.
       commands = await WebTestRequestBuilderService.stitchCommandsForTestCase(commands, intentCase, targetUrl);
     } else if (intentCase.replay_strategy === 'graph_extract' && Array.isArray(intentCase.graph_ref?.steps) && intentCase.graph_ref.steps.length > 0) {
-      commands = intentCase.graph_ref.steps;
+      // `graph_ref.steps` are IntentStep-shaped, so they carry the author's
+      // on/off flag — but they bypass `convertIntentStepsToCommands` (which is
+      // where the steps_json branch filters), so a disabled step would run.
+      commands = intentCase.graph_ref.steps.filter(
+        (s: any) => s?.options?.enabled !== false,
+      );
       // Phase B (May 2026) — pass-through, see comment above.
       commands = await WebTestRequestBuilderService.stitchCommandsForTestCase(commands, intentCase, targetUrl);
     } else if (Array.isArray(intentCase.steps_json) && intentCase.steps_json.length > 0) {

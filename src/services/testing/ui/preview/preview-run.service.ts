@@ -1008,9 +1008,11 @@ export class PreviewRunService {
       // executed so the progress bar reads "1/20" instead of "16/35"
       // (the prior 15 are skipped on the wire — the user explicitly
       // chose this mode to avoid re-running them).
-      const visibleTotalSteps = startFromIndex > 0
-        ? Math.max(0, steps.length - startFromIndex)
-        : steps.length;
+      // Author-disabled steps are excluded from the denominator too: they are
+      // never executed, so counting them would leave the bar stuck short of
+      // 100% (e.g. "18/20 done") for the whole run.
+      const visibleTotalSteps = (startFromIndex > 0 ? steps.slice(startFromIndex) : steps)
+        .filter((s) => s.options?.enabled !== false).length;
       webSocketService.emitToUser(userId, 'preview:run:started', {
         previewSessionId,
         totalSteps: visibleTotalSteps,
@@ -1472,7 +1474,40 @@ export class PreviewRunService {
       // it with a wait_for derived from earlier steps would just block on
       // state we already trust (the live preview is exactly where the user
       // recorded from).
-      const stepsAfterSlice = startFromIndex > 0 ? steps.slice(startFromIndex) : steps;
+      const rawStepsAfterSlice = startFromIndex > 0 ? steps.slice(startFromIndex) : steps;
+
+      // ── Author-disabled steps (options.enabled === false) ──────────────
+      // Removed BEFORE auto-wait injection so `shouldInjectWaitFor(cur, next)`
+      // pairs the steps that will actually run — a disabled step sitting
+      // between a click and its follow-up would otherwise misplace the wait.
+      //
+      // Unlike background replay (where the step simply never becomes a
+      // command), the editor tells the user what happened: each disabled step
+      // gets one `skipped` emit so its row reads "Skipped" instead of sitting
+      // on "pending" forever. `skippedSteps` is NOT incremented — that counter
+      // feeds the run summary's "couldn't run these" tally, and the author
+      // asked for these to be left out.
+      const stepsAfterSlice = rawStepsAfterSlice.filter((s) => s.options?.enabled !== false);
+      if (stepsAfterSlice.length !== rawStepsAfterSlice.length) {
+        rawStepsAfterSlice.forEach((s, idx) => {
+          if (s.options?.enabled !== false) return;
+          webSocketService.emitToUser(userId, 'preview:run:step', {
+            previewSessionId,
+            stepIndex: startFromIndex + idx,
+            stepId: s.id,
+            status: 'skipped',
+            action: s.type,
+            description: s.description,
+            disabled: true,
+            timestamp: new Date().toISOString(),
+          });
+        });
+        logger.info('[PreviewRun] Skipping author-disabled steps', {
+          previewSessionId,
+          disabledCount: rawStepsAfterSlice.length - stepsAfterSlice.length,
+        });
+      }
+
       const stepsToExecute = injectAutoWaitForSteps(stepsAfterSlice);
       if (stepsToExecute.length !== stepsAfterSlice.length) {
         logger.info('[PreviewRun] Pre-injected auto-wait steps for first-run stability', {

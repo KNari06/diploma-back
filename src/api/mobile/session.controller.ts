@@ -46,6 +46,7 @@ import { Request, Response } from 'express';
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { applyProjectPolicyToSession } from '@/services/mobile/permission-policy.service';
+import { track as trackSessionInFlight } from '@/services/mobile/session-inflight.registry';
 import { CompanionFeature } from '@/config/features/companion';
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -1931,6 +1932,16 @@ export async function applySession(req: Request, res: Response): Promise<void> {
     }
   }
 
+  // Hoisted out of the try so the catch can report the REAL elapsed time. How
+  // long a failed apply ran is the primary diagnostic for a stall (a 7-minute
+  // latency says "connection died", a 30s one says "runner timeout"), so a
+  // placeholder 0 here would throw away the most useful number in the trace.
+  const applyStart = Date.now();
+  // Guards against writing two `mobile_apply_result` events for one step: the
+  // success path writes as soon as the verdict is known, so a throw in the
+  // post-verdict work below must not make the catch write again.
+  let resultTraced = false;
+
   try {
     // Trace logging for mobile editor
     const traceSessionId = `mobile-${sessionId}`;
@@ -1947,7 +1958,6 @@ export async function applySession(req: Request, res: Response): Promise<void> {
       value: stepDraft.value,
       sessionId,
     });
-    const applyStart = Date.now();
 
     // Propagate client-disconnect to the runner so its step loop exits
     // promptly and releases the session mutex. Without this, hitting Stop
@@ -1963,12 +1973,18 @@ export async function applySession(req: Request, res: Response): Promise<void> {
     const { MobileStepApplyService } = await import('@/services/mobile/mobile-step-apply.service');
     let output;
     try {
-      output = await MobileStepApplyService.apply({
-        sessionId,
-        stepDraft,
-        userId: req.user!.id,
-        signal: abortController.signal,
-      });
+      // Marked in-flight for the duration of the runner call so a WebSocket
+      // ping-timeout cleanup can't destroy this session mid-step. The run is
+      // driven over REST but the session's lifetime is governed by the WS, and
+      // the two fail independently — see session-inflight.registry.ts.
+      output = await trackSessionInFlight(sessionId, () =>
+        MobileStepApplyService.apply({
+          sessionId,
+          stepDraft,
+          userId: req.user!.id,
+          signal: abortController.signal,
+        }),
+      );
     } finally {
       req.off('close', onReqClose);
     }
@@ -1984,6 +2000,11 @@ export async function applySession(req: Request, res: Response): Promise<void> {
         durationMs: output.stepResult?.durationMs,
       },
     });
+    // The result event is now on the wire. Everything below (credit charge,
+    // compiled-plan persist, res.json) is post-verdict, so if any of it throws,
+    // the catch must NOT write a SECOND result event for this step — that would
+    // double-count `failedSteps` in trace_summary.
+    resultTraced = true;
 
     // Charge credits for an AI-assisted mobile apply — same rate and dedup as
     // the web preview path (preview.handler.ts). Only fires when the runner
@@ -2065,6 +2086,34 @@ export async function applySession(req: Request, res: Response): Promise<void> {
       });
     }
   } catch (error) {
+    // Record the failure in the trace BEFORE any early return. Without this the
+    // request/result events are unbalanced: `writeMobileApplyRequest` ran at the
+    // top, `writeMobileApplyResult` only runs on the success path, so an apply
+    // that threw left a request with no result. `trace_summary` then reported
+    // `errors: 0, failedSteps: 0` for a run the UI had shown as failed —
+    // observed 2026-07-31, where the only way to diagnose a 7-minute stall was
+    // a screenshot, because the trace claimed the run was clean.
+    // Best-effort: tracing must never mask the original error.
+    if (!resultTraced) {
+      try {
+        const trace = EditorTraceService.getOrCreate(`mobile-${sessionId}`, req.user!.id);
+        trace.writeMobileApplyResult({
+          stepId: stepDraft.id || `apply_${Date.now()}`,
+          sessionId,
+          latencyMs: Date.now() - applyStart,
+          result: {
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+      } catch (traceError) {
+        logger.warn('[MOBILE_SESSION] Failed to write apply failure to trace (non-fatal)', {
+          sessionId,
+          error: traceError instanceof Error ? traceError.message : String(traceError),
+        });
+      }
+    }
+
     // If the client aborted, there's nothing to respond to — just log.
     if (res.writableEnded) {
       logger.info('[MOBILE_SESSION] Apply aborted by client', {
@@ -2645,6 +2694,17 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
 
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i] as any;
+
+      // Author switched this step off in the editor — never dispatch it. Only
+      // an explicit `false` disables, so steps saved before the flag existed
+      // keep running. Checked before `hardFailed` so a disabled step reports
+      // its own reason rather than inheriting the previous failure's.
+      if (step.options?.enabled === false) {
+        stepResults.push({ stepId: step.id, success: true, error: undefined, durationMs: 0 });
+        skippedSteps++;
+        sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'skipped', durationMs: 0, disabled: true });
+        continue;
+      }
 
       // If a previous *required* step failed, skip remaining.
       if (hardFailed) {

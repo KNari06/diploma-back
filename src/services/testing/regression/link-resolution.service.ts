@@ -300,6 +300,11 @@ export class LinkResolutionService {
       const platform = platformByCaseId.get(id) ?? row.platform ?? 'web';
       let total = 0;
       for (const step of row.steps_json as IntentStep[]) {
+        // Author-disabled steps are dropped before dispatch and never billed,
+        // so they must not inflate the estimate — including a disabled
+        // `link_test_case` marker, which would otherwise pull in the whole
+        // linked case's step count.
+        if (step?.options?.enabled === false) continue;
         const link = getLinkOptions(step);
         if (link?.linkedTestCaseId && link.linkedPlatform === platform && rowById.has(link.linkedTestCaseId)) {
           total += computeEffectiveLength(link.linkedTestCaseId);

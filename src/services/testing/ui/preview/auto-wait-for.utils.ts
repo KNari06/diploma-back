@@ -61,6 +61,15 @@ const SKIP_INJECT_AFTER_TYPES: Set<IntentActionType> = new Set([
  * @returns true if wait_for should be injected between them
  */
 function shouldInjectWaitFor(prevStep: IntentStep, nextStep: IntentStep): boolean {
+  // Author-disabled steps never execute, so they can neither cause a navigation
+  // to wait for nor be the step that waits. Injecting around one would persist a
+  // `wait_for` whose `changedFrom` URL is taken from a step that never runs —
+  // and (unlike the run-time filters) this function also runs on SAVE, so that
+  // bad wait would be baked into `steps_json` permanently.
+  if (prevStep.options?.enabled === false || nextStep.options?.enabled === false) {
+    return false;
+  }
+
   // Get URLs from compiled context, fallback to evidence.pageUrl (captured during recording)
   // This fallback is critical for first-run: steps have evidence but no compiled plans yet
   const prevUrl = prevStep.compiled?.context?.pageUrl || prevStep.evidence?.pageUrl;

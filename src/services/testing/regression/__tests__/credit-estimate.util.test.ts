@@ -89,4 +89,63 @@ describe('computeUiStepCredits', () => {
       expect(total).toBe((10 + 1) * M);
     });
   });
+
+  describe('author-disabled steps (options.enabled === false)', () => {
+    const disabled = () => ({ options: { enabled: false } });
+    const enabled = () => ({ options: { enabled: true } });
+
+    it('excludes a disabled step from the estimate', () => {
+      // 3 steps, 1 disabled → 2 billable + 1 goto = 3
+      const row: UiStepCountRow = { id: 'a', steps_json: [{}, disabled(), {}] };
+      expect(computeUiStepCredits([web('a')], [row])).toBe(3);
+    });
+
+    it('counts a step with enabled:true and one with no flag identically', () => {
+      const explicit: UiStepCountRow = { id: 'a', steps_json: [enabled(), enabled()] };
+      const implicit: UiStepCountRow = { id: 'a', steps_json: [{}, {}] };
+      expect(computeUiStepCredits([web('a')], [explicit]))
+        .toBe(computeUiStepCredits([web('a')], [implicit]));
+    });
+
+    it('keeps the +1 goto when every step is disabled — the initial navigation still runs', () => {
+      const row: UiStepCountRow = { id: 'a', steps_json: [disabled(), disabled()] };
+      expect(computeUiStepCredits([web('a')], [row])).toBe(1);
+    });
+
+    it('applies the mobile multiplier only to the steps that will run', () => {
+      const row: UiStepCountRow = { id: 'm', steps_json: [{}, disabled(), disabled()] };
+      // 1 billable + 1 goto = 2, ×4
+      expect(computeUiStepCredits([mobile('m')], [row])).toBe(2 * M);
+    });
+
+    it('excludes disabled setup_steps and teardown_steps', () => {
+      const row: UiStepCountRow = {
+        id: 'a',
+        steps_json: [{}],
+        setup_steps: [{}, disabled()],
+        teardown_steps: [disabled()],
+      };
+      // steps_json(1) + goto(1) + setup(1) + teardown(0) = 3
+      expect(computeUiStepCredits([web('a')], [row])).toBe(3);
+    });
+
+    it('excludes disabled commands on the commands replay strategy', () => {
+      const row: UiStepCountRow = {
+        id: 'a',
+        replay_strategy: 'commands',
+        commands: [{}, disabled(), {}],
+      };
+      // commands path has no +1 goto (the goto is already a command)
+      expect(computeUiStepCredits([web('a')], [row])).toBe(2);
+    });
+
+    it('still charges the per-case minimum of 1 when all steps are disabled on the commands path', () => {
+      const row: UiStepCountRow = {
+        id: 'a',
+        replay_strategy: 'commands',
+        commands: [disabled(), disabled()],
+      };
+      expect(computeUiStepCredits([web('a')], [row])).toBe(1);
+    });
+  });
 });
