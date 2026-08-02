@@ -17,6 +17,7 @@
  */
 
 import { getMobileRunnerClientForSession } from './session-runner-routing';
+import { RESOLVE_DISPATCH_TIMEOUT_MS } from './mobile-runner-client';
 import type { MobileCompiledPlan } from './mobile-runner.types';
 import { buildTriggerFiredPayload, type TriggerFiredPayload } from '@/services/testing/ui/preview/web-trigger-engine';
 import { logger } from '@/utils/core/logger';
@@ -408,7 +409,17 @@ export class MobileStepApplyService {
             commands.push({ type: RAW_CMD_MAP[rawStepType] || 'tap', params: { ...coordParams }, ...visionFlag });
           }
 
-          await client.executeBatchCommands(sessionId, commands, { userId });
+          // These commands carry `intent` (+ a deliberately demoted
+          // `coordsConfidence`), so the runner re-resolves before dispatching
+          // and then runs its post-action stability wait. That is a resolve
+          // budget, not a dispatch budget — the 30s default expired on a
+          // request the runner had already completed, and the `catch` below
+          // then re-ran the whole step against the screen the first tap had
+          // already navigated to. See `RESOLVE_DISPATCH_TIMEOUT_MS`.
+          await client.executeBatchCommands(sessionId, commands, {
+            userId,
+            timeoutMs: RESOLVE_DISPATCH_TIMEOUT_MS,
+          });
           const durationMs = Date.now() - applyStart;
 
           const appliedStep = {

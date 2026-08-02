@@ -73,6 +73,29 @@ export function resolveRunnerUrlForHost(hostPlatform: 'android' | 'ios' | undefi
 // CONFIGURATION
 // ============================================================================
 
+/**
+ * Timeout for a command batch that carries an `intent`, so the runner may
+ * RE-RESOLVE before dispatching (see `TapParams.coordsConfidence`).
+ *
+ * `defaultTimeoutMs` (30s) budgets for a dispatch, not for a resolve plus the
+ * post-action stability wait, and on a Flutter screen that is nowhere near
+ * enough: measured on JanaPost TC-13, the tap itself landed ~2s in, then the
+ * runner spent ~28s more re-fetching the 337-node inspector tree for its
+ * stability poll — so the client abandoned a request the runner had already
+ * completed successfully. A screenshot-only step is the worst case by
+ * construction: `MobileStepApplyService` deliberately demotes vision-sourced
+ * `coordsConfidence` below the trust threshold precisely SO the runner
+ * re-resolves, which buys a second full tree pass on top of the first.
+ *
+ * The damage was not the timeout but the recovery: the apply service treats the
+ * throw as "lint path failed" and re-runs the SAME step through runSteps —
+ * against the screen the (successful) first tap had already navigated to. On
+ * TC-13 that re-resolved "settings icon…" on the freshly opened Settings
+ * screen, matched its app-bar BACK arrow, tapped it, and the run ended back on
+ * Profile while reporting pass.
+ */
+export const RESOLVE_DISPATCH_TIMEOUT_MS = 120_000;
+
 const CLIENT_CONFIG = {
   /** Default timeout for most requests */
   defaultTimeoutMs: 30_000,
