@@ -14,7 +14,7 @@
 import { randomUUID } from 'crypto';
 import { env } from '@/config/environment/env';
 import { redisConnection, QueueManager } from '@/config/infrastructure/queues';
-import { getMobileRunnerClient, MobileRunnerClient, resolveRunnerUrlForHost, type IMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { getMobileRunnerClient, MobileRunnerClient, resolveRunnerUrlForHost, RESOLVE_DISPATCH_TIMEOUT_MS, type IMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { CompanionRunnerClient } from '@/services/mobile/companion/companion-runner-client';
 import { companionRegistry } from '@/services/mobile/companion/companion-registry';
 import {
@@ -2736,12 +2736,13 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
         // Only for steps WITHOUT a compiled plan (first run / manual adds).
         if (!hasCompiled && description && LINT_TYPES.has(rawType)) {
           const lintActionType = ACTION_TYPE_MAP[rawType] || 'tap';
+          const useScreenshotOnly = (step as any).options?.useScreenshotOnly === true;
           // Forward the step's screenshot-only flag — this lint IS the
           // resolution for an uncompiled step on this run path, so dropping it
           // here silently text-resolves a step the user marked vision-only.
           const lintResult = await client.lintElement(sessionId, description, lintActionType, undefined, {
             userId,
-            useScreenshotOnly: (step as any).options?.useScreenshotOnly === true,
+            useScreenshotOnly,
           });
 
           if (lintResult.status === 'resolved' && lintResult.boundingBox) {
@@ -2767,10 +2768,27 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
             };
             if (coordsConfidence !== undefined) coordParams.coordsConfidence = coordsConfidence;
 
+            // The lint above resolved vision-led, but the coordinates it
+            // produced are demoted below TRUST_COORDS_THRESHOLD (0.9), so the
+            // runner RE-RESOLVES before tapping — and without this flag that
+            // re-resolve drops back to the text pipeline and re-picks the very
+            // element the toggle exists to avoid. CLAUDE.md Hard invariant #7
+            // requires it on the dispatched command; MobileStepApplyService
+            // does this already, and this loop is a second copy of the same
+            // lint-then-tap logic that was missing it.
+            //
+            // Live evidence (JanaPost TC-13, unlabeled settings gear): Find
+            // highlighted the gear at vision confidence exactly 0.9, then a
+            // full Run tapped the `EN` language button 182 px away — and
+            // reported PASS, because tapping EN succeeded.
+            const visionFlag: Record<string, unknown> = useScreenshotOnly
+              ? { _useScreenshotOnly: true }
+              : {};
+
             const commands: Array<{ type: string; params: Record<string, unknown> }> = [];
 
             if (rawType === 'type' || rawType === 'fill') {
-              commands.push({ type: 'tap', params: { ...coordParams } });
+              commands.push({ type: 'tap', params: { ...coordParams }, ...visionFlag });
               if (step.value) {
                 commands.push({
                   type: 'type_text',
@@ -2788,16 +2806,26 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
                     // Editor "type like a human" toggle → runner typing realism.
                     ...(step.options?.typeMode ? { typeMode: step.options.typeMode } : {}),
                   },
+                  ...visionFlag,
                 });
                 if (step.options?.pressEnter) {
                   commands.push({ type: 'press_key', params: { keycode: 'KEYCODE_ENTER' } });
                 }
               }
             } else {
-              commands.push({ type: RAW_CMD_MAP[rawType] || 'tap', params: { ...coordParams } });
+              commands.push({ type: RAW_CMD_MAP[rawType] || 'tap', params: { ...coordParams }, ...visionFlag });
             }
 
-            await client.executeBatchCommands(sessionId, commands, { userId });
+            // Same resolve budget as MobileStepApplyService's dispatch, and for
+            // the same reason: these commands carry `intent` + a demoted
+            // `coordsConfidence`, so the runner re-resolves and then runs its
+            // post-action stability wait. On the 30s default the client abandons
+            // a request the runner has already completed, and the `catch` below
+            // re-runs the step against the screen the first tap navigated to.
+            await client.executeBatchCommands(sessionId, commands, {
+              userId,
+              timeoutMs: RESOLVE_DISPATCH_TIMEOUT_MS,
+            });
             const durationMs = Date.now() - stepStart;
             stepResults.push({ stepId: step.id, success: true, durationMs });
             passedSteps++;

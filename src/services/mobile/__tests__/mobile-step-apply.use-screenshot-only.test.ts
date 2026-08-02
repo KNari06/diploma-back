@@ -98,6 +98,33 @@ describe('MobileStepApplyService.apply — useScreenshotOnly forwarding', () => 
     expect(commands[0]).toMatchObject({ type: 'tap', _useScreenshotOnly: true });
   });
 
+  it('gives the dispatch a resolve budget, not the 30s default', async () => {
+    // This request covers a runner-side re-resolve AND the post-action
+    // stability wait, not just a dispatch. Measured live on JanaPost TC-13:
+    // the tap landed ~2s in, then ~28s of Flutter inspector-tree polling — so
+    // on the 30s default the client abandoned a request the runner had already
+    // completed, and the catch below re-ran the step against the screen the
+    // first tap had navigated to (a second tap, on the Settings back arrow).
+    const { RESOLVE_DISPATCH_TIMEOUT_MS } = jest.requireActual('../mobile-runner-client');
+    const lintElement = jest.fn().mockResolvedValue(lintResolved);
+    const executeBatchCommands = jest.fn().mockResolvedValue({ results: [{ success: true }] });
+    getMobileRunnerClientForSession.mockResolvedValue({ lintElement, executeBatchCommands });
+
+    await MobileStepApplyService.apply({
+      sessionId: 'sess-1',
+      stepDraft: {
+        id: 'step-1',
+        type: 'tap',
+        description: 'gear icon settings',
+        options: { useScreenshotOnly: true },
+      },
+      userId: 'user-1',
+    });
+
+    const [, , opts] = executeBatchCommands.mock.calls[0];
+    expect(opts).toMatchObject({ timeoutMs: RESOLVE_DISPATCH_TIMEOUT_MS });
+  });
+
   it('leaves the dispatched command unflagged for an ordinary step', async () => {
     const lintElement = jest.fn().mockResolvedValue({ ...lintResolved, visionMode: false });
     const executeBatchCommands = jest.fn().mockResolvedValue({ results: [{ success: true }] });
