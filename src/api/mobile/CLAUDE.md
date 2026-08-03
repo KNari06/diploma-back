@@ -109,6 +109,18 @@ identity. See the ADR: [CI auth via a separate router + upload-time build contra
 
 ## Gotchas
 
+- **A host lane can only be written if the project has a build for it.**
+  `PUT /projects/:id/app/flutter-host` answers **409 `HOST_BUILD_MISSING`** for
+  `host: 'ios'` when no iOS build exists (base slot, legacy slot, or any named
+  variant — the predicate is `hasProjectMobileBuild`). Same gate on the per-flow
+  host (`flows.controller.ts`, 409) and the per-case `host_platform`
+  (`IntentTestCaseService`, 400). Single source:
+  [flutter-host-guard.service.ts](../../services/mobile/flutter-host-guard.service.ts) —
+  **route every new host-writing path through it**, or the unrunnable pair comes
+  back and fails 2 minutes later as an opaque WebDriverAgent timeout that blames
+  the runner. Android is deliberately NOT gated (it is the implicit fallback
+  lane; gating it would strand a project already on iOS). See the
+  [ADR](../../../.claude/decisions/20260802-ios-host-lane-hard-blocked-without-an-ios-build.md).
 - **`finalize` is slow and synchronous** — it downloads the whole build, parses
   it, and inflates a ~46 MB kernel blob. 13–26 s for a 146 MB APK. Any ingress
   timeout below the mutex TTL means a client 504s while the server works on.

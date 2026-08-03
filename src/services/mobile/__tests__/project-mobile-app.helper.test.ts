@@ -233,3 +233,45 @@ describe('resolveFlutterHost (case override > project default > android)', () =>
     expect(resolveFlutterHost('bogus', undefined)).toBe('android');
   });
 });
+
+// ── Host-lane build availability (write guard) ────────────────────────────
+
+import { hasProjectMobileBuild } from '@/services/mobile/project-mobile-app.helper';
+
+describe('hasProjectMobileBuild', () => {
+  const iosApp = { storagePath: 'app.ipa', platform: 'ios', originalName: 'app.ipa' } as any;
+
+  it('is false for a project with no settings at all', () => {
+    expect(hasProjectMobileBuild(undefined, 'ios')).toBe(false);
+    expect(hasProjectMobileBuild(null, 'ios')).toBe(false);
+    expect(hasProjectMobileBuild({}, 'ios')).toBe(false);
+  });
+
+  it('is false when only the OTHER platform has a build', () => {
+    const settings = { mobileApps: { android: { storagePath: 'app.apk', platform: 'android' } } };
+    expect(hasProjectMobileBuild(settings, 'ios')).toBe(false);
+    expect(hasProjectMobileBuild(settings, 'android')).toBe(true);
+  });
+
+  it('is true from the per-platform slot', () => {
+    expect(hasProjectMobileBuild({ mobileApps: { ios: iosApp } }, 'ios')).toBe(true);
+  });
+
+  it('is true from the legacy singular slot when it IS an iOS app', () => {
+    expect(hasProjectMobileBuild({ mobileApp: iosApp }, 'ios')).toBe(true);
+    expect(hasProjectMobileBuild({ mobileApp: { storagePath: 'a.apk' } }, 'ios')).toBe(false);
+  });
+
+  it('is true when the only iOS build lives in a NAMED variant lane', () => {
+    // The bug a naive `!!settings.mobileApps.ios` check would introduce: this
+    // project can run on iOS, so the write must not be refused.
+    const settings = {
+      mobileAppVariants: { ios: [{ label: 'Staging', isDefault: false, latest: iosApp }] },
+    };
+    expect(hasProjectMobileBuild(settings, 'ios')).toBe(true);
+  });
+
+  it('is false when the iOS variant registry exists but is empty', () => {
+    expect(hasProjectMobileBuild({ mobileAppVariants: { ios: [] } }, 'ios')).toBe(false);
+  });
+});

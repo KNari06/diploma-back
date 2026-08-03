@@ -13,6 +13,7 @@ import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 import { emitTestCaseMutated } from '@/websocket/helpers/project-mutation-emit';
 import { validateTriggers, sanitizeTriggers } from '@/services/mobile/trigger-validation.util';
 import { normaliseHostOverride, normaliseVariantOverride } from '@/services/mobile/project-mobile-app.helper';
+import { assertProjectSupportsFlutterHost } from '@/services/mobile/flutter-host-guard.service';
 import { extractLinkedTestCaseIds, wouldCreateCycle, LinkGraphNode } from '@/utils/graph/link-graph';
 import { ValidationError } from '@/types';
 
@@ -190,6 +191,14 @@ export class IntentTestCaseService {
     } = params;
     const mobileVariantLabel = normaliseVariantOverride(params.mobileVariantLabel);
     const hostPlatform = normaliseHostOverride(params.hostPlatform);
+    // Refuse a host lane the project has no build for. Without this the bad
+    // pair persists silently and every run of this test — editor, regression,
+    // scheduled, CI — dies 2 minutes later on an opaque WebDriverAgent
+    // timeout that names the runner instead of the setting. No-op (and no DB
+    // read) for android / inherit — see flutter-host-guard.service.ts.
+    if (hostPlatform) {
+      await assertProjectSupportsFlutterHost(projectId, userId, hostPlatform);
+    }
     // Explicit `null` from the caller means "no opinion" → store NULL.
     // Anything else (undefined / valid enum) falls back to 'medium'.
     const priority: 'critical' | 'high' | 'medium' | 'low' | null =
@@ -632,7 +641,21 @@ export class IntentTestCaseService {
       }
       if (hostPlatform !== undefined) {
         // `null`/invalid clears the override → inherit project default.
-        updates.host_platform = normaliseHostOverride(hostPlatform);
+        const nextHost = normaliseHostOverride(hostPlatform);
+        // Same guard as create: a host lane with no build behind it is
+        // refused rather than persisted. The project lookup runs only for a
+        // gated lane (iOS), so clearing the override or pinning android costs
+        // nothing extra. Fails OPEN if the project can't be resolved — the
+        // update itself would fail on the very next query anyway, and turning
+        // an unrelated DB error into "no iOS build" would mislead.
+        if (nextHost) {
+          const { data: ownerRows } = await intentTestCaseDb.getTestCaseOwnersByIds([id]);
+          const projectId = (ownerRows || [])[0]?.project_id as string | undefined;
+          if (projectId) {
+            await assertProjectSupportsFlutterHost(projectId, userId, nextHost);
+          }
+        }
+        updates.host_platform = nextHost;
       }
       if (startUrl !== undefined) updates.start_url = startUrl;
       if (url !== undefined) updates.url = url;

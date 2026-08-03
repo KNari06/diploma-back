@@ -354,6 +354,28 @@ export function getProjectMobileVariants(
 }
 
 /**
+ * True when the project has ANY installable build for `platform` — the base
+ * slot, the legacy singular slot, or a named variant lane. Pure (settings-only),
+ * so it can gate a write without a second DB round-trip.
+ *
+ * Deliberately reuses `getProjectMobileVariants`: that function already folds
+ * every source a run can resolve (registry lanes + virtual-filled default slot)
+ * into one list, so this predicate can never disagree with what prep would
+ * actually find. A hand-rolled `!!settings.mobileApps[platform]` check would
+ * miss a project whose only iOS build lives in a named lane.
+ *
+ * Used to reject `flutterDefaultHost: 'ios'` / `host_platform: 'ios'` on a
+ * project with no iOS build — a combination that cannot succeed and whose
+ * failure surfaces 2 minutes later as an opaque WebDriverAgent timeout.
+ */
+export function hasProjectMobileBuild(
+  settings: ProjectSettings | undefined | null,
+  platform: MobilePlatform,
+): boolean {
+  return getProjectMobileVariants(settings, platform).length > 0;
+}
+
+/**
  * Build a settings patch that REMOVES a variant lane from the registry.
  * Only touches `mobileAppVariants[platform]` — the legacy/shard slot is left
  * alone (callers must not delete the default lane, which mirrors it).
