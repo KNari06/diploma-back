@@ -352,6 +352,15 @@ export async function deleteUserMobileKeys(userId: string): Promise<number> {
   // Match either `mobile_warmup:{anything}:{userId}` or the pending-install
   // counterpart. We can't anchor ":{userId}" in Redis MATCH (no $-anchor),
   // so we glob-then-filter in JS.
+  //
+  // `mobile_installed_build:*` (INSTALLED_BUILD_PREFIX in
+  // mobile-app-prep.service.ts) is deliberately NOT swept here. It records
+  // which build is on the DEVICE, and the app stays installed after the user
+  // goes idle or disconnects — so dropping it on session teardown would
+  // recreate the very expiry hole it exists to close, sending the next prep
+  // back to package-presence guessing. It ages out on its own 30d TTL, and a
+  // stale-positive is harmless because the fast path still verifies the
+  // package is actually on the device before trusting the record.
   const patterns = [`${WARMUP_PREFIX}*`, `${PENDING_INSTALL_PREFIX}*`];
   const targetSuffix = `:${userId}`;
   const lockSuffix = `:${userId}:lock`; // also includes the warmup lock if present
