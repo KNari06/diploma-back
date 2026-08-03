@@ -1172,10 +1172,14 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
 
     // Install the project's mobile app and run launch_app BEFORE returning, so the
     // preview stream shows the app already open when the frontend connects.
-    // Non-fatal: on failure we still return the session so the user can retry.
-    // For Flutter we install but DON'T launch here — `attachFlutter` below
-    // clears logcat and launches so the one-time VM Service log line is
-    // inside the detection window.
+    // A native-editor warmup can remain usable after an install failure, so its
+    // prep is non-fatal. Flutter is different: attachFlutter immediately launches
+    // the package to find its VM service. Continuing after a failed install turns
+    // the real storage/install error into a misleading "No activities found" or
+    // "Flutter VM Service not detected" error.
+    // For Flutter we install but DON'T launch here — `attachFlutter` below clears
+    // logcat and launches so the one-time VM Service log line is inside the
+    // detection window.
     let preppedPackage: string | undefined;
     try {
       preppedPackage = await time('prep_app_fresh', () => MobileAppPrepService.prepApp({
@@ -1191,11 +1195,34 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
       }));
     } catch (err) {
-      logger.warn('[MOBILE_SESSION] App install/launch during warmup failed (non-fatal)', {
+      const prepError = err instanceof Error ? err.message : String(err);
+      logger.warn('[MOBILE_SESSION] App install/launch during warmup failed', {
         sessionId: session.sessionId,
         projectId,
-        error: err instanceof Error ? err.message : String(err),
+        platform,
+        fatal: isFlutter,
+        error: prepError,
       });
+      if (isFlutter) {
+        // The warmup entry was written before prep so concurrent callers could
+        // find the freshly-created session. It is invalid when its required APK
+        // could not be installed; remove it and tear down the session rather
+        // than handing a future retry a broken emulator.
+        await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`).catch(() => {});
+        await client.destroySession(session.sessionId, { userId }).catch((destroyErr) => {
+          logger.warn('[MOBILE_SESSION] Failed to destroy session after Flutter app-prep failure', {
+            sessionId: session.sessionId,
+            projectId,
+            error: destroyErr instanceof Error ? destroyErr.message : String(destroyErr),
+          });
+        });
+        res.status(422).json({
+          success: false,
+          code: 'FLUTTER_APP_INSTALL_FAILED',
+          error: `Unable to install the Flutter app before starting the session: ${prepError}`,
+        });
+        return;
+      }
     }
 
     // Flutter: upgrade the native session into a Flutter session (launch →

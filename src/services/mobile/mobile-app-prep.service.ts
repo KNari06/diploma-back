@@ -63,6 +63,27 @@ import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
  */
 export type AppPrepStage = 'installing_app' | 'launching_app' | 'ready';
 
+/**
+ * Durable record of which build we last actually INSTALLED for a
+ * project+user, surviving the warmup key's TTL.
+ *
+ * Why this exists: the warmup entry describes a fact with no expiry — the
+ * app installed on the device stays there until something removes it — but
+ * the entry itself expires after `WARMUP_TTL`. Once it did, `buildMismatch`
+ * had nothing to compare against and Branch 2 fell back to "is the package
+ * present?", which cannot tell one build of a package from another. A
+ * release build left on the device then got relaunched in place of a freshly
+ * uploaded debug build, and the Flutter attach failed with the misleading
+ * FLUTTER_NOT_DETECTED (the relaunched build has no Dart VM Service).
+ *
+ * Scope is project+user, matching the warmup key, and it is only ever
+ * written after a real install — never after a fast path that merely
+ * *assumed* what was on the device, which would persist a guess as fact.
+ */
+export const INSTALLED_BUILD_PREFIX = 'mobile_installed_build:';
+/** 30d — long enough to outlive any realistic gap between two sessions. */
+export const INSTALLED_BUILD_TTL = 60 * 60 * 24 * 30;
+
 export interface PrepAppArgs {
   client: IMobileRunnerClient;
   sessionId: string;
@@ -174,6 +195,21 @@ export class MobileAppPrepService {
       });
       return false;
     }
+  }
+
+  /**
+   * Record (or slide the TTL of) the build we know is installed for this
+   * project+user. Best-effort: this is a correctness *hint*, and a Redis
+   * blip must not fail app prep. A lost write costs one extra full install
+   * on the next prep, which is the safe direction to fail.
+   */
+  private static async rememberInstalledBuild(key: string, storagePath: string): Promise<void> {
+    await redisConnection.set(key, storagePath, 'EX', INSTALLED_BUILD_TTL).catch((err) => {
+      logger.debug('[MOBILE_APP_PREP] Failed to persist installed-build record (non-fatal)', {
+        key,
+        error: (err as Error).message,
+      });
+    });
   }
 
   static async prepApp(args: PrepAppArgs): Promise<string | undefined> {
@@ -381,11 +417,21 @@ export class MobileAppPrepService {
     // Parallel get — independent keys, no need to serialise.
     const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
     const pendingKey = `${PENDING_INSTALL_PREFIX}${projectId}:${userId}`;
-    const [warmupRaw, pendingStoragePath] = await time('redis_gets', () => Promise.all([
+    const installedBuildKey = `${INSTALLED_BUILD_PREFIX}${projectId}:${userId}`;
+    const [warmupRaw, pendingStoragePath, installedBuildPath] = await time('redis_gets', () => Promise.all([
       redisConnection.get(redisKey),
       redisConnection.get(pendingKey),
+      redisConnection.get(installedBuildKey),
     ]));
     const warmup: WarmupData | null = warmupRaw ? JSON.parse(warmupRaw) : null;
+
+    /**
+     * What we believe is installed, preferring the warmup entry and falling
+     * back to the durable record once that has expired. `undefined` means we
+     * genuinely do not know — which the fast paths below must treat as
+     * "reinstall", never as "no mismatch".
+     */
+    const recordedStoragePath: string | undefined = warmup?.appStoragePath ?? installedBuildPath ?? undefined;
 
     // Pending-install flag — set by autoBootAndInstall when an upload
     // couldn't reach the emulator. If present AND matches the current APK,
@@ -419,13 +465,16 @@ export class MobileAppPrepService {
     // (Branch 2) would wrongly keep the stale build — so force a full install.
     // This covers every switch direction (named↔named, named↔base, base↔named),
     // not just the named-variant resolve that sets `exactBuildRequested`.
-    const buildMismatch = !!(warmup?.appStoragePath && warmup.appStoragePath !== effectiveStoragePath);
+    // Reads `recordedStoragePath`, not `warmup` alone, so the check still
+    // fires after the warmup key has expired (see INSTALLED_BUILD_PREFIX).
+    const buildMismatch = !!(recordedStoragePath && recordedStoragePath !== effectiveStoragePath);
     if (buildMismatch) {
       logger.info('[MOBILE_APP_PREP] installed build differs from target — forcing full install', {
         sessionId,
         projectId,
-        installed: warmup?.appStoragePath,
+        installed: recordedStoragePath,
         target: effectiveStoragePath,
+        source: warmup?.appStoragePath ? 'warmup' : 'installed_build_record',
       });
     }
 
@@ -478,6 +527,10 @@ export class MobileAppPrepService {
             { type: 'launch_app', params: { packageName: cachedPackage } },
           ], { timeoutMs: 60_000, userId }));
         }
+        // Branch 1 already required `warmup.appStoragePath === effectiveStoragePath`
+        // and verified the package on-device, so this is a confirmed identity —
+        // keep the durable record alive for when the warmup entry expires.
+        await this.rememberInstalledBuild(installedBuildKey, effectiveStoragePath);
         branchTaken = 'cached_fast_path';
         logger.info('[MOBILE_APP_PREP] timing', {
           sessionId, projectId, branch: branchTaken,
@@ -523,8 +576,27 @@ export class MobileAppPrepService {
     // the emulator. Skipped when a pending-install flag is set (we don't
     // trust device state in that case) or when an exact build was demanded
     // (package presence ≠ correct build present — see exactBuildRequested).
+    //
+    // Requires POSITIVE identity confirmation — `recordedStoragePath` must
+    // equal the build we are about to run — rather than merely the absence of
+    // a known mismatch. `check_package` answers "is this package present?",
+    // which is true for ANY build of it; without a record naming the build,
+    // taking this branch relaunches whatever happens to be installed. That is
+    // how a stale release build survived a debug upload and surfaced as
+    // FLUTTER_NOT_DETECTED. Unknown identity now falls through to Branch 3,
+    // whose install writes the record, so a project self-heals after one
+    // full install instead of being stuck guessing forever.
     const knownPackage = appPackageOverride || projectAny.packageName;
-    if (knownPackage && !hasPendingInstall && !exactBuildRequested && !buildMismatch) {
+    const identityConfirmed = !!recordedStoragePath && recordedStoragePath === effectiveStoragePath;
+    if (!identityConfirmed && knownPackage && !hasPendingInstall && !exactBuildRequested && !buildMismatch) {
+      logger.info('[MOBILE_APP_PREP] no record of which build is installed — forcing full install instead of trusting package presence', {
+        sessionId,
+        projectId,
+        package: knownPackage,
+        target: effectiveStoragePath,
+      });
+    }
+    if (identityConfirmed && knownPackage && !hasPendingInstall && !exactBuildRequested && !buildMismatch) {
       const isInstalled = await time('branch2_check_package', () =>
         this.isPackageOnDevice(client, sessionId, userId, knownPackage));
       if (isInstalled) {
@@ -558,6 +630,10 @@ export class MobileAppPrepService {
           warmup.appStoragePath = effectiveStoragePath;
           await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
         }
+        // Slide the durable record's TTL. Safe here precisely because this
+        // branch now requires a confirmed identity match — we are refreshing
+        // a fact we just verified, not recording an assumption.
+        await this.rememberInstalledBuild(installedBuildKey, effectiveStoragePath);
 
         // Persist packageName to project settings so future preps can
         // hit this fast path even after Redis expires (knownPackage may
@@ -660,6 +736,13 @@ export class MobileAppPrepService {
       warmup.appStoragePath = effectiveStoragePath;
       await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
     }
+
+    // Durable record of what we just put on the device. Deliberately NOT
+    // gated on `warmup` — that entry is null exactly when it has expired,
+    // which is the case this record exists to cover. Gating it the same way
+    // would leave the next prep just as blind and the fast path could never
+    // recover its identity.
+    await this.rememberInstalledBuild(installedBuildKey, effectiveStoragePath);
 
     // Persist packageName to project settings so future preps can use
     // the check_package fast path even after Redis TTL expires. With
