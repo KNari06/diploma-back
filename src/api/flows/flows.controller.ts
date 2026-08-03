@@ -7,6 +7,11 @@ import { supabaseAdmin } from '@/db/supabase';
 import { FlowService } from '@/services/testing/flows/flow.service';
 import { ModuleService } from '@/services/testing/modules/module.service';
 import { getProjectMobileApp, normaliseHostOverride } from '@/services/mobile/project-mobile-app.helper';
+import {
+  projectSupportsFlutterHost,
+  HOST_BUILD_MISSING_CODE,
+  HOST_BUILD_MISSING_MESSAGE,
+} from '@/services/mobile/flutter-host-guard.service';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
@@ -57,6 +62,24 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
     const projectId = module.projectId;
 
     const isMobilePlatform = typeof platform === 'string' && platform.startsWith('mobile_');
+
+    // Flutter host lane gate — runs BEFORE `FlowService.create`, not at the
+    // test-case insert below, because by then the flow row exists and bailing
+    // out would leave an orphan flow with no test case. A lane the project has
+    // no build for cannot run: without this the pair persists and every later
+    // run (editor, regression, scheduled, CI) fails ~2 minutes in with an
+    // opaque WebDriverAgent timeout that blames the runner.
+    if (platform === 'mobile_flutter' && hostPlatform !== undefined) {
+      const requestedHost = normaliseHostOverride(hostPlatform);
+      if (requestedHost && !(await projectSupportsFlutterHost(projectId, userId, requestedHost))) {
+        res.status(409).json({
+          success: false,
+          code: HOST_BUILD_MISSING_CODE,
+          error: HOST_BUILD_MISSING_MESSAGE,
+        });
+        return;
+      }
+    }
 
     // Mobile gate: validate the package name when an app IS uploaded for
     // the requested platform.
@@ -180,6 +203,8 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
         // on the initial test case so a non-editor run (regression/scheduled/CI)
         // targets the chosen host from the very first save.
         if (platform === 'mobile_flutter' && hostPlatform !== undefined) {
+          // Already validated against the project's uploaded builds above,
+          // before the flow row was created.
           insertPayload.host_platform = normaliseHostOverride(hostPlatform);
         }
 
@@ -355,6 +380,26 @@ export async function updateFlow(req: AuthenticatedRequest, res: Response): Prom
     const { id } = req.params;
     const { name, moduleId, flowType, tags, priority, preconditions, expectedResult, orderIndex, mobileVariantLabel, hostPlatform } = req.body;
     const userId = getUserId(req);
+
+    // Flutter host lane gate — runs BEFORE the update so a refused lane leaves
+    // the flow entirely untouched (the host write below is best-effort and
+    // swallows its own errors, so validating there would silently succeed).
+    // Costs one extra read, and only when the caller actually sends a host.
+    if (hostPlatform !== undefined) {
+      const requestedHost = normaliseHostOverride(hostPlatform);
+      const current = requestedHost ? await FlowService.getById(id, userId) : null;
+      if (requestedHost && current?.platform === 'mobile_flutter') {
+        const projectId = await resolveFlowProjectId(current.moduleId, userId);
+        if (projectId && !(await projectSupportsFlutterHost(projectId, userId, requestedHost))) {
+          res.status(409).json({
+            success: false,
+            code: HOST_BUILD_MISSING_CODE,
+            error: HOST_BUILD_MISSING_MESSAGE,
+          });
+          return;
+        }
+      }
+    }
 
     const flow = await FlowService.update({
       id,

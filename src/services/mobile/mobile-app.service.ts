@@ -22,6 +22,7 @@ import {
   buildMobileAppSettingsPatch,
   buildSetFlutterDefaultHostPatch,
   normaliseHostOverride,
+  hasProjectMobileBuild,
   getMaxMobileVariants,
   DEFAULT_VARIANT_LABEL,
 } from '@/services/mobile/project-mobile-app.helper';
@@ -60,7 +61,8 @@ export type MobileAppError =
   | { kind: 'cannot_modify_default_variant' }
   | { kind: 'variant_not_found'; label: string }
   | { kind: 'variant_name_taken'; label: string }
-  | { kind: 'invalid_host' };
+  | { kind: 'invalid_host' }
+  | { kind: 'host_build_missing'; host: FlutterHostPlatform };
 
 /**
  * Guard the per-platform variant cap. The default lane and any already-existing
@@ -460,6 +462,11 @@ export async function getMobileApp(
  * Written by the editor's Android/iOS toggle so the choice survives the
  * browser and drives every non-editor run (regression / scheduled / CI).
  * Per-test-case `host_platform` overrides still win at dispatch time.
+ *
+ * Refuses an iOS lane the project has no build for — that combination cannot
+ * succeed and its failure surfaces two minutes later as an opaque WebDriverAgent
+ * timeout that blames the runner. See `flutter-host-guard.service.ts` for why
+ * the android lane is deliberately NOT gated.
  */
 export async function setFlutterDefaultHost(
   projectId: string,
@@ -471,6 +478,16 @@ export async function setFlutterDefaultHost(
 
   const project = await ProjectService.getProject(projectId, userId);
   if (!project) return { kind: 'project_not_found' };
+
+  // Read from the settings we already loaded rather than calling the guard's
+  // own project fetch — same predicate, one round-trip instead of two.
+  if (host === 'ios' && !hasProjectMobileBuild(project.settings, 'ios')) {
+    logger.info('[MOBILE_APP] Rejected flutter default host — no iOS build uploaded', {
+      projectId,
+      host,
+    });
+    return { kind: 'host_build_missing', host };
+  }
 
   await ProjectService.updateProject(projectId, userId, {
     settings: buildSetFlutterDefaultHostPatch(host),

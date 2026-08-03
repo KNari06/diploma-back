@@ -8,6 +8,10 @@ import type { Response } from 'express';
 import type { MobileAppError } from '@/services/mobile/mobile-app.service';
 import { logger } from '@/utils/core/logger';
 import { MAX_UPLOAD_SIZE_BYTES, ALLOWED_UPLOAD_EXTENSIONS } from '@/services/mobile/mobile-app.service';
+import {
+  HOST_BUILD_MISSING_CODE,
+  HOST_BUILD_MISSING_MESSAGE,
+} from '@/services/mobile/flutter-host-guard.service';
 
 const MB = 1024 * 1024;
 
@@ -271,6 +275,20 @@ export function sendMobileAppError(res: Response, err: MobileAppError): void {
 
     case 'invalid_host':
       res.status(400).json({ success: false, error: 'host must be "android" or "ios"' });
+      return;
+
+    case 'host_build_missing':
+      // 409, not 400: the request is well-formed, it conflicts with the
+      // project's current state (no build in that lane). Carries a typed `code`
+      // so the editor can point the user at the upload screen instead of
+      // showing a generic failure.
+      res.status(409).json({
+        success: false,
+        code: HOST_BUILD_MISSING_CODE,
+        host: err.host,
+        error: HOST_BUILD_MISSING_MESSAGE,
+        message: HOST_BUILD_MISSING_MESSAGE,
+      });
       return;
   }
 }
