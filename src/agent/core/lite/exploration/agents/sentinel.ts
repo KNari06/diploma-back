@@ -23,6 +23,7 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 
 import type { ExplorationBlackboard, SentinelInput, SentinelAssessment } from './agent-types';
 import { EXPLORATION_AGENT_LLM } from './agent-llm-config';
+import { formatBriefForSentinel } from '../phase0/brief-format';
 import {
   buildFlowSummaries,
   buildBlockedFlowSummaries,
@@ -38,6 +39,15 @@ import {
 
 /** Centralized LLM tuning for this agent (model / temp / tokens / timeout). */
 const LLM = EXPLORATION_AGENT_LLM.sentinel;
+
+/**
+ * Below this many discovered entry points, the fallback ratio is not evidence of
+ * coverage — it is evidence that discovery failed. See `fallbackAssessment`.
+ */
+const FALLBACK_MIN_ENTRY_POINTS_FOR_FULL_SCORE = 5;
+
+/** Score ceiling applied when discovery was too thin to trust the ratio. */
+const FALLBACK_THIN_DISCOVERY_SCORE_CAP = 40;
 
 export class ExplorationSentinel {
   constructor(private readonly bb: ExplorationBlackboard) {}
@@ -149,6 +159,9 @@ export class ExplorationSentinel {
       errorsFound: executedFlows.reduce((sum, f) => sum + f.errors.length, 0),
       budget: buildBudgetSummary(this.bb.budget),
       scopeHint: this.bb.scopeHint,
+      productBrief: this.bb.productBrief
+        ? formatBriefForSentinel(this.bb.productBrief)
+        : undefined,
     };
   }
 
@@ -160,7 +173,19 @@ export class ExplorationSentinel {
     // Clamp to [0, 100]: Scout-discovered branches can push completed past the
     // initial tree entry point count, which would otherwise yield >100%.
     const rawScore = total > 0 ? Math.round((completed / total) * 100) : 0;
-    const score = Math.max(0, Math.min(100, rawScore));
+    let score = Math.max(0, Math.min(100, rawScore));
+
+    // The denominator is what we DISCOVERED, so this ratio inverts exactly when
+    // discovery failed worst: if Cartographer returned 2 entry points instead of
+    // 40 (LLM parse failure — which emits no progress event, so nothing else
+    // flags it), exploring both scored 100 and a near-total discovery failure
+    // surfaced as PERFECT coverage on the dashboard. Cap the score whenever the
+    // evidence base is too thin to support a confident number: a ratio over a
+    // handful of entry points is not coverage of an app.
+    const thinDiscovery = total < FALLBACK_MIN_ENTRY_POINTS_FOR_FULL_SCORE;
+    if (thinDiscovery) {
+      score = Math.min(score, FALLBACK_THIN_DISCOVERY_SCORE_CAP);
+    }
     const budgetExhausted = this.bb.budget?.isExhausted?.() ?? true;
 
     // Continue exploring if coverage is low AND budget allows AND there is
@@ -170,15 +195,26 @@ export class ExplorationSentinel {
 
     return {
       coverageScore: score,
-      gaps: uncoveredCategories.map((c) => `Category "${c}" not yet tested`),
       continueExploring: shouldContinue,
       focusNext: uncoveredCategories.length > 0 ? uncoveredCategories : undefined,
+      gaps: thinDiscovery && total > 0
+        ? [
+            `Only ${total} testable flow(s) were discovered — coverage cannot be assessed reliably`,
+            ...uncoveredCategories.map((c) => `Category "${c}" not yet tested`),
+          ]
+        : uncoveredCategories.map((c) => `Category "${c}" not yet tested`),
       qualitySummary: total === 0
         ? 'No entry points discovered during survey. AI assessment unavailable.'
-        : `Explored ${completed} of ${total} discovered flows (${score}% coverage). AI assessment unavailable.`,
-      recommendations: uncoveredCategories.length > 0
-        ? [`Test uncovered categories: ${uncoveredCategories.join(', ')}`]
-        : [],
+        : thinDiscovery
+          // Say the ratio is untrustworthy rather than printing a confident
+          // percentage over a 2-flow denominator.
+          ? `Only ${total} testable flow(s) were discovered, so coverage cannot be assessed reliably — the survey may have failed to understand the pages. Explored ${completed} of them. AI assessment unavailable.`
+          : `Explored ${completed} of ${total} discovered flows (${score}% coverage). AI assessment unavailable.`,
+      recommendations: thinDiscovery && total > 0
+        ? ['Very few flows were discovered — check that the entry URL reaches the app, and provide credentials if it is behind a login']
+        : uncoveredCategories.length > 0
+          ? [`Test uncovered categories: ${uncoveredCategories.join(', ')}`]
+          : [],
       riskAreas: [],
     };
   }

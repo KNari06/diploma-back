@@ -8,6 +8,19 @@ import { logger } from '@/utils/core/logger';
 import type { ExplorationResult, DiscoveredTestCase, ExplorationCheckpoint } from '@/agent/core/lite/exploration/types';
 import { toIntentTestCase } from '@/agent/core/lite/exploration/types';
 
+/**
+ * Terminal statuses a FAILED run may carry.
+ *
+ * Mirrors the CHECK in 20260802_exploration_runs_honest_failure_status.sql —
+ * a value absent there fails the whole UPDATE (PostgREST rejects the row), so
+ * keep the two in sync. Deliberately excludes `timed_out` / `cancelled`: those
+ * are written by the stale sweep and the cancel path, not by `failRun`.
+ */
+export type ExplorationFailureStatus =
+  | 'failed'
+  | 'unreachable'
+  | 'blocked_by_bot';
+
 export interface ExplorationRunRecord {
   id: string;
   exploration_id: string;
@@ -15,7 +28,20 @@ export interface ExplorationRunRecord {
   user_id: string;
   chat_session_id: string | null;
   entry_url: string;
-  status: 'running' | 'completed' | 'failed';
+  /**
+   * Full lifecycle set, not just the three this service writes: `timed_out` is
+   * written by the stale sweep and `cancelled` by the cancel path, so a reader
+   * typed to `running|completed|failed` was already wrong before the honest
+   * failure statuses landed.
+   */
+  status:
+    | 'running'
+    | 'completed'
+    | 'failed'
+    | 'timed_out'
+    | 'cancelled'
+    | 'unreachable'
+    | 'blocked_by_bot';
   config: Record<string, any> | null;
   summary: Record<string, any> | null;
   budget_used: Record<string, any> | null;
@@ -88,7 +114,12 @@ export class ExplorationStorageService {
           summary: result.summary,
           budget_used: result.budgetUsed,
           duration_ms: result.durationMs,
-          test_cases_count: result.testCases.length,
+          // Runnable cases only — this is what the history card shows and what
+          // actually persists. `result.testCases.length` also counts zero-step
+          // not_explored placeholders, which made the card's total ("34 tests")
+          // exceed the results panel's total ("All (22)"). Same source as
+          // summary.runnableTestCases and the chat "Test cases generated" line.
+          test_cases_count: result.summary.runnableTestCases,
           completed_at: new Date().toISOString(),
         })
         .eq('exploration_id', explorationId);
@@ -259,13 +290,26 @@ export class ExplorationStorageService {
 
   /**
    * Mark exploration run as failed.
+   *
+   * `status` narrows WHY it ended when the cause is known (see
+   * 20260802_exploration_runs_honest_failure_status.sql). It defaults to
+   * `'failed'`, so every existing caller keeps its behaviour and only a caller
+   * that can actually tell the difference passes something else — a wrong
+   * specific status is worse than an honest generic one.
+   *
+   * `error_message` is still written in every case: the status makes the
+   * outcome queryable, it does not replace the human-readable reason.
    */
-  static async failRun(explorationId: string, errorMessage: string): Promise<void> {
+  static async failRun(
+    explorationId: string,
+    errorMessage: string,
+    status: ExplorationFailureStatus = 'failed',
+  ): Promise<void> {
     try {
       const { error } = await supabaseAdmin
         .from('exploration_runs')
         .update({
-          status: 'failed',
+          status,
           error_message: errorMessage,
           completed_at: new Date().toISOString(),
         })
@@ -334,16 +378,43 @@ export class ExplorationStorageService {
   /**
    * Save discovered test cases to intent_test_cases table.
    * Returns inserted IDs.
+   *
+   * Cases with no steps are DROPPED, not saved. `TestCaseBuilder` emits one
+   * zero-step `not_explored` placeholder per unexplored entry point (budget
+   * exhausted / skipped by the Strategist), and persisting those produced real
+   * `intent_test_cases` rows with `steps_json: []` — unrunnable, indistinguishable
+   * from a genuine draft except by a `not-explored` tag, and cluttering the user's
+   * project after every run. The mobile snapshot path already guarded this exact
+   * case (`if (steps.length === 0) continue`); the web path did not.
    */
   static async saveTestCases(
     testCases: DiscoveredTestCase[],
     projectId: string,
     userId: string,
+    /**
+     * The run that discovered these. Stamped onto each row so the results
+     * screen can list exactly this run's output — without it the reader can
+     * only filter `source='exploration'` and returns every exploration case
+     * the project ever accumulated (516 rows from 8 runs, measured on prod).
+     * Optional so existing callers keep compiling; a null column falls back
+     * to the old project-wide read.
+     */
+    explorationId?: string,
   ): Promise<string[]> {
     if (testCases.length === 0) return [];
 
+    const runnable = testCases.filter((tc) => Array.isArray(tc.steps) && tc.steps.length > 0);
+    if (runnable.length < testCases.length) {
+      logger.info('[EXPLORATION_STORAGE] Skipping step-less discovered cases', {
+        projectId,
+        skipped: testCases.length - runnable.length,
+        saving: runnable.length,
+      });
+    }
+    if (runnable.length === 0) return [];
+
     try {
-      const records = testCases.map((tc) => {
+      const records = runnable.map((tc) => {
         const intent = toIntentTestCase(tc, projectId, userId);
         // Carry network assertions forward into tags as a compact tag
         // `assert:METHOD:pattern:family`. This lets users filter regression
@@ -369,13 +440,42 @@ export class ExplorationStorageService {
           status: 'draft',
           kind: 'standalone',
           source: 'exploration',
+          exploration_id: explorationId ?? null,
+          // The entry-point id this case came from. Name is NOT a usable key:
+          // 42 names collide within a single run on prod (worst case 5 rows),
+          // so a results screen matching on name would add the wrong cases.
+          entry_point_id: intent.id ?? null,
+          // The FULL assertion shape, so replay can actually verify it. The
+          // `assert:` tags above stay for human filtering, but they are
+          // write-only (nothing reads them back) and drop `expect` entirely —
+          // they were never verification. NULL when there is nothing recorded,
+          // which replay must read as "nothing to verify", not "verified empty".
+          network_assertions: intent.networkAssertions?.length
+            ? intent.networkAssertions
+            : null,
         };
       });
 
-      const { data, error } = await supabaseAdmin
-        .from('intent_test_cases')
-        .insert(records)
-        .select('id');
+      const insertOnce = (rows: Array<Record<string, unknown>>) =>
+        supabaseAdmin.from('intent_test_cases').insert(rows).select('id');
+
+      let { data, error } = await insertOnce(records);
+
+      // Backward-compatible fallback: `network_assertions` ships with a migration
+      // (20260801_intent_test_cases_network_assertions.sql) that may not be
+      // applied yet. PostgREST answers PGRST204 for a missing column and fails
+      // the WHOLE insert — so without this retry, adding the column to the
+      // payload would break every exploration save until the migration lands.
+      // Losing the assertions is a degraded save; losing the test cases is a
+      // regression. Mirrors the artifact-column fallback in db/supabase.ts.
+      if (error && (error as { code?: string }).code === 'PGRST204') {
+        logger.warn('[EXPLORATION_STORAGE] intent_test_cases missing network_assertions column; retrying without it', {
+          originalError: error.message,
+          hint: 'Apply supabase-migrations/20260801_intent_test_cases_network_assertions.sql and restart the Supabase API to refresh the PostgREST schema cache.',
+        });
+        const withoutAssertions = records.map(({ network_assertions: _dropped, ...rest }) => rest);
+        ({ data, error } = await insertOnce(withoutAssertions));
+      }
 
       if (error) {
         logger.error('[EXPLORATION_STORAGE] Failed to save test cases', {

@@ -70,6 +70,7 @@ function makeBlackboard(opts: {
       visitedPages: {},
       accomplishments: [],
       categoriesExplored: new Set(),
+      blockersByCategory: {},
     },
     userDirectives: [],
     budget: {

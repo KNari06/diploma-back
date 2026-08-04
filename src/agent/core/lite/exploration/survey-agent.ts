@@ -31,11 +31,16 @@ import type { ExplorationConfig, EntryPoint, NavigationAction, TestFlowCategory,
 import { ExplorationTree } from './exploration-tree';
 import { BudgetTracker } from './budget-tracker';
 import { RateLimiter } from './rate-limiter';
+import { EntryUnreachableError } from './entry-unreachable.error';
+import { redactCredentialValues } from '@/utils/interpolation/redact-secrets';
+import { isBlockedSsrfHostname } from '@/utils/validation/validation';
+import type { ProductBrief } from './phase0/product-brief.types';
+import { formatBriefForCartographer } from './phase0/brief-format';
 import { parsePageClassificationResponse } from './prompts';
 import { OverlayDismisser, type OverlayCleanupResult } from './overlay-dismisser';
 import type { ExplorationTraceService } from './exploration-trace.service';
 import { Cartographer } from './agents/cartographer';
-import type { CartographerInput, CartographerOutput } from './agents/agent-types';
+import type { CartographerInput, CartographerOutput, CartographerInsight } from './agents/agent-types';
 import {
   isPasswordInput,
   isCredentialInput,
@@ -53,6 +58,28 @@ const MAX_NAV_LINKS_PER_PAGE = 15;
 
 /** Timeout for page navigation (ms) */
 const NAV_TIMEOUT_MS = 30_000;
+
+/**
+ * Attempts to load the ENTRY url before declaring it unreachable. Only the entry
+ * URL gets retries — a failed sub-page is already recorded as an error node and
+ * must not multiply the survey's wall-clock.
+ *
+ * The cap alone is NOT the bound: 3 × `NAV_TIMEOUT_MS` + backoff is 94.5s, which
+ * is 79% of the `quick` preset's 120s total budget, so a flat retry policy would
+ * turn a recoverable blip into a guaranteed zero-flow run on the onboarding
+ * preset. `navigateToEntryUrl` therefore clamps each attempt to the remaining
+ * budget and stops retrying below `ENTRY_NAV_MIN_BUDGET_FOR_RETRY_MS`.
+ */
+const ENTRY_NAV_MAX_ATTEMPTS = 3;
+
+/** Linear backoff base between entry-nav attempts (multiplied by attempt number). */
+const ENTRY_NAV_RETRY_DELAY_MS = 1_500;
+
+/**
+ * Remaining wall-clock below which a retry is not worth attempting — the run
+ * needs time to actually explore after the page loads, not just to load it.
+ */
+const ENTRY_NAV_MIN_BUDGET_FOR_RETRY_MS = 45_000;
 
 /** Max fallback entry points when AI returns 0 (raised from 8 for form-heavy pages) */
 const MAX_FALLBACK_ENTRY_POINTS = 20;
@@ -84,6 +111,34 @@ export class SurveyAgent {
   private readonly cartographer: Cartographer;
   /** Track page types seen for Cartographer exploration context */
   private pageTypesSeen: string[] = [];
+  /**
+   * Origin we actually landed on after following the entry URL's redirects.
+   * Null until the entry navigation succeeds. Treated as in-scope alongside the
+   * configured entry origin — see `isSameOrigin`.
+   */
+  private landedOrigin: string | null = null;
+  /**
+   * Phase 0 product brief, when one was produced. Optional by design: `quick`
+   * runs skip Phase 0 entirely, and every Phase 0 failure is a named skip, so the
+   * survey must work identically without it.
+   */
+  private productBrief?: ProductBrief;
+  /**
+   * Cartographer's deep insight for the page currently being classified.
+   *
+   * Held here because `classifyWithCartographer` returns a narrowed shape
+   * (pageType / entryPoints / navigationLinks) that drops `pageInsight`, and the
+   * blackboard key it must be stored under (`page-N`) does not exist until
+   * `tree.addNode()` runs AFTER classification. Consumed and cleared by
+   * `publishPageInsight`.
+   */
+  private lastPageInsight: CartographerInsight | null = null;
+  /**
+   * Sink for per-page insight, wired by the engine. Kept as a narrow callback
+   * rather than handing the whole ExplorationBlackboard to the survey — the
+   * survey has no business mutating cross-phase state beyond this one map.
+   */
+  private onPageInsight?: (pageId: string, insight: CartographerInsight) => void;
 
   constructor(
     private readonly page: Page,
@@ -199,8 +254,189 @@ export class SurveyAgent {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
+   * Load the entry URL, or throw `EntryUnreachableError`.
+   *
+   * Retries transient transport failures (DNS blip, refused connection, TLS
+   * handshake, `load` timeout) with a short linear backoff — previously ONLY a
+   * 429 got a retry, so a cold-starting app (Render/Heroku/Azure spin-up) that
+   * needed more than one attempt was a guaranteed zero-result run. Rate-limit
+   * errors keep going through the RateLimiter so its degradation accounting and
+   * computed backoff still apply (the old code discarded that `backoffMs`).
+   */
+  private async navigateToEntryUrl(): Promise<void> {
+    const url = this.config.entryUrl;
+
+    for (let attempt = 1; attempt <= ENTRY_NAV_MAX_ATTEMPTS; attempt++) {
+      const canNavigate = await this.rateLimiter.acquireSlot('navigation');
+      if (!canNavigate) {
+        logger.error('[SURVEY] Target site degraded, cannot navigate to entry URL', { url });
+        throw new EntryUnreachableError(url, 'site_degraded');
+      }
+
+      // Never let one attempt outlive the whole run's budget. On the `quick`
+      // preset (120s total) a flat 3 × 30s + backoff would burn 94.5s — 79% of
+      // everything — leaving no time to explore even if the retry succeeded.
+      const navTimeout = Math.min(NAV_TIMEOUT_MS, Math.max(1_000, this.budget.remainingTimeMs()));
+
+      try {
+        await this.page.goto(url, { waitUntil: 'load', timeout: navTimeout });
+        this.rateLimiter.recordSuccess('target_site');
+        this.recordLandedOrigin();
+        return;
+      } catch (error) {
+        const err = error as Error;
+        // Stop retrying once the budget can no longer fund an attempt PLUS some
+        // exploration — a retry that consumes the last of the clock converts a
+        // recoverable blip into a guaranteed zero-flow run.
+        const budgetTooLow = this.budget.remainingTimeMs() < ENTRY_NAV_MIN_BUDGET_FOR_RETRY_MS;
+        const isLast = attempt === ENTRY_NAV_MAX_ATTEMPTS || budgetTooLow;
+        if (budgetTooLow && attempt < ENTRY_NAV_MAX_ATTEMPTS) {
+          logger.warn('[SURVEY] Skipping entry-nav retry — not enough budget left', {
+            url,
+            attempt,
+            remainingMs: this.budget.remainingTimeMs(),
+          });
+        }
+
+        if (RateLimiter.isRateLimitError(err)) {
+          const result = await this.rateLimiter.recordFailure('target_site', err);
+          if (!result.shouldRetry || isLast) {
+            logger.error('[SURVEY] Entry URL rate limited', {
+              url,
+              attempt,
+              degraded: result.isDegraded,
+            });
+            throw new EntryUnreachableError(url, 'rate_limited');
+          }
+          // Honor the limiter's computed backoff — the previous implementation
+          // retried immediately and threw this value away.
+          if (result.backoffMs > 0) {
+            await new Promise((r) => setTimeout(r, result.backoffMs));
+          }
+          continue;
+        }
+
+        if (isLast) {
+          logger.error('[SURVEY] Failed to navigate to entry URL', {
+            url,
+            attempts: attempt,
+            error: err.message,
+          });
+          throw new EntryUnreachableError(url, 'navigation_failed', err.message);
+        }
+
+        logger.warn('[SURVEY] Entry URL navigation failed, retrying', {
+          url,
+          attempt,
+          error: err.message,
+        });
+        await new Promise((r) => setTimeout(r, ENTRY_NAV_RETRY_DELAY_MS * attempt));
+      }
+    }
+
+    // Unreachable — the loop either returns or throws. Keeps TS exhaustive.
+    throw new EntryUnreachableError(url, 'navigation_failed');
+  }
+
+  /**
+   * Register the sink that receives each page's Cartographer insight.
+   *
+   * WHY this exists: `bb.pageInsights` had THREE readers (Strategist, Sentinel,
+   * and the Planner via FlowRunner's `pageInsightContext`) and ZERO writers on a
+   * fresh run — the only write was the checkpoint-resume path. Cartographer
+   * computed `forms` / `dataEntities` / `interactiveAreas` per page and the
+   * result was discarded, so every downstream agent planned against a blank page
+   * model. `git log -S "pageInsights.set"` finds nothing: never implemented.
+   */
+  setPageInsightSink(sink: (pageId: string, insight: CartographerInsight) => void): void {
+    this.onPageInsight = sink;
+  }
+
+  /** Hand the survey Phase 0's product brief, when one was produced. */
+  setProductBrief(brief: ProductBrief | undefined): void {
+    this.productBrief = brief;
+  }
+
+  /**
+   * Hand the pending insight to the sink under the tree's node id, then clear it.
+   *
+   * Must run only for a node that was actually ADDED — `addNode` returns null on
+   * URL/content/depth dedup, and storing an insight under a missing id would
+   * leave an entry no consumer can look up (FlowRunner resolves url → node.id).
+   * Best-effort: an insight is an optimization, never worth failing a survey for.
+   */
+  private publishPageInsight(pageId: string): void {
+    const insight = this.lastPageInsight;
+    this.lastPageInsight = null;
+    if (!insight || !this.onPageInsight) return;
+    try {
+      // Stamp the real node id — Cartographer's parser sets pageId from the URL
+      // it was given, but consumers key on `page-N`.
+      this.onPageInsight(pageId, { ...insight, pageId });
+    } catch (error) {
+      logger.debug('[SURVEY] Failed to publish page insight', {
+        pageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Remember the origin we landed on, and surface an off-origin entry redirect.
+   * Best-effort: a URL parse failure must never fail the survey.
+   */
+  private recordLandedOrigin(): void {
+    try {
+      const landedUrl = new URL(this.page.url());
+      const landed = landedUrl.origin;
+      const configured = new URL(this.config.entryUrl).origin;
+
+      // SSRF: promoting the landed origin makes it BFS-crawlable, so it must
+      // pass the same blocklist the entry URL did. A site redirecting to
+      // http://10.0.0.5/ would otherwise get a private origin crawled inside the
+      // browser — past the preflight, which the worker never runs. Only the
+      // configured origin stays in scope in that case.
+      if (
+        landed !== configured &&
+        process.env.NODE_ENV !== 'development' &&
+        isBlockedSsrfHostname(landedUrl.hostname)
+      ) {
+        logger.warn('[SURVEY] Entry URL redirected to a blocked origin — not promoting', {
+          from: configured,
+          to: landed,
+        });
+        this.trace?.writeWarning?.('entry_redirect_blocked', {
+          phase: 'survey',
+          from: configured,
+          to: landed,
+        });
+        return;
+      }
+
+      this.landedOrigin = landed;
+      if (landed !== configured) {
+        logger.info('[SURVEY] Entry URL redirected to a different origin', {
+          from: configured,
+          to: landed,
+        });
+        this.trace?.writeWarning?.('entry_redirected_off_origin', {
+          phase: 'survey',
+          from: configured,
+          to: landed,
+        });
+      }
+    } catch {
+      // Non-fatal — isSameOrigin falls back to the configured entry origin.
+    }
+  }
+
+  /**
    * Run the full BFS survey.
    * Returns the completed ExplorationTree with all discovered entry points.
+   *
+   * @throws EntryUnreachableError when the entry URL itself never loads — the
+   *   caller MUST let this propagate so the run fails honestly instead of
+   *   reporting `completed` with zero entry points (and billing for it).
    */
   async survey(): Promise<ExplorationTree> {
     logger.info('[SURVEY] Starting page survey', {
@@ -208,51 +444,14 @@ export class SurveyAgent {
       maxPages: this.config.budget.maxSurveyPages,
     });
 
-    // Navigate to entry URL
-    try {
-      const canNavigate = await this.rateLimiter.acquireSlot('navigation');
-      if (!canNavigate) {
-        logger.error('[SURVEY] Target site degraded, cannot navigate to entry URL', {
-          url: this.config.entryUrl,
-        });
-        return this.tree;
-      }
-      await this.page.goto(this.config.entryUrl, {
-        waitUntil: 'load',
-        timeout: NAV_TIMEOUT_MS,
-      });
-      this.rateLimiter.recordSuccess('target_site');
-    } catch (error) {
-      if (RateLimiter.isRateLimitError(error as Error)) {
-        const result = await this.rateLimiter.recordFailure('target_site', error as Error);
-        if (result.shouldRetry) {
-          try {
-            await this.page.goto(this.config.entryUrl, {
-              waitUntil: 'load',
-              timeout: NAV_TIMEOUT_MS,
-            });
-            this.rateLimiter.recordSuccess('target_site');
-          } catch {
-            logger.error('[SURVEY] Failed to navigate to entry URL after retry', {
-              url: this.config.entryUrl,
-            });
-            return this.tree;
-          }
-        } else {
-          logger.error('[SURVEY] Entry URL rate limited, skipping', {
-            url: this.config.entryUrl,
-            degraded: result.isDegraded,
-          });
-          return this.tree;
-        }
-      } else {
-        logger.error('[SURVEY] Failed to navigate to entry URL', {
-          url: this.config.entryUrl,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return this.tree;
-      }
-    }
+    // Navigate to entry URL.
+    //
+    // Every failure path here THROWS EntryUnreachableError rather than returning
+    // an empty tree. Returning made "never reached the site" look identical to
+    // "site has no flows", so the engine reported `completed` and the job charged
+    // 10 credits for nothing. Throwing reaches the job's catch, which fails the
+    // run honestly and skips the charge.
+    await this.navigateToEntryUrl();
 
     // Check if we got redirected to a login page
     const isLoginPage = this.isLoginUrl(this.page.url());
@@ -562,7 +761,11 @@ export class SurveyAgent {
         // Non-critical
       }
 
-      // AI classification via Cartographer agent
+      // AI classification via Cartographer agent. `pageHealth` was collected
+      // above and then dropped on the floor — passing it lets Cartographer tell
+      // "this page is broken / still loading" apart from "this page has no
+      // interactive flows", which is exactly the distinction a 0-entry-point
+      // result needs.
       const classification = await this.classifyWithCartographer(
         formattedSnapshot,
         screenshotBase64,
@@ -571,6 +774,7 @@ export class SurveyAgent {
         item.depth,
         snapshot,
         overlayCleanupResult?.overlaySummary ?? undefined,
+        pageHealth,
       );
 
       // Log discovered entry points & nav links
@@ -614,6 +818,11 @@ export class SurveyAgent {
       });
 
       if (nodeId) {
+        // Publish Cartographer's page understanding under the tree node id the
+        // Strategist / Sentinel / Planner all look up. Inside the `if (nodeId)`
+        // guard on purpose: a deduped page (addNode → null) has no id to key on.
+        this.publishPageInsight(nodeId);
+
         // Update sourceNodeId on entry points
         for (const ep of entryPoints) {
           ep.sourceNodeId = nodeId;
@@ -903,13 +1112,21 @@ export class SurveyAgent {
     depth: number,
     snapshot?: LiteSnapshot,
     overlaySummary?: string,
+    pageHealth?: string,
   ): Promise<ReturnType<typeof parsePageClassificationResponse>> {
     // Build Cartographer input with exploration context
     const categoriesSeen = [...new Set(this.pageTypesSeen)];
     const recentPageTypes = this.pageTypesSeen.slice(-3);
 
     // Collect product context from DOM for richer AI understanding
-    const productContext = await this.collectProductContext();
+    // Phase 0's brief is REASONED product understanding; `collectProductContext`
+    // is a per-page DOM scrape (title / meta / h1 / nav / CTA regex) with no
+    // reasoning. Prefer the brief and fall back to the scrape, so a run without
+    // Phase 0 (quick preset, or any of its named skips) behaves exactly as before.
+    const briefContext = this.productBrief
+      ? formatBriefForCartographer(this.productBrief)
+      : undefined;
+    const productContext = briefContext || (await this.collectProductContext());
 
     const cartographerInput: CartographerInput = {
       url,
@@ -927,9 +1144,20 @@ export class SurveyAgent {
       },
       overlaysDismissed: overlaySummary ? [overlaySummary] : undefined,
       productContext: productContext || undefined,
+      // Page-derived text bound for an LLM prompt → must be credential-redacted
+      // (lite CLAUDE.md invariant #3): an error banner can echo a submitted
+      // credential back into the DOM.
+      pageHealth: pageHealth
+        ? redactCredentialValues(pageHealth, this.config.credentials)
+        : undefined,
     };
 
     const result = await this.cartographer.analyze(cartographerInput, formattedSnapshot);
+
+    // Stash the deep insight for `publishPageInsight` to store once the tree
+    // node id exists. Captured BEFORE the returns below, which narrow the shape
+    // and drop it — that drop is why the blackboard map was always empty.
+    this.lastPageInsight = result.pageInsight ?? null;
 
     // Track page type for future context
     this.pageTypesSeen.push(result.pageType);
@@ -964,6 +1192,25 @@ export class SurveyAgent {
         })),
       };
     }
+
+    // Cartographer produced nothing (LLM parse failure, timeout, or a page it
+    // could not read) and we are about to fall back to DOM heuristics. Tell the
+    // user: this is the degradation that silently shrinks the entry-point count,
+    // and a shrunken count is what made the Sentinel fallback score read as
+    // "100% coverage" when discovery had actually failed. Strategist and Sentinel
+    // already emit `agent_warning` on their own failures; Cartographer did not.
+    this.config.onProgress?.({
+      explorationId: this.config.explorationId,
+      phase: 'survey',
+      event: 'agent_warning',
+      data: {
+        agent: 'cartographer',
+        url,
+        message: 'Page analysis returned nothing — falling back to basic detection, so fewer flows may be found on this page.',
+      },
+      progressPercent: 0,
+      timestamp: Date.now(),
+    });
 
     // Fallback: Cartographer returned empty → use heuristic detection
     if (snapshot) {
@@ -1060,9 +1307,15 @@ export class SurveyAgent {
    */
   private isSameOrigin(url: string): boolean {
     try {
-      const entryOrigin = new URL(this.config.entryUrl).origin;
       const testOrigin = new URL(url).origin;
-      return entryOrigin === testOrigin;
+      if (testOrigin === new URL(this.config.entryUrl).origin) return true;
+      // Accept the post-redirect origin too. `acme.com` 301-ing to `acme.io`
+      // seeds the BFS from the redirect target, so comparing ONLY against the
+      // configured entryUrl rejected every link on the site we actually landed
+      // on — one page surveyed, zero flows, and the run still billed. This
+      // mirrors `checkDomainBoundary`, which deliberately treats both the entry
+      // origin and the current origin as in-scope.
+      return this.landedOrigin !== null && testOrigin === this.landedOrigin;
     } catch {
       return false;
     }

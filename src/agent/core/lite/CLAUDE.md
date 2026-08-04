@@ -86,8 +86,10 @@ TestPipeline per flow + Scout branch discovery) → Coverage eval (Sentinel).
 | File | Purpose |
 | --- | --- |
 | [exploration-engine.ts](exploration/exploration-engine.ts) | The 4-phase orchestrator + checkpoint/resume. |
-| [survey-agent.ts](exploration/survey-agent.ts) | Phase 1 BFS page discovery; calls Cartographer per page. |
+| [survey-agent.ts](exploration/survey-agent.ts) | Phase 1 BFS page discovery; calls Cartographer per page. **`survey()` THROWS `EntryUnreachableError` when the entry URL never loads** — see invariant #8. |
+| [entry-unreachable.error.ts](exploration/entry-unreachable.error.ts) | Typed error for "never reached the entry URL", so it can't be confused with "site has no flows". |
 | [flow-runner.ts](exploration/flow-runner.ts) | Phase 2 — runs each flow through `TestPipeline` (concurrency-bounded); builds `PipelineConfig` (incl. `flowIsAuth`, `pageInsightContext`); Scout after each flow. |
+| [prior-learnings.ts](exploration/prior-learnings.ts) | Pure renderer for the cross-flow learnings block (blockers → strategy → tried), incl. the priority-aware char cap. |
 | [flow-queue.ts](exploration/flow-queue.ts) · [per-page-budget.ts](exploration/per-page-budget.ts) | Priority queue + per-page fairness cap. |
 | [budget-tracker.ts](exploration/budget-tracker.ts) · [rate-limiter.ts](exploration/rate-limiter.ts) | Time/flow/round budget; AI + navigation throttling. |
 | [auth-url-patterns.ts](exploration/auth-url-patterns.ts) | **Single source** for login/auth URL heuristics (`isLoginUrl`). Consumed by survey-agent + page-health. English-only by design (LLM covers the tail). |
@@ -162,3 +164,12 @@ console errors ⇒ visible JS break · progress%+rounds ⇒ "stuck, change strat
    success path; when you add a NEW fall-through boundary, call `resetPathCharges()`
    before the next path runs. `settleStepCharges` latches `creditsExhausted` (surfaced on
    `LiteTestResult`) and never throws — mirrors the replay path.
+8-23. **Exploration invariants moved** → **[exploration/CLAUDE.md](exploration/CLAUDE.md)**
+   (entry-URL validation + SSRF, billing gates, resume, network assertions,
+   cross-flow memory). Numbering is continuous across the two files.
+---
+
+## `exploration/phase0/` — Product Analyst
+
+Pre-Phase-1 product discovery → `ProductBrief`, read by all four agents.
+See **[phase0/CLAUDE.md](exploration/phase0/CLAUDE.md)** (invariants 24-30).

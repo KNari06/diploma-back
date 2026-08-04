@@ -22,6 +22,7 @@ import type {
 } from 'openai/resources/chat/completions';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { AI_MODELS } from '@/config/ai/ai-models.config';
+import { chooseToolCapableModel as pickToolCapableModel } from '../shared/tool-capable-model';
 import { logger } from '@/utils/core/logger';
 import { env } from '@/config/environment/env';
 import { MobileBlackboard } from './blackboard';
@@ -66,18 +67,7 @@ const MAX_TOOL_ROUNDS = 30;
  * back to a known OpenAI model that supports function calling. Phase 4+
  * can revisit this when we wire a proper multi-provider tool abstraction.
  */
-function chooseToolCapableModel(): string {
-  const configured = AI_MODELS.fast;
-  if (configured.startsWith('gemini-')) {
-    logger.warn(
-      '[MOBILE_AGENT_PIPELINE] Configured fast model is Gemini; function calling ' +
-        'is unsupported through the shared wrapper. Falling back to gpt-4.1-mini.',
-      { configured },
-    );
-    return 'gpt-4.1-mini';
-  }
-  return configured;
-}
+const chooseToolCapableModel = (): string => pickToolCapableModel('MOBILE_AGENT_PIPELINE');
 
 export interface MobileAgentResult {
   reply: string;

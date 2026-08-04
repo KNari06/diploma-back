@@ -41,7 +41,10 @@ Your responsibilities:
 PRINCIPLES:
 - Auth flows must run BEFORE auth-gated flows — always place login at priority 1
 - Prioritize DIVERSE category coverage over depth in one category (1 checkout + 1 search beats 3 checkout)
-- Critical business flows (login, checkout, registration) before secondary features
+- Critical business flows before secondary features. When a PRODUCT BRIEF is supplied, its
+  "BUSINESS-CRITICAL FLOWS" list IS that ordering — follow it. Only when there is no brief
+  should you fall back to the generic guess of login / checkout / registration, which
+  assumes an English-language e-commerce product and is wrong for many apps
 - Pages with more interactive areas deserve more flows allocated to them
 - Respect the user's scope hint — flows matching scope get priority boost
 - Be budget-aware — if only 5 flows remain, pick the 5 most valuable across different categories
@@ -71,6 +74,13 @@ Respond with valid JSON only.`;
 
 export function buildStrategistPrompt(input: StrategistInput): string {
   const sections: string[] = [];
+
+  // Product brief FIRST — it reframes every judgement below. Without it this
+  // agent falls back to the generic "login, checkout, registration" priors in the
+  // system prompt, which are an English e-commerce assumption.
+  if (input.productBrief) {
+    sections.push(`PRODUCT BRIEF (from pre-exploration analysis — prefer this over generic assumptions):\n${input.productBrief}`);
+  }
 
   // Scope hint
   if (input.scopeHint) {

@@ -1,5 +1,5 @@
 import { AgentResponse, TestJobData } from '@/types';
-import type { ExplorationBudget, RateLimitingConfig } from '@/agent/core/lite/exploration/types';
+import type { ExplorationBudget, ExplorationPreset, RateLimitingConfig } from '@/agent/core/lite/exploration/types';
 import type { MobileTestJobData, MobileAppBriefing } from '@/services/mobile/mobile-runner.types';
 import type { AllureImportJobData } from '@/services/allure-import/allure-import.types';
 import { handleQueueError } from '@/utils/core/error-handler';
@@ -36,6 +36,17 @@ export interface ExplorationJobData {
    */
   authFixture?: unknown;
   budget?: Partial<ExplorationBudget>;
+  /**
+   * Which preset produced `budget`. Carried explicitly because the budget object
+   * alone cannot answer "was this a quick run?" — the controller resolves
+   * preset → budget and the preset was previously discarded. Phase 0 (product
+   * analyst) is `full`-only, and that gate must read as a condition in code, not
+   * be re-derived from a timeout threshold.
+   *
+   * Absent = treat as `full`: the chat producers pass no budget at all and get
+   * DEFAULT_EXPLORATION_BUDGET, which IS the full preset.
+   */
+  preset?: ExplorationPreset;
   maxConcurrency?: number;
   rateLimiting?: RateLimitingConfig;
 }

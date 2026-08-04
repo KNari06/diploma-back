@@ -32,7 +32,7 @@ jest.mock('../tools', () => ({
 }));
 
 jest.mock('@/config/ai/ai-models.config', () => ({
-  AI_MODELS: { fast: 'gpt-4.1-mini' },
+  AI_MODELS: { fast: 'gpt-4.1-mini', smart: 'gpt-5.4-mini' },
 }));
 
 import { runMobileAgentPipeline } from '../pipeline';

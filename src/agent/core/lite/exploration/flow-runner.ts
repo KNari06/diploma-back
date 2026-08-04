@@ -21,7 +21,9 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { AI_MODELS } from '@/config/ai/ai-models.config';
 
 import { TestPipeline, type PipelineIntegrations } from '../pipeline/test-pipeline';
-import type { PipelineConfig, TestPipelineResult } from '../pipeline/types';
+import type { PipelineConfig, TestPipelineResult, ExecutionRound } from '../pipeline/types';
+import type { FormAnalysis } from '../agents/types';
+import { formatBriefForPlanner } from './phase0/brief-format';
 import { ActionExecutor } from '../execution/action-executor';
 import { NetworkTracker } from '../collectors/network-tracker';
 import { GoalDetector } from '../analysis/goal-detector';
@@ -43,6 +45,7 @@ import {
   type BlockerType,
   type ExplorationProgressCallback,
   DEFAULT_MAX_CONCURRENCY,
+  categoryAllowsAssertAuthoring,
 } from './types';
 import type { NetworkSuccess } from '../lite-types';
 import { attributeCallsToSteps } from './network-assertions';
@@ -60,6 +63,9 @@ import type { ExplorationTraceService } from './exploration-trace.service';
 import { Scout } from './agents/scout';
 import type { ScoutInput, ExplorationBlackboard, CartographerInsight } from './agents/agent-types';
 import { normalizeUrlWithPattern } from './url-pattern';
+import { recordFlowOutcome } from './agents/blackboard';
+import { buildPriorLearnings } from './prior-learnings';
+import { buildFlowStepPayload } from './flow-step-feed';
 import { redactCredentialValues } from '@/utils/interpolation/redact-secrets';
 
 /**
@@ -81,13 +87,24 @@ const FLOW_NAV_WAIT_UNTIL = 'load' as const;
  * Caps keep the hint compact so it informs without bloating the prompt budget.
  */
 const PAGE_INSIGHT_MAX_ITEMS_PER_LIST = 4;
-const PAGE_INSIGHT_MAX_CHARS = 300;
+/**
+ * Raised from 300 when form FIELD LABELS replaced a bare `forms: N` count. A
+ * checkout form's labels alone can run ~120 chars, and truncating mid-list is
+ * worse than a slightly longer hint: a Planner that sees half a field list will
+ * confidently submit an incomplete form.
+ */
+const PAGE_INSIGHT_MAX_CHARS = 600;
+/** Field labels shown per form before collapsing to `+N`. */
+const PAGE_INSIGHT_MAX_FORM_FIELDS = 6;
 
-// Cross-flow learnings slice handed to each flow's Planner. Kept tight so it
-// stays a useful signal, not prompt bloat (recency-ordered, capped both ways).
-const PRIOR_LEARNINGS_MAX_ACCOMPLISHMENTS = 5;
-const PRIOR_LEARNINGS_MAX_BLOCKERS = 4;
-const PRIOR_LEARNINGS_MAX_CHARS = 500;
+/**
+ * Separate cap for the Phase 0 brief slice prepended to the Planner's context.
+ * Kept independent of `PAGE_INSIGHT_MAX_CHARS` so a verbose brief can never
+ * squeeze out the page understanding — they answer different questions ("what is
+ * this flow for" vs "what is on this page") and the Planner needs both.
+ */
+const PLANNER_BRIEF_MAX_CHARS = 700;
+
 
 // Step-extraction (rounds → DiscoveredStep + compiled plans) now lives in the
 // shared pipeline-step-extractor so the editor iterative-authoring service
@@ -133,6 +150,13 @@ export class FlowRunner {
   private knownFlowNames: string[] = [];
   private flowsCompleted: number = 0;
   private totalFlows: number = 0;
+  /**
+   * Per-flow live step counter (entryPointId → last emitted stepNumber).
+   * Rounds restart their own numbering at 1, but the frontend dedups on
+   * stepNumber, so the sequence has to be continuous across the whole flow.
+   * Flows run concurrently, hence a map rather than a single counter.
+   */
+  private readonly flowStepCounters = new Map<string, number>();
   private checkpointCallback?: CheckpointCallback;
   private readonly scout: Scout;
 
@@ -227,6 +251,61 @@ export class FlowRunner {
         timestamp: Date.now(),
       });
     } catch { /* never let progress reporting crash exploration */ }
+  }
+
+  /**
+   * Stream one `flow_step` per command as the round that ran them completes.
+   *
+   * Wired to `PipelineIntegrations.onRoundComplete`, the same hook the editor
+   * authoring service uses for `preview:run:step`. Replaces a loop that ran
+   * AFTER the whole flow finished, over `extractSteps` output — which had
+   * already dropped every failed command and hardcoded `success: true`, so the
+   * "live" feed was neither live nor capable of showing a failure.
+   *
+   * `result.success` is the executor's real per-command verdict, so a failed
+   * click now reaches the UI as a failure instead of vanishing.
+   *
+   * Best-effort by contract: the pipeline swallows a throwing listener, but do
+   * not rely on that — a broken feed must never fail the flow it reports on.
+   */
+  private emitRoundSteps(entryPoint: EntryPoint, round: ExecutionRound, page?: Page): void {
+    if (!this.onProgress) return;
+    try {
+      // `CommandResult` carries no per-command URL, so read the live page once
+      // per round rather than inventing a field. Best-effort: a closed page
+      // must not break the feed.
+      let pageUrl: string | undefined;
+      try {
+        pageUrl = page?.url();
+      } catch { /* page gone — omit the URL rather than fail */ }
+
+      for (const executed of round.commands) {
+        // `stepNumber` must stay 1-based and monotonic per flow (see
+        // buildFlowStepPayload) — but only INCREMENT for a command that is
+        // actually emitted, so a filtered infrastructure command cannot leave a
+        // gap the frontend reads as a lost step. Hence the payload is built
+        // first, and the counter advances only if it survived.
+        const candidate = buildFlowStepPayload(executed, {
+          stepNumber: (this.flowStepCounters.get(entryPoint.id) ?? 0) + 1,
+          roundNumber: round.roundNumber,
+          pageUrl,
+          credentials: this.config.credentials,
+        });
+        if (!candidate) continue;
+
+        this.flowStepCounters.set(entryPoint.id, candidate.stepNumber);
+        this.emitProgress('flow_step', {
+          entryPointId: entryPoint.id,
+          name: entryPoint.name,
+          ...candidate,
+        });
+      }
+    } catch (error) {
+      logger.debug('[FLOW_RUNNER] Failed to emit round steps', {
+        entryPointId: entryPoint.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -353,6 +432,11 @@ export class FlowRunner {
       const task = await this.runSingleFlow(entryPoint);
       results.push(task);
       this.flowsCompleted++;
+
+      // Fold this flow into working memory BEFORE the next one starts, so its
+      // Planner can read it. `bb.completedFlows` is only filled after Phase 2
+      // returns, which is far too late to inform anything inside Phase 2.
+      this.recordOutcomeInWorkingMemory(task);
 
       // Mark as completed for dependency tracking — always, even on failure/blocked.
       // A failed auth flow should not deadlock all auth-gated flows forever;
@@ -485,6 +569,11 @@ export class FlowRunner {
       }
 
       results.push(task);
+
+      // An infra-level failure is a learning too — recorded AFTER the blocker
+      // classification above, so the memory carries the classified reason
+      // ("Rate limited by target site") rather than a raw stack message.
+      this.recordOutcomeInWorkingMemory(task);
 
       this.emitProgress('flow_failed', {
         entryPointId: entryPoint.id,
@@ -640,6 +729,9 @@ export class FlowRunner {
         goalDetector,
         browserContext: context,
         traceWriter: this.trace?.getWriter(),
+        // Live per-step feed: fires as each round finishes, carrying the real
+        // per-command result (see emitRoundSteps).
+        onRoundComplete: (round) => this.emitRoundSteps(entryPoint, round, page),
       };
 
       // 4. Create and run pipeline
@@ -657,9 +749,14 @@ export class FlowRunner {
         // Auth flows EXPECT to land on a login URL — tell the page-health
         // check so it doesn't misread that as a "session lost" regression.
         flowIsAuth: entryPoint.category === 'authentication',
+        // Let the Executor freeze a deterministic text assertion, so a discovered
+        // case re-verifies a real value on replay instead of relying solely on the
+        // terminal ai_check self-judge. Safe autonomously because the value itself
+        // is screened by `checkAssertVolatility` — see invariant #24.
+        enableAssertAuthoring: categoryAllowsAssertAuthoring(entryPoint.category),
         // Hand the Planner the Cartographer's understanding of this page so it
         // plans against known forms/entities instead of re-deriving from DOM.
-        pageInsightContext: this.formatPageInsightContext(page.url()),
+        pageInsightContext: this.formatPageInsightContext(page.url(), entryPoint.name),
         // Cross-flow memory: what sibling flows accomplished / got blocked on +
         // strategy focus, so the Planner reuses their outcomes (invariant #10 safe).
         priorLearnings: this.formatPriorLearnings(),
@@ -718,23 +815,6 @@ export class FlowRunner {
           steps: discoveredSteps,
           count: discoveredSteps.length,
         });
-
-        // Emit flow_step events for real-time frontend updates.
-        // `extractSteps` keeps ONLY successful commands (failed ones are
-        // filtered out above), so every emitted step is a success — the FE
-        // reads `data.success` to render the per-step ✓ indicator.
-        for (const step of discoveredSteps) {
-          this.emitProgress('flow_step', {
-            entryPointId: entryPoint.id,
-            name: entryPoint.name,
-            stepNumber: step.stepNumber,
-            action: step.action,
-            description: step.description,
-            value: step.value,
-            pageUrl: step.pageUrl,
-            success: true,
-          });
-        }
       }
 
       // 6. Extract errors from pipeline result
@@ -776,6 +856,19 @@ export class FlowRunner {
       let status: FlowExplorationStatus;
       let blockerType: BlockerType | undefined;
       let canUserHelp: boolean | undefined;
+      /**
+       * Goal/progress outcome as of the LATEST attempt. Tracked separately from
+       * `pipelineResult` because the recovery retry below can succeed after the
+       * first attempt failed: the retry set `status='completed'` but the return
+       * still read `pipelineResult.success`, so a genuinely recovered flow was
+       * saved as `goalAchieved: false` → TestCaseBuilder marked it `'failed'`
+       * while `status` said `'completed'`, and the summary counted it in BOTH
+       * `flowsPassed`-eligible and `flowsFailed`.
+       */
+      let effectiveGoalAchieved = pipelineResult.success;
+      let effectiveProgressScore = pipelineResult.progressScore;
+      let effectiveRoundsUsed = pipelineResult.roundsExecuted;
+      let effectiveBlockedReason = pipelineResult.blockedReason;
 
       if (pipelineResult.success) {
         status = 'completed';
@@ -885,6 +978,9 @@ export class FlowRunner {
                 goalDetector: new GoalDetector(entryPoint.goal, entryPoint.id),
                 browserContext: context,
                 traceWriter: this.trace?.getWriter(),
+                // Keep the live feed running through the recovery retry too —
+                // otherwise the UI goes silent exactly when a flow is struggling.
+                onRoundComplete: (round) => this.emitRoundSteps(entryPoint, round, page),
               };
               const retryPipeline = new TestPipeline(retryIntegrations);
               const retryConfig: PipelineConfig = {
@@ -906,7 +1002,8 @@ export class FlowRunner {
                 // an auth flow's login landing isn't misread as "session lost"
                 // and the Planner keeps its page understanding on retry too.
                 flowIsAuth: entryPoint.category === 'authentication',
-                pageInsightContext: this.formatPageInsightContext(page.url()),
+                enableAssertAuthoring: categoryAllowsAssertAuthoring(entryPoint.category),
+                pageInsightContext: this.formatPageInsightContext(page.url(), entryPoint.name),
                 priorLearnings: this.formatPriorLearnings(),
               };
               const retryStartTime = Date.now();
@@ -918,6 +1015,12 @@ export class FlowRunner {
                   status = 'completed';
                   blockerType = undefined;
                   canUserHelp = undefined;
+                  // Adopt the retry's outcome for every derived field, not just
+                  // `status` — see `effectiveGoalAchieved`.
+                  effectiveGoalAchieved = true;
+                  effectiveProgressScore = retryResult.progressScore;
+                  effectiveRoundsUsed = pipelineResult.roundsExecuted + retryResult.roundsExecuted;
+                  effectiveBlockedReason = undefined;
                   // Merge steps — reuse the same attribution pipeline so
                   // network calls captured during the retry get attached too.
                   const { steps: retrySteps, stepsByRound: retryStepsByRound } = await extractDiscoveredSteps(retryResult, page);
@@ -983,12 +1086,12 @@ export class FlowRunner {
         errors,
         errorClassification,
         durationMs: Date.now() - startTime,
-        goalAchieved: pipelineResult.success,
-        blockedReason: pipelineResult.blockedReason,
+        goalAchieved: effectiveGoalAchieved,
+        blockedReason: effectiveBlockedReason,
         blockerType,
         canUserHelp,
-        progressScore: pipelineResult.progressScore,
-        roundsUsed: pipelineResult.roundsExecuted,
+        progressScore: effectiveProgressScore,
+        roundsUsed: effectiveRoundsUsed,
         finalUrl,
       };
     } catch (error) {
@@ -1296,8 +1399,13 @@ export class FlowRunner {
     type: BlockerType;
     canUserHelp: boolean;
   } {
+    // MUST stay in sync with the BlockerType union. `needs_data` was missing, so
+    // an Executor that correctly reported `BLOCKED [needs_data]` had it silently
+    // downgraded to 'other' — and 'other' is not in the clarification allow-list
+    // below, so the user was never asked for the value and the flow stayed dead.
     const VALID_BLOCKER_TYPES: BlockerType[] = [
-      'captcha', '2fa', 'payment', 'external_service', 'login_wall', 'file_upload', 'other',
+      'captcha', '2fa', 'payment', 'external_service', 'login_wall', 'file_upload',
+      'needs_data', 'other',
     ];
 
     // 1. Strongest signal: explicit BLOCKED [type] from report_blocked command
@@ -1474,14 +1582,56 @@ export class FlowRunner {
    * Scout prompt's "CURRENT PAGE CONTEXT" shape. Returns undefined when the
    * page wasn't surveyed. Length-capped so it can't bloat the Planner prompt.
    */
-  private formatPageInsightContext(url: string): string | undefined {
+  /**
+   * Render a form list as `"Login"[email*, password*] + 1 more` — labels the
+   * Planner can act on, with `*` marking required fields, and the submit control
+   * named so it doesn't have to guess which button commits the form.
+   *
+   * Defensive by necessity: `forms` comes straight from an LLM response
+   * (`parseCartographerResponse` passes `insight.forms` through with only an
+   * Array check), so any field may be missing or the wrong type.
+   */
+  private summarizeForms(forms: FormAnalysis[], cap: number): string {
+    const shown = forms.slice(0, cap).map((form) => {
+      const fields = Array.isArray(form?.fields) ? form.fields : [];
+      const labels = fields
+        .slice(0, PAGE_INSIGHT_MAX_FORM_FIELDS)
+        .map((f) => {
+          const name = typeof f?.label === 'string' && f.label.trim() ? f.label.trim() : f?.type || 'field';
+          return f?.required ? `${name}*` : name;
+        })
+        .filter(Boolean);
+      const extra = fields.length > PAGE_INSIGHT_MAX_FORM_FIELDS
+        ? `, +${fields.length - PAGE_INSIGHT_MAX_FORM_FIELDS}`
+        : '';
+      const submit = typeof form?.submitButtonText === 'string' && form.submitButtonText.trim()
+        ? ` → "${form.submitButtonText.trim()}"`
+        : '';
+      return labels.length ? `[${labels.join(', ')}${extra}]${submit}` : `[unknown fields]${submit}`;
+    });
+    const remaining = forms.length - shown.length;
+    return shown.join(' ') + (remaining > 0 ? ` +${remaining} more form(s)` : '');
+  }
+
+  private formatPageInsightContext(url: string, flowName?: string): string | undefined {
+    // Phase 0's brief is flow-independent and valuable on its own, so it must
+    // survive the no-page-insight early return below — a page we never surveyed
+    // is exactly where the Planner most needs product orientation.
+    const briefText = this.blackboard?.productBrief
+      ? formatBriefForPlanner(this.blackboard.productBrief, flowName)
+      : undefined;
+
     const insight = this.findPageInsight(url);
-    if (!insight) return undefined;
+    if (!insight) return briefText;
     const formCount = insight.forms?.length ?? 0;
     const cap = PAGE_INSIGHT_MAX_ITEMS_PER_LIST;
     const parts = [
       `Page understanding (from survey): ${insight.pageType}, complexity ${insight.complexity}`,
-      formCount > 0 ? `forms: ${formCount}` : '',
+      // Field LABELS, not just a count. "forms: 2" told the Planner nothing it
+      // could act on; the required-field list is the whole reason Cartographer's
+      // prompt calls `forms` mandatory ("an empty forms array means the planner
+      // cannot fill the form"). Only reachable now that pageInsights is written.
+      formCount > 0 ? `forms: ${this.summarizeForms(insight.forms, cap)}` : '',
       insight.interactiveAreas?.length ? `interactive: ${insight.interactiveAreas.slice(0, cap).join(', ')}` : '',
       insight.dataEntities?.length ? `entities: ${insight.dataEntities.slice(0, cap).join(', ')}` : '',
     ].filter(Boolean);
@@ -1489,7 +1639,46 @@ export class FlowRunner {
     // form labels / entity names before this string reaches the Planner prompt
     // (CLAUDE.md invariant #10 — the insight is page-derived, LLM-facing text).
     const text = redactCredentialValues(parts.join(' | '), this.config.credentials);
-    return text.length > PAGE_INSIGHT_MAX_CHARS ? text.slice(0, PAGE_INSIGHT_MAX_CHARS) : text;
+    const pageText = text.length > PAGE_INSIGHT_MAX_CHARS ? text.slice(0, PAGE_INSIGHT_MAX_CHARS) : text;
+
+    // Brief FIRST: it says what the flow is for, which frames how to read the
+    // page. Capped separately so a long brief can never squeeze out the page
+    // understanding — the two answer different questions and the Planner needs
+    // both. (The brief is already credential-redacted by the normalizer.)
+    if (!briefText) return pageText;
+    const cappedBrief = briefText.length > PLANNER_BRIEF_MAX_CHARS
+      ? briefText.slice(0, PLANNER_BRIEF_MAX_CHARS)
+      : briefText;
+    return `${cappedBrief}\n${pageText}`;
+  }
+
+  /**
+   * Publish a finished flow into the blackboard's working memory.
+   *
+   * Best-effort by contract: memory is an optimization, so a failure here must
+   * never fail the flow that just succeeded (CLAUDE.md hard invariant #11). The
+   * blocker reason is page-derived text, so it is credential-redacted at the
+   * SOURCE rather than relying on the redaction in `formatPriorLearnings` —
+   * `categoriesExplored` and the stored strings outlive that one read
+   * (invariant #10).
+   */
+  private recordOutcomeInWorkingMemory(task: FlowExplorationTask): void {
+    if (!this.blackboard) return;
+    try {
+      // Redact on a SHALLOW COPY — mutating `task.blockedReason` in place would
+      // change what the caller then emits, traces and returns.
+      recordFlowOutcome(this.blackboard, {
+        ...task,
+        blockedReason: task.blockedReason
+          ? redactCredentialValues(task.blockedReason, this.config.credentials)
+          : undefined,
+      });
+    } catch (error) {
+      logger.warn('[FLOW_RUNNER] Failed to record flow outcome in working memory', {
+        name: task.entryPoint.name,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
@@ -1503,38 +1692,21 @@ export class FlowRunner {
    */
   private formatPriorLearnings(): string | undefined {
     if (!this.blackboard) return undefined;
-    const parts: string[] = [];
+    // Blockers come from WORKING MEMORY, not `completedFlows` — the latter is
+    // filled only after Phase 2 returns, so every reader inside Phase 2 saw an
+    // empty list and this section never rendered at all.
+    const text = buildPriorLearnings({
+      blockersByCategory: this.blackboard.workingMemory?.blockersByCategory ?? {},
+      accomplishments: this.blackboard.workingMemory?.accomplishments ?? [],
+      focusAreas: this.blackboard.currentStrategy?.focusAreas,
+      maxFocusAreas: PAGE_INSIGHT_MAX_ITEMS_PER_LIST,
+    });
+    if (!text) return undefined;
 
-    // Active strategy focus (one line — what the Strategist told everyone to prioritise).
-    const focus = this.blackboard.currentStrategy?.focusAreas;
-    if (focus?.length) {
-      parts.push(`Strategy focus: ${focus.slice(0, PAGE_INSIGHT_MAX_ITEMS_PER_LIST).join(', ')}`);
-    }
-
-    // Recent accomplishments — most recent last in the array, so take the tail.
-    const accomplishments = this.blackboard.workingMemory?.accomplishments ?? [];
-    if (accomplishments.length) {
-      const recent = accomplishments.slice(-PRIOR_LEARNINGS_MAX_ACCOMPLISHMENTS);
-      parts.push(`Already done by earlier flows: ${recent.join('; ')}`);
-    }
-
-    // Most recent blocked flows + reason (dedup by category — one dead end per
-    // category is enough signal; repeating them just eats the budget).
-    const blockedByCategory = new Map<string, string>();
-    for (const flow of this.blackboard.completedFlows) {
-      if (flow.status !== 'blocked' || !flow.blockedReason) continue;
-      blockedByCategory.set(flow.category, flow.blockedReason); // keep-last = most recent
-    }
-    if (blockedByCategory.size) {
-      const blockers = Array.from(blockedByCategory.entries())
-        .slice(-PRIOR_LEARNINGS_MAX_BLOCKERS)
-        .map(([cat, reason]) => `${cat}: ${reason}`);
-      parts.push(`Blockers other flows hit: ${blockers.join(' | ')}`);
-    }
-
-    if (!parts.length) return undefined;
-    const text = redactCredentialValues(parts.join('\n'), this.config.credentials);
-    return text.length > PRIOR_LEARNINGS_MAX_CHARS ? text.slice(0, PRIOR_LEARNINGS_MAX_CHARS) : text;
+    // Redacted AFTER capping: the mask (3 chars) is never longer than what it
+    // replaces (min 4), so redaction can only shrink the block — capping first
+    // therefore cannot break the limit, and cannot cut a mask in half.
+    return redactCredentialValues(text, this.config.credentials);
   }
 
   private normalizeUrl(url: string): string {

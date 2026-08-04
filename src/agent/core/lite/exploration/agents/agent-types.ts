@@ -24,6 +24,7 @@ import type { ExplorationTree } from '../exploration-tree';
 import type { FlowQueue } from '../flow-queue';
 import type { RateLimiter } from '../rate-limiter';
 import type { ExplorationTraceService } from '../exploration-trace.service';
+import type { ProductBrief } from '../phase0/product-brief.types';
 import type {
   ExplorationConfig,
   ExplorationProgressCallback,
@@ -50,6 +51,13 @@ export interface ExplorationBlackboard {
   readonly entryUrl: string;
   readonly scopeHint?: string;
   readonly hasCredentials: boolean;
+  /**
+   * Phase 0 product brief. Written ONCE by the engine before Phase 1 and read by
+   * Strategist + Sentinel (Cartographer and the Planner receive their own
+   * pre-rendered slices instead). Absent on `quick` runs and on every Phase 0
+   * skip, so every reader must treat it as optional.
+   */
+  productBrief?: ProductBrief;
 
   // ── Page Graph (Cartographer writes, all read) ──
   // null before Phase 1 completes — always check before access
@@ -100,6 +108,13 @@ export interface ExplorationWorkingMemory {
   accomplishments: string[];
   /** Categories of flows we've explored */
   categoriesExplored: Set<string>;
+  /**
+   * Most recent dead end per flow category (category → reason), written the
+   * moment a flow ends. Lives here rather than being derived from
+   * `completedFlows`, which is only populated AFTER Phase 2 returns — so a
+   * reader inside Phase 2 always saw an empty list.
+   */
+  blockersByCategory: Record<string, string>;
 }
 
 /** User directive from WebSocket intervention */
@@ -171,6 +186,13 @@ export interface CartographerInput {
   overlaysDismissed?: string[];
   /** Product context collected from DOM (meta tags, headings, nav links, prominent buttons) */
   productContext?: string;
+  /**
+   * Visible error banners / non-complete readyState observed on the page.
+   * Credential-redacted by the caller. Lets Cartographer distinguish "this page
+   * is broken or still loading" from "this page has no interactive flows" —
+   * without it, both produce an empty entryPoints array indistinguishably.
+   */
+  pageHealth?: string;
 }
 
 export interface CartographerOutput {
@@ -265,6 +287,11 @@ export interface StrategistInput {
   userDirective?: string;
   /** Nav link URLs discovered during survey but not yet visited — concrete targets for continueSurvey */
   unvisitedNavLinks: Array<{ url: string; label: string; sourcePageUrl: string }>;
+  /**
+   * Phase 0 product brief, pre-rendered for this agent. Absent on `quick` runs
+   * and on any Phase 0 skip, so the prompt must remain correct without it.
+   */
+  productBrief?: string;
 }
 
 export interface StrategistOutput {
@@ -413,6 +440,11 @@ export interface SentinelInput {
   budget: BudgetSummary;
   /** User scope hint */
   scopeHint?: string;
+  /**
+   * Phase 0 product brief, pre-rendered for this agent — lets coverage be scored
+   * against what MATTERS rather than the raw discovered-entry-point count.
+   */
+  productBrief?: string;
 }
 
 export interface SentinelAssessment {

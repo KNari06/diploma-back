@@ -91,8 +91,10 @@ export function getSharedOpenAIClient(): OpenAI {
  * confirmed in logs).
  *
  * The fix: when we see a 400 invalid-model error, transparently retry the
- * SAME request once with a known-good fallback model (`gpt-4.1-mini` — still
- * the default for OPENAI_MODEL_FAST, so we know it's always reachable). The
+ * SAME request once with a known-good fallback model (`gpt-4.1-mini` — a
+ * long-lived, widely-available OpenAI model, chosen precisely BECAUSE it is not
+ * whatever the env currently points at: a fallback that tracked the configured
+ * model would fall back onto the same broken value). The
  * retry result is returned to the caller as if the
  * primary model had succeeded — the circuit breaker never triggers, accuracy
  * is preserved, and prod (where the primary model works) is unaffected
@@ -103,6 +105,19 @@ export function getSharedOpenAIClient(): OpenAI {
  * straight to the fallback for them. The set is in-memory per process — it
  * resets on restart, which is the right behaviour if the model becomes
  * available again later.
+ */
+/**
+ * DO NOT set this to the configured model (`AI_MODELS.smart` / `.fast`).
+ *
+ * The retry below is guarded by `effectiveModel !== FALLBACK_MODEL` so it can
+ * never loop. Point this at the configured model and that guard is permanently
+ * false: the fallback stops firing entirely, tests stay green, and prod quietly
+ * loses the safety net that keeps the element-resolver circuit breaker shut.
+ *
+ * It also has to be a model present in `AI_PRICING` / `MODEL_PRICING`, or a
+ * fallback request is costed at the wrong rate — which rules out simply picking
+ * another nano/mini id. gpt-4.1-mini satisfies both: distinct from the
+ * configured model, and priced.
  */
 const FALLBACK_MODEL = 'gpt-4.1-mini';
 const knownInvalidModels = new Set<string>();

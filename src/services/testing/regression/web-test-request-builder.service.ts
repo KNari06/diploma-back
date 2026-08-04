@@ -162,6 +162,13 @@ export class WebTestRequestBuilderService {
       commands, // Pre-generated commands
       options: mergedOptions,
       resourceBindings,
+      // Network expectations recorded at discovery time. `getSavedTestCase`
+      // selects `*`, so the column arrives here without a query change. Only
+      // spread when non-empty so an absent value stays absent (meaning "nothing
+      // to verify") rather than becoming an empty array.
+      ...(Array.isArray(intentCase.network_assertions) && intentCase.network_assertions.length > 0
+        ? { networkAssertions: intentCase.network_assertions }
+        : {}),
       // Routes WS progress/result to chat:<sessionId> when launched from chat.
       ...(chatSessionId ? { chatSessionId } : {}),
       ...(runId ? { regressionRunId: runId } : {}),

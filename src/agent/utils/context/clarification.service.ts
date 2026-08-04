@@ -264,15 +264,36 @@ export class ClarificationService {
    */
   static async requestClarificationViaRedis(params: {
     explorationId: string;
-    chatSessionId: string;
+    /**
+     * Chat room to deliver into. OPTIONAL — the REST `/explorations/start` path
+     * has no chat session at all, so requiring it made asking impossible there.
+     * Supply `userId` instead (or as well); the emit routes to whichever is set,
+     * and the web client filters on `explorationId`.
+     */
+    chatSessionId?: string;
+    /** User room fallback. At least one of chatSessionId / userId is required. */
+    userId?: string;
     question: string;
     // 'test_data' = the flow needs a real value it can't invent (promo/referral
     // code, account number, a one-time code that isn't strictly 2FA). Reuses the
     // same text-input clarification UI as '2fa_code'. NOT for credentials —
     // passwords need a dedicated secure form (see FlowRunner note).
-    type: 'captcha_solve' | '2fa_code' | 'test_data';
+    // 'product_brief' = a Phase 0 discovery question the analyst could not infer
+    // (is this production? which role is the test account?). Same text/choice UI.
+    type: 'captcha_solve' | '2fa_code' | 'test_data' | 'product_brief';
+    /** Optional fixed choices, rendered as buttons instead of a text field. */
+    options?: string[];
     timeout?: number;
   }): Promise<string | null> {
+    // Without a destination the question can never be delivered, and the caller
+    // would block for the full timeout waiting for an answer nobody was asked for.
+    if (!params.chatSessionId && !params.userId) {
+      logger.warn('[CLARIFICATION_SERVICE] No chatSessionId or userId — cannot deliver', {
+        explorationId: params.explorationId,
+        type: params.type,
+      });
+      return null;
+    }
     const questionId = uuidv4();
     const redisKey = `exploration:clarification:${questionId}`;
     const timeout = params.timeout || 120_000; // 2 min for captcha
@@ -292,6 +313,9 @@ export class ClarificationService {
       type: params.type,
       timeout,
       chatSessionId: params.chatSessionId,
+      // Routes to the user room when there is no chat session (REST path).
+      userId: params.userId,
+      ...(params.options?.length ? { options: params.options } : {}),
       timestamp: new Date().toISOString(),
     });
 

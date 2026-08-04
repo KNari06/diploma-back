@@ -27,7 +27,17 @@ export const AI_MODELS = {
   /** High-quality model for complex reasoning, auditing, vision. Default: gpt-5.4-mini */
   smart: env.OPENAI_MODEL || 'gpt-5.4-mini',
 
-  /** Fast/cheap model for classification, extraction, disambiguation. Default: gpt-5.4-mini */
+  /**
+   * Classification, extraction, disambiguation.
+   *
+   * **Currently resolves to the SAME model as `smart`, on purpose.** The tiers
+   * were split once and deliberately re-merged: gpt-4.1-mini was judged too weak
+   * for the work on this alias (`aiCheck`, `chatResponder`, `selectorResolution`
+   * — product-critical paths), and prod pins `var.openai_model_fast` to
+   * gpt-5.4-mini. Splitting them again is a real 10× cost lever (see AI_PRICING)
+   * but must be driven by per-task measurement, not by the alias name — a blanket
+   * downgrade silently degrades every caller at once.
+   */
   fast: env.OPENAI_MODEL_FAST || 'gpt-5.4-mini',
 
   /** Vision-capable model for screenshot analysis. Default: gpt-5.4-mini */
@@ -39,9 +49,10 @@ export const AI_MODELS = {
    *
    * Now gpt-5.4-mini, matching `smart`/`vision`: extraction tasks (step
    * conversion, PDF parsing) get noticeably better action-type inference, which
-   * directly reduces degraded imports. Resolves via `OPENAI_MODEL` (NOT
-   * `OPENAI_MODEL_FAST`, whose env default is still gpt-4.1-mini and would
-   * silently pin this back to the old model).
+   * directly reduces degraded imports. Stays bound to `OPENAI_MODEL` rather than
+   * `OPENAI_MODEL_FAST` even though both now default to the same model, so that
+   * the day the fast tier IS split off this alias does not silently follow it
+   * back down to a weaker model.
    */
   classify: env.OPENAI_MODEL || 'gpt-5.4-mini',
 } as const;
@@ -148,8 +159,9 @@ export const AI_TASK_MODELS = {
    * Negative-test mutation generation. Reasoning task: read each happy-path
    * step's field identity, decide the highest-value attack (auth/validation
    * over navigation), and write an observable error-state assertion — not a
-   * classification. Uses the smart tier (gpt-5.4-mini), NOT `AI_MODELS.fast`
-   * (whose env default is gpt-4.1-mini). Override via OPENAI_MODEL_NEGATIVE_GEN.
+   * classification. Bound to the smart tier, NOT `AI_MODELS.fast` — the two
+   * resolve to the same model today, but this task must follow `smart` if the
+   * fast tier is ever split off. Override via OPENAI_MODEL_NEGATIVE_GEN.
    */
   negativeGeneration: env.OPENAI_MODEL_NEGATIVE_GEN || AI_MODELS.smart,
 

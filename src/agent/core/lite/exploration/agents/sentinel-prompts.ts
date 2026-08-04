@@ -65,6 +65,13 @@ Respond with valid JSON only.`;
 export function buildSentinelPrompt(input: SentinelInput): string {
   const sections: string[] = [];
 
+  // Product brief FIRST — it changes what "covered" MEANS. Without it this agent
+  // scores against the raw count of discovered entry points, which rewards
+  // breadth over business relevance.
+  if (input.productBrief) {
+    sections.push(`PRODUCT BRIEF (from pre-exploration analysis):\n${input.productBrief}`);
+  }
+
   if (input.scopeHint) {
     sections.push(`USER SCOPE: "${input.scopeHint}" — evaluate coverage relative to this scope.`);
   }

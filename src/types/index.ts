@@ -465,6 +465,14 @@ export interface TestJobData {
   chatSessionId?: string; // Chat session ID for WebSocket routing isolation
   prefilledSteps?: import('@/services/testing/resolver/resolver.types').PrefilledStep[]; // Smart Resolver prefilled steps
   /**
+   * Network expectations recorded when this test was discovered by exploration
+   * (`intent_test_cases.network_assertions`). Verified AFTER the steps run, so a
+   * UI that renders fine while its API is broken still fails.
+   *
+   * Absent/empty means "nothing to verify" — never "verified and empty".
+   */
+  networkAssertions?: import('@/types/testing.types').TestAssertion[];
+  /**
    * Test resources bound to this run (auth logins, environments, secrets, etc).
    * Resolved from `intent_test_cases.resource_bindings` + workspace defaults
    * before the job is enqueued. The runner hands this to ResourceApplier

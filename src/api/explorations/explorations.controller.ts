@@ -17,7 +17,8 @@ import {
   generateExplorationId,
   type ExplorationPreset,
 } from '@/agent/core/lite/exploration/types';
-import { sanitizeUrl } from '@/utils/validation/validation';
+import { normalizeEntryUrl } from '@/utils/validation/entry-url';
+import { preflightEntryUrl } from '@/services/testing/exploration/entry-preflight.service';
 import { projectBelongsToWorkspace } from '@/services/core/db/self-serve.db';
 
 interface AuthenticatedRequest extends Request {
@@ -136,13 +137,26 @@ export async function getExplorationTestCases(req: AuthenticatedRequest, res: Re
       return;
     }
 
-    // Get test cases created by this exploration
+    // Test cases created by THIS run.
+    //
+    // Scoped by `exploration_id` (added 2026-08-03). Before it, this filtered on
+    // project + source only and returned every exploration case the project had
+    // ever accumulated — 516 rows from 8 runs on one prod project, including
+    // cases from entirely different entry URLs. A run that found 20 tests listed
+    // hundreds, and any bulk action taken there operated on that wrong set.
+    //
+    // NO fallback to the project-wide query when this returns nothing. A
+    // legacy run genuinely cannot know which rows were its own, and guessing
+    // reproduces the exact bug: a NEW run that discovered nothing would show
+    // the project's entire history as if it had just found it. An empty list is
+    // the honest answer — `run.test_cases_count` already tells the user how
+    // many this run produced, so 0 rows next to "0 test cases" reads correctly.
     const { data: testCases, error } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, name, description, start_url, steps_json, tags, priority, status, created_at')
+      .select('id, entry_point_id, name, description, start_url, steps_json, tags, priority, status, created_at')
       .eq('project_id', run.project_id)
       .eq('user_id', userId)
-      .eq('source', 'exploration')
+      .eq('exploration_id', explorationId)
       .order('created_at', { ascending: true });
 
     if (error) {
@@ -356,12 +370,38 @@ export async function startExploration(req: AuthenticatedRequest, res: Response)
     const userId = getUserId(req);
     const { url, projectId: bodyProjectId, preset, scopeHint } = req.body ?? {};
 
-    // Validate URL (http/https only) — sanitizeUrl throws ValidationError otherwise.
+    // Normalize + validate. `normalizeEntryUrl` accepts a bare domain
+    // ("app.acme.com") — the most natural thing a user types, which the old
+    // sanitizeUrl-only path rejected — while applying the same http(s)
+    // allowlist and SSRF blocklist.
     let entryUrl: string;
     try {
-      entryUrl = sanitizeUrl(url);
-    } catch {
-      res.status(400).json({ success: false, error: 'A valid http(s) url is required' });
+      entryUrl = normalizeEntryUrl(url);
+    } catch (err) {
+      res.status(400).json({
+        success: false,
+        error: err instanceof ValidationError ? err.message : 'A valid http(s) url is required',
+      });
+      return;
+    }
+
+    // Reachability probe BEFORE the job is enqueued — and therefore before the
+    // job charges EXPLORATION_DISCOVERY_CREDITS. Without this, a typo'd or dead
+    // URL produced a `status:'completed'` run with 0 test cases and still billed
+    // 10 credits, while telling the user their site had no flows.
+    const preflight = await preflightEntryUrl(entryUrl);
+    if (!preflight.ok) {
+      logger.info('[EXPLORATIONS_API] Entry preflight rejected exploration', {
+        userId,
+        entryUrl,
+        verdict: preflight.verdict,
+        status: preflight.status,
+      });
+      res.status(400).json({
+        success: false,
+        error: preflight.message,
+        verdict: preflight.verdict,
+      });
       return;
     }
 
@@ -415,6 +455,9 @@ export async function startExploration(req: AuthenticatedRequest, res: Response)
       workspaceId,
       scopeHint: typeof scopeHint === 'string' ? scopeHint : undefined,
       budget,
+      // Carry the preset, not just the budget it resolved to — preset-gated
+      // phases (Phase 0) need the policy, and a timeout threshold is a bad proxy.
+      preset: resolvedPreset,
       maxConcurrency: 5,
     });
 

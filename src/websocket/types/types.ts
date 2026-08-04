@@ -1485,11 +1485,19 @@ export interface ExplorationClarificationPayload {
   // (e.g. confirming a destructive action the crawl's guard blocked). The answer
   // routes back to the RUNNER (see mobile-clarification-route.service), not the
   // web ClarificationService.
-  type: 'captcha_solve' | '2fa_code' | 'test_data' | 'confirmation' | 'choice';
-  /** For 'choice' — selectable options the user picks from. */
+  // 'product_brief' = a Phase 0 discovery question the analyst could not infer
+  // (is this production? which role does the test account hold?). Rendered with
+  // the same text/choice modal.
+  type: 'captcha_solve' | '2fa_code' | 'test_data' | 'confirmation' | 'choice' | 'product_brief';
+  /** For 'choice' / 'product_brief' — selectable options the user picks from. */
   options?: string[];
   timeout: number;
-  chatSessionId: string;
+  /**
+   * OPTIONAL: the REST `/explorations/start` path has no chat session, so a
+   * question there is delivered to the user room via `userId` instead. At least
+   * one of the two must be set or the emit reaches nobody.
+   */
+  chatSessionId?: string;
   userId?: string;
   timestamp: string;
 }

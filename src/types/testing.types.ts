@@ -597,9 +597,49 @@ export interface IntentTestCase {
   // Provenance
   sourceTestId?: string;
   sourceIntelligentSessionId?: string;
-  
+
+  /**
+   * Machine-checkable network expectations derived during exploration —
+   * `{type:'network', expect, source:{method, urlPattern, status}}`.
+   *
+   * Test-case-level, NOT positional like `stepsJson`: "this flow hits
+   * POST /api/auth and it must return 2xx" is a property of the run, not of
+   * step 4. Verification compares status FAMILY and an id-parameterized url
+   * pattern, so a per-run id or a 200→204 change cannot false-fail.
+   *
+   * `undefined` means "no expectations recorded" (manual/imported tests) and
+   * must be treated as "nothing to verify", never as "verified and empty".
+   */
+  networkAssertions?: TestAssertion[];
+
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * A machine-checkable expectation attached to a test case.
+ *
+ * Lives here rather than in `exploration/types.ts` because exploration AUTHORS
+ * these while replay VERIFIES them — it is a cross-boundary contract. (Moving it
+ * also avoided an import cycle: `exploration/types` already imports
+ * `IntentTestCase` from this file.)
+ */
+export interface TestAssertion {
+  type: 'network' | 'url' | 'console';
+  /** Human-readable expectation, e.g. "POST /api/auth returns 2xx". Prose — not parsed. */
+  expect: string;
+  /**
+   * The machine-checkable part. For `type:'network'` this is what verification
+   * actually matches on; an assertion WITHOUT it is unverifiable (and must be
+   * skipped, never failed — `expect` alone is not a predicate).
+   */
+  source?: {
+    method?: string;
+    /** Id-parameterized pattern from `normalizeUrlWithPattern` (e.g. `/orders/:id`). */
+    urlPattern?: string;
+    /** Observed status. Verification compares the FAMILY (2xx), not this exact value. */
+    status?: number;
+  };
 }
 
 /**
