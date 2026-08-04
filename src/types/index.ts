@@ -1352,6 +1352,15 @@ export interface JiraIssueRequest {
    * NULL / undefined → falls through to severity-derived priority.
    */
   testCasePriority?: 'critical' | 'high' | 'medium' | 'low';
+  /**
+   * Paste-ready developer fix prompt (markdown) for the run's highest-severity
+   * bug — `AISummary.fixPrompt`, produced by `DeveloperFixPromptService`. When
+   * present it is posted as its own comment on the created issue, so the
+   * developer who receives the ticket never has to open QAIT to get it.
+   * Undefined when the run found no bugs or `DEVELOPER_FIX_PROMPT_ENABLED` was
+   * off at analysis time — in which case no comment is posted.
+   */
+  fixPrompt?: string;
 }
 
 export interface JiraIssue {

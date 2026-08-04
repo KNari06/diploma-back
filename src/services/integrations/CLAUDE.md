@@ -38,7 +38,28 @@ structured **handoff artifact** (`HandoffService` + `db/handoff.db.ts`, table
 [../../ai/prompts/fix-prompt.prompts.ts](../../ai/prompts/fix-prompt.prompts.ts),
 gated `DEVELOPER_FIX_PROMPT_ENABLED`. Runs post-run in
 [../../jobs/ai-analysis.job.ts](../../jobs/ai-analysis.job.ts): black-box markdown →
-`ai_summary.fixPrompt` + a Jira feedback comment + the frontend "Copy fix-prompt".
+`ai_summary.fixPrompt`, from which it reaches **four** surfaces — the frontend
+"Copy fix-prompt", a Jira feedback comment on the *source* ticket
+(`jira-feedback.service.ts`), and both paths that FILE a new issue from a run
+(`JiraReportService`, as its own comment).
+
+Filing paths pass it via `JiraIssueRequest.fixPrompt`: the job has the summary in
+memory; the manual endpoint (`POST /reports/:testId/jira`) resolves it from the
+persisted summary through
+[resolve-fix-prompt.util.ts](../testing/analysis/resolve-fix-prompt.util.ts)
+(fail-open, reads `test_results` then the forked `mobile_test_results`).
+
+## Filing a Jira issue from a test report
+
+| file | purpose |
+| ---- | ------- |
+| `jira-report.service.ts` | Orchestration: create issue → attachments → comments → save link. Only the create step throws; everything after it is best-effort. |
+| `jira-report-formatter.ts` | Pure ADF builders (description, code comment, fix-prompt comment). Each comment builder returns `null` when it has nothing to say — ADF rejects an empty text node, which would 400 the comment. |
+| `jira-report-attachments.ts` | Video / trace / screenshot upload. Never throws. |
+| `db/jira-report.db.ts` | `test_jira_issues` link insert. |
+
+Rich comments go through `addJiraComment`, which takes `string | AdfDoc` — pass a
+**doc**, not text, or `plainTextToADF` flattens the code block into paragraphs.
 
 ---
 

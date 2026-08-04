@@ -843,6 +843,9 @@ export class RegressionReportAssemblerService {
         ...(execAiSummary?.classificationEvidence?.length > 0 && {
           classificationEvidence: execAiSummary.classificationEvidence,
         }),
+        // Same summary object the Jira filing path reads. Carried here so the
+        // run report can preview the task QAIT would file without Jira.
+        ...(execAiSummary?.fixPrompt && { fixPrompt: execAiSummary.fixPrompt }),
         ...(failureReason && { failureReason }),
       });
     }

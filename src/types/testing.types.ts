@@ -1290,6 +1290,14 @@ export interface RunReportExecution {
   rootCauseStep?: number | null;
   classificationEvidence?: string[];
   /**
+   * Paste-ready developer fix prompt for this execution's highest-severity bug
+   * (`ai_summary.fixPrompt`). Surfaced on the run report so the "generated
+   * tasks" view can show the ticket QAIT would file — including the prompt —
+   * without a Jira connection. Absent when the run found no bugs or
+   * `DEVELOPER_FIX_PROMPT_ENABLED` was off at analysis time.
+   */
+  fixPrompt?: string;
+  /**
    * Set when the run failed BEFORE any step executed (device attach / session
    * setup / runner unreachable). Drives the case-level failure banner in the
    * report. Absent for normal pass / step-failure executions.

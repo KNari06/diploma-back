@@ -811,6 +811,10 @@ export class AIAnalysisJobHandler {
         testReport: report,
         issueType: 'Bug',
         testCasePriority,
+        // Already in memory — the generation block above mutates this same
+        // `aiSummary` object. Undefined when the flag is off, in which case
+        // the service posts no fix-prompt comment.
+        fixPrompt: aiSummary?.fixPrompt,
       });
 
       logger.info('[AI-ANALYSIS] Jira issue created (syncOnCreate)', {

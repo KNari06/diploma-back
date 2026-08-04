@@ -3,6 +3,7 @@ import { logger } from '@/utils/core/logger';
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
 import { JiraReportService } from '@/services/integrations/jira-report.service';
 import { resolveTestCasePriorityForTestId } from '@/services/testing/regression/resolve-test-case-priority.util';
+import { resolveFixPromptForTestId } from '@/services/testing/analysis/resolve-fix-prompt.util';
 import { supabaseAdmin } from '@/db/supabase';
 import { FinalTestReport, JiraIssueRequest } from '@/types';
 
@@ -270,6 +271,11 @@ export const createJiraIssue = async (req: Request, res: Response): Promise<void
     // Helper is statically imported at the top of this file.
     const testCasePriority = await resolveTestCasePriorityForTestId(testId);
 
+    // Best-effort: the developer fix prompt persisted by the post-run analysis,
+    // so a manually-filed issue carries it just like an auto-filed one.
+    // Fail-open — a missing prompt must not block filing.
+    const fixPrompt = await resolveFixPromptForTestId(testId);
+
     // Create Jira issue
     const jiraIssue = await JiraReportService.createJiraIssueFromReport({
       userId,
@@ -278,6 +284,7 @@ export const createJiraIssue = async (req: Request, res: Response): Promise<void
       issueType: issueType || 'Bug',
       priority,
       testCasePriority,
+      fixPrompt,
     });
 
     res.status(200).json({

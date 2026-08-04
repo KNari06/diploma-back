@@ -1,18 +1,34 @@
 import { logger } from '@/utils/core/logger';
-import { FinalTestReport, JiraIssueRequest, JiraIssue, JiraAttachment } from '@/types';
-import { supabaseAdmin } from '@/db/supabase';
-import { downloadFromStorage } from '@/services/storage/test-artifacts-storage.service';
-import { getJiraToken, ensureValidToken } from '@/services/api/jira.service';
+import { FinalTestReport, JiraIssueRequest, JiraIssue } from '@/types';
+import {
+  addJiraComment,
+  ensureValidToken,
+  getJiraToken,
+  type AdfDoc,
+} from '@/services/api/jira.service';
+import {
+  buildCodeCommentADF,
+  buildDescriptionADF,
+  buildFixPromptCommentADF,
+} from './jira-report-formatter';
+import { uploadReportAttachments, type JiraAuth } from './jira-report-attachments';
+import { insertTestJiraIssueLink } from './db/jira-report.db';
 
 /**
- * Service for creating Jira issues from test reports
+ * Files a Jira issue from a completed test report: create the issue, attach the
+ * run's artifacts, then add the follow-up comments (generated code, developer
+ * fix prompt). Formatting lives in `jira-report-formatter.ts`, uploads in
+ * `jira-report-attachments.ts` — this class is orchestration.
  */
 export class JiraReportService {
   /**
-   * Create Jira issue from test report with full details and attachments
+   * Create a Jira issue from a test report, with attachments and comments.
+   * Throws if the issue itself cannot be created; every post-creation step is
+   * best-effort (the issue exists, and losing an attachment must not look like
+   * a failed filing).
    */
   static async createJiraIssueFromReport(params: JiraIssueRequest): Promise<JiraIssue> {
-    const { userId, projectKey, testReport, issueType = 'Bug', priority, testCasePriority } = params;
+    const { userId, projectKey, testReport, issueType = 'Bug', priority, testCasePriority, fixPrompt } = params;
 
     logger.info('[JIRA_REPORT] Creating Jira issue', {
       userId,
@@ -22,82 +38,20 @@ export class JiraReportService {
     });
 
     try {
-      // 1. Get Jira credentials
       const jiraAuth = await this.getJiraAuth(userId);
       if (!jiraAuth) {
         throw new Error('Jira not connected. Please connect your Jira account first.');
       }
 
-      // 2. Format description with all test details
-      const description = this.formatJiraDescription(testReport);
+      const issuePriority = this.resolvePriority(testReport, priority, testCasePriority);
 
-      // 3. Determine priority via 3-tier precedence:
-      //    a) Explicit `priority` from caller — already a Jira label, wins
-      //       (used by the API endpoint when user manually picked one).
-      //    b) `testCasePriority` from the saved intent_test_case row —
-      //       lets a user who marks a test as "critical" auto-file
-      //       Highest-priority Jira issues without re-setting it per run.
-      //    c) AI-derived severity from the test report (legacy behaviour).
-      //
-      // Why test-case priority sits BETWEEN explicit and severity:
-      //   - explicit caller priority is a deliberate per-call decision,
-      //     usually from a UI button — must win.
-      //   - test-case priority is a per-test-case curator choice that
-      //     should beat AI severity (which is per-run and can drift),
-      //     because curators know what's actually business-critical.
-      //   - severity is the safety net when neither signal is present
-      //     (ad-hoc / chat-lite runs with no saved test case).
-      const issuePriority =
-        priority
-        || (testCasePriority ? this.mapTestCasePriorityToJira(testCasePriority) : undefined)
-        || this.determinePriority(testReport.analysis.severity);
-      const prioritySource = priority
-        ? 'explicit'
-        : testCasePriority
-          ? 'test_case'
-          : 'severity_fallback';
-      logger.info('[JIRA_REPORT] Priority resolution', {
-        testId: testReport.testId,
-        chosen: issuePriority,
-        prioritySource,
-        testCasePriority,
-        severity: testReport.analysis.severity,
+      const createdIssue = await this.createIssue({
+        jiraAuth,
+        projectKey,
+        issueType,
+        priority: issuePriority,
+        report: testReport,
       });
-
-      // 4. Create Jira issue
-      const response = await fetch(
-        `https://api.atlassian.com/ex/jira/${jiraAuth.cloudId}/rest/api/3/issue`,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${jiraAuth.accessToken}`,
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-          },
-          body: JSON.stringify({
-            fields: {
-              project: { key: projectKey },
-              summary: `[QAI Test] ${testReport.testUrl} - ${testReport.summary.bugsFound} bugs found`,
-              description: this.formatDescriptionADF(description, testReport),
-              issuetype: { name: issueType },
-              priority: { name: issuePriority },
-              labels: [
-                'automated-test',
-                'qai',
-                `severity-${testReport.analysis.severity}`,
-                `status-${testReport.status}`,
-              ],
-            },
-          }),
-        }
-      );
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Jira API error: ${response.status} - ${errorText}`);
-      }
-
-      const createdIssue = await response.json() as JiraIssue;
 
       logger.info('[JIRA_REPORT] Issue created successfully', {
         issueKey: createdIssue.key,
@@ -105,13 +59,19 @@ export class JiraReportService {
         testId: testReport.testId,
       });
 
-      // 5. Upload attachments (video, trace, screenshots) in parallel
-      await this.uploadAttachments(createdIssue.key, testReport, jiraAuth);
+      await uploadReportAttachments(createdIssue.key, testReport, jiraAuth);
 
-      // 6. Add generated code as comment
-      await this.addCodeComment(createdIssue.key, testReport.generatedCode.code, jiraAuth);
+      // Optional-chained on purpose: a `test_reports` row can carry a null
+      // `generated_code`, and a throw HERE would skip saveJiraIssueLink below,
+      // leaving an issue in Jira that nothing links back to the run while the
+      // caller is told the filing failed.
+      await this.postComment(createdIssue.key, buildCodeCommentADF(testReport.generatedCode?.code ?? ''), jiraAuth, 'code');
 
-      // 7. Save Jira issue link to database
+      // The paste-ready fix prompt. Present only when the run found a bug AND
+      // DEVELOPER_FIX_PROMPT_ENABLED was on when the run was analysed — absent
+      // otherwise, in which case no comment is posted at all.
+      await this.postComment(createdIssue.key, buildFixPromptCommentADF(fixPrompt), jiraAuth, 'fix-prompt');
+
       await this.saveJiraIssueLink(testReport.testId, createdIssue.key, createdIssue.self);
 
       return createdIssue;
@@ -126,387 +86,117 @@ export class JiraReportService {
     }
   }
 
-  /**
-   * Format Jira description with full test details (plain text version)
-   */
-  private static formatJiraDescription(report: FinalTestReport): string {
-    const duration = (report.duration / 1000).toFixed(2);
+  /** POST the issue itself. Throws on a non-2xx — this is the one step that must succeed. */
+  private static async createIssue(input: {
+    jiraAuth: JiraAuth;
+    projectKey: string;
+    issueType: string;
+    priority: string;
+    report: FinalTestReport;
+  }): Promise<JiraIssue> {
+    const { jiraAuth, projectKey, issueType, priority, report } = input;
 
-    return `
-🤖 *Automated Test Report*
-
-📊 *Test Summary*
-• Test ID: ${report.testId}
-• URL: ${report.testUrl}
-• Status: ${report.status.toUpperCase()}
-• Duration: ${duration}s
-• Executed: ${new Date(report.executedAt).toLocaleString()}
-
-📋 *Test Steps*
-• Total: ${report.summary.totalSteps} steps
-• ✅ Passed: ${report.summary.passedSteps}
-• ❌ Failed: ${report.summary.failedSteps}
-
-🐛 *Bugs Found: ${report.summary.bugsFound}*
-${report.summary.criticalBugs > 0 ? `🔴 Critical: ${report.summary.criticalBugs}` : ''}
-
-📝 *Detailed Findings*
-${report.analysis.bugs.map((bug, i) => `
-${i + 1}. [${bug.severity.toUpperCase()}] ${bug.message}
-   • Type: ${bug.type}
-   ${bug.selector ? `• Selector: ${bug.selector}` : ''}
-   • Fix: ${bug.recommendation}
-`).join('\n')}
-
-${report.analysis.recommendations.length > 0 ? `
-💡 *Recommendations*
-${report.analysis.recommendations.map((rec, i) => `${i + 1}. ${rec}`).join('\n')}
-` : ''}
-
-🎬 *Artifacts*
-${report.artifacts.video ? `• 📹 Video: Available` : '• 📹 Video: Not recorded'}
-${report.artifacts.trace ? `• 📊 Trace: Available` : '• 📊 Trace: Not available'}
-• 📸 Screenshots: ${report.artifacts.screenshots.length} attached
-• 🌐 Network Logs: ${report.artifacts.networkLogs.length} requests
-• 📜 Console Logs: ${report.artifacts.logs.length} entries
-
-🔗 *Links*
-• View in QAI: https://app.qai.so/tests/${report.testId}
-
----
-🤖 Generated by QAI - Automated Testing Platform
-📊 Confidence: ${(report.analysis.confidence * 100).toFixed(0)}%
-    `.trim();
-  }
-
-  /**
-   * Format description in Atlassian Document Format (ADF)
-   */
-  private static formatDescriptionADF(plainText: string, report: FinalTestReport): any {
-    return {
-      type: 'doc',
-      version: 1,
-      content: [
-        {
-          type: 'heading',
-          attrs: { level: 2 },
-          content: [{ type: 'text', text: '🤖 Automated Test Report' }],
+    const response = await fetch(
+      `https://api.atlassian.com/ex/jira/${jiraAuth.cloudId}/rest/api/3/issue`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${jiraAuth.accessToken}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
         },
-        {
-          type: 'panel',
-          attrs: { panelType: 'info' },
-          content: [
-            {
-              type: 'paragraph',
-              content: [
-                { type: 'text', text: 'Test ID: ', marks: [{ type: 'strong' }] },
-                { type: 'text', text: report.testId },
-              ],
-            },
-            {
-              type: 'paragraph',
-              content: [
-                { type: 'text', text: 'URL: ', marks: [{ type: 'strong' }] },
-                { type: 'text', text: report.testUrl },
-              ],
-            },
-            {
-              type: 'paragraph',
-              content: [
-                { type: 'text', text: 'Status: ', marks: [{ type: 'strong' }] },
-                { type: 'text', text: report.status.toUpperCase() },
-              ],
-            },
-          ],
-        },
-        {
-          type: 'heading',
-          attrs: { level: 3 },
-          content: [{ type: 'text', text: `🐛 Bugs Found: ${report.summary.bugsFound}` }],
-        },
-        ...report.analysis.bugs.map((bug, i) => ({
-          type: 'panel',
-          attrs: { panelType: bug.severity === 'critical' || bug.severity === 'high' ? 'error' : 'warning' },
-          content: [
-            {
-              type: 'paragraph',
-              content: [
-                { type: 'text', text: `${i + 1}. `, marks: [{ type: 'strong' }] },
-                { type: 'text', text: `[${bug.severity.toUpperCase()}] ${bug.message}` },
-              ],
-            },
-            {
-              type: 'bulletList',
-              content: [
-                {
-                  type: 'listItem',
-                  content: [
-                    {
-                      type: 'paragraph',
-                      content: [
-                        { type: 'text', text: 'Type: ', marks: [{ type: 'strong' }] },
-                        { type: 'text', text: bug.type },
-                      ],
-                    },
-                  ],
-                },
-                ...(bug.selector
-                  ? [
-                      {
-                        type: 'listItem',
-                        content: [
-                          {
-                            type: 'paragraph',
-                            content: [
-                              { type: 'text', text: 'Selector: ', marks: [{ type: 'strong' }] },
-                              { type: 'text', text: bug.selector, marks: [{ type: 'code' }] },
-                            ],
-                          },
-                        ],
-                      },
-                    ]
-                  : []),
-                {
-                  type: 'listItem',
-                  content: [
-                    {
-                      type: 'paragraph',
-                      content: [
-                        { type: 'text', text: 'Fix: ', marks: [{ type: 'strong' }] },
-                        { type: 'text', text: bug.recommendation },
-                      ],
-                    },
-                  ],
-                },
-              ],
-            },
-          ],
-        })),
-        {
-          type: 'heading',
-          attrs: { level: 3 },
-          content: [{ type: 'text', text: '🎬 Artifacts' }],
-        },
-        {
-          type: 'paragraph',
-          content: [
-            { type: 'text', text: `📹 Video: ${report.artifacts.video ? 'Available (see attachments)' : 'Not recorded'}` },
-          ],
-        },
-        {
-          type: 'paragraph',
-          content: [
-            { type: 'text', text: `📊 Trace: ${report.artifacts.trace ? 'Available (see attachments)' : 'Not available'}` },
-          ],
-        },
-        {
-          type: 'paragraph',
-          content: [
-            { type: 'text', text: `📸 Screenshots: ${report.artifacts.screenshots.length} attached` },
-          ],
-        },
-      ],
-    };
-  }
-
-  /**
-   * Upload attachments to Jira issue
-   */
-  private static async uploadAttachments(
-    issueKey: string,
-    report: FinalTestReport,
-    jiraAuth: any
-  ): Promise<void> {
-    try {
-      logger.info('[JIRA_REPORT] Uploading attachments', {
-        issueKey,
-        hasVideo: !!report.artifacts.video,
-        hasTrace: !!report.artifacts.trace,
-        screenshotsCount: report.artifacts.screenshots.length,
-      });
-
-      const attachments: JiraAttachment[] = [];
-
-      // Download and prepare video
-      if (report.artifacts.video) {
-        try {
-          const videoBuffer = await downloadFromStorage(report.artifacts.video);
-          attachments.push({
-            filename: `test-${report.testId}-video.webm`,
-            buffer: videoBuffer,
-            mimeType: 'video/webm',
-          });
-        } catch (error) {
-          logger.warn('[JIRA_REPORT] Failed to download video', { error });
-        }
-      }
-
-      // Download and prepare trace
-      if (report.artifacts.trace) {
-        try {
-          const traceBuffer = await downloadFromStorage(report.artifacts.trace);
-          attachments.push({
-            filename: `test-${report.testId}-trace.zip`,
-            buffer: traceBuffer,
-            mimeType: 'application/zip',
-          });
-        } catch (error) { 
-          logger.warn('[JIRA_REPORT] Failed to download trace', { error });
-        }
-      }
-
-      // Prepare screenshots (limit to 5 to avoid too many attachments)
-      const screenshotsToAttach = report.artifacts.screenshots.slice(0, 5);
-      for (let i = 0; i < screenshotsToAttach.length; i++) {
-        const screenshot = screenshotsToAttach[i];
-        if (screenshot) {
-          try {
-            // Check if it's a URL or base64
-            let buffer: Buffer;
-            const isJpeg = screenshot.startsWith('data:image/jpeg') || screenshot.startsWith('/9j/');
-            if (screenshot.startsWith('http')) {
-              buffer = await downloadFromStorage(screenshot);
-            } else {
-              // Base64 — strip any image data URI prefix
-              const base64Data = screenshot.replace(/^data:image\/[a-z]+;base64,/, '');
-              buffer = Buffer.from(base64Data, 'base64');
-            }
-
-            const ext = isJpeg ? 'jpg' : 'png';
-            const mimeType = isJpeg ? 'image/jpeg' : 'image/png';
-            attachments.push({
-              filename: `screenshot-${i + 1}.${ext}`,
-              buffer,
-              mimeType,
-            });
-          } catch (error) {
-            logger.warn('[JIRA_REPORT] Failed to process screenshot', { index: i, error });
-          }
-        }
-      }
-
-      // Upload all attachments
-      for (const attachment of attachments) {
-        try {
-          const formData = new FormData();
-          const blob = new Blob([attachment.buffer], { type: attachment.mimeType });
-          formData.append('file', blob, attachment.filename);
-
-          const response = await fetch(
-            `https://api.atlassian.com/ex/jira/${jiraAuth.cloudId}/rest/api/3/issue/${issueKey}/attachments`,
-            {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${jiraAuth.accessToken}`,
-                'X-Atlassian-Token': 'no-check',
-              },
-              body: formData,
-            }
-          );
-
-          if (!response.ok) {
-            logger.warn('[JIRA_REPORT] Failed to upload attachment', {
-              filename: attachment.filename,
-              status: response.status,
-            });
-          } else {
-            logger.info('[JIRA_REPORT] Attachment uploaded', {
-              filename: attachment.filename,
-              issueKey,
-            });
-          }
-        } catch (error) {
-          logger.warn('[JIRA_REPORT] Attachment upload error', {
-            filename: attachment.filename,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-
-      logger.info('[JIRA_REPORT] Attachments upload completed', {
-        issueKey,
-        totalAttempted: attachments.length,
-      });
-    } catch (error) {
-      logger.error('[JIRA_REPORT] Attachments upload failed', {
-        error: error instanceof Error ? error.message : String(error),
-        issueKey,
-      });
-      // Don't throw - attachments are nice-to-have
-    }
-  }
-
-  /**
-   * Add generated Playwright code as comment
-   */
-  private static async addCodeComment(
-    issueKey: string,
-    code: string,
-    jiraAuth: any
-  ): Promise<void> {
-    try {
-      logger.info('[JIRA_REPORT] Adding code comment', { issueKey });
-
-      const response = await fetch(
-        `https://api.atlassian.com/ex/jira/${jiraAuth.cloudId}/rest/api/3/issue/${issueKey}/comment`,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${jiraAuth.accessToken}`,
-            'Content-Type': 'application/json',
+        body: JSON.stringify({
+          fields: {
+            project: { key: projectKey },
+            summary: `[QAI Test] ${report.testUrl} - ${report.summary.bugsFound} bugs found`,
+            description: buildDescriptionADF(report),
+            issuetype: { name: issueType },
+            priority: { name: priority },
+            labels: [
+              'automated-test',
+              'qai',
+              `severity-${report.analysis.severity}`,
+              `status-${report.status}`,
+            ],
           },
-          body: JSON.stringify({
-            body: {
-              type: 'doc',
-              version: 1,
-              content: [
-                {
-                  type: 'heading',
-                  attrs: { level: 3 },
-                  content: [{ type: 'text', text: '🧪 Generated Playwright Test Code' }],
-                },
-                {
-                  type: 'codeBlock',
-                  attrs: { language: 'typescript' },
-                  content: [{ type: 'text', text: code }],
-                },
-                {
-                  type: 'paragraph',
-                  content: [
-                    {
-                      type: 'text',
-                      text: 'This code was automatically generated from the test execution. Copy and use it in your test suite.',
-                      marks: [{ type: 'em' }],
-                    },
-                  ],
-                },
-              ],
-            },
-          }),
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error(`Failed to add comment: ${response.status}`);
+        }),
       }
+    );
 
-      logger.info('[JIRA_REPORT] Code comment added', { issueKey });
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Jira API error: ${response.status} - ${errorText}`);
+    }
+
+    return await response.json() as JiraIssue;
+  }
+
+  /**
+   * Add one follow-up comment. A null doc means there was nothing to say
+   * (no code, no fix prompt) — skip silently. Never throws: the issue is
+   * already filed, and a lost comment must not surface as a failed filing.
+   */
+  private static async postComment(
+    issueKey: string,
+    body: AdfDoc | null,
+    jiraAuth: JiraAuth,
+    kind: 'code' | 'fix-prompt',
+  ): Promise<void> {
+    if (!body) return;
+
+    try {
+      await addJiraComment(jiraAuth.accessToken, jiraAuth.cloudId, issueKey, body);
+      logger.info('[JIRA_REPORT] Comment added', { issueKey, kind });
     } catch (error) {
-      logger.error('[JIRA_REPORT] Failed to add code comment', {
+      logger.error('[JIRA_REPORT] Failed to add comment', {
         error: error instanceof Error ? error.message : String(error),
         issueKey,
+        kind,
       });
-      // Don't throw - comment is nice-to-have
     }
   }
 
   /**
-   * Get Jira authentication tokens from database
+   * Determine the Jira priority via 3-tier precedence:
+   *   a) Explicit `priority` from the caller — already a Jira label, wins
+   *      (used by the API endpoint when the user manually picked one).
+   *   b) `testCasePriority` from the saved intent_test_case row — lets a user
+   *      who marks a test as "critical" auto-file Highest-priority issues
+   *      without re-setting it per run.
+   *   c) AI-derived severity from the test report (legacy behaviour).
+   *
+   * Why test-case priority sits BETWEEN explicit and severity:
+   *   - explicit caller priority is a deliberate per-call decision, usually
+   *     from a UI button — must win.
+   *   - test-case priority is a per-test-case curator choice that should beat
+   *     AI severity (which is per-run and can drift), because curators know
+   *     what's actually business-critical.
+   *   - severity is the safety net when neither signal is present (ad-hoc /
+   *     chat-lite runs with no saved test case).
    */
-  private static async getJiraAuth(userId: string): Promise<{
-    accessToken: string;
-    cloudId: string;
-  } | null> {
+  private static resolvePriority(
+    report: FinalTestReport,
+    explicit: JiraIssueRequest['priority'],
+    testCasePriority: JiraIssueRequest['testCasePriority'],
+  ): string {
+    const chosen =
+      explicit
+      || (testCasePriority ? this.mapTestCasePriorityToJira(testCasePriority) : undefined)
+      || this.determinePriority(report.analysis.severity);
+
+    logger.info('[JIRA_REPORT] Priority resolution', {
+      testId: report.testId,
+      chosen,
+      prioritySource: explicit ? 'explicit' : testCasePriority ? 'test_case' : 'severity_fallback',
+      testCasePriority,
+      severity: report.analysis.severity,
+    });
+
+    return chosen;
+  }
+
+  /** Get Jira authentication tokens from database */
+  private static async getJiraAuth(userId: string): Promise<JiraAuth | null> {
     try {
       const tokenData = await getJiraToken(userId);
       if (!tokenData) {
@@ -527,9 +217,7 @@ ${report.artifacts.trace ? `• 📊 Trace: Available` : '• 📊 Trace: Not av
     }
   }
 
-  /**
-   * Determine Jira priority from severity
-   */
+  /** Determine Jira priority from severity */
   private static determinePriority(severity: string): string {
     switch (severity) {
       case 'critical':
@@ -549,14 +237,14 @@ ${report.artifacts.trace ? `• 📊 Trace: Available` : '• 📊 Trace: Not av
    * Map an `intent_test_cases.priority` value to a Jira priority label.
    *
    * Mirrors `determinePriority()` but typed against the test-case enum
-   * (no 'none' bucket — test cases either have a priority or
-   * undefined / NULL, in which case the caller falls through to severity).
+   * (no 'none' bucket — test cases either have a priority or undefined /
+   * NULL, in which case the caller falls through to severity).
    *
    * Kept as a SEPARATE helper from `determinePriority` so:
-   *   - the two input vocabularies stay decoupled (test-case priority is
-   *     a curator choice on the saved test; severity is an AI run-time
-   *     judgment of the bugs found). If we ever extend one without the
-   *     other, the mapping doesn't accidentally drift.
+   *   - the two input vocabularies stay decoupled (test-case priority is a
+   *     curator choice on the saved test; severity is an AI run-time judgment
+   *     of the bugs found). If we ever extend one without the other, the
+   *     mapping doesn't accidentally drift.
    *   - call sites read clearly: "we're mapping test-case priority" vs
    *     "we're mapping AI severity".
    */
@@ -575,35 +263,19 @@ ${report.artifacts.trace ? `• 📊 Trace: Available` : '• 📊 Trace: Not av
     }
   }
 
-  /**
-   * Save Jira issue link to database
-   */
+  /** Save Jira issue link to database */
   private static async saveJiraIssueLink(
     testId: string,
     issueKey: string,
     issueUrl: string
   ): Promise<void> {
     try {
-      const { error } = await supabaseAdmin
-        .from('test_jira_issues')
-        .insert({
-          test_id: testId,
-          jira_issue_key: issueKey,
-          jira_issue_url: issueUrl,
-          created_at: new Date().toISOString(),
-        });
+      const { error } = await insertTestJiraIssueLink({ testId, issueKey, issueUrl });
 
       if (error) {
-        logger.error('[JIRA_REPORT] Failed to save Jira issue link', {
-          error,
-          testId,
-          issueKey,
-        });
+        logger.error('[JIRA_REPORT] Failed to save Jira issue link', { error, testId, issueKey });
       } else {
-        logger.info('[JIRA_REPORT] Jira issue link saved', {
-          testId,
-          issueKey,
-        });
+        logger.info('[JIRA_REPORT] Jira issue link saved', { testId, issueKey });
       }
     } catch (error) {
       logger.error('[JIRA_REPORT] Error saving Jira issue link', {
