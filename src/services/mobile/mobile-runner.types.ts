@@ -137,6 +137,12 @@ export type MobileIntentActionType =
   | 'biometric' | 'otp' | 'permission' | 'clipboard'
   // Network simulation
   | 'network'
+  // Stage a file on the device and drive the system picker to select it.
+  // `step.value` carries a durable public URL (the editor's Supabase
+  // publicUrl); `description` names the element that opens the picker, and an
+  // empty description means stage-only. Android hosts only — the runner
+  // rejects a URL source on iOS explicitly.
+  | 'upload'
   // Device conditions (runner: set_geolocation/clear_geolocation, set_orientation)
   | 'geolocation'       // mock GPS location (set lat/lng, or clear)
   | 'rotate'            // device orientation (portrait / landscape / reverse_*)
@@ -190,6 +196,29 @@ export interface MobileIntentStepOptions {
   direction?: 'up' | 'down' | 'left' | 'right';
   /** Swipe distance hint (0-1 normalised). Forwarded by the editor. */
   distance?: number;
+  /**
+   * Upload step — mirrors the web upload step's descriptor. `sourceType:
+   * 'storage'` means `step.value` is a durable Supabase publicUrl (from
+   * POST /api/v1/preview/upload-file); `'url'` means an author-supplied
+   * public URL. The runner downloads it at dispatch and pushes it to the
+   * device, so nothing here is a runner-host path.
+   */
+  upload?: {
+    sourceType?: 'storage' | 'url';
+    filename?: string;
+    envVar?: string;
+  };
+  /** Upload step — original filename, used for the on-device name and for the
+   *  filename match in a document picker. */
+  uploadFilename?: string;
+  /** Upload step — runner-host path form, produced only by the `file`
+   *  test-resource compiler, never by the editor. */
+  uploadFilePath?: string;
+  /** Upload step — override the kind-derived on-device destination. */
+  uploadRemotePath?: string;
+  /** Upload step — MIME hint ('image/*', 'application/pdf'). Selects both the
+   *  on-device destination directory and the expected picker strategy. */
+  uploadMimeType?: string;
   continueOnError?: boolean;
   /**
    * Author-time "step is switched off" toggle. `false` = the runner skips this
