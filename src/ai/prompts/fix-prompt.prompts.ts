@@ -18,7 +18,10 @@ export interface FixPromptInput {
   actualResult?: string;
   reproSteps?: string[];
   rootCauseHint?: string;            // from aiSummary.rootCauseStep / failure classification
-  consoleErrors?: string[];          // bounded, redacted
+  // Bounded, NOT redacted — raw console lines and full request URLs (query
+  // string included) straight off the run. They reach every surface the
+  // resulting prompt does, which now includes auto-filed Jira issues.
+  consoleErrors?: string[];
   networkErrors?: string[];          // e.g. "POST /api/checkout → 500"
   screenshotUrl?: string;
 }

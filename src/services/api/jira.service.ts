@@ -965,8 +965,19 @@ export async function searchJiraIssues(
   return { issues, total };
 }
 
+/**
+ * An Atlassian Document Format document. Callers that need rich nodes
+ * (codeBlock, panel, heading) build the doc themselves and hand it to
+ * `addJiraComment` directly — `plainTextToADF` only ever emits paragraphs.
+ */
+export interface AdfDoc {
+  type: 'doc';
+  version: number;
+  content: unknown[];
+}
+
 /** Convert plain text to Atlassian Document Format */
-function plainTextToADF(text: string): { type: 'doc'; version: number; content: unknown[] } {
+function plainTextToADF(text: string): AdfDoc {
   const lines = (text || '').split('\n').filter(Boolean);
   const content = lines.length > 0
     ? lines.map((line) => ({
@@ -1304,15 +1315,20 @@ export async function getJiraIssueWithContext(
 }
 
 /**
- * Add comment to Jira issue (plain text → ADF)
+ * Add comment to Jira issue.
+ *
+ * Accepts either plain text (converted to paragraph-only ADF) or a
+ * pre-built `AdfDoc` for callers that need rich nodes — a code block
+ * survives only if the caller builds the doc, because `plainTextToADF`
+ * would flatten it into paragraphs.
  */
 export async function addJiraComment(
   accessToken: string,
   cloudId: string,
   issueKey: string,
-  bodyPlain: string
+  bodyPlainOrAdf: string | AdfDoc
 ): Promise<void> {
-  const body = plainTextToADF(bodyPlain);
+  const body = typeof bodyPlainOrAdf === 'string' ? plainTextToADF(bodyPlainOrAdf) : bodyPlainOrAdf;
   const url = `${JIRA_API_URL}/ex/jira/${cloudId}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`;
   const response = await fetch(url, {
     method: 'POST',
