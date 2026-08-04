@@ -6,6 +6,7 @@ import {
   getCategoriesCovered,
   taskToFlowResult,
   getPageInsightsArray,
+  recordFlowOutcome,
 } from '../blackboard';
 
 const flow = (over: Record<string, unknown> = {}) =>
@@ -153,5 +154,93 @@ describe('taskToFlowResult — status mapping', () => {
 
   it('uses the captured finalUrl when present', () => {
     expect(taskToFlowResult(task({ finalUrl: 'https://x/done' })).finalUrl).toBe('https://x/done');
+  });
+});
+
+describe('recordFlowOutcome', () => {
+  const bb = () =>
+    ({
+      workingMemory: {
+        visitedPages: {},
+        accomplishments: [],
+        categoriesExplored: new Set<string>(),
+        blockersByCategory: {} as Record<string, string>,
+      },
+    }) as any;
+
+  const task = (over: Record<string, unknown> = {}) =>
+    ({
+      entryPoint: { id: 'ep1', name: 'Checkout', category: 'commerce', sourcePageUrl: 'https://x/src' },
+      status: 'completed',
+      goalAchieved: true,
+      discoveredSteps: [],
+      branchPoints: [],
+      errors: [],
+      errorClassification: {},
+      durationMs: 10,
+      progressScore: 100,
+      roundsUsed: 1,
+      ...over,
+    }) as any;
+
+  it('records a win so the next flow does not redo it', () => {
+    const b = bb();
+    recordFlowOutcome(b, task());
+    expect(b.workingMemory.accomplishments).toEqual(['Checkout (commerce) — done']);
+  });
+
+  it('records a failure too — "tried and it broke" is a learning', () => {
+    const b = bb();
+    recordFlowOutcome(b, task({ status: 'completed', goalAchieved: false }));
+    expect(b.workingMemory.accomplishments[0]).toBe('Checkout (commerce) — failed');
+  });
+
+  it('carries the blocker reason, which is the useful part', () => {
+    const b = bb();
+    recordFlowOutcome(b, task({ status: 'blocked', goalAchieved: false, blockedReason: 'hCaptcha' }));
+    expect(b.workingMemory.accomplishments[0]).toBe('Checkout (commerce) — blocked: hCaptcha');
+    expect(b.workingMemory.blockersByCategory).toEqual({ commerce: 'hCaptcha' });
+  });
+
+  it('keeps only the most recent dead end per category', () => {
+    const b = bb();
+    recordFlowOutcome(b, task({ status: 'blocked', blockedReason: 'first' }));
+    recordFlowOutcome(b, task({ status: 'blocked', blockedReason: 'second' }));
+    expect(b.workingMemory.blockersByCategory).toEqual({ commerce: 'second' });
+  });
+
+  it('ignores a skipped flow — it never ran, so it teaches nothing', () => {
+    const b = bb();
+    recordFlowOutcome(b, task({ status: 'skipped' }));
+    expect(b.workingMemory.accomplishments).toEqual([]);
+    expect(b.workingMemory.categoriesExplored.size).toBe(0);
+  });
+
+  it('does not record a blocker without a reason — a bare category is not a learning', () => {
+    const b = bb();
+    recordFlowOutcome(b, task({ status: 'blocked', blockedReason: undefined }));
+    expect(b.workingMemory.blockersByCategory).toEqual({});
+    expect(b.workingMemory.accomplishments[0]).toBe('Checkout (commerce) — blocked');
+  });
+
+  it('tracks the category as explored', () => {
+    const b = bb();
+    recordFlowOutcome(b, task());
+    expect([...b.workingMemory.categoriesExplored]).toEqual(['commerce']);
+  });
+
+  it('falls back to the category when the flow has no name', () => {
+    const b = bb();
+    recordFlowOutcome(b, task({ entryPoint: { id: 'e', name: '  ', category: 'auth' } }));
+    expect(b.workingMemory.accomplishments[0]).toBe('auth (auth) — done');
+  });
+
+  it('caps accomplishments so a long run cannot grow the prompt without bound', () => {
+    const b = bb();
+    for (let i = 0; i < 60; i++) {
+      recordFlowOutcome(b, task({ entryPoint: { id: `e${i}`, name: `Flow ${i}`, category: 'c' } }));
+    }
+    expect(b.workingMemory.accomplishments).toHaveLength(50);
+    expect(b.workingMemory.accomplishments[49]).toBe('Flow 59 (c) — done');
   });
 });

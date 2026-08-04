@@ -66,6 +66,13 @@ interface FlowSummary {
   mobileVariantLabel?: string | null;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Newest `intent_test_cases.updated_at` among this flow's test cases — when
+   * the test's CONTENT last changed. Prefer this over `updatedAt` for display:
+   * the flow row is a thin wrapper and a drag-reorder rewrites its `updated_at`
+   * for every flow in the module. Null when the flow has no test cases.
+   */
+  contentUpdatedAt?: string | null;
 }
 
 interface TestCaseSummary {
@@ -269,6 +276,41 @@ export class PlatformTreeService {
       throw new Error(`Failed to get flows: ${flowsResult.error.message}`);
     }
 
+    // `test_flows.updated_at` is a poor "when was this test last changed?"
+    // signal: the row is a thin wrapper, the content lives in
+    // `intent_test_cases`, and a drag-reorder rewrites every flow's
+    // `updated_at` via `trigger_update_test_flows_updated_at`. Measured on prod:
+    // 109 of 324 one-to-one flows showed a timestamp ~97h older than the test
+    // case actually holding the content.
+    //
+    // So carry the newest child timestamp alongside it. One batched `.in()`
+    // over the page's ids — not a per-flow query.
+    const flowIds = (flowsResult.data || []).map((f: any) => f.id);
+    const contentUpdatedByFlowId = new Map<string, string>();
+    if (flowIds.length > 0) {
+      const { data: tcRows, error: tcError } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('flow_id, updated_at')
+        .in('flow_id', flowIds);
+      if (tcError) {
+        // Non-fatal: the tree still renders, rows just fall back to the flow's
+        // own timestamp. Better a slightly stale column than a failed page.
+        logger.warn('[PLATFORM_TREE] Failed to load test-case timestamps (non-fatal)', {
+          error: tcError.message,
+        });
+      } else {
+        // A flow can own several test cases (one holds 14 on prod), so keep the
+        // newest — "last touched anything in this test".
+        for (const row of tcRows || []) {
+          const fid = String((row as any).flow_id);
+          const ts = (row as any).updated_at as string | null;
+          if (!fid || !ts) continue;
+          const seen = contentUpdatedByFlowId.get(fid);
+          if (!seen || ts > seen) contentUpdatedByFlowId.set(fid, ts);
+        }
+      }
+    }
+
     return {
       module: {
         id: moduleData.id,
@@ -293,6 +335,11 @@ export class PlatformTreeService {
           mobileVariantLabel: f.mobile_variant_label ?? null,
           createdAt: f.created_at,
           updatedAt: f.updated_at || f.created_at,
+          // When the test's CONTENT last changed, as opposed to when the flow
+          // row was last written (a reorder rewrites that for every row in the
+          // module). Null when the flow has no test cases yet — the client
+          // falls back to `updatedAt`.
+          contentUpdatedAt: contentUpdatedByFlowId.get(String(f.id)) ?? null,
         })),
         pageInfo: {
           limit,

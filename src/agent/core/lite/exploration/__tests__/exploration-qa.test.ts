@@ -166,12 +166,29 @@ describe('toIntentSteps — action type mapping completeness', () => {
   });
 
   it('should generate bindingHints when ref is present', () => {
+    // Real refs are `e${counter}` (snapshot-collector), not readable names —
+    // the old fixture used 'submit-btn', which hid the bug: the label was set
+    // to the REF, and bindingHints are the preferred semantic-match source, so
+    // the resolver hunted for an element named "e7" and the description that
+    // would have matched was demoted. The human name is recovered from the
+    // executor's own output instead ("Clicked \"Sign in\" (button)").
     const steps: DiscoveredStep[] = [
-      { stepNumber: 1, description: 'Click button', action: 'click', ref: 'submit-btn', pageUrl: 'https://x.com' },
+      { stepNumber: 1, description: 'Clicked "Sign in" (button)', action: 'click', ref: 'e7', pageUrl: 'https://x.com' },
     ];
     const result = toIntentSteps(steps);
     expect(result[0].bindingHints).toBeDefined();
-    expect(result[0].bindingHints!.label).toBe('submit-btn');
+    expect(result[0].bindingHints!.label).toBe('Sign in');
+  });
+
+  it('should omit the bindingHints label rather than emit a ref', () => {
+    const steps: DiscoveredStep[] = [
+      { stepNumber: 1, description: 'Click "e7"', action: 'click', ref: 'e7', pageUrl: 'https://x.com' },
+    ];
+    const result = toIntentSteps(steps);
+    // No hint beats a hint that matches nothing — the resolver then falls
+    // through to nearText / the description.
+    expect(result[0].bindingHints!.label).toBeUndefined();
+    expect(result[0].bindingHints!.nearText).toBe('Click "e7"');
   });
 });
 

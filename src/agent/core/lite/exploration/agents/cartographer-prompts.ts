@@ -84,6 +84,13 @@ export function buildCartographerPrompt(input: CartographerInput, preFormattedSn
     sections.push(`PRODUCT CONTEXT:\n${input.productContext}`);
   }
 
+  if (input.pageHealth) {
+    sections.push(`PAGE HEALTH WARNINGS:
+${input.pageHealth}
+If the page is still loading or showing an error, say so in skipReason instead of
+inventing entry points from a broken render.`);
+  }
+
   if (input.scopeHint) {
     sections.push(`SCOPE HINT: Focus on "${input.scopeHint}" related flows, but also identify other important flows.`);
   }

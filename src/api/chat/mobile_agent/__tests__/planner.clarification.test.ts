@@ -22,7 +22,7 @@ jest.mock('@/services/ai/core/openai.service', () => ({
 }));
 
 jest.mock('@/config/ai/ai-models.config', () => ({
-  AI_MODELS: { fast: 'gpt-4.1-mini' },
+  AI_MODELS: { fast: 'gpt-4.1-mini', smart: 'gpt-5.4-mini' },
 }));
 
 // The planner reads env for PII redaction; the progress emitter fires WS

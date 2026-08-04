@@ -91,6 +91,7 @@ function createWorkingMemory(): ExplorationWorkingMemory {
     visitedPages: {},
     accomplishments: [],
     categoriesExplored: new Set(),
+    blockersByCategory: {},
   };
 }
 
@@ -253,5 +254,55 @@ export function recordAccomplishment(bb: ExplorationBlackboard, accomplishment: 
   bb.workingMemory.accomplishments.push(accomplishment);
   if (bb.workingMemory.accomplishments.length > 50) {
     bb.workingMemory.accomplishments = bb.workingMemory.accomplishments.slice(-50);
+  }
+}
+
+/**
+ * Fold a just-finished flow into working memory, so the NEXT flow's Planner can
+ * read it. Called the moment a flow ends — `bb.completedFlows` is only filled
+ * after Phase 2 finishes, which is far too late to inform anything inside it.
+ *
+ * Every terminal outcome is recorded, not just the wins:
+ *   - passed          → "don't redo this"
+ *   - blocked/timeout → "this dead end is known" (the reason is the useful part)
+ *   - failed          → "this was tried and it broke"
+ * `skipped` is deliberately excluded: it never executed, so it teaches nothing
+ * and would crowd the capped list with noise.
+ *
+ * Takes the TASK and maps it through `taskToFlowResult`, deliberately NOT a
+ * hand-rolled status check: `FlowExplorationTask.status` ('completed') and
+ * `FlowExecutionResult.status` ('passed') are DIFFERENT unions, so a second
+ * mapping here would silently drift — reading `=== 'completed'` off an already
+ * mapped result never matches, and every win would be logged as a failure.
+ *
+ * `blockedReason` is page-derived text, so the CALLER must redact credentials
+ * before this point (CLAUDE.md hard invariant #10) — the blackboard has no
+ * access to the flow's credentials.
+ */
+export function recordFlowOutcome(bb: ExplorationBlackboard, task: FlowExplorationTask): void {
+  const result = taskToFlowResult(task);
+  if (result.status === 'skipped') return;
+
+  bb.workingMemory.categoriesExplored.add(result.category);
+
+  const label = result.name.trim() || result.category;
+  if (result.status === 'passed') {
+    recordAccomplishment(bb, `${label} (${result.category}) — done`);
+    return;
+  }
+
+  const verb = result.status === 'failed' ? 'failed' : result.status;
+  const reason = result.blockedReason?.trim();
+  recordAccomplishment(
+    bb,
+    reason
+      ? `${label} (${result.category}) — ${verb}: ${reason}`
+      : `${label} (${result.category}) — ${verb}`,
+  );
+
+  // Keep-last per category: one dead end per category is enough signal, and the
+  // most recent one reflects the current state of the site.
+  if (result.status === 'blocked' && reason) {
+    bb.workingMemory.blockersByCategory[result.category] = reason;
   }
 }

@@ -11,6 +11,9 @@ import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/core/logger';
 import { DEFAULT_EXPLORATION_BUDGET, generateExplorationId } from '@/agent/core/lite/exploration/types';
 import { classifyConfirmation } from './confirmation-classifier';
+import { ValidationError } from '@/types';
+import { normalizeEntryUrl } from '@/utils/validation/entry-url';
+import { preflightEntryUrl } from '@/services/testing/exploration/entry-preflight.service';
 
 export const PENDING_EXPLORATION_PREFIX = 'pending_exploration:';
 
@@ -78,18 +81,67 @@ export async function handlePendingExplorationConfirmation(
       return false;
     }
 
+    // Defense in depth: the producer now stores an already-validated URL, but a
+    // pending payload written before this change (TTL is PENDING_EXPLORATION_TTL_SEC)
+    // can still carry a raw one, and Redis is a mutable store. Re-validate rather
+    // than trust the blob — this is the last gate before a paid job is enqueued.
+    let safeEntryUrl = '';
+    let rejection: string | null = null;
+    try {
+      safeEntryUrl = normalizeEntryUrl(pending.entryUrl);
+    } catch (err) {
+      const reason = err instanceof ValidationError ? err.message : 'a valid http(s) url is required';
+      rejection = `I can't explore **${pending.entryUrl}** — ${reason}`;
+      logger.warn('[EXPLORATION_CONFIRM] Rejected — invalid entry URL', {
+        url: pending.entryUrl,
+        reason,
+      });
+    }
+
+    // Re-probe, don't reuse the ask-time verdict: the pending payload lives for
+    // PENDING_EXPLORATION_TTL_SEC, so a site that was reachable when we asked can
+    // be down by the time the user confirms — and this is the last gate before a
+    // paid job is enqueued.
+    if (!rejection) {
+      const preflight = await preflightEntryUrl(safeEntryUrl);
+      if (!preflight.ok) {
+        rejection = `I couldn't start exploring **${safeEntryUrl}** — ${preflight.message}`;
+        logger.info('[EXPLORATION_CONFIRM] Rejected by entry preflight', {
+          url: safeEntryUrl,
+          verdict: preflight.verdict,
+        });
+      }
+    }
+
+    if (rejection) {
+      const errorReply = rejection;
+      if (chatSessionId) {
+        ChatService.saveChatMessages(chatSessionId, [
+          { role: 'user', content: message },
+          { role: 'ai', content: errorReply },
+        ]).catch(() => {});
+      }
+      res.json({
+        success: false,
+        reply: errorReply,
+        timestamp: new Date().toISOString(),
+        sessionId: chatSessionId,
+      });
+      return true;
+    }
+
     const explorationId = generateExplorationId(userId);
 
     logger.info('[EXPLORATION_CONFIRM] User confirmed exploration', {
       explorationId,
-      url: pending.entryUrl,
+      url: safeEntryUrl,
       userId,
     });
 
     try {
       await QueueManager.addExplorationJob({
         explorationId,
-        entryUrl: pending.entryUrl,
+        entryUrl: safeEntryUrl,
         projectId: pending.projectId,
         userId: pending.userId,
         chatSessionId: pending.chatSessionId,
@@ -100,7 +152,7 @@ export async function handlePendingExplorationConfirmation(
       });
 
       const budgetMinutes = Math.round((DEFAULT_EXPLORATION_BUDGET.totalTimeoutMs) / 60000);
-      const replyMessage = `Exploration started for **${pending.entryUrl}**.\n\n⏱ Budget: up to **${budgetMinutes} minutes** and **${DEFAULT_EXPLORATION_BUDGET.maxFlows} test flows**. I'll notify you when test cases are discovered.`;
+      const replyMessage = `Exploration started for **${safeEntryUrl}**.\n\n⏱ Budget: up to **${budgetMinutes} minutes** and **${DEFAULT_EXPLORATION_BUDGET.maxFlows} test flows**. I'll notify you when test cases are discovered.`;
 
       if (chatSessionId) {
         ChatService.saveChatMessages(chatSessionId, [
@@ -108,7 +160,7 @@ export async function handlePendingExplorationConfirmation(
           {
             role: 'ai',
             content: replyMessage,
-            metadata: { explorationId, mode: 'exploration', url: pending.entryUrl },
+            metadata: { explorationId, mode: 'exploration', url: safeEntryUrl },
           },
         ]).catch(() => {});
       }

@@ -96,7 +96,12 @@ const envSchema = z.object({
   // OpenAI
   OPENAI_API_KEY: z.string().min(1, 'OPENAI_API_KEY is required'),
   OPENAI_MODEL: z.string().default('gpt-5.4-mini'),
-  OPENAI_MODEL_FAST: z.string().default('gpt-4.1-mini'),
+  // Deliberately the SAME model as OPENAI_MODEL: prod pins gpt-5.4-mini via
+  // `var.openai_model_fast` in qait-infra, so a gpt-4.1-mini default here meant
+  // local dev silently ran a different (10× cheaper, weaker) model than prod on
+  // every `fast` task — the worst kind of environment drift, since it makes
+  // local quality unrepresentative. Split the tiers only with measurements.
+  OPENAI_MODEL_FAST: z.string().default('gpt-5.4-mini'),
   // Negative-test mutation generation. Reasoning-heavy (understand each field's
   // purpose, pick the highest-value attack) — defaults to the smart tier, NOT
   // the fast tier. Override only to pin a specific model for this task.

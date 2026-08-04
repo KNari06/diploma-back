@@ -41,6 +41,8 @@ import {
   type ApplyResult,
 } from '@/services/test-resource';
 import { createCommandExecutorRecipeRunner } from '@/services/test-resource/runtime/recipe-executor';
+import { NetworkCallRecorder } from '@/agent/playwright/execution/network-call-recorder';
+import { findNetworkAssertionFailures } from '@/agent/playwright/execution/network-assertion-matcher';
 import { composeStepDescription } from '@/agent/playwright/core/step-description';
 
 /**
@@ -650,6 +652,13 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // elsewhere in this function (see `let activePage = page!` below).
       const navTracker = new NavigationStatusTracker();
       navTracker.attach(page!);
+
+      // Network-assertion recording. Attached ONLY when this test actually
+      // carries expectations, so a test without them pays literally nothing —
+      // no listener, no allocation. Verified after the step loop below.
+      const expectedNetworkAssertions = testData.networkAssertions ?? [];
+      const networkRecorder = expectedNetworkAssertions.length > 0 ? new NetworkCallRecorder() : null;
+      networkRecorder?.attach(page!);
       const authResource = resourceApply
         ? Array.from(resourceApply.resources.values()).find((r) => r.kind === 'auth')
         : undefined;
@@ -1633,6 +1642,66 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
 
             // Stop on first failure
             break;
+          }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Network-assertion verification (exploration-discovered tests)
+        //
+        // Runs only when every step passed: a test that already failed has a
+        // clearer reason, and a missing API call is an EXPECTED consequence of
+        // stopping early, not an independent finding.
+        //
+        // POLICY — fail ONLY on an unambiguous 5xx where 2xx was expected.
+        // These assertions are authored autonomously by exploration and nobody
+        // reviews them before they land in the user's project, so a spurious
+        // failure turns a whole discovered suite into triage noise. A 5xx where
+        // the discovery run saw 2xx is the one case that cannot be a matter of
+        // opinion — the API broke. Softer mismatches (call absent, 4xx, family
+        // drift) are REPORTED, never fatal.
+        // ═══════════════════════════════════════════════════════════════
+        if (allSuccess && networkRecorder && expectedNetworkAssertions.length > 0) {
+          try {
+            const observedCalls = networkRecorder.getAllCalls();
+            const failures = findNetworkAssertionFailures(expectedNetworkAssertions, observedCalls);
+
+            if (failures.length > 0) {
+              const fatal = failures.filter((f) => f.serverError);
+              const soft = failures.filter((f) => !f.serverError);
+
+              replayTrace.write({
+                eventType: 'network_assertions_checked', step: currentStepIndex, totalSteps,
+                payload: {
+                  expected: expectedNetworkAssertions.length,
+                  observedCalls: observedCalls.length,
+                  fatal: fatal.map((f) => f.detail),
+                  soft: soft.map((f) => f.detail),
+                },
+              });
+
+              if (soft.length > 0) {
+                logger.warn('[TEST_EXECUTOR] Network assertion mismatches (not failing the test)', {
+                  testId: testData.testId,
+                  details: soft.map((f) => f.detail),
+                });
+              }
+
+              if (fatal.length > 0) {
+                allSuccess = false;
+                finalError = `API failure: ${fatal.map((f) => f.detail).join('; ')}`;
+                logger.error('[TEST_EXECUTOR] Network assertion failed with a server error', {
+                  testId: testData.testId,
+                  details: fatal.map((f) => f.detail),
+                });
+              }
+            }
+          } catch (assertErr) {
+            // Verification is an ADDITIONAL signal — it must never fail a test
+            // by throwing. A broken check is a missing check, not a red test.
+            logger.warn('[TEST_EXECUTOR] Network assertion verification failed (ignored)', {
+              testId: testData.testId,
+              error: assertErr instanceof Error ? assertErr.message : String(assertErr),
+            });
           }
         }
       } finally {

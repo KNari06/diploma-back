@@ -24,6 +24,7 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 
 import type { ExplorationBlackboard, StrategistInput, StrategistOutput } from './agent-types';
 import { EXPLORATION_AGENT_LLM } from './agent-llm-config';
+import { formatBriefForStrategist } from '../phase0/brief-format';
 import {
   buildTreeSummary,
   buildFlowSummaries,
@@ -176,6 +177,9 @@ export class ExplorationStrategist {
       scopeHint: this.bb.scopeHint,
       userDirective,
       unvisitedNavLinks: this.bb.tree?.getUnvisitedNavLinks() ?? [],
+      productBrief: this.bb.productBrief
+        ? formatBriefForStrategist(this.bb.productBrief)
+        : undefined,
     };
   }
 

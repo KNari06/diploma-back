@@ -17,6 +17,9 @@ import { Request, Response } from 'express';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { acquireChatTestLock, releaseChatTestLock } from '../shared/chat-test-lock';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
+import { ValidationError } from '@/types';
+import { normalizeEntryUrl } from '@/utils/validation/entry-url';
+import { preflightEntryUrl } from '@/services/testing/exploration/entry-preflight.service';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
 import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
 import { QueueManager } from '@/config/infrastructure/queues';
@@ -646,6 +649,59 @@ export async function handlePlatformTest(
     if (effectiveStrategy === 'exploration') {
       const isExplicitExploration = executionStrategy === 'exploration'; // from frontend UI
 
+      // SECURITY: the chat path reaches exploration WITHOUT ever calling
+      // sanitizeUrl — `normalizeUrl` only prepends a scheme and its own comment
+      // defers private IPs to "a higher level if needed". For exploration no such
+      // level existed, so this was an SSRF hole (and skipped the http(s)
+      // allowlist too). Re-validate here, at the exploration boundary only, so
+      // non-exploration platform_test paths keep their current behaviour.
+      let safeEntryUrl = '';
+      let entryRejection: string | null = null;
+      try {
+        safeEntryUrl = normalizeEntryUrl(extractedUrl);
+      } catch (err) {
+        const reason = err instanceof ValidationError ? err.message : 'a valid http(s) url is required';
+        entryRejection = `I can't explore **${extractedUrl}** — ${reason}`;
+        logger.warn('[PLATFORM_TEST] Exploration rejected — invalid entry URL', {
+          url: extractedUrl,
+          reason,
+        });
+      }
+
+      // Reachability probe before enqueue → before the job charges credits.
+      if (!entryRejection) {
+        const preflight = await preflightEntryUrl(safeEntryUrl);
+        if (!preflight.ok) {
+          entryRejection = `I couldn't start exploring **${safeEntryUrl}** — ${preflight.message}`;
+          logger.info('[PLATFORM_TEST] Exploration rejected by entry preflight', {
+            url: safeEntryUrl,
+            verdict: preflight.verdict,
+            status: preflight.status,
+          });
+        }
+      }
+
+      if (entryRejection) {
+        if (chatSessionId) {
+          ChatService.saveChatMessages(chatSessionId, [
+            { role: 'user', content: message },
+            { role: 'ai', content: entryRejection },
+          ]).catch(() => {});
+        }
+        if (lockAcquired && chatSessionId) {
+          await releaseChatTestLock(chatSessionId);
+          lockAcquired = false;
+        }
+        res.json({
+          success: false,
+          reply: entryRejection,
+          mode: 'exploration',
+          timestamp: new Date().toISOString(),
+          sessionId: chatSessionId,
+        });
+        return;
+      }
+
       if (isExplicitExploration) {
         // ─────────────────────────────────────────────────────────────────
         // EXPLICIT EXPLORATION — user chose exploration in UI, skip confirmation
@@ -661,7 +717,7 @@ export async function handlePlatformTest(
         try {
           await QueueManager.addExplorationJob({
             explorationId,
-            entryUrl: extractedUrl.trim(),
+            entryUrl: safeEntryUrl,
             projectId: project_id,
             userId,
             chatSessionId,
@@ -731,7 +787,9 @@ export async function handlePlatformTest(
       // ─────────────────────────────────────────────────────────────────
       const pendingKey = `${PENDING_EXPLORATION_PREFIX}${chatSessionId || userId}`;
       const pendingData = JSON.stringify({
-        entryUrl: extractedUrl.trim(),
+        // Store the VALIDATED url — the confirmation path enqueues this verbatim,
+        // so validating only at ask-time would let the raw value through on confirm.
+        entryUrl: safeEntryUrl,
         projectId: project_id,
         userId,
         chatSessionId,

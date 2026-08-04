@@ -18,8 +18,9 @@
 
 import type { TestAction, TestCase, TestStep } from '../test-case/types';
 import type { IntentStep, IntentActionType, CompiledStepPlan } from '@/services/testing/ui/preview/preview.types';
-import type { IntentTestCase, Priority } from '@/types/testing.types';
+import type { IntentTestCase, Priority, TestAssertion } from '@/types/testing.types';
 import { isBoundSecretPlaceholder } from '@/utils/interpolation/redact-secrets';
+import { extractElementLabel } from './element-label';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // EXPLORATION CONFIG (input)
@@ -84,6 +85,17 @@ export interface ExplorationConfig {
   scopeHint?: string;
   /** Budget constraints */
   budget: ExplorationBudget;
+  /**
+   * Which preset produced `budget`. Explicit rather than inferred from the budget
+   * numbers, because "is this a quick run?" is a policy question and a timeout
+   * threshold is a bad proxy for it (a caller with a custom budget would behave
+   * unpredictably).
+   *
+   * Absent = `full`: the chat producers pass no budget and receive
+   * DEFAULT_EXPLORATION_BUDGET, which IS the full preset. Read this via
+   * `isQuickPreset()` — never compare the string in two places.
+   */
+  preset?: ExplorationPreset;
   /** Max concurrent flow explorations (sub-agents) */
   maxConcurrency?: number;
   /** Project ID for context */
@@ -158,6 +170,23 @@ export const EXPLORATION_PRESETS: Record<ExplorationPreset, Partial<ExplorationB
 };
 
 /**
+ * Is this run on the `quick` (onboarding) preset?
+ *
+ * **Single source for every preset-gated behaviour** — never compare the string
+ * inline. `quick` is 2 min TOTAL and is the self-serve "magic first test" path
+ * where time-to-first-test beats depth, so optional phases (Phase 0 product
+ * analysis) are skipped there rather than given a smaller budget: a phase that
+ * eats 30s of 120s before Phase 1 starts is worse than no phase at all.
+ *
+ * `undefined` → NOT quick. The chat producers pass no budget and get
+ * DEFAULT_EXPLORATION_BUDGET, which IS the full preset; defaulting the other way
+ * would silently disable optional phases on every chat-initiated run.
+ */
+export function isQuickPreset(preset?: ExplorationPreset): boolean {
+  return preset === 'quick';
+}
+
+/**
  * Build a unique exploration run id. Single source of format for every call
  * site (chat confirmation + REST start) so ids stay greppable.
  */
@@ -185,6 +214,25 @@ export type TestFlowCategory =
   | 'user_management'
   | 'error_handling'
   | 'other';
+
+/**
+ * May a flow in this category author a deterministic `assert_text` step?
+ *
+ * Only `authentication` is excluded, and for a structural reason rather than a
+ * cautious one: an auth flow's replay cannot reproduce its own login (the
+ * credential path differs at replay time), so an assertion frozen against the
+ * post-login page has nothing to stand on. Every other category replays the
+ * steps that produced the asserted value, so the assertion is meaningful there.
+ *
+ * Deliberately NOT a longer blocklist: value-level risk (timestamps, ids,
+ * live totals) is handled by `checkAssertVolatility`, which judges the actual
+ * string. Banning whole categories on suspicion would silently delete the
+ * feature's value for `e_commerce` and `crud`, which are exactly where a
+ * checkable value matters most.
+ */
+export function categoryAllowsAssertAuthoring(category: TestFlowCategory): boolean {
+  return category !== 'authentication';
+}
 
 export type FlowPriority = 'critical' | 'high' | 'medium' | 'low';
 
@@ -433,17 +481,17 @@ export interface DiscoveredStep {
  * Single assertion attached to a DiscoveredTestCase — produced by the builder,
  * consumed by users reviewing exploration output and by downstream replay.
  */
-export interface TestAssertion {
-  type: 'network' | 'url' | 'console';
-  /** Human-readable expectation, e.g. "POST /api/auth returns 2xx" */
-  expect: string;
-  /** For type=network: the captured call that sourced this assertion */
-  source?: {
-    method?: string;
-    urlPattern?: string;
-    status?: number;
-  };
-}
+/**
+ * Re-exported from shared types. The definition moved to
+ * [testing.types.ts](../../../../types/testing.types.ts) when `IntentTestCase`
+ * gained `networkAssertions` — exploration AUTHORS these, but replay VERIFIES
+ * them, so the contract can no longer live in an exploration-private module.
+ * `exploration/types.ts` already imports from `testing.types`, so importing back
+ * would have made a cycle.
+ *
+ * Kept as a re-export so existing `from './types'` imports still resolve.
+ */
+export type { TestAssertion };
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DISCOVERED TEST CASE (final output per flow)
@@ -527,7 +575,11 @@ export function toTestCase(discovered: DiscoveredTestCase): TestCase {
       id: `step-${step.stepNumber}`,
       description: step.description,
       action: step.action,
-      selector: step.selector || step.ref,
+      // NOT `|| step.ref`: a snapshot ref is not a selector. Writing `e7` here
+      // produced a step whose selector matches nothing on any page, which reads
+      // as a real locator and fails at replay instead of falling through to
+      // description-based resolution.
+      selector: step.selector,
       value: step.value,
       screenshot: true,
     })),
@@ -618,10 +670,18 @@ export function toIntentSteps(steps: DiscoveredStep[]): IntentStep[] {
       intentStep.expectedOutcome = 'error';
     }
 
-    // Add binding hints from step metadata
+    // Add binding hints from step metadata.
+    //
+    // `label` must be a HUMAN name, never the snapshot ref: bindingHints are the
+    // PREFERRED semantic-match source (evidence-shortcut.utils prefers them over
+    // the description), so passing `e7` sends the resolver hunting for an element
+    // labelled "e7" — which exists on no page — and demotes the description that
+    // would actually have matched. The real name is recoverable from the
+    // description the executor wrote ("Clicked \"Sign in\" (button)").
     if (step.ref || step.selector) {
+      const label = extractElementLabel(step.description);
       intentStep.bindingHints = {
-        label: step.ref,
+        ...(label ? { label } : {}),
         nearText: step.description,
       };
     }
@@ -661,6 +721,14 @@ export function toIntentTestCase(
     priority: discovered.priority as Priority,
     expectedResult: discovered.expectedResult,
     preconditions: discovered.preconditions,
+    // Machine-checkable network expectations. Previously dropped here entirely:
+    // the only trace that survived persist was a lossy `assert:` tag that
+    // nothing reads back, so a discovered test's sole pass criterion was the
+    // terminal `ai_check`. Only `network` assertions are carried — they are the
+    // ones replay can verify (status family + id-parameterized url pattern);
+    // `url`/`console` kinds have no verifier yet, and persisting an assertion
+    // nothing can check would be decoration that LOOKS like verification.
+    networkAssertions: discovered.assertions?.filter((a) => a.type === 'network'),
   };
 }
 
@@ -705,6 +773,20 @@ export interface ExplorationSummary {
   flowsBlocked: number;
   /** Skipped flows (budget exhausted) */
   flowsSkipped: number;
+  /**
+   * Entry points that yielded no runnable test case (zero-step timeout or
+   * runner-level skip). Not a failure — these never ran — and excluded from the
+   * rendered `flows`, so surfaced as its own bucket instead of inflating
+   * flowsFailed. `flowsExplored === flowsPassed + flowsFailed + flowsBlocked`.
+   */
+  flowsNotExplored: number;
+  /**
+   * Runnable test cases = `flows.length`. This is what the results panel renders
+   * and what actually persists (zero-step placeholders are dropped on save). Use
+   * this for user-facing "test cases" counts, NOT `testCases.length`, which still
+   * includes not_explored placeholders.
+   */
+  runnableTestCases: number;
   /** Total steps discovered */
   totalStepsDiscovered: number;
   /** Unique pages visited */

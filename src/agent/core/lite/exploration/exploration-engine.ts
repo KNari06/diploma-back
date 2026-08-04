@@ -49,10 +49,29 @@ import { ExplorationTraceService } from './exploration-trace.service';
 import { createBlackboard, taskToFlowResult } from './agents/blackboard';
 import { ExplorationStrategist } from './agents/strategist';
 import { ExplorationSentinel } from './agents/sentinel';
+import { runProductAnalyst } from './phase0/product-analyst';
+import { buildProductBriefView } from './phase0/brief-format';
 import type { ExplorationBlackboard } from './agents/agent-types';
 
 /** Save checkpoint every N completed flows */
 const CHECKPOINT_EVERY_N_FLOWS = 3;
+
+/**
+ * Flag a resumed run's summary as lacking a coverage assessment.
+ *
+ * `resumeFromCheckpoint` deliberately skips Phase 1.5 and Phase 2.5 — it never
+ * constructs the Strategist or the Sentinel, and builds its queue with the static
+ * `FlowQueue.fromEntryPoints` formula instead of `fromStrategyOutput`. So a
+ * resumed run has NO AI prioritization and NO coverage score, yet it wrote
+ * `status:'completed'` with an empty coverage section, which reads as "assessed,
+ * scored 0" rather than "not assessed". Say which it is.
+ */
+export function markResumedRunSummary(result: ExplorationResult): void {
+  result.summary.qualitySummary =
+    'This run was resumed after an interruption, so coverage was not assessed and flow order was not AI-prioritised. Re-run the exploration for a full assessment.';
+  result.summary.gaps = ['Coverage assessment skipped — run was resumed after an interruption'];
+  result.summary.recommendations = ['Re-run this exploration to get a coverage score and gap analysis'];
+}
 
 export class ExplorationEngine {
   private readonly config: ExplorationConfig;
@@ -203,6 +222,44 @@ export class ExplorationEngine {
     // BFS page discovery — Cartographer analyzes each page
     // ════════════════════════════════════════════════════════════════════
 
+    // ════════════════════════════════════════════════════════════════════
+    // PHASE 0: PRODUCT ANALYSIS (full preset only)
+    // Builds the brief that Cartographer / Strategist / Planner / Sentinel read.
+    // Enhancement-only: every failure is a NAMED skip and exploration continues
+    // exactly as it did before Phase 0 existed.
+    // ════════════════════════════════════════════════════════════════════
+    const phase0 = await runProductAnalyst(this.config, trace);
+    bb.productBrief = phase0.brief;
+    if (phase0.brief) {
+      this.emitProgress('survey', 'agent_warning', {
+        agent: 'product_analyst',
+        message: `Product understood: ${phase0.brief.productType.value}. ${phase0.brief.criticalFlows.value.length} business-critical flow(s) identified.`,
+        severity: 'info',
+        productType: phase0.brief.productType.value,
+        criticalFlows: phase0.brief.criticalFlows.value.map((f) => f.name),
+        openQuestions: phase0.brief.openQuestions,
+        confidence: phase0.brief.overallConfidence,
+        // The brief itself, structured for rendering. Until now the client saw
+        // only the one-line message above, so a user had no way to check what
+        // the agents were about to act on — and Phase 0 feeds all four of them.
+        // Read-only on purpose: showing it answers "is this right?", which is
+        // the question worth answering before building an editor for ~20 fields.
+        briefView: buildProductBriefView(phase0.brief, phase0.reusedFrom),
+      });
+    } else if (phase0.skipReason && phase0.skipReason !== 'quick_preset') {
+      // Say when the agents are running WITHOUT product understanding. A skip
+      // was logged and traced but never surfaced, so the user saw a normal-
+      // looking run and had no way to know Phase 0 had produced nothing — the
+      // same invisible-degradation class the audit kept turning up. The `quick`
+      // preset is excluded because skipping there is the DESIGN, not a fault.
+      this.emitProgress('survey', 'agent_warning', {
+        agent: 'product_analyst',
+        message: 'Could not build a product understanding for this site — exploring with generic assumptions.',
+        severity: 'warning',
+        skipReason: phase0.skipReason,
+      });
+    }
+
     logger.info('[EXPLORATION] Phase 1: Starting page survey');
     trace.writePhaseStart('survey');
 
@@ -218,6 +275,11 @@ export class ExplorationEngine {
       } catch { /* non-fatal */ }
 
       const surveyAgent = new SurveyAgent(surveyPage, this.config, budget, rateLimiter, trace);
+      // Feed Cartographer's per-page understanding into the blackboard. Without
+      // this the map stays empty for the whole run and the Strategist, Sentinel
+      // and Planner all plan against a blank page model (see invariant #12).
+      surveyAgent.setPageInsightSink((pageId, insight) => bb.pageInsights.set(pageId, insight));
+      surveyAgent.setProductBrief(bb.productBrief);
       bb.tree = await surveyAgent.survey();
       await surveyPage.close();
     } finally {
@@ -329,6 +391,10 @@ export class ExplorationEngine {
           } catch { /* non-fatal */ }
 
           const targetedSurvey = new SurveyAgent(targetedPage, this.config, budget, rateLimiter, trace);
+          // Same sink as the entry survey — pages found in a targeted pass must
+          // contribute insights too, else the extra round plans blind.
+          targetedSurvey.setPageInsightSink((pageId, insight) => bb.pageInsights.set(pageId, insight));
+          targetedSurvey.setProductBrief(bb.productBrief);
           const updatedTree = await targetedSurvey.surveyTargets(
             bb.currentStrategy.surveyTargets,
             bb.tree!,
@@ -493,6 +559,10 @@ export class ExplorationEngine {
             } catch { /* non-fatal */ }
 
             const targetedSurvey = new SurveyAgent(targetedPage, this.config, budget, rateLimiter, trace);
+            // Same sink as the entry survey — pages found in a targeted pass must
+            // contribute insights too, else the extra round plans blind.
+            targetedSurvey.setPageInsightSink((pageId, insight) => bb.pageInsights.set(pageId, insight));
+            targetedSurvey.setProductBrief(bb.productBrief);
             const updatedTree = await targetedSurvey.surveyTargets(
               focused.surveyTargets,
               bb.tree!,
@@ -611,7 +681,11 @@ export class ExplorationEngine {
     await ExplorationStorageService.clearCheckpoint(this.config.explorationId);
 
     this.emitProgress('complete', 'coverage_evaluated', {
-      testCases: result.testCases.length,
+      // Runnable count — matches summary.flows / the panel / the history card.
+      // (The frontend's coverage_evaluated handler currently reads only the
+      // coverage fields, but keep this honest so a future consumer can't wire up
+      // a stale total. Raw testCases.length still feeds trace/log records above.)
+      testCases: result.summary.runnableTestCases,
       flowsPassed: result.summary.flowsPassed,
       flowsFailed: result.summary.flowsFailed,
       flowsBlocked: result.summary.flowsBlocked,
@@ -752,7 +826,9 @@ export class ExplorationEngine {
       await trace.close();
       const builder = new TestCaseBuilder();
       const tasks = checkpoint.flowRunner?.completedTasks || [];
-      return builder.build(tree, tasks, budget, config, checkpoint.budget.startTime, []);
+      const staleResult = builder.build(tree, tasks, budget, config, checkpoint.budget.startTime, []);
+      markResumedRunSummary(staleResult);
+      return staleResult;
     }
 
     const allEntryPoints = tree.getAllEntryPoints();
@@ -816,6 +892,7 @@ export class ExplorationEngine {
 
       const builder = new TestCaseBuilder();
       const result = builder.build(tree, flowTasks, budget, config, checkpoint.budget.startTime, queue.remaining());
+      markResumedRunSummary(result);
       await ExplorationStorageService.clearCheckpoint(config.explorationId);
       trace.writeExplorationEnd({
         status: 'completed',
@@ -883,6 +960,7 @@ export class ExplorationEngine {
 
     const builder = new TestCaseBuilder();
     const result = builder.build(tree, allFlowTasks, budget, config, checkpoint.budget.startTime, queue.remaining());
+    markResumedRunSummary(result);
     await ExplorationStorageService.clearCheckpoint(config.explorationId);
     trace.writeExplorationEnd({
       status: 'completed',

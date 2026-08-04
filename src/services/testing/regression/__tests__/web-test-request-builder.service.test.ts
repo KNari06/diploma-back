@@ -167,3 +167,37 @@ describe('stitchCommandsForTestCase', () => {
     await expect(WebTestRequestBuilderService.stitchCommandsForTestCase(cmds, {}, 'https://x')).resolves.toBe(cmds);
   });
 });
+
+describe('buildTestRequest — network assertions', () => {
+  const assertions = [
+    { type: 'network', expect: 'POST /api/auth returns 2xx', source: { method: 'POST', urlPattern: 'https://app.test/api/auth', status: 200 } },
+  ];
+
+  it('forwards network_assertions from the row to the job', async () => {
+    // `getSavedTestCase` selects `*`, so the column arrives on the row without a
+    // query change — this asserts the thread-through to TestJobData.
+    const req = await build(intentCase({ network_assertions: assertions }), 'u1', {});
+
+    expect(req.networkAssertions).toEqual(assertions);
+  });
+
+  it('omits the field entirely when the row has none', async () => {
+    const req = await build(intentCase(), 'u1', {});
+
+    // Absent must stay absent — it means "nothing to verify", and an empty array
+    // would read as "verified and empty".
+    expect('networkAssertions' in req).toBe(false);
+  });
+
+  it('omits the field when the row has an empty array', async () => {
+    const req = await build(intentCase({ network_assertions: [] }), 'u1', {});
+
+    expect('networkAssertions' in req).toBe(false);
+  });
+
+  it('omits the field when the column holds a non-array (defensive)', async () => {
+    const req = await build(intentCase({ network_assertions: { bogus: true } }), 'u1', {});
+
+    expect('networkAssertions' in req).toBe(false);
+  });
+});

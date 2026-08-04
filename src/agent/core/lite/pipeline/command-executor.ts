@@ -45,6 +45,7 @@ import { evaluateOverlayGate } from '../exploration/intra-flow-overlay-gate';
 import { OverlayDismisser } from '../exploration/overlay-dismisser';
 import { redactCredentialValues } from '@/utils/interpolation/redact-secrets';
 import { classifyPageHealth, formatPageHealth, pageHealthHasSignal } from '../collectors/page-health';
+import { checkAssertVolatility, volatilityRejectionMessage } from './assert-volatility';
 
 /**
  * PR-Hybrid: Commands that carry a `ref` parameter and can be intercepted
@@ -1251,6 +1252,25 @@ export class CommandExecutor {
       };
     }
 
+    // Refuse a value that cannot hold across runs BEFORE grounding it against
+    // the page: a timestamp grounds perfectly right now and is red forever
+    // after. Prompt guidance alone was enough for the editor (a human reviews
+    // the step) but not for exploration, where the assertion reaches the user's
+    // project unreviewed. The rejection goes back to the model as a tool error
+    // so it can choose a stable value instead of losing the round.
+    const volatility = checkAssertVolatility(expected);
+    if (volatility.volatile) {
+      logger.debug('[CMD_EXECUTOR] assert_text rejected as volatile', {
+        ref,
+        reason: volatility.reason,
+      });
+      return {
+        success: false,
+        output: '',
+        error: volatilityRejectionMessage(expected, volatility.reason!),
+      };
+    }
+
     const refCheck = this.checkRefExists(ref);
     if (!refCheck.valid) {
       return { success: false, output: '', error: refCheck.error! };
@@ -1531,9 +1551,22 @@ export class CommandExecutor {
         .slice(0, 20)
         .map(el => `${el.ref}(${el.tag}${el.name ? ':' + el.name.slice(0, 20) : ''})`)
         .join(', ');
+      // A ref that fits the snapshot's `eNN` shape but is absent is almost always
+      // STALE, not hallucinated: the model saw it in a real earlier snapshot and
+      // the DOM has since re-rendered (SPA route change, list re-mount, validation
+      // repaint). This is the single most common exploration failure — the agent
+      // keeps addressing the pre-render ref and burns its whole round budget. The
+      // recovery is deterministic (re-snapshot, then re-pick), so make the error
+      // an explicit directive to `observe_page` FIRST rather than a bare
+      // "not found" the model tends to answer by guessing another stale ref.
+      const looksStale = /^e\d+$/i.test(ref);
+      const guidance = looksStale
+        ? `Element ref "${ref}" is no longer on the page — the DOM changed since the last snapshot (stale ref). ` +
+          `Call observe_page to refresh, then pick the current ref for the same element. Do NOT reuse "${ref}".`
+        : `Element ref "${ref}" not found on page.`;
       return {
         valid: false,
-        error: `Element ref "${ref}" not found on page. Available: ${availableRefs}`,
+        error: `${guidance} Available: ${availableRefs}`,
       };
     }
 

@@ -28,7 +28,7 @@
 
 import { z } from 'zod';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
-import { AI_MODELS } from '@/config/ai/ai-models.config';
+import { chooseToolCapableModel as pickToolCapableModel } from '../shared/tool-capable-model';
 import { logger } from '@/utils/core/logger';
 import type { MobileUiState } from '@/services/mobile/mobile-runner.types';
 import { redactPii } from '@/services/chat/pii-redactor';
@@ -315,14 +315,4 @@ function formatScreenForPlanner(snap: MobileUiState): string {
  * OpenAI wrapper doesn't forward tool/response_format params through the
  * Gemini path reliably.
  */
-function chooseToolCapableModel(): string {
-  const configured = AI_MODELS.fast;
-  if (configured.startsWith('gemini-')) {
-    logger.warn(
-      '[MOBILE_PLANNER] Configured fast model is Gemini; falling back to gpt-4.1-mini for JSON-mode planning.',
-      { configured },
-    );
-    return 'gpt-4.1-mini';
-  }
-  return configured;
-}
+const chooseToolCapableModel = (): string => pickToolCapableModel('MOBILE_PLANNER');
