@@ -442,7 +442,16 @@ export class MobileStepApplyService {
             // Carry the lint-built compiled plan onto the IntentStep so the NEXT
             // apply (regression / replay) goes through runner's fast-path
             // instead of re-linting via LLM.
-            ...(lintResult.compiledPlan ? { compiled: lintResult.compiledPlan } : {}),
+            //
+            // NOT for a forced-vision step. The runner gates its compiled
+            // fast-path off the same flag, so the plan could never be used —
+            // but persisting it flips `hasCompiled` above, which routes every
+            // later run away from this lint call and onto `runSteps`. The
+            // author gets one vision-resolved run, then silent text resolution
+            // forever, with the toggle still showing as on. Keeping forced
+            // steps plan-less keeps them on one path, and the plan is dead
+            // weight the moment the flag is set anyway.
+            ...(lintResult.compiledPlan && !useScreenshotOnly ? { compiled: lintResult.compiledPlan } : {}),
           };
 
           return {
@@ -558,7 +567,10 @@ export class MobileStepApplyService {
           // apply will short-circuit the LLM pipeline if this plan still matches.
           // Strip the plan when the runner flagged it stale post-dispatch even
           // though `success === true` — saving it would re-introduce the bug.
-          ...(stepResult!.compiledPlan && !planIsStale
+          // Same `useScreenshotOnly` exclusion as the lint path above: a forced
+          // step can never USE a plan, and storing one only routes its next run
+          // away from lint.
+          ...(stepResult!.compiledPlan && !planIsStale && !useScreenshotOnly
             ? { compiled: stepResult!.compiledPlan }
             : {}),
         }

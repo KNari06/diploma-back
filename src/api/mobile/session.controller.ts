@@ -1872,7 +1872,12 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
       // round-trip. Only forwarded when the plan is meaningful — i.e. the
       // resolve actually succeeded; on `not_found` / `error` / failed lint
       // there's no plan to share. Optional field, ignored by older frontends.
-      ...(lintResult.compiledPlan ? { compiled: lintResult.compiledPlan } : {}),
+      //
+      // Withheld for a forced-vision step: the runner gates its compiled
+      // fast-path off the same flag, so the plan is unusable — and once the
+      // frontend saves it, `hasCompiled` routes that step's every later run
+      // away from this lint call and onto `runSteps`.
+      ...(lintResult.compiledPlan && !useScreenshotOnly ? { compiled: lintResult.compiledPlan } : {}),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -2758,12 +2763,16 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
         // short-circuit the LLM pipeline in ~5ms, beating a 200-500ms lint
         // round-trip. Only steps WITHOUT compiled use the lint fast-path.
         const hasCompiled = !!(step as any).compiled;
+        // "Use screenshot to find element". Read once per step: it both forces
+        // vision on the lint below AND suppresses plan persistence further
+        // down, because a stored plan is what routes the NEXT run of this step
+        // past the lint entirely.
+        const useScreenshotOnly = (step as any).options?.useScreenshotOnly === true;
 
         // Fast path: lint to find element, then execute by coordinates (same as applySession).
         // Only for steps WITHOUT a compiled plan (first run / manual adds).
         if (!hasCompiled && description && LINT_TYPES.has(rawType)) {
           const lintActionType = ACTION_TYPE_MAP[rawType] || 'tap';
-          const useScreenshotOnly = (step as any).options?.useScreenshotOnly === true;
           // Forward the step's screenshot-only flag — this lint IS the
           // resolution for an uncompiled step on this run path, so dropping it
           // here silently text-resolves a step the user marked vision-only.
@@ -2927,7 +2936,12 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
           // foreground mismatch). Skip persistence in that case — saving
           // a "successful dispatch but wrong element" plan locks in the bug.
           const planIsStale = !!stepResult.planStaleReason;
-          const shouldPersist = !planIsStale && (stepResult.success === true || planIsProven);
+          // A forced-vision step never persists a plan. The runner gates its
+          // compiled fast-path off the same flag, so the plan is unusable —
+          // and storing one flips `hasCompiled` above, sending every later run
+          // down `runSteps` instead of the lint call that honours the toggle.
+          const shouldPersist = !planIsStale && !useScreenshotOnly
+            && (stepResult.success === true || planIsProven);
           if (shouldPersist) {
             try {
               const { IntentTestCaseService } = await import(
