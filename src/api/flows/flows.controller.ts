@@ -13,6 +13,7 @@ import {
   HOST_BUILD_MISSING_MESSAGE,
 } from '@/services/mobile/flutter-host-guard.service';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import type { ResourceBinding } from '@/services/test-resource/test-resource.service';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
@@ -36,7 +37,7 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function createFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { moduleId, name, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings, mobileVariantLabel, hostPlatform } = req.body;
+    const { moduleId, name, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings, mobileVariantLabel, hostPlatform, environmentResourceId } = req.body;
 
     // Validate moduleId required
     if (!moduleId) {
@@ -62,6 +63,34 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
     const projectId = module.projectId;
 
     const isMobilePlatform = typeof platform === 'string' && platform.startsWith('mobile_');
+    // Declared up here (not just before the insert below) because the
+    // environment-binding gate needs it: only a web UI test case ever receives
+    // an environment binding. Mobile uses its own resource scope, and an api
+    // flow creates NO initial test case in this path — so gating on
+    // `!isMobilePlatform` (which is also true for api) would validate the
+    // environment and then silently drop it.
+    const flowIsApi = flowType === 'api' || platform === 'api';
+    const isWebTestCase =
+      !isMobilePlatform && !flowIsApi &&
+      (platform === 'web' || !platform || platformKey === 'web_ui');
+
+    // Web-only: if the user picked a saved environment in the Create-test
+    // dialog, bind that environment resource to the initial test case so its
+    // `env.<KEY>` variables resolve on every run — not just its BASE_URL.
+    // Validated HERE, before `FlowService.create`, so a bad id 400s without
+    // orphaning a flow. Scoping is consistent with the dialog: the dropdown
+    // lists the user's own environments (listResources is user+project
+    // scoped), so getResource (user-scoped) resolves exactly what was offered.
+    let environmentBinding: ResourceBinding | null = null;
+    if (isWebTestCase && environmentResourceId) {
+      const { resolveEnvironmentBinding } = await import('@/services/testing/flows/environment-binding.service');
+      const resolved = await resolveEnvironmentBinding({ userId, projectId, environmentResourceId });
+      if (!resolved.ok) {
+        res.status(400).json({ success: false, error: 'Invalid environmentResourceId' });
+        return;
+      }
+      environmentBinding = resolved.binding;
+    }
 
     // Flutter host lane gate — runs BEFORE `FlowService.create`, not at the
     // test-case insert below, because by then the flow row exists and bailing
@@ -149,11 +178,6 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
     // via the API flow builder, not this UI-test path).
     let createdTestCaseId: string | undefined;
 
-    const flowIsApi = flowType === 'api' || platform === 'api';
-    const isWebTestCase =
-      !isMobilePlatform && !flowIsApi &&
-      (platform === 'web' || !platform || platformKey === 'web_ui');
-
     if (isWebTestCase || isMobilePlatform) {
         // Sanitize baseUrl if provided (only relevant for web flows)
         let sanitizedBaseUrl: string | null = null;
@@ -230,7 +254,10 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
             const bindings = await enrichBindingsWithDefaults({
               userId,
               projectId,
-              bindings: [],
+              // Seed the user's explicit environment pick (web only). Enrichment
+              // never overrides an explicit binding, so defaults only fill the
+              // OTHER kinds and the chosen environment survives.
+              bindings: environmentBinding ? [environmentBinding] : [],
               scope: {
                 platform: scopePlatform,
                 url: sanitizedBaseUrl,
