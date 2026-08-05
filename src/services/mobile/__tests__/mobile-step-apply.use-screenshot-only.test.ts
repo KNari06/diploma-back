@@ -140,3 +140,88 @@ describe('MobileStepApplyService.apply — useScreenshotOnly forwarding', () => 
     expect(commands[0]).not.toHaveProperty('_useScreenshotOnly');
   });
 });
+
+/**
+ * `appliedStep.compiled` is what the frontend persists onto the saved step, and
+ * a saved plan flips `hasCompiled` — which makes the NEXT apply skip the lint
+ * call above and go to `runSteps` instead. That is how a forced step quietly
+ * loses its vision resolution one run after it gains it.
+ *
+ * The runner also refuses to use a compiled plan when the flag is set, so the
+ * plan has no upside to trade against that. Withhold it on both paths.
+ */
+describe('MobileStepApplyService.apply — a forced-vision step emits no compiled plan', () => {
+  const plan = { version: 1, platform: 'flutter', compiledAt: 'z', strategies: [], fingerprint: {} };
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it('withholds the lint-built plan when the step is screenshot-only', async () => {
+    const lintElement = jest.fn().mockResolvedValue({
+      status: 'resolved',
+      boundingBox: { x: 100, y: 200, width: 60, height: 60 },
+      resolvedVia: 'vision',
+      confidence: 0.9,
+      visionMode: true,
+      compiledPlan: plan,
+    });
+    const executeBatchCommands = jest.fn().mockResolvedValue({ results: [{ success: true }] });
+    getMobileRunnerClientForSession.mockResolvedValue({ lintElement, executeBatchCommands });
+
+    const out = await MobileStepApplyService.apply({
+      sessionId: 'sess-1',
+      stepDraft: {
+        id: 'step-1',
+        type: 'tap',
+        description: 'gear icon settings',
+        options: { useScreenshotOnly: true },
+      },
+      userId: 'user-1',
+    });
+
+    expect(out.appliedStep).toBeDefined();
+    expect(out.appliedStep).not.toHaveProperty('compiled');
+  });
+
+  it('still emits the lint-built plan for an ordinary step', async () => {
+    const lintElement = jest.fn().mockResolvedValue({
+      status: 'resolved',
+      boundingBox: { x: 100, y: 200, width: 60, height: 60 },
+      resolvedVia: 'llm',
+      confidence: 0.9,
+      compiledPlan: plan,
+    });
+    const executeBatchCommands = jest.fn().mockResolvedValue({ results: [{ success: true }] });
+    getMobileRunnerClientForSession.mockResolvedValue({ lintElement, executeBatchCommands });
+
+    const out = await MobileStepApplyService.apply({
+      sessionId: 'sess-1',
+      stepDraft: { id: 'step-1', type: 'tap', description: 'Continue' },
+      userId: 'user-1',
+    });
+
+    expect(out.appliedStep).toMatchObject({ compiled: expect.objectContaining({ compiledAt: 'z' }) });
+  });
+
+  it('withholds the runner-built plan on the runSteps fallback too', async () => {
+    const lintElement = jest.fn().mockResolvedValue({ status: 'not_found' });
+    const runSteps = jest.fn().mockResolvedValue({
+      steps: [{ success: true, resolvedVia: 'vision', compiledPlan: plan }],
+    });
+    getMobileRunnerClientForSession.mockResolvedValue({ lintElement, runSteps });
+
+    const out = await MobileStepApplyService.apply({
+      sessionId: 'sess-1',
+      stepDraft: {
+        id: 'step-1',
+        type: 'tap',
+        description: 'gear icon settings',
+        options: { useScreenshotOnly: true },
+      },
+      userId: 'user-1',
+    });
+
+    expect(runSteps).toHaveBeenCalled();
+    expect(out.appliedStep).toBeDefined();
+    expect(out.appliedStep).not.toHaveProperty('compiled');
+  });
+});

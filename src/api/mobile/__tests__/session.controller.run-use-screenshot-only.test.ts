@@ -47,7 +47,11 @@ jest.mock('@/services/mobile/session-runner-routing', () => ({
   getMobileRunnerClientForSession: jest.fn(),
 }));
 jest.mock('@/services/testing/ui/preview/intent-test-case.service', () => ({
-  IntentTestCaseService: { getByIdInternal: jest.fn(), updateStepsCompiled: jest.fn() },
+  IntentTestCaseService: {
+    getByIdInternal: jest.fn(),
+    updateStepsCompiled: jest.fn(),
+    updateStepFromPreviewApply: jest.fn(),
+  },
 }));
 
 import { getMobileRunnerClientForSession } from '@/services/mobile/session-runner-routing';
@@ -57,6 +61,9 @@ import { runTestCaseOnSession } from '../session.controller';
 
 const getClientForSession = getMobileRunnerClientForSession as jest.Mock;
 const getByIdInternal = (IntentTestCaseService as unknown as { getByIdInternal: jest.Mock }).getByIdInternal;
+const updateStepFromPreviewApply = (
+  IntentTestCaseService as unknown as { updateStepFromPreviewApply: jest.Mock }
+).updateStepFromPreviewApply;
 
 /** A vision resolve lands right on the trust threshold — the runner still re-resolves. */
 const lintResolved = {
@@ -176,5 +183,65 @@ describe('runTestCaseOnSession — useScreenshotOnly on the full-run path', () =
     await runTestCaseOnSession(req, res as never);
 
     expect(firstDispatchedCommands(executeBatchCommands)[0]).not.toHaveProperty('_useScreenshotOnly');
+  });
+});
+
+/**
+ * The flag's second-order effect, and the one that made the July fix look like
+ * it had regressed: a stored `compiled` plan is what decides WHICH resolution
+ * path a step gets. `hasCompiled` skips the lint call above — the only hop that
+ * forwards `useScreenshotOnly` — and sends the step to `runSteps` instead. So a
+ * forced step that persists a plan on its first run silently text-resolves on
+ * every run after it, while the editor still shows the toggle on.
+ *
+ * A forced step can never USE a plan either (the runner gates its compiled
+ * fast-path off the same flag), so the plan is pure dead weight. Don't store it.
+ */
+describe('runTestCaseOnSession — a forced-vision step never persists a compiled plan', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  function runStepsStep(options: Record<string, unknown>) {
+    // `compiled` present → the loop skips the lint fast path and goes to runSteps,
+    // which is the branch that auto-persists.
+    return {
+      id: 'step-2',
+      type: 'click',
+      description: 'settings icon on the right top side, gear icon settings',
+      options,
+      compiled: { version: 1, platform: 'flutter', compiledAt: 'x', strategies: [], fingerprint: {} },
+    };
+  }
+
+  const runnerReturnedAPlan = {
+    steps: [{
+      success: true,
+      resolvedVia: 'vision',
+      compiledPlan: { version: 1, platform: 'flutter', compiledAt: 'y', strategies: [], fingerprint: {} },
+    }],
+  };
+
+  it('withholds the plan when the step is marked screenshot-only', async () => {
+    const runSteps = jest.fn().mockResolvedValue(runnerReturnedAPlan);
+    getClientForSession.mockResolvedValue({ lintElement: jest.fn(), runSteps });
+
+    const { req, res } = makeReqRes(runStepsStep({ useScreenshotOnly: true }));
+    await runTestCaseOnSession(req, res as never);
+
+    expect(runSteps).toHaveBeenCalled();
+    expect(updateStepFromPreviewApply).not.toHaveBeenCalled();
+  });
+
+  it('still persists the plan for an ordinary step, so the fast path keeps working', async () => {
+    const runSteps = jest.fn().mockResolvedValue(runnerReturnedAPlan);
+    getClientForSession.mockResolvedValue({ lintElement: jest.fn(), runSteps });
+
+    const { req, res } = makeReqRes(runStepsStep({}));
+    await runTestCaseOnSession(req, res as never);
+
+    expect(updateStepFromPreviewApply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        appliedStep: expect.objectContaining({ compiled: expect.objectContaining({ compiledAt: 'y' }) }),
+      }),
+    );
   });
 });
