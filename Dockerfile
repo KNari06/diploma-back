@@ -4,7 +4,12 @@ WORKDIR /app
 
 COPY package*.json ./
 ENV HUSKY=0
-RUN npm ci
+# --ignore-scripts: dependency install hooks are the execution vector for npm
+# supply-chain worms, and this stage only needs to type-check and compile TS —
+# no native binary is built here. Stated explicitly rather than inherited from
+# the repo's .npmrc, which is not COPYed into this stage.
+# The runtime stage below has always installed this way; this makes the two match.
+RUN npm ci --ignore-scripts
 
 # Copy source files (note: .env is excluded via .dockerignore)
 # Environment variables should be passed via docker run -e or --env-file at runtime

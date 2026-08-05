@@ -17,6 +17,11 @@
 >   Check with `git status -sb` before amending.
 > - **Long installs/builds:** never relaunch `npm install` because one "looked killed" —
 >   check `pgrep -fl "npm install"` first. See [../.claude/rules/operations.md](../.claude/rules/operations.md).
+> - **Installs:** `.npmrc` sets `ignore-scripts=true` — dependency install hooks are the
+>   execution vector for npm supply-chain worms. Nothing here needs a rebuild (prod has
+>   always installed with `--ignore-scripts`); both Dockerfile stages pass the flag
+>   explicitly, since `.npmrc` is not `COPY`ed into the image. Never remove it to make a
+>   build pass. See [../.claude/rules/supply-chain.md](../.claude/rules/supply-chain.md).
 > - **Tests:** unit tests mock at the data-access boundary; integration tests hit a real
 >   database — never mock Supabase in an integration test.
 > - **Live testing shares ONE machine.** Before `run-dev.sh` or starting the emulator,
