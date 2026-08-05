@@ -358,6 +358,15 @@ export interface MobileCompiledPlan {
     role?: string;
     siblingCount?: number;
     parentText?: string;
+    /**
+     * Element dimensions at build time. The runner has always emitted this
+     * (`compiled-plan-builder.ts` buildFingerprint, set only when both axes
+     * measure > 0) but the backend type omitted it. Read by
+     * `deriveMobileHeal`'s ancestor-fallback guard: a resolver that falls back
+     * to a container reports a dramatically larger element than the control
+     * that was anchored.
+     */
+    boundsSize?: { width: number; height: number };
   };
 }
 
@@ -391,6 +400,15 @@ export interface MobileStepResult {
   /** ai_check steps only, pass or fail: 1-2 sentence LLM explanation. */
   aiCheckExplanation?: string;
   durationMs: number;
+  /**
+   * Rebuilt binding hints, returned when the FULL resolver (LLM/vision) ran and
+   * succeeded above its confidence floor — i.e. the cheap text-finder / compiled
+   * fast paths did not answer. The runner has always sent this; the backend type
+   * omitted it, so it was dropped on the floor. Read by `deriveMobileHeal`
+   * (step-failure-classifier.ts) as the mobile equivalent of a self-heal, since
+   * Flutter's finder-first path never persists a compiled plan to miss.
+   */
+  enrichedHints?: MobileBindingHints;
   /** Freshly-built compiled plan from this run. Persist onto the IntentStep. */
   compiledPlan?: MobileCompiledPlan;
   /**

@@ -59,6 +59,19 @@ back to cap=1 (serial) on any failure path. Logged as
 `mobile_test_results` (mirroring the read fallback in `getTestResult`) — so a mobile
 run's `ai_summary` lands on its `mobile_test_results` row.
 
+**`failedReason` + `healed` on a mobile step** —
+[../services/mobile/step-failure-classifier.ts](../services/mobile/step-failure-classifier.ts).
+`failedReason` maps the runner's STRUCTURED `errorClassification` (never the message
+text), falling back to `resolvedVia` then, last, a timeout regex. `healed` cannot use
+web's "compiled plan missed" notion: Flutter's `smartResolve` returns early on a text
+finder (`resolvedVia: 'flutter_finder_first'`) before the compiled path and returns no
+plan, so a matchable control never persists one. It keys on `enrichedHints` — built only
+when the FULL resolver ran — plus a differing prior `bindingHints.label`, which is also
+what fills the report's before/after diff. **`reduceRuntimeMeta`
+([../services/testing/results/test-executed-steps-redis.service.ts](../services/testing/results/test-executed-steps-redis.service.ts))
+is an allowlist:** a new `runtimeMeta` field added anywhere must be added there too, or
+it survives the live WS broadcast but is dropped on the way to `tests.executed_steps`.
+
 **Screenshot upload** — `uploadMobileStepScreenshots` in
 [../services/storage/step-screenshot.service.ts](../services/storage/step-screenshot.service.ts),
 gated by `SCREENSHOT_EACH_STEP_ENABLED` → `runtimeMeta.stepScreenshotUrl` +
@@ -67,7 +80,7 @@ gated by `SCREENSHOT_EACH_STEP_ENABLED` → `runtimeMeta.stepScreenshotUrl` +
 **Mobile regression diverges from web in five ways:** (1) batch RPC (`runSteps`)
 not per-step apply; (2) hardcoded `screenshotEachStep: true`; (3) NO heal layer
 above the runner — mobile relies solely on the runner's per-step retry +
-stabilization-retry tail; (4) compiled-plan persistence happens explicitly via
+stabilization-retry tail, though a heal is now REPORTED (see below); (4) compiled-plan persistence happens explicitly via
 `CompiledPlanPersistenceService.persistFromRun` (web persists differently); (5) sessions claimed
 from a runner-side pool (warmup → cold-start fallback) and released in the
 finally block. See `mobile-test-run.job.ts` for the full lifecycle.

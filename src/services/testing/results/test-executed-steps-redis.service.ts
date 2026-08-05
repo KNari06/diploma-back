@@ -103,6 +103,16 @@ export function reduceRuntimeMeta(meta: any): any {
     bugScreenshotUrl: truncateString(meta.bugScreenshotUrl, 2000),
     stepScreenshotUrl: truncateString(meta.stepScreenshotUrl, 2000),
     healConfidence: typeof meta.healConfidence === 'number' ? meta.healConfidence : undefined,
+    // Self-heal before/after provenance. Allowlisted so it survives the
+    // Redis → Postgres round-trip into `tests.executed_steps`: without these
+    // three the producer sets them, this reducer silently drops them, and the
+    // saved report's heal diff card renders empty while the LIVE view (which
+    // reads the un-reduced broadcast payload) shows it — the same step looking
+    // different before and after the run finishes. Both readers expect them:
+    // regression-report-assembler.service.ts and TestDetails' client transform.
+    healedFrom: truncateString(meta.healedFrom, 500),
+    healedTo: truncateString(meta.healedTo, 500),
+    healWhatChanged: truncateString(meta.healWhatChanged, 500),
     needsReview: typeof meta.needsReview === 'boolean' ? meta.needsReview : undefined,
     flaky: typeof meta.flaky === 'boolean' ? meta.flaky : undefined,
     resolutionPath: truncateString(meta.resolutionPath, 32),

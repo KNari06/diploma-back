@@ -32,6 +32,7 @@ import { classifyJobErrorCode } from '@/services/testing/regression/job-error-co
 import { MobileRunnerClient, type IMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { CompanionRunnerClient } from '@/services/mobile/companion/companion-runner-client';
 import { getSessionRunnerBinding } from '@/services/mobile/session-runner-routing';
+import { classifyMobileFailure, deriveMobileHeal } from '@/services/mobile/step-failure-classifier';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
@@ -985,6 +986,11 @@ export class MobileTestRunJobHandler {
       const stepActionById = new Map(
         intentSteps.map((s) => [s.id, s.type]),
       );
+      // id → the authored step itself. `deriveMobileHeal` compares what the step
+      // was ANCHORED to (its persisted compiled plan) against what the runner
+      // resolved this run — which is what distinguishes a genuine re-resolve
+      // from a step's first resolve.
+      const stepById = new Map(intentSteps.map((s) => [s.id, s]));
 
       // Emit step-level progress
       for (let i = 0; i < runResult.steps.length; i++) {
@@ -1025,6 +1031,12 @@ export class MobileTestRunJobHandler {
                 : isSoftFailure
                   ? 'soft-failed'
                   : 'failed';
+
+          // Did this step only pass because the runner had to re-resolve the
+          // element? Compares the label the step was anchored to against the
+          // one it resolved to now — see step-failure-classifier.ts for where
+          // each side comes from and why an ancestor fallback is excluded.
+          const heal = deriveMobileHeal(stepById.get(stepResult.stepId), stepResult);
 
           // Audit (Loki): a mobile AI-check could NOT produce a trustworthy
           // verdict — the runner sets `aiCheckSkippedReason` ONLY on a check
@@ -1073,11 +1085,25 @@ export class MobileTestRunJobHandler {
             timestamp: new Date().toISOString(),
             runtimeMeta: {
               stepId: stepResult.stepId,
-              runtimeStatus,
+              // A step that only passed because the element was re-resolved
+              // reports 'healed', so the report can flag it rather than showing
+              // it as an ordinary pass. Never overrides a terminal status —
+              // skipped/soft-failed/failed are decided above and stay.
+              runtimeStatus: runtimeStatus === 'executed' && heal.healed ? 'healed' : runtimeStatus,
               executionMs: stepResult.durationMs,
-              failedReason: stepResult.error ? 'unknown' : undefined,
+              failedReason: classifyMobileFailure(stepResult, stepActionById.get(stepResult.stepId)),
               failureExplanation: redactedFailureExplanation,
               resolvedVia: stepResult.resolvedVia,
+              // Heal provenance for the report's before/after diff card. Emitted
+              // only on a real heal so renderers can truthy-check.
+              ...(heal.healed
+                ? {
+                    source: 'self_heal' as const,
+                    healedFrom: heal.healedFrom,
+                    healedTo: heal.healedTo,
+                    healWhatChanged: heal.healWhatChanged,
+                  }
+                : {}),
               // Soft-fail signal for the frontend. Absent (not `false`) for
               // hard failures and successes — keeps the field truthy-only
               // so existing renderers don't accidentally render a "soft"
