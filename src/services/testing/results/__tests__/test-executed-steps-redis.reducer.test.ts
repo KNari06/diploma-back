@@ -98,4 +98,41 @@ describe('reduceRuntimeMeta', () => {
       expect(reduceRuntimeMeta({ triggerFired: 'nope' as any }).triggerFired).toBeUndefined();
     });
   });
+
+  describe('self-heal before/after provenance', () => {
+    // These three were absent from the allowlist, so the producer set them, this
+    // reducer dropped them, and the saved report's heal diff card was always
+    // empty — while the LIVE view, which reads the un-reduced broadcast payload,
+    // showed it. The same step looked different before and after the run ended.
+    it('preserves the healed before/after pair through the Redis → Postgres reduction', () => {
+      const reduced = reduceRuntimeMeta({
+        runtimeStatus: 'healed',
+        source: 'self_heal',
+        healedFrom: 'Sign in',
+        healedTo: 'Continue',
+        healWhatChanged: 'Element label changed from "Sign in" to "Continue"',
+      });
+
+      expect(reduced.runtimeStatus).toBe('healed');
+      expect(reduced.source).toBe('self_heal');
+      expect(reduced.healedFrom).toBe('Sign in');
+      expect(reduced.healedTo).toBe('Continue');
+      expect(reduced.healWhatChanged).toContain('Continue');
+    });
+
+    it('returns them undefined when absent, so a normal step renders no diff card', () => {
+      const reduced = reduceRuntimeMeta({ runtimeStatus: 'executed' });
+
+      expect(reduced.healedFrom).toBeUndefined();
+      expect(reduced.healedTo).toBeUndefined();
+      expect(reduced.healWhatChanged).toBeUndefined();
+    });
+
+    it('truncates an overlong label rather than persisting it whole', () => {
+      const reduced = reduceRuntimeMeta({ healedFrom: 'x'.repeat(900) });
+
+      expect(reduced.healedFrom).toMatch(/…\[truncated\]$/);
+      expect(reduced.healedFrom!.length).toBeLessThan(900);
+    });
+  });
 });
