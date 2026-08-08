@@ -2,7 +2,7 @@ import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileRunnerClient } from './mobile-runner-client';
-import type { MobilePlatform } from './mobile-runner.types';
+import { MobileRunnerError, type MobilePlatform } from './mobile-runner.types';
 import { resolveDedicatedDevice } from './dedicated-device.service';
 import { storeSessionRunnerBinding, getSessionRunnerBinding } from './session-runner-routing';
 import { DedicatedDeviceFeature } from '@/config/features/dedicated-device';
@@ -19,7 +19,42 @@ import { env } from '@/config/environment/env';
  *   3. Cold start (new emulator/simulator, ~60s)
  * ═══════════════════════════════════════════════════════════════════════════
  */
+/**
+ * Dedicated-create retry budget. Three attempts over ~30s: long enough to
+ * outlast the tail of a sibling run's teardown, short enough that a genuinely
+ * occupied device still reports back inside the job's patience.
+ */
+const DEDICATED_BUSY_RETRIES = 2;
+const DEDICATED_BUSY_BACKOFF_MS = [10_000, 20_000];
+
 export class MobileSessionAcquisitionService {
+  /**
+   * Create the dedicated session, retrying only on the runner's DEVICE_BUSY.
+   *
+   * Every other failure (DEVICE_NOT_FOUND, DEVICE_INIT_FAILED, transport) is
+   * rethrown untouched — those are not transient and re-firing them only
+   * delays the user-visible error, the same reasoning the client's own retry
+   * loop applies to typed device errors.
+   */
+  private static async createDedicatedWithRetry(
+    client: MobileRunnerClient,
+    platform: MobilePlatform,
+    config: Parameters<MobileRunnerClient['createSession']>[1],
+    onRetry: (attempt: number, waitMs: number) => void,
+  ): Promise<{ sessionId: string }> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await client.createSession(platform, config);
+      } catch (err) {
+        const isBusy = err instanceof MobileRunnerError && err.code === 'DEVICE_BUSY';
+        if (!isBusy || attempt >= DEDICATED_BUSY_RETRIES) throw err;
+        const waitMs = DEDICATED_BUSY_BACKOFF_MS[attempt] ?? 20_000;
+        onRetry(attempt + 1, waitMs);
+        await new Promise((r) => setTimeout(r, waitMs));
+      }
+    }
+  }
+
   /**
    * Attempt to acquire a mobile runner session via pool → warmup → cold-start.
    *
@@ -115,12 +150,30 @@ export class MobileSessionAcquisitionService {
       // Isolation primarily comes from the dedicated container itself, not the
       // Android user. NO shared-pool fallback on failure — a dedicated workspace
       // must never silently land on a shared device (that breaks isolation).
-      const session = await client.createSession(platform, {
-        deviceSelector: { serial: dedicated.serial },
-        ownerId: workspaceId,
-        userId,
-        dedicated: true,
-      });
+      //
+      // DEVICE_BUSY is the ONE runner code worth retrying here. The runner's
+      // per-serial guard rejects a second session on the workspace's container
+      // *expecting the caller to come back* — but the generic retry loop in
+      // MobileRunnerClient only retries bare 5xx (a coded 409 is excluded), so
+      // nothing ever did. A dedicated workspace can genuinely have two runs
+      // overlap: MOBILE_WORKER_CONCURRENCY defaults to 2, so a plan with two
+      // mobile tests dispatches both at once and the loser used to fail in
+      // seconds. Bounded — this covers a real overlap, NOT a stuck session
+      // (the runner reclaims those itself now).
+      const session = await MobileSessionAcquisitionService.createDedicatedWithRetry(
+        client,
+        platform,
+        { deviceSelector: { serial: dedicated.serial }, ownerId: workspaceId, userId, dedicated: true },
+        (attempt, waitMs) => {
+          emitSessionPhase(
+            `Your dedicated ${platform} device is busy — retrying in ${Math.round(waitMs / 1000)}s…`,
+            12,
+          );
+          logger.info('[MOBILE-TEST] Dedicated device busy — retrying', {
+            testId, workspaceId, serial: dedicated.serial, attempt, waitMs,
+          });
+        },
+      );
       logger.info('[MOBILE-TEST] Dedicated session created', {
         testId,
         sessionId: session.sessionId,

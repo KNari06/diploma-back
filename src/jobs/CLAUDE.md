@@ -111,8 +111,13 @@ runs a **tier-0 dedicated intercept**: `resolveDedicatedDevice(workspaceId, plat
 
 On a hit it pins the session (`createSession({deviceSelector:{serial}, ownerId:workspaceId, dedicated:true})`,
 `sessionSource:'dedicated'`), SKIPS the shared ladder, and on cleanup calls
-`endDedicatedSession` (reset-without-destroy) instead of `destroySession` — the runner
-keeps the container alive. NO shared-pool fallback on failure (preserves isolation).
+`endDedicatedSession` — app-state reset, then the runner RELEASES the session id, with
+no device teardown, so the container stays alive but the serial is free for the next run.
+(Before 2026-08-08 it only reset, leaving an immortal record that made every later run on
+that container fail `DEVICE_BUSY` until the runner restarted.) NO shared-pool fallback on
+failure (preserves isolation) — instead the create retries a bounded 3 times on
+`DEVICE_BUSY` only, since `MOBILE_WORKER_CONCURRENCY` (default 2) lets two runs of one
+dedicated workspace genuinely overlap.
 
 The same intercept runs at the other 3 session-birth sites: editor warmup + auto-boot
 ([../api/mobile/session.controller.ts](../api/mobile/session.controller.ts)).
