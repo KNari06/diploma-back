@@ -110,7 +110,13 @@ runs a **tier-0 dedicated intercept**: `resolveDedicatedDevice(workspaceId, plat
 `workspace_dedicated_device`) returns the workspace's pinned `runner_serial` or null.
 
 On a hit it pins the session (`createSession({deviceSelector:{serial}, ownerId:workspaceId, dedicated:true})`,
-`sessionSource:'dedicated'`), SKIPS the shared ladder, and on cleanup calls
+`sessionSource:'dedicated'`) **on a client built from the row's `runner_url`, not
+the job's default client** — the dispatcher sets `runnerUrl` from
+`resolveRunnerUrlForHost` (the SHARED runner) and never reads the dedicated row,
+while tier-0 binds every later call to `dedicated.runnerUrl`; creating on one host
+and using on another 404s as `SESSION_RECLAIMED` and no dedicated run can complete
+(2026-08-08). A null `runner_url` legitimately means the default runner serves the
+device. It SKIPS the shared ladder, and on cleanup calls
 `endDedicatedSession` — app-state reset, then the runner RELEASES the session id, with
 no device teardown, so the container stays alive but the serial is free for the next run.
 (Before 2026-08-08 it only reset, leaving an immortal record that made every later run on

@@ -160,8 +160,33 @@ export class MobileSessionAcquisitionService {
       // mobile tests dispatches both at once and the loser used to fail in
       // seconds. Bounded — this covers a real overlap, NOT a stuck session
       // (the runner reclaims those itself now).
+      // Create on the workspace's OWN runner, not the job's default client.
+      //
+      // The job builds its client from `resolveRunnerUrlForHost` → the SHARED
+      // runner, because the dispatcher never looks at the dedicated row. But
+      // tier-0 stores a binding to `dedicated.runnerUrl`, and the job swaps to
+      // that binding for every later call (install, attach-flutter, run-steps).
+      // So the session was born on one host and every subsequent request went
+      // to another, which 404s → `SESSION_RECLAIMED: session not found`. A
+      // dedicated regression run could never complete (2026-08-08); DEVICE_BUSY
+      // was failing them earlier than this, which is why it stayed hidden.
+      // The editor already does this correctly (session.controller.ts builds
+      // its client from the resolved row) — this brings the job path in line.
+      // A null `runnerUrl` legitimately means "the default runner serves it",
+      // so fall back to the caller's client rather than inventing a URL.
+      const dedicatedClient = dedicated.runnerUrl
+        ? new MobileRunnerClient({
+            baseUrl: dedicated.runnerUrl,
+            apiKey: dedicated.runnerApiKey ?? '',
+          })
+        : client;
+      if (dedicated.runnerUrl) {
+        logger.info('[MOBILE-TEST] Creating dedicated session on the workspace runner', {
+          testId, workspaceId, runnerUrl: dedicated.runnerUrl, serial: dedicated.serial,
+        });
+      }
       const session = await MobileSessionAcquisitionService.createDedicatedWithRetry(
-        client,
+        dedicatedClient,
         platform,
         { deviceSelector: { serial: dedicated.serial }, ownerId: workspaceId, userId, dedicated: true },
         (attempt, waitMs) => {
