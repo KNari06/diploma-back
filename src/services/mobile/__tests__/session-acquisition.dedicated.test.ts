@@ -25,6 +25,17 @@ jest.mock('../session-runner-routing', () => ({
   storeSessionRunnerBinding: jest.fn().mockResolvedValue(undefined),
   getSessionRunnerBinding: jest.fn().mockResolvedValue(null),
 }));
+// Capture the runner a dedicated session is CREATED on. The whole point of the
+// dedicated path is that this must be the workspace's own runner, not the job's
+// shared-runner default.
+const mockDedicatedCtor = jest.fn();
+const mockDedicatedCreateSession = jest.fn();
+jest.mock('../mobile-runner-client', () => ({
+  MobileRunnerClient: jest.fn().mockImplementation((cfg) => {
+    mockDedicatedCtor(cfg);
+    return { createSession: mockDedicatedCreateSession, claimSession: jest.fn() };
+  }),
+}));
 
 const mockResolve = resolveDedicatedDevice as jest.Mock;
 const mockFlag = DedicatedDeviceFeature.isEnabled as jest.Mock;
@@ -258,5 +269,55 @@ describe('acquireSession — dedicated DEVICE_BUSY retry', () => {
     ).rejects.toMatchObject({ code: 'DEVICE_INIT_FAILED' });
 
     expect(client.createSession).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── The session must be born on the workspace's own runner ──────────────────
+// The job's default client is the SHARED runner (the dispatcher never reads the
+// dedicated row), but tier-0 binds later calls to `dedicated.runnerUrl`. Create
+// on one host + use on another = `SESSION_RECLAIMED: session not found` on the
+// first install/attach call, which is what a dedicated regression run hit live
+// on 2026-08-08 once DEVICE_BUSY stopped masking it.
+
+describe('acquireSession — dedicated create targets the workspace runner', () => {
+  it('creates on the dedicated runner_url rather than the job default client', async () => {
+    mockResolve.mockResolvedValue({
+      serial: '127.0.0.1:5600',
+      runnerUrl: 'https://cell1.qait.dev',
+      runnerApiKey: 'cell-key',
+    });
+    const client = makeClient();
+    mockDedicatedCreateSession.mockResolvedValue({ sessionId: 'sess-ded' });
+
+    const r = await MobileSessionAcquisitionService.acquireSession(baseParams(client));
+
+    expect(r.sessionSource).toBe('dedicated');
+    // A client was built for the workspace's OWN runner, with the row's key...
+    expect(mockDedicatedCtor).toHaveBeenCalledWith(
+      expect.objectContaining({ baseUrl: 'https://cell1.qait.dev', apiKey: 'cell-key' }),
+    );
+    // ...and that is the client the session was created on.
+    expect(mockDedicatedCreateSession).toHaveBeenCalledTimes(1);
+    // The caller's (shared-runner) client must NOT have been used to create.
+    expect(client.createSession).not.toHaveBeenCalled();
+    // ...and the binding stored must be the same runner we created on, or the
+    // job's later calls would go somewhere the session does not exist.
+    expect(mockStoreBinding).toHaveBeenCalledWith(
+      'sess-ded',
+      expect.objectContaining({ runnerUrl: 'https://cell1.qait.dev' }),
+      expect.any(Number),
+    );
+  });
+
+  it('falls back to the caller client when the row carries no runner_url', async () => {
+    mockResolve.mockResolvedValue({ serial: '127.0.0.1:5600', runnerUrl: null });
+    const client = makeClient();
+    client.createSession.mockResolvedValue({ sessionId: 'sess-ded' });
+
+    await MobileSessionAcquisitionService.acquireSession(baseParams(client));
+
+    // A null runner_url means "the default runner serves this device".
+    expect(client.createSession).toHaveBeenCalledTimes(1);
+    expect(mockDedicatedCtor).not.toHaveBeenCalled();
   });
 });
