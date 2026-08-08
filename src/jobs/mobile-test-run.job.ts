@@ -1579,12 +1579,24 @@ export class MobileTestRunJobHandler {
             logger.debug('[MOBILE-TEST] Session destroyed', { testId, sessionId, sessionSource });
           }
         } catch (err) {
-          logger.warn('[MOBILE-TEST] Session cleanup failed (runner TTL will handle)', {
-            testId,
-            sessionId,
-            sessionSource,
-            error: err instanceof Error ? err.message : String(err),
-          });
+          // "The runner TTL will handle it" is true for pool/cold/warmup
+          // sessions and FALSE for dedicated ones: a dedicated session is
+          // excluded from both TTL cleanup and capacity eviction, so a failed
+          // end here leaves the workspace's container pinned until the runner's
+          // own abandoned-session reclaim (idle > session TTL) frees it. Say
+          // which one actually applies, or the next reader trusts a log line
+          // that isn't true for the case they're debugging.
+          logger.warn(
+            sessionSource === 'dedicated'
+              ? '[MOBILE-TEST] Dedicated session end failed — serial stays pinned until the runner reclaims it as abandoned'
+              : '[MOBILE-TEST] Session cleanup failed (runner TTL will handle)',
+            {
+              testId,
+              sessionId,
+              sessionSource,
+              error: err instanceof Error ? err.message : String(err),
+            },
+          );
         }
       }
 

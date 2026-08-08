@@ -4,6 +4,7 @@ import { DedicatedDeviceFeature } from '@/config/features/dedicated-device';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { logger } from '@/utils/core/logger';
 import { storeSessionRunnerBinding, getSessionRunnerBinding } from '../session-runner-routing';
+import { MobileRunnerError } from '../mobile-runner.types';
 
 jest.mock('../dedicated-device.service', () => ({
   resolveDedicatedDevice: jest.fn(),
@@ -195,5 +196,67 @@ describe('acquireSession — dedicated observability (Phase 7 log-only)', () => 
       String(msg).includes('Dedicated feature on but no device resolved'),
     );
     expect(warned).toBe(false);
+  });
+});
+
+// ─── DEVICE_BUSY retry ────────────────────────────────────────────────────────
+// The runner's per-serial guard rejects a second session on a workspace's
+// container expecting the caller to come back; the client's generic retry loop
+// skips coded 409s, so this is the only place that retry can live. A dedicated
+// workspace really can overlap two runs — MOBILE_WORKER_CONCURRENCY defaults
+// to 2, so a plan with two mobile tests dispatches both at once.
+
+describe('acquireSession — dedicated DEVICE_BUSY retry', () => {
+  const busy = () => new MobileRunnerError('Dedicated device is busy', 409, 'DEVICE_BUSY');
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    mockResolve.mockResolvedValue({ serial: '10.0.0.5:5606', runnerUrl: null });
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('retries a busy dedicated device and uses the session it eventually gets', async () => {
+    const client = makeClient();
+    client.createSession
+      .mockRejectedValueOnce(busy())
+      .mockResolvedValueOnce({ sessionId: 'sess-ded' });
+
+    const promise = MobileSessionAcquisitionService.acquireSession(baseParams(client));
+    await jest.advanceTimersByTimeAsync(10_000);
+    const r = await promise;
+
+    expect(r.sessionId).toBe('sess-ded');
+    expect(r.sessionSource).toBe('dedicated');
+    expect(client.createSession).toHaveBeenCalledTimes(2);
+    // Never silently downgraded to the shared pool — that would break the
+    // isolation the dedicated container exists to provide.
+    expect(client.claimSession).not.toHaveBeenCalled();
+  });
+
+  it('gives up after the retry budget and surfaces DEVICE_BUSY', async () => {
+    const client = makeClient();
+    client.createSession.mockRejectedValue(busy());
+
+    const promise = MobileSessionAcquisitionService.acquireSession(baseParams(client));
+    const assertion = expect(promise).rejects.toMatchObject({ code: 'DEVICE_BUSY' });
+    await jest.advanceTimersByTimeAsync(60_000);
+    await assertion;
+
+    expect(client.createSession).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not retry a non-transient device failure', async () => {
+    const client = makeClient();
+    client.createSession.mockRejectedValue(
+      new MobileRunnerError('Device never came up', 503, 'DEVICE_INIT_FAILED'),
+    );
+
+    await expect(
+      MobileSessionAcquisitionService.acquireSession(baseParams(client)),
+    ).rejects.toMatchObject({ code: 'DEVICE_INIT_FAILED' });
+
+    expect(client.createSession).toHaveBeenCalledTimes(1);
   });
 });
