@@ -1,13 +1,17 @@
 import { MobileSessionAcquisitionService } from '../session-acquisition.service';
-import { resolveDedicatedDevice } from '../dedicated-device.service';
+import { resolveDedicatedDevices } from '../dedicated-device.service';
 import { DedicatedDeviceFeature } from '@/config/features/dedicated-device';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { logger } from '@/utils/core/logger';
 import { storeSessionRunnerBinding, getSessionRunnerBinding } from '../session-runner-routing';
 import { MobileRunnerError } from '../mobile-runner.types';
 
+// Only the RESOLVER is stubbed. `createOnFirstFreeDedicatedDevice` stays real
+// on purpose: the busy/retry cases below are exactly its behaviour, and a
+// stubbed walk would assert nothing.
 jest.mock('../dedicated-device.service', () => ({
-  resolveDedicatedDevice: jest.fn(),
+  ...jest.requireActual('../dedicated-device.service'),
+  resolveDedicatedDevices: jest.fn(),
 }));
 jest.mock('@/config/features/dedicated-device', () => ({
   DedicatedDeviceFeature: { isEnabled: jest.fn() },
@@ -37,7 +41,7 @@ jest.mock('../mobile-runner-client', () => ({
   }),
 }));
 
-const mockResolve = resolveDedicatedDevice as jest.Mock;
+const mockResolve = resolveDedicatedDevices as jest.Mock;
 const mockFlag = DedicatedDeviceFeature.isEnabled as jest.Mock;
 const mockWarmed = claimWarmedSession as jest.Mock;
 const mockWarn = logger.warn as jest.Mock;
@@ -68,7 +72,7 @@ beforeEach(() => {
 
 describe('acquireSession — dedicated intercept', () => {
   it('pins to the dedicated device and skips pool/warmup/cold', async () => {
-    mockResolve.mockResolvedValue({ serial: '10.0.0.5:5606', runnerUrl: null });
+    mockResolve.mockResolvedValue([{ serial: '10.0.0.5:5606', runnerUrl: null, runnerApiKey: null }]);
     const client = makeClient();
     client.createSession.mockResolvedValue({ sessionId: 'sess-ded' });
 
@@ -88,7 +92,7 @@ describe('acquireSession — dedicated intercept', () => {
     // Binding stored so getMobileRunnerClientForSession resolves the dedicated runner.
     expect(mockStoreBinding).toHaveBeenCalledWith(
       'sess-ded',
-      { runnerUrl: null, runnerApiKey: undefined },
+      { runnerUrl: null, runnerApiKey: null },
       900,
     );
     // The shared ladder is never touched.
@@ -97,7 +101,7 @@ describe('acquireSession — dedicated intercept', () => {
   });
 
   it('does NOT fall back to the shared pool when the dedicated create fails', async () => {
-    mockResolve.mockResolvedValue({ serial: '10.0.0.5:5606', runnerUrl: null });
+    mockResolve.mockResolvedValue([{ serial: '10.0.0.5:5606', runnerUrl: null, runnerApiKey: null }]);
     const client = makeClient();
     client.createSession.mockRejectedValue(new Error('dedicated container down'));
 
@@ -110,7 +114,7 @@ describe('acquireSession — dedicated intercept', () => {
   });
 
   it('falls through to the normal ladder when there is no dedicated device', async () => {
-    mockResolve.mockResolvedValue(null);
+    mockResolve.mockResolvedValue([]);
     const client = makeClient();
     client.claimSession.mockResolvedValue({ sessionId: 'sess-pool' });
 
@@ -169,7 +173,7 @@ describe('acquireSession — warmup runner-binding refresh', () => {
 describe('acquireSession — dedicated observability (Phase 7 log-only)', () => {
   it('warns when the feature is ON but no device resolves (silent routing breakage)', async () => {
     mockFlag.mockReturnValue(true);
-    mockResolve.mockResolvedValue(null);
+    mockResolve.mockResolvedValue([]);
     const client = makeClient();
     client.claimSession.mockResolvedValue({ sessionId: 'sess-pool' });
 
@@ -183,7 +187,7 @@ describe('acquireSession — dedicated observability (Phase 7 log-only)', () => 
 
   it('does NOT warn when the feature is OFF (default deploy — fall-through is expected)', async () => {
     mockFlag.mockReturnValue(false);
-    mockResolve.mockResolvedValue(null);
+    mockResolve.mockResolvedValue([]);
     const client = makeClient();
     client.claimSession.mockResolvedValue({ sessionId: 'sess-pool' });
 
@@ -197,7 +201,7 @@ describe('acquireSession — dedicated observability (Phase 7 log-only)', () => 
 
   it('does NOT warn for ios (expected fall-through — no dedicated iOS in v1)', async () => {
     mockFlag.mockReturnValue(true);
-    mockResolve.mockResolvedValue(null);
+    mockResolve.mockResolvedValue([]);
     const client = makeClient();
     client.claimSession.mockResolvedValue({ sessionId: 'sess-pool' });
 
@@ -222,7 +226,7 @@ describe('acquireSession — dedicated DEVICE_BUSY retry', () => {
 
   beforeEach(() => {
     jest.useFakeTimers();
-    mockResolve.mockResolvedValue({ serial: '10.0.0.5:5606', runnerUrl: null });
+    mockResolve.mockResolvedValue([{ serial: '10.0.0.5:5606', runnerUrl: null, runnerApiKey: null }]);
   });
   afterEach(() => {
     jest.useRealTimers();
@@ -281,11 +285,11 @@ describe('acquireSession — dedicated DEVICE_BUSY retry', () => {
 
 describe('acquireSession — dedicated create targets the workspace runner', () => {
   it('creates on the dedicated runner_url rather than the job default client', async () => {
-    mockResolve.mockResolvedValue({
+    mockResolve.mockResolvedValue([{
       serial: '127.0.0.1:5600',
       runnerUrl: 'https://cell1.qait.dev',
       runnerApiKey: 'cell-key',
-    });
+      }]);
     const client = makeClient();
     mockDedicatedCreateSession.mockResolvedValue({ sessionId: 'sess-ded' });
 
@@ -310,7 +314,7 @@ describe('acquireSession — dedicated create targets the workspace runner', () 
   });
 
   it('falls back to the caller client when the row carries no runner_url', async () => {
-    mockResolve.mockResolvedValue({ serial: '127.0.0.1:5600', runnerUrl: null });
+    mockResolve.mockResolvedValue([{ serial: '127.0.0.1:5600', runnerUrl: null, runnerApiKey: null }]);
     const client = makeClient();
     client.createSession.mockResolvedValue({ sessionId: 'sess-ded' });
 

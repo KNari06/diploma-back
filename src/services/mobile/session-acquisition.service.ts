@@ -3,7 +3,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileRunnerClient } from './mobile-runner-client';
 import { MobileRunnerError, type MobilePlatform } from './mobile-runner.types';
-import { resolveDedicatedDevice } from './dedicated-device.service';
+import { resolveDedicatedDevices, createOnFirstFreeDedicatedDevice } from './dedicated-device.service';
 import { storeSessionRunnerBinding, getSessionRunnerBinding } from './session-runner-routing';
 import { DedicatedDeviceFeature } from '@/config/features/dedicated-device';
 import { env } from '@/config/environment/env';
@@ -36,24 +36,6 @@ export class MobileSessionAcquisitionService {
    * delays the user-visible error, the same reasoning the client's own retry
    * loop applies to typed device errors.
    */
-  private static async createDedicatedWithRetry(
-    client: MobileRunnerClient,
-    platform: MobilePlatform,
-    config: Parameters<MobileRunnerClient['createSession']>[1],
-    onRetry: (attempt: number, waitMs: number) => void,
-  ): Promise<{ sessionId: string }> {
-    for (let attempt = 0; ; attempt++) {
-      try {
-        return await client.createSession(platform, config);
-      } catch (err) {
-        const isBusy = err instanceof MobileRunnerError && err.code === 'DEVICE_BUSY';
-        if (!isBusy || attempt >= DEDICATED_BUSY_RETRIES) throw err;
-        const waitMs = DEDICATED_BUSY_BACKOFF_MS[attempt] ?? 20_000;
-        onRetry(attempt + 1, waitMs);
-        await new Promise((r) => setTimeout(r, waitMs));
-      }
-    }
-  }
 
   /**
    * Attempt to acquire a mobile runner session via pool → warmup → cold-start.
@@ -142,8 +124,8 @@ export class MobileSessionAcquisitionService {
     // warmed session being claimed for a dedicated workspace. Resolver is a
     // no-op (null) unless the feature flag is on AND a row exists, so this
     // block is inert in the default deploy.
-    const dedicated = await resolveDedicatedDevice(workspaceId, platform);
-    if (dedicated) {
+    const dedicatedDevices = await resolveDedicatedDevices(workspaceId, platform);
+    if (dedicatedDevices.length > 0) {
       emitSessionPhase(`Starting your dedicated ${platform} emulator…`, 12);
       // ownerId=workspaceId gives per-workspace Android multi-user isolation
       // on the runner IF it has multi-user enabled; harmless no-op otherwise.
@@ -174,29 +156,40 @@ export class MobileSessionAcquisitionService {
       // its client from the resolved row) — this brings the job path in line.
       // A null `runnerUrl` legitimately means "the default runner serves it",
       // so fall back to the caller's client rather than inventing a URL.
-      const dedicatedClient = dedicated.runnerUrl
-        ? new MobileRunnerClient({
-            baseUrl: dedicated.runnerUrl,
-            apiKey: dedicated.runnerApiKey ?? '',
-          })
-        : client;
-      if (dedicated.runnerUrl) {
-        logger.info('[MOBILE-TEST] Creating dedicated session on the workspace runner', {
-          testId, workspaceId, runnerUrl: dedicated.runnerUrl, serial: dedicated.serial,
-        });
-      }
-      const session = await MobileSessionAcquisitionService.createDedicatedWithRetry(
-        dedicatedClient,
-        platform,
-        { deviceSelector: { serial: dedicated.serial }, ownerId: workspaceId, userId, dedicated: true },
-        (attempt, waitMs) => {
-          emitSessionPhase(
-            `Your dedicated ${platform} device is busy — retrying in ${Math.round(waitMs / 1000)}s…`,
-            12,
-          );
-          logger.info('[MOBILE-TEST] Dedicated device busy — retrying', {
-            testId, workspaceId, serial: dedicated.serial, attempt, waitMs,
+      // A workspace may pin SEVERAL devices so a regression can run while the
+      // editor holds one. Every device is tried before any waiting — sleeping
+      // on a busy device while a free one sits beside it is exactly the stall
+      // this is here to remove. Only when all of them are busy does the
+      // backoff kick in, with the same schedule as before.
+      const { result: session, device: dedicated } = await createOnFirstFreeDedicatedDevice(
+        dedicatedDevices,
+        (d) => {
+          const dedicatedClient = d.runnerUrl
+            ? new MobileRunnerClient({ baseUrl: d.runnerUrl, apiKey: d.runnerApiKey ?? '' })
+            : client;
+          if (d.runnerUrl) {
+            logger.info('[MOBILE-TEST] Creating dedicated session on the workspace runner', {
+              testId, workspaceId, runnerUrl: d.runnerUrl, serial: d.serial,
+            });
+          }
+          return dedicatedClient.createSession(platform, {
+            deviceSelector: { serial: d.serial },
+            ownerId: workspaceId,
+            userId,
+            dedicated: true,
           });
+        },
+        {
+          backoffMs: DEDICATED_BUSY_BACKOFF_MS.slice(0, DEDICATED_BUSY_RETRIES),
+          onRetry: (round, waitMs) => {
+            emitSessionPhase(
+              `Your dedicated ${platform} devices are busy — retrying in ${Math.round(waitMs / 1000)}s…`,
+              12,
+            );
+            logger.info('[MOBILE-TEST] All dedicated devices busy — retrying', {
+              testId, workspaceId, devices: dedicatedDevices.length, round, waitMs,
+            });
+          },
         },
       );
       logger.info('[MOBILE-TEST] Dedicated session created', {

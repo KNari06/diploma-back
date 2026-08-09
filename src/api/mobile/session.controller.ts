@@ -23,7 +23,7 @@ import {
   clearSessionRunnerBinding,
   runnerUrlToSocketUrl,
 } from '@/services/mobile/session-runner-routing';
-import { resolveDedicatedDevice } from '@/services/mobile/dedicated-device.service';
+import { resolveDedicatedDevices } from '@/services/mobile/dedicated-device.service';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { normalizeMobileBriefing } from '@/services/mobile/mobile-briefing.util';
@@ -501,7 +501,13 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   // exists. workspaceId is derived from the access-checked project above — never
   // from the request body (tenancy invariant).
   const dedicatedWorkspaceId: string | undefined = accessibleProject.workspace_id ?? undefined;
-  const dedicated = await resolveDedicatedDevice(dedicatedWorkspaceId, sessionCreatePlatform);
+  // A workspace may pin several devices. The editor takes the FIRST — it fixes
+  // `deviceSelector` here, long before the session is created, so it cannot walk
+  // the list on DEVICE_BUSY the way the regression job does. Known gap: if a job
+  // is holding device 1, opening the editor still reports it busy instead of
+  // moving to device 2. Fixing that means restructuring warmup so creation and
+  // device choice sit together.
+  const dedicated = (await resolveDedicatedDevices(dedicatedWorkspaceId, sessionCreatePlatform))[0] ?? null;
   if (dedicated) {
     deviceSelector = { serial: dedicated.serial };
     logger.info('[MOBILE_SESSION] warmup pinned to dedicated device', {
@@ -2243,7 +2249,9 @@ export async function autoBootAndInstall(
     // the HOST (iOS is shared-only → returns null, so an iOS-host Flutter run
     // never pins an android dedicated device).
     const autoBootWorkspaceId: string | undefined = project.workspace_id ?? undefined;
-    const autoBootDedicated = await resolveDedicatedDevice(autoBootWorkspaceId, sessionCreatePlatform);
+    // First pinned device — same constraint as the warmup path above: the client
+    // is built before creation, so there is no point to retry from.
+    const autoBootDedicated = (await resolveDedicatedDevices(autoBootWorkspaceId, sessionCreatePlatform))[0] ?? null;
     const autoBootRunnerUrl = autoBootDedicated?.runnerUrl ?? null;
     const autoBootRunnerApiKey = autoBootDedicated?.runnerApiKey ?? null;
     // Route Flutter-on-iOS to MOBILE_RUNNER_IOS_URL when configured; locally
