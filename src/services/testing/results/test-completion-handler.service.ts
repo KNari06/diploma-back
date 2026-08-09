@@ -20,8 +20,7 @@ import { env } from '@/config/environment/env';
 import { AutomationActionService } from '@/services/automation/automation-action.service';
 import { getProjectWorkspaceMemberIds } from '@/services/testing/regression/regression-report-assembler.service';
 import * as crypto from 'crypto';
-
-const STALE_RUN_THRESHOLD_MS = 30 * 60 * 1000;
+import { STALE_RUN_THRESHOLD_MIN, STALE_RUN_THRESHOLD_MS } from '@/config/testing/run-staleness';
 
 /**
  * Pure predicate: has `iso` aged past `thresholdMs` relative to `nowMs`?
@@ -61,6 +60,50 @@ export function isPendingSegmentsStale(
   nowMs: number,
 ): boolean {
   return isTimestampStale(run.last_segment_dispatched_at ?? run.started_at, nowMs, STALE_RUN_THRESHOLD_MS);
+}
+
+/**
+ * Has a run made NO forward progress for `thresholdMs`?
+ *
+ * Generalises `isPendingSegmentsStale` to the ordinary multi-test run. The
+ * clock is the NEWEST of every progress signal the run has produced:
+ *   - `started_at` — the run was dispatched,
+ *   - `last_segment_dispatched_at` — a link_test_case segment was dispatched,
+ *   - each child's `started_at` — that test was handed to a worker
+ *     (`ExecutionService.updateStatus` stamps it on the flip to 'running',
+ *     which every dispatched web/mobile/API execution goes through),
+ *   - each child's `completed_at` — that test reached a terminal status.
+ *
+ * Anchoring on `run.started_at` alone (what this replaced) meant a suite that
+ * legitimately runs longer than the threshold force-failed its own still-live
+ * children on every completion event past the cutoff — reporting passing tests
+ * as timed out and losing the run's real result. A run only looks stale here
+ * once it stops producing signals altogether, at which point the newest one is
+ * frozen and the window elapses for real.
+ *
+ * Pure + exported so it's directly unit-testable without mocking Supabase
+ * (this file has no `db/` sublayer yet to mock against instead, per
+ * testing.md's mock-boundary rule).
+ */
+export function isRunProgressStale(
+  run: { started_at?: string | null; last_segment_dispatched_at?: string | null },
+  rows: Array<{ started_at?: string | null; completed_at?: string | null }>,
+  nowMs: number,
+  thresholdMs: number = STALE_RUN_THRESHOLD_MS,
+): boolean {
+  // Nulls are absent signals, not old ones — a 'pending' child has no
+  // started_at, a 'running' one no completed_at. Drop them rather than letting
+  // them count either way.
+  const signals = [
+    run.started_at,
+    run.last_segment_dispatched_at,
+    ...rows.flatMap((r) => [r.started_at, r.completed_at]),
+  ].filter((iso): iso is string => iso != null);
+
+  // Stale only when EVERY signal is stale; one recent signal keeps the whole
+  // run alive. No signals at all → not stale (same fail-safe as
+  // `isTimestampStale`: don't judge what we can't see).
+  return signals.length > 0 && signals.every((iso) => isTimestampStale(iso, nowMs, thresholdMs));
 }
 
 /**
@@ -1031,7 +1074,7 @@ export class TestCompletionHandlerService {
           // (race condition: BullMQ job can finish before result.testId is persisted)
           const { data: freshExecs } = await supabaseAdmin
             .from('test_executions')
-            .select('id, status')
+            .select('id, status, started_at, completed_at')
             .eq('run_id', run.id);
 
           const stillStuck = (freshExecs || []).filter(
@@ -1042,18 +1085,22 @@ export class TestCompletionHandlerService {
             // All executions resolved between first query and re-check
             statuses = (freshExecs || []).map((e: any) => e.status);
           } else {
-            // Check if stuck executions are older than 30 minutes — force-fail them
-            const isStale = isTimestampStale(run.started_at, Date.now(), STALE_RUN_THRESHOLD_MS);
+            // Force-fail only once the run has stopped progressing entirely —
+            // NOT merely because it started long ago. A sibling that started or
+            // finished recently means these rows are queued/executing behind it,
+            // not dead.
+            const isStale = isRunProgressStale(run, freshExecs ?? [], Date.now());
 
             if (isStale) {
               logger.warn('[TEST_COMPLETION] Force-failing stuck executions for stale run', {
                 runId: run.id,
                 stuckCount: stillStuck.length,
+                thresholdMin: STALE_RUN_THRESHOLD_MIN,
               });
               const stuckIds = stillStuck.map((e: any) => e.id);
               const { error: forceFailError } = await forceFailStuckExecutions(
                 stuckIds,
-                'Execution timed out (stuck for >30 minutes)',
+                `Execution timed out (no run progress for ${STALE_RUN_THRESHOLD_MIN} minutes)`,
               );
 
               if (forceFailError) {
@@ -1367,7 +1414,7 @@ export class TestCompletionHandlerService {
       // Get all underlying test statuses
       const { data: tests, error: testsError } = await supabaseAdmin
         .from('tests')
-        .select('id, status')
+        .select('id, status, started_at, completed_at')
         .in('id', underlyingTestIds);
 
       if (testsError || !tests) {
@@ -1393,8 +1440,10 @@ export class TestCompletionHandlerService {
       const hasRunning = statuses.some(s => s === 'running' || s === 'pending');
 
       if (hasRunning) {
-        // Check if run is stale (>30 min) — force-fail stuck tests
-        const isStale = isTimestampStale(run.started_at, Date.now(), STALE_RUN_THRESHOLD_MS);
+        // Force-fail only once nothing in the run has progressed for the
+        // threshold — same progress clock as the unified path above, NOT the
+        // run's age.
+        const isStale = isRunProgressStale(run, tests, Date.now());
 
         if (!isStale) {
           logger.debug('[TEST_COMPLETION] Run still has running tests', {

@@ -18,12 +18,14 @@ import type { StaleRunRow } from '@/services/testing/results/db/test-completion.
 jest.mock('@/services/testing/results/db/test-completion.db', () => ({
   findStaleRuns: jest.fn(),
   findRunIdsWithStaleExecutions: jest.fn(),
+  findExecutionActivityByRunIds: jest.fn(),
   getRunsByIds: jest.fn(),
 }));
 
 import {
   findStaleRuns,
   findRunIdsWithStaleExecutions,
+  findExecutionActivityByRunIds,
   getRunsByIds,
 } from '@/services/testing/results/db/test-completion.db';
 import { TestCompletionHandlerService } from '@/services/testing/results/test-completion-handler.service';
@@ -34,6 +36,9 @@ const mockFindExecRunIds = findRunIdsWithStaleExecutions as jest.MockedFunction<
   typeof findRunIdsWithStaleExecutions
 >;
 const mockGetRunsByIds = getRunsByIds as jest.MockedFunction<typeof getRunsByIds>;
+const mockFindActivity = findExecutionActivityByRunIds as jest.MockedFunction<
+  typeof findExecutionActivityByRunIds
+>;
 
 const makeRun = (id: string): StaleRunRow => ({
   id,
@@ -61,6 +66,9 @@ describe('StaleReaperService.reapStaleRuns', () => {
     mockFindStaleRuns.mockResolvedValue([]);
     mockFindExecRunIds.mockResolvedValue([]);
     mockGetRunsByIds.mockResolvedValue([]);
+    // No child activity by default — `makeRun`'s ancient started_at is then the
+    // only progress signal, so the run reads as stalled.
+    mockFindActivity.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -68,6 +76,7 @@ describe('StaleReaperService.reapStaleRuns', () => {
     mockFindStaleRuns.mockReset();
     mockFindExecRunIds.mockReset();
     mockGetRunsByIds.mockReset();
+    mockFindActivity.mockReset();
   });
 
   it('does nothing and reports zero when there are no stale runs', async () => {
@@ -157,5 +166,46 @@ describe('StaleReaperService.reapStaleRuns', () => {
 
     expect(result).toEqual({ scanned: 0 });
     expect(recomputeSpy).not.toHaveBeenCalled();
+  });
+
+  // Regression: the candidate queries select on an OLD timestamp, which says
+  // nothing about whether the run is still moving. A long-but-healthy suite used
+  // to be recomputed AND logged as `run.vanished` on every sweep.
+  it('skips a candidate whose executions are still progressing', async () => {
+    mockFindStaleRuns.mockResolvedValue([makeRun('busy')]);
+    mockFindActivity.mockResolvedValue([
+      { run_id: 'busy', started_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(), completed_at: new Date(Date.now() - 60 * 1000).toISOString() },
+      { run_id: 'busy', started_at: new Date(Date.now() - 30 * 1000).toISOString(), completed_at: null },
+    ]);
+
+    const result = await StaleReaperService.reapStaleRuns();
+
+    expect(result).toEqual({ scanned: 0 });
+    expect(recomputeSpy).not.toHaveBeenCalled();
+  });
+
+  it('still reaps a candidate whose executions all went quiet', async () => {
+    mockFindStaleRuns.mockResolvedValue([makeRun('dead'), makeRun('busy')]);
+    mockFindActivity.mockResolvedValue([
+      { run_id: 'dead', started_at: '2026-05-26T09:40:00.000Z', completed_at: '2026-05-26T09:45:00.000Z' },
+      { run_id: 'busy', started_at: new Date(Date.now() - 60 * 1000).toISOString(), completed_at: null },
+    ]);
+
+    const result = await StaleReaperService.reapStaleRuns();
+
+    expect(result).toEqual({ scanned: 1 });
+    expect(recomputeSpy).toHaveBeenCalledTimes(1);
+    expect(recomputeSpy.mock.calls[0][0]).toMatchObject({ id: 'dead' });
+  });
+
+  // Fail-open: a broken activity query must not silently disable the backstop.
+  it('reaps unfiltered when the activity read throws', async () => {
+    mockFindStaleRuns.mockResolvedValue([makeRun('r1'), makeRun('r2')]);
+    mockFindActivity.mockRejectedValue(new Error('activity query broken'));
+
+    const result = await StaleReaperService.reapStaleRuns();
+
+    expect(result).toEqual({ scanned: 2 });
+    expect(recomputeSpy).toHaveBeenCalledTimes(2);
   });
 });

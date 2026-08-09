@@ -170,6 +170,23 @@ exactly one of `cronExpression` or `runAt`
 [../api/schedules/schedules.controller.ts](../api/schedules/schedules.controller.ts),
 `qa_manage_schedule`).
 
+### Stale-run reaper (5 min)
+
+`StaleRunReaperJob` ([stale-run-reaper.job.ts](stale-run-reaper.job.ts) → `StaleReaperService`)
+finalizes runs / tests / explorations stranded in `running`/`pending` when no completion event
+ever arrived (worker crash, job never picked up, Redis flush). It is the ONLY backstop — the
+API used to run its own `cleanupZombieRuns` interval on every replica; that was deleted
+([ADR-0027](../../../.claude/decisions/20260809-run-staleness-is-measured-by-progress.md)).
+
+**Staleness is measured by PROGRESS, never by run age.** `isRunProgressStale` (exported from
+[../services/testing/results/test-completion-handler.service.ts](../services/testing/results/test-completion-handler.service.ts))
+takes the newest of the run's `started_at`, `last_segment_dispatched_at`, and every child
+execution's `started_at`/`completed_at`; a run is dead only when all of them are past the
+threshold. Anchoring on `regression_runs.started_at` alone force-failed the still-live children
+of any suite that legitimately ran longer than the window. Threshold:
+`STALE_RUN_THRESHOLD_MIN` (default 30) in [../config/testing/run-staleness.ts](../config/testing/run-staleness.ts) —
+one constant shared by the sweep and by `recomputeRunStatus`'s own guard, so they cannot drift.
+
 ### 24h sweeps
 
 Also in the scheduler bundle (single-instance — guarded by the leader lock when hosted

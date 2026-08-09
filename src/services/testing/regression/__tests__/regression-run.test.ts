@@ -1,5 +1,5 @@
 /**
- * Tests for RegressionRunService — run creation / routing / cleanup. Untestable
+ * Tests for RegressionRunService — run creation and routing. Untestable
  * until its regression_runs + test-case-resolution queries moved behind the
  * `db/` sublayer. DB is stubbed at the `db/` boundary; collaborators (executors,
  * dispatchers, credits, orchestrator) are stubbed. No Supabase mocked directly.
@@ -10,14 +10,8 @@
 jest.mock('@/services/testing/regression/db/regression-run.db', () => ({
   insertRun: jest.fn(),
   updateRunById: jest.fn(),
-  findZombieRunCandidates: jest.fn(),
-  forceFailRunsByIds: jest.fn(),
   listRunsByProject: jest.fn(),
   getRunExecutionStatsRows: jest.fn(),
-}));
-
-jest.mock('@/services/testing/results/test-completion-handler.service', () => ({
-  isPendingSegmentsStale: jest.fn(),
 }));
 
 jest.mock('@/services/testing/regression/db/regression-test-query.db', () => ({
@@ -97,8 +91,6 @@ jest.mock('@/services/testing/regression/test-execution-orchestrator.service', (
 import {
   insertRun,
   updateRunById,
-  findZombieRunCandidates,
-  forceFailRunsByIds,
 } from '@/services/testing/regression/db/regression-run.db';
 import { RegressionTestQueryService } from '@/services/testing/regression/db/regression-test-query.db';
 import { getProjectForAccess } from '@/services/testing/regression/db/regression.db';
@@ -109,14 +101,10 @@ import { MobileTestDispatcherService } from '@/services/testing/regression/mobil
 import { WebTestRequestBuilderService } from '@/services/testing/regression/web-test-request-builder.service';
 import { TestExecutionOrchestratorService } from '@/services/testing/regression/test-execution-orchestrator.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
-import { isPendingSegmentsStale } from '@/services/testing/results/test-completion-handler.service';
 import { ValidationError, NotFoundError, InsufficientCreditsError } from '@/types';
 
 const mockInsertRun = insertRun as jest.MockedFunction<typeof insertRun>;
 const mockUpdateRun = updateRunById as jest.MockedFunction<typeof updateRunById>;
-const mockFindZombieCandidates = findZombieRunCandidates as jest.MockedFunction<typeof findZombieRunCandidates>;
-const mockForceFailRuns = forceFailRunsByIds as jest.MockedFunction<typeof forceFailRunsByIds>;
-const mockIsPendingSegmentsStale = isPendingSegmentsStale as jest.MockedFunction<typeof isPendingSegmentsStale>;
 const mockGetSavedCase = RegressionTestQueryService.getSavedTestCase as jest.MockedFunction<any>;
 const mockGetStepRows = RegressionTestQueryService.getUiStepCountRows as jest.MockedFunction<any>;
 const mockGetByPriority = RegressionTestQueryService.getUiTestCasesByPriority as jest.MockedFunction<any>;
@@ -130,61 +118,6 @@ const mockBuildWebReq = WebTestRequestBuilderService.buildTestRequest as jest.Mo
 const mockExecuteAsync = TestExecutionOrchestratorService.executeTestCasesAsync as jest.MockedFunction<any>;
 
 const USER = 'user-1';
-
-describe('RegressionRunService.cleanupZombieRuns', () => {
-  beforeEach(() => {
-    mockFindZombieCandidates.mockResolvedValue({ candidates: [], error: null });
-    mockForceFailRuns.mockResolvedValue({ ids: [], error: null });
-    mockIsPendingSegmentsStale.mockReturnValue(false);
-  });
-  afterEach(() => jest.clearAllMocks());
-
-  it('force-fails a non-segmented stale run without consulting the per-segment check', async () => {
-    mockFindZombieCandidates.mockResolvedValue({
-      candidates: [{ id: 'z1', started_at: '2020-01-01T00:00:00.000Z', pending_segments: null, last_segment_dispatched_at: null }],
-      error: null,
-    });
-    mockForceFailRuns.mockResolvedValue({ ids: ['z1'], error: null });
-
-    await expect(RegressionRunService.cleanupZombieRuns()).resolves.toBeUndefined();
-
-    expect(mockIsPendingSegmentsStale).not.toHaveBeenCalled();
-    expect(mockForceFailRuns).toHaveBeenCalledWith(['z1']);
-  });
-
-  // Regression: this sweep used to force-fail ANY run whose chain-wide
-  // started_at was old, with zero awareness of a segmented link_test_case
-  // chain still legitimately executing (ADR-0011 update 6) — it bypassed
-  // recomputeRunStatus's own per-segment staleness check entirely.
-  it('does not force-fail a segmented chain the per-segment check says is not stale', async () => {
-    mockFindZombieCandidates.mockResolvedValue({
-      candidates: [{ id: 'segmented-1', started_at: '2020-01-01T00:00:00.000Z', pending_segments: 2, last_segment_dispatched_at: '2026-07-08T00:00:00.000Z' }],
-      error: null,
-    });
-    mockIsPendingSegmentsStale.mockReturnValue(false);
-
-    await RegressionRunService.cleanupZombieRuns();
-
-    expect(mockIsPendingSegmentsStale).toHaveBeenCalledWith(
-      { started_at: '2020-01-01T00:00:00.000Z', last_segment_dispatched_at: '2026-07-08T00:00:00.000Z' },
-      expect.any(Number),
-    );
-    expect(mockForceFailRuns).toHaveBeenCalledWith([]);
-  });
-
-  it('does force-fail a segmented chain the per-segment check confirms is genuinely stale', async () => {
-    mockFindZombieCandidates.mockResolvedValue({
-      candidates: [{ id: 'segmented-dead', started_at: '2020-01-01T00:00:00.000Z', pending_segments: 1, last_segment_dispatched_at: '2020-01-01T00:10:00.000Z' }],
-      error: null,
-    });
-    mockIsPendingSegmentsStale.mockReturnValue(true);
-    mockForceFailRuns.mockResolvedValue({ ids: ['segmented-dead'], error: null });
-
-    await RegressionRunService.cleanupZombieRuns();
-
-    expect(mockForceFailRuns).toHaveBeenCalledWith(['segmented-dead']);
-  });
-});
 
 describe('RegressionRunService.runSavedTestCase', () => {
   beforeEach(() => {

@@ -114,6 +114,40 @@ export async function getRunsByIds(ids: string[]): Promise<StaleRunRow[]> {
   return (data ?? []) as StaleRunRow[];
 }
 
+/** Per-execution progress timestamps, keyed back to the run they belong to. */
+export interface ExecutionActivityRow {
+  run_id: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+/**
+ * Every child execution's progress timestamps for the given runs, in one
+ * batched read (`run_id` is indexed). Feeds the reaper's progress check so a
+ * run that is merely OLD — but whose children are still starting and
+ * finishing — is left alone instead of being reported vanished.
+ *
+ * Throws on DB/network error; the caller treats that as "can't tell" and
+ * proceeds unfiltered rather than skipping the sweep (a broken query must not
+ * silently disable the backstop).
+ */
+export async function findExecutionActivityByRunIds(
+  runIds: string[],
+): Promise<ExecutionActivityRow[]> {
+  if (runIds.length === 0) return [];
+
+  const { data, error } = await supabaseAdmin
+    .from('test_executions')
+    .select('run_id, started_at, completed_at')
+    .in('run_id', runIds);
+
+  if (error) {
+    throw new Error(`findExecutionActivityByRunIds failed: ${error.message}`);
+  }
+
+  return (data ?? []) as ExecutionActivityRow[];
+}
+
 // ── stale standalone tests ────────────────────────────────────────────────────
 
 /**

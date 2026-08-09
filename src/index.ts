@@ -1710,22 +1710,14 @@ const startServer = async () => {
           });
         }
 
-        // Cleanup zombie regression runs from previous server crashes
-        try {
-          const { RegressionRunService } = await import('@/services/testing/regression/regression-run.service');
-          await RegressionRunService.cleanupZombieRuns();
-
-          // Run zombie cleanup every 10 minutes to catch runs stuck during runtime
-          setInterval(async () => {
-            try {
-              await RegressionRunService.cleanupZombieRuns();
-            } catch (err) {
-              logger.error('[SERVER] Periodic zombie cleanup failed', { error: formatError(err) });
-            }
-          }, 10 * 60 * 1000);
-        } catch (cleanupError) {
-          logger.error('[SERVER] Failed to cleanup zombie runs', { error: formatError(cleanupError) });
-        }
+        // NOTE: zombie regression-run cleanup is intentionally NOT started here.
+        // It used to run as a 10-minute setInterval on EVERY API replica and
+        // force-failed any run older than 30 minutes by writing the row
+        // directly — outside `recomputeRunStatus`, and blind to whether the run
+        // was still progressing. `StaleRunReaperJob` on the scheduler now owns
+        // it: single-instance behind the leader lock, goes through the
+        // finalization funnel, and measures no-progress time rather than run
+        // age. Same reasoning as the AccountDeletionPurgeJob note below.
 
         // NOTE: AccountDeletionPurgeJob is intentionally NOT started here.
         // It runs in the dedicated `src/scheduler/index.ts` process —
