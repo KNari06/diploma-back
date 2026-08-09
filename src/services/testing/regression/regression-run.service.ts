@@ -34,13 +34,10 @@ import {
   insertRun,
   updateRunById,
   updateRunByIdIfActive,
-  findZombieRunCandidates,
-  forceFailRunsByIds,
   listRunsByProject,
   getRunExecutionStatsRows,
 } from './db/regression-run.db';
 import { getProjectForAccess, getTestBrowsersAndOptions } from './db/regression.db';
-import { isPendingSegmentsStale } from '@/services/testing/results/test-completion-handler.service';
 import { priorityRank } from './resolve-test-case-priority.util';
 import { TestExecutionOrchestratorService } from './test-execution-orchestrator.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
@@ -71,55 +68,6 @@ const MAX_LIST_LIMIT = 500;
  * Creates and dispatches underlying test executions
  */
 export class RegressionRunService {
-  /**
-   * Clean up zombie runs that got stuck in 'running' or 'pending' status.
-   * Should be called on server startup to recover from crashes.
-   * Marks stale runs (older than 30 minutes) as 'failed'.
-   */
-  static async cleanupZombieRuns(): Promise<void> {
-    try {
-      const now = Date.now();
-      const thirtyMinutesAgo = new Date(now - 30 * 60 * 1000).toISOString();
-      const { candidates, error: findError } = await findZombieRunCandidates(thirtyMinutesAgo);
-
-      if (findError) {
-        // Use formatError so upstream HTML gateway responses (e.g. Cloudflare 520
-        // when Supabase origin is down) don't dump multi-KB of HTML into the logs.
-        logger.error('[REGRESSION_RUN] Failed to find zombie run candidates', { error: formatError(findError) });
-        return;
-      }
-
-      // The candidate query casts a broad net on chain-wide `started_at`
-      // alone. A segmented (link_test_case) chain can legitimately still be
-      // executing despite an old `started_at` — filter those out using the
-      // same per-segment clock recomputeRunStatus's own staleness guard uses
-      // (ADR-0011 update 6), instead of force-failing every old row
-      // unconditionally.
-      const idsToFail = candidates
-        .filter((c) => (c.pending_segments ?? 0) <= 0 || isPendingSegmentsStale(
-          { started_at: c.started_at, last_segment_dispatched_at: c.last_segment_dispatched_at },
-          now,
-        ))
-        .map((c) => c.id);
-
-      const { ids: zombieRunIds, error } = await forceFailRunsByIds(idsToFail);
-
-      if (error) {
-        logger.error('[REGRESSION_RUN] Failed to cleanup zombie runs', { error: formatError(error) });
-        return;
-      }
-
-      if (zombieRunIds.length > 0) {
-        logger.warn('[REGRESSION_RUN] Cleaned up zombie runs', {
-          count: zombieRunIds.length,
-          runIds: zombieRunIds,
-        });
-      }
-    } catch (error) {
-      logger.error('[REGRESSION_RUN] Error in zombie run cleanup', { error: formatError(error) });
-    }
-  }
-
   /**
    * Run an intent test case (unified table for UI test cases)
    * Method name kept as runSavedTestCase for API compatibility.

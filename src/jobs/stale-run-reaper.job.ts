@@ -30,6 +30,7 @@
 
 import { logger } from '@/utils/core/logger';
 import { StaleReaperService } from '@/services/testing/results/stale-reaper.service';
+import { STALE_RUN_THRESHOLD_MIN } from '@/config/testing/run-staleness';
 
 /** Tick interval — default 5 min. Frequent enough to clear orphans fast,
  *  cheap enough (one indexed query returning ~0 rows in the common case). */
@@ -38,13 +39,11 @@ const DEFAULT_TICK_MS = parseInt(
   10,
 );
 
-/** Staleness threshold in minutes. Matches recomputeRunStatus's internal
- *  30-min force-fail guard — a smaller value would select runs the guard
- *  then refuses to force-fail. */
-const THRESHOLD_MINUTES = parseInt(
-  process.env.STALE_RUN_REAPER_THRESHOLD_MIN ?? '30',
-  10,
-);
+/** Staleness threshold in minutes — how long a run may show NO progress before
+ *  it is presumed dead. Shared with recomputeRunStatus's own force-fail guard
+ *  (`STALE_RUN_THRESHOLD_MIN`, env-tunable) so the two can't drift: a smaller
+ *  value here would select runs the guard then refuses to force-fail. */
+const THRESHOLD_MINUTES = STALE_RUN_THRESHOLD_MIN;
 
 export class StaleRunReaperJob {
   private static intervalId: NodeJS.Timeout | null = null;

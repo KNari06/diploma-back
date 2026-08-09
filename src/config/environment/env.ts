@@ -479,6 +479,11 @@ const envSchema = z.object({
   // (editor traces + per-apply forensic jsonl/ds/html triplets) that otherwise
   // grow without bound — ~16 files per editor session, no upstream cleanup.
   EDITOR_LOG_RETENTION_DAYS: z.string().transform(Number).default('3'),
+  // A regression run / test is presumed dead after this many minutes with NO
+  // observed progress (see config/testing/run-staleness.ts). Measured against
+  // the last dispatch/start/completion in the run, never against how long the
+  // run has been going — a legitimately long suite must not reap itself.
+  STALE_RUN_THRESHOLD_MIN: z.string().transform(Number).default('30'),
 
   // ──────────────────────────────────────────────────────────────────
   // Release-readiness report — ADR-0012. The verdict itself is a free,

@@ -1,14 +1,20 @@
 import {
   findStaleRuns,
   findRunIdsWithStaleExecutions,
+  findExecutionActivityByRunIds,
   getRunsByIds,
   findStaleRunningTests,
   forceFailStuckTests,
   finalizeAbandonedTest,
+  type ExecutionActivityRow,
   type StaleRunRow,
 } from '@/services/testing/results/db/test-completion.db';
-import { TestCompletionHandlerService } from '@/services/testing/results/test-completion-handler.service';
+import {
+  TestCompletionHandlerService,
+  isRunProgressStale,
+} from '@/services/testing/results/test-completion-handler.service';
 import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
+import { STALE_RUN_THRESHOLD_MIN } from '@/config/testing/run-staleness';
 import { logger } from '@/utils/core/logger';
 
 /** Whole minutes since an ISO timestamp, or undefined if unparseable. */
@@ -32,7 +38,7 @@ function ageMinutesSince(iso: string | null): number | undefined {
  *     can't (jobs lost before enqueue, Redis flush, all workers down).
  *
  * Run/execution finalization is delegated to the single funnel
- * `TestCompletionHandlerService.recomputeRunStatus` (which owns the 30-min
+ * `TestCompletionHandlerService.recomputeRunStatus` (which owns the no-progress
  * force-fail + telemetry aggregation). This service only finds the stale rows
  * and feeds them in; it never writes run status itself.
  */
@@ -83,21 +89,29 @@ export class StaleReaperService {
   /**
    * Reap regression runs stuck in 'running'/'pending'.
    *
-   * `recomputeRunStatus` already force-fails executions stuck >30 min, but it
+   * `recomputeRunStatus` already force-fails a stalled run's executions, but it
    * only runs when a test-completion event fires. If a job is never picked up,
    * no event ever arrives — so the run and its orphaned executions stay
    * 'running' forever. This sweep is the missing trigger.
+   *
+   * The DB queries can only select on an OLD timestamp, so candidates are then
+   * narrowed by `filterToStalledRuns`: a long-but-healthy run is skipped
+   * entirely rather than being recomputed and reported vanished.
    *
    * Idempotent: already-terminal runs are excluded by the status filter, and
    * recomputeRunStatus's optimistic lock prevents double-finalization. Side
    * effects (notifications, automation, flaky-retry, doctor) are suppressed —
    * firing them long after the fact would be noise.
    *
-   * @param thresholdMinutes Sweep runs older than this. Defaults to 30 to match
-   *   recomputeRunStatus's internal staleness guard.
-   * @returns count of runs scanned this sweep
+   * @param thresholdMinutes A run is dead after this long with NO progress.
+   *   Defaults to the shared `STALE_RUN_THRESHOLD_MIN` so this and
+   *   recomputeRunStatus's internal guard can't drift apart.
+   * @returns count of runs actually reaped this sweep (candidates still
+   *   progressing are not counted)
    */
-  static async reapStaleRuns(thresholdMinutes = 30): Promise<{ scanned: number }> {
+  static async reapStaleRuns(
+    thresholdMinutes = STALE_RUN_THRESHOLD_MIN,
+  ): Promise<{ scanned: number }> {
     const cutoff = new Date(Date.now() - thresholdMinutes * 60 * 1000).toISOString();
 
     // Two orphan classes, unioned:
@@ -133,9 +147,26 @@ export class StaleReaperService {
       return { scanned: 0 };
     }
 
-    logger.info('[STALE_RUN_REAPER] Reaping stale runs', { count: runs.length });
+    // Both queries above select on an OLD timestamp, which says nothing about
+    // whether the run is still moving. Drop the candidates whose children are
+    // still starting/finishing — reporting one of those as vanished is a false
+    // alarm, and recomputing it is a no-op anyway (the same progress clock
+    // guards the force-fail inside `recomputeRunStatus`).
+    const dead = await this.filterToStalledRuns(runs, thresholdMinutes);
 
-    for (const run of runs) {
+    if (dead.length === 0) {
+      logger.debug('[STALE_RUN_REAPER] All stale-looking runs are still progressing', {
+        candidates: runs.length,
+      });
+      return { scanned: 0 };
+    }
+
+    logger.info('[STALE_RUN_REAPER] Reaping stale runs', {
+      count: dead.length,
+      stillProgressing: runs.length - dead.length,
+    });
+
+    for (const run of dead) {
       this.emitRunVanished({
         kind: 'run',
         runId: run.id,
@@ -154,7 +185,51 @@ export class StaleReaperService {
       }
     }
 
-    return { scanned: runs.length };
+    return { scanned: dead.length };
+  }
+
+  /**
+   * Narrow reaper candidates to the ones that have genuinely stalled — no
+   * child execution has started or completed within the threshold.
+   *
+   * Fail-open: if the activity read throws we keep every candidate, which is
+   * the pre-existing behaviour. A backstop that silently disables itself on a
+   * query error is worse than one that occasionally finalizes early.
+   */
+  private static async filterToStalledRuns(
+    runs: StaleRunRow[],
+    thresholdMinutes: number,
+  ): Promise<StaleRunRow[]> {
+    let activity: ExecutionActivityRow[];
+    try {
+      activity = await findExecutionActivityByRunIds(runs.map((r) => r.id));
+    } catch (err) {
+      logger.warn('[STALE_RUN_REAPER] Execution-activity read failed — reaping unfiltered', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return runs;
+    }
+
+    const byRun = new Map<string, ExecutionActivityRow[]>();
+    for (const row of activity) {
+      const bucket = byRun.get(row.run_id);
+      if (bucket) bucket.push(row);
+      else byRun.set(row.run_id, [row]);
+    }
+
+    const now = Date.now();
+    const thresholdMs = thresholdMinutes * 60 * 1000;
+
+    return runs.filter((run) => {
+      const stalled = isRunProgressStale(run, byRun.get(run.id) ?? [], now, thresholdMs);
+      if (!stalled) {
+        logger.debug('[STALE_RUN_REAPER] Run is old but still progressing — leaving it alone', {
+          runId: run.id,
+          startedAt: run.started_at,
+        });
+      }
+      return stalled;
+    });
   }
 
   /**
@@ -167,7 +242,7 @@ export class StaleReaperService {
    * primary, fast path; this catches what that can't — jobs lost before
    * enqueue, Redis flush, or all workers down.
    */
-  static async reapStaleTests(thresholdMinutes = 30): Promise<{ scanned: number }> {
+  static async reapStaleTests(thresholdMinutes = STALE_RUN_THRESHOLD_MIN): Promise<{ scanned: number }> {
     const cutoff = new Date(Date.now() - thresholdMinutes * 60 * 1000).toISOString();
 
     let stale: Array<{ id: string }>;
@@ -209,7 +284,7 @@ export class StaleReaperService {
    * dies without throwing leaves the row 'running' forever. Flips such rows to
    * 'timed_out'. Same poll cadence + threshold as the tests/runs reapers.
    */
-  static async reapStaleExplorations(thresholdMinutes = 30): Promise<{ scanned: number }> {
+  static async reapStaleExplorations(thresholdMinutes = STALE_RUN_THRESHOLD_MIN): Promise<{ scanned: number }> {
     const cutoff = new Date(Date.now() - thresholdMinutes * 60 * 1000).toISOString();
     const count = await ExplorationStorageService.reapStaleRunningRuns(cutoff);
     if (count > 0) {

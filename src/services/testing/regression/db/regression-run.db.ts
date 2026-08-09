@@ -144,62 +144,6 @@ export async function insertRun(
   return { data: (data as { id: string } | null) ?? null, error };
 }
 
-export interface ZombieRunCandidate {
-  id: string;
-  started_at: string | null;
-  pending_segments: number | null;
-  last_segment_dispatched_at: string | null;
-}
-
-/**
- * Candidates for the zombie sweep: runs stuck in pending/running whose
- * chain-wide `started_at` is past the cutoff. A broad net by design — this is
- * NOT the force-fail decision. A segmented (`link_test_case`) chain can be
- * legitimately still executing despite an old `started_at` (each segment has
- * its own poll budget, and a 3+ segment chain's aggregate age easily exceeds
- * a flat cutoff) — the caller must additionally check `pending_segments` /
- * `last_segment_dispatched_at` before deciding which of these to actually
- * force-fail (ADR-0011 update 6). Returns just enough to make that decision;
- * the caller re-fetches nothing else before calling `forceFailRunsByIds`.
- */
-export async function findZombieRunCandidates(
-  cutoffIso: string,
-): Promise<{ candidates: ZombieRunCandidate[]; error: unknown }> {
-  const { data, error } = await supabaseAdmin
-    .from('regression_runs')
-    .select('id, started_at, pending_segments, last_segment_dispatched_at')
-    .in('status', ['running', 'pending'])
-    .lt('started_at', cutoffIso);
-
-  return { candidates: (data as ZombieRunCandidate[]) || [], error };
-}
-
-/**
- * Force-fail an explicit list of run ids (the zombie sweep's own decision,
- * after filtering `findZombieRunCandidates`'s broad net). Guarded
- * (`.in('status', [...])`) — defense in depth against the same read-then-write
- * race `updateRunByIdIfActive`/`forceFailStuckTests` guard elsewhere: a run
- * could have legitimately finalized in the gap between the candidate read and
- * this write.
- */
-export async function forceFailRunsByIds(
-  ids: string[],
-): Promise<{ ids: string[]; error: unknown }> {
-  if (ids.length === 0) return { ids: [], error: null };
-
-  const { data, error } = await supabaseAdmin
-    .from('regression_runs')
-    .update({
-      status: 'failed',
-      completed_at: new Date().toISOString(),
-    })
-    .in('id', ids)
-    .in('status', ['running', 'pending'])
-    .select('id');
-
-  return { ids: ((data as Array<{ id: string }>) || []).map((r) => r.id), error };
-}
-
 /**
  * List runs for a project (newest first) including plan name.
  */
