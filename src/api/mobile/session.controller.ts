@@ -23,7 +23,7 @@ import {
   clearSessionRunnerBinding,
   runnerUrlToSocketUrl,
 } from '@/services/mobile/session-runner-routing';
-import { resolveDedicatedDevices } from '@/services/mobile/dedicated-device.service';
+import { resolveDedicatedDevices, createOnFirstFreeDedicatedDevice } from '@/services/mobile/dedicated-device.service';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { normalizeMobileBriefing } from '@/services/mobile/mobile-briefing.util';
@@ -501,19 +501,24 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   // exists. workspaceId is derived from the access-checked project above — never
   // from the request body (tenancy invariant).
   const dedicatedWorkspaceId: string | undefined = accessibleProject.workspace_id ?? undefined;
-  // A workspace may pin several devices. The editor takes the FIRST — it fixes
-  // `deviceSelector` here, long before the session is created, so it cannot walk
-  // the list on DEVICE_BUSY the way the regression job does. Known gap: if a job
-  // is holding device 1, opening the editor still reports it busy instead of
-  // moving to device 2. Fixing that means restructuring warmup so creation and
-  // device choice sit together.
-  const dedicated = (await resolveDedicatedDevices(dedicatedWorkspaceId, sessionCreatePlatform))[0] ?? null;
+  // A workspace may pin several devices. The values below are the OPENING BID,
+  // not the decision: `deviceSelector` and the health check need something
+  // concrete before the create call, but the create itself walks the whole list
+  // (see `createOnFirstFreeDedicatedDevice` at the create site) and reassigns
+  // `dedicated` to whichever device actually took the session.
+  //
+  // Until 2026-08-11 this really was the decision — the editor took `[0]` and
+  // could not move on, so a regression holding device 1 made the editor report
+  // "busy" while device 2 sat idle. That is the whole point of pinning two.
+  const dedicatedDevices = await resolveDedicatedDevices(dedicatedWorkspaceId, sessionCreatePlatform);
+  let dedicated = dedicatedDevices[0] ?? null;
   if (dedicated) {
     deviceSelector = { serial: dedicated.serial };
-    logger.info('[MOBILE_SESSION] warmup pinned to dedicated device', {
+    logger.debug('[MOBILE_SESSION] warmup will try dedicated devices', {
       projectId,
       workspaceId: dedicatedWorkspaceId,
       platform,
+      devices: dedicatedDevices.length,
     });
   }
   // Route to the companion when the user either explicitly pinned their physical
@@ -967,22 +972,36 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
 
     // Health check — use the dedicated runner if one is configured, otherwise
     // fall back to the env-singleton. dedicated is already resolved above.
-    const dedicatedRunnerUrl = dedicated?.runnerUrl ?? null;
-    const dedicatedRunnerApiKey = dedicated?.runnerApiKey ?? null;
+    // `let`, not `const`: the dedicated create below may fail over to another
+    // pinned device, and these two feed BOTH the runner client and the session
+    // binding persisted afterwards. If they stayed pinned to device 1 while the
+    // session actually booted on device 2, the editor would open a socket to the
+    // wrong cell — a session that exists but answers nothing.
+    let dedicatedRunnerUrl = dedicated?.runnerUrl ?? null;
+    let dedicatedRunnerApiKey = dedicated?.runnerApiKey ?? null;
     // Host-lane routing (ADR-0019 deferred half): an ios-host Flutter warmup
     // targets MOBILE_RUNNER_IOS_URL when configured. Locally inert — the var
     // is unset, so hostRunnerUrl === env.MOBILE_RUNNER_URL and the singleton
     // is used as before. Dedicated/companion still take precedence.
     const hostRunnerUrl = resolveRunnerUrlForHost(isFlutter ? flutterHostPlatform : undefined);
     const isDistinctHostRunner = hostRunnerUrl !== env.MOBILE_RUNNER_URL;
-    const client: IMobileRunnerClient = useCompanionRunner
+    // `let` for the same reason as the two above — the dedicated create can
+    // fail over, and every later call (policy, prepApp, steps) must go to the
+    // cell that actually holds the session.
+    let client: IMobileRunnerClient = useCompanionRunner
       ? new CompanionRunnerClient(userId)
       : dedicatedRunnerUrl
       ? new MobileRunnerClient({ baseUrl: dedicatedRunnerUrl, apiKey: dedicatedRunnerApiKey ?? '' })
       : isDistinctHostRunner
       ? new MobileRunnerClient({ baseUrl: hostRunnerUrl })
       : getMobileRunnerClient();
-    const healthy = await time('runner_health_check', () => client.isHealthy());
+    // A multi-device workspace skips this pre-flight: it is a check against ONE
+    // cell, and failing the whole warmup on it would throw away the very
+    // failover the next device exists to provide. The create walk below reports
+    // an unreachable cell per device instead.
+    const healthy = dedicatedDevices.length > 1
+      ? true
+      : await time('runner_health_check', () => client.isHealthy());
     if (!healthy) {
       // isHealthy() swallows the underlying cause (timeout / ECONNREFUSED /
       // non-200), so this is the one place an operator can see that the editor's
@@ -1045,7 +1064,49 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // and a crash surfaces as a real failure (catch block below) instead of a
     // phantom-complete checklist.
     emitWarmupProgress(userId, 'boot_emulator', 10);
-    if (skipPoolForPhysical) {
+    if (dedicated) {
+      // Walk the workspace's pinned devices — the same helper the regression
+      // worker uses, so the editor and a run can no longer disagree about what
+      // "my second emulator" means. No `backoffMs`: a person is watching, and
+      // moving to the next device beats making them wait on a busy one.
+      //
+      // Everything device-specific is built INSIDE the callback (client,
+      // selector, and the `serial` the runner pins) so a failover swaps all of
+      // them together. That coupling is why the editor could not fail over
+      // before: the selector was fixed ~500 lines earlier than the create.
+      const walk = await time('create_session_dedicated', () => createOnFirstFreeDedicatedDevice(
+        dedicatedDevices,
+        async (device) => {
+          // `runnerUrl: null` means "the default runner" — same reading as the
+          // regression path, which must not diverge from this one.
+          const deviceClient: IMobileRunnerClient = device.runnerUrl
+            ? new MobileRunnerClient({ baseUrl: device.runnerUrl, apiKey: device.runnerApiKey ?? '' })
+            : client;
+          const created = await deviceClient.createSession(sessionCreatePlatform, {
+            ownerId: effectiveOwnerId,
+            deviceSelector: { serial: device.serial },
+            userId,
+            dedicated: true,
+          });
+          return { created, deviceClient };
+        },
+      ));
+      session = walk.result.created;
+      // Adopt the winner for every later call and for the persisted binding.
+      client = walk.result.deviceClient;
+      dedicated = walk.device;
+      dedicatedRunnerUrl = walk.device.runnerUrl;
+      dedicatedRunnerApiKey = walk.device.runnerApiKey ?? null;
+      deviceSelector = { serial: walk.device.serial };
+      logger.info('[MOBILE_SESSION] warmup pinned to dedicated device', {
+        projectId,
+        workspaceId: dedicatedWorkspaceId,
+        platform,
+        runnerUrl: walk.device.runnerUrl,
+        serial: walk.device.serial,
+        ofDevices: dedicatedDevices.length,
+      });
+    } else if (skipPoolForPhysical) {
       logger.info('[MOBILE_SESSION] Pinned selector — bypassing pool', {
         projectId,
         deviceSelector,
@@ -1054,7 +1115,6 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         ownerId: effectiveOwnerId,
         deviceSelector,
         userId,
-        ...(dedicated ? { dedicated: true } : {}),
       }));
     } else {
       try {

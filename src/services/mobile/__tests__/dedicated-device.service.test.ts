@@ -148,4 +148,51 @@ describe('createOnFirstFreeDedicatedDevice', () => {
       .rejects.toThrow('already held');
     expect(create).toHaveBeenCalledTimes(2);
   });
+
+  // 2026-08-11: a JanaPost regression died on NETWORK_ERROR while its SECOND
+  // pinned emulator sat idle and healthy — only DEVICE_BUSY advanced back then.
+  // A second device has to protect against a cell being unreachable, not just
+  // against contention; unreachable is the more common way a host fails.
+  it('moves to the next device when the first cell is unreachable', async () => {
+    const create = jest.fn()
+      .mockRejectedValueOnce(
+        new MobileRunnerError('Failed to reach mobile runner: fetch failed', 0, 'NETWORK_ERROR'),
+      )
+      .mockResolvedValueOnce('sess');
+    const r = await createOnFirstFreeDedicatedDevice([DEV_1, DEV_2], create);
+    expect(r).toEqual({ result: 'sess', device: DEV_2 });
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it('moves on for a gateway status with no runner code (nginx up, runner not)', async () => {
+    const create = jest.fn()
+      .mockRejectedValueOnce(new MobileRunnerError('Bad Gateway', 502))
+      .mockResolvedValueOnce('sess');
+    const r = await createOnFirstFreeDedicatedDevice([DEV_1, DEV_2], create);
+    expect(r.device).toEqual(DEV_2);
+  });
+
+  // The counterpart, and the reason the `!code` half of the check exists: the
+  // RUNNER answers 503 for a real boot failure. Retrying that on every device
+  // turns one honest error into N, and delays it by the whole backoff.
+  it('does NOT move on for a runner-coded 503 (a real device failure)', async () => {
+    const create = jest.fn().mockRejectedValue(
+      new MobileRunnerError('Device never came up', 503, 'DEVICE_INIT_FAILED'),
+    );
+    await expect(createOnFirstFreeDedicatedDevice([DEV_1, DEV_2], create))
+      .rejects.toThrow('Device never came up');
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  // A11Y_AGENT_UNAVAILABLE is deliberately NOT skipped: cell2 served it 100% of
+  // the time for four hours on 2026-08-10 because its agent APK had never been
+  // installed. Failing over would have hidden a broken cell behind a working one.
+  it('does NOT move on for A11Y_AGENT_UNAVAILABLE (a broken cell must stay loud)', async () => {
+    const create = jest.fn().mockRejectedValue(
+      new MobileRunnerError('agent failed to start', 503, 'A11Y_AGENT_UNAVAILABLE'),
+    );
+    await expect(createOnFirstFreeDedicatedDevice([DEV_1, DEV_2], create))
+      .rejects.toThrow('agent failed to start');
+    expect(create).toHaveBeenCalledTimes(1);
+  });
 });

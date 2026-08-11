@@ -134,7 +134,7 @@ export async function createOnFirstFreeDedicatedDevice<T>(
   if (devices.length === 0) throw new Error('createOnFirstFreeDedicatedDevice called with no devices');
 
   const backoff = opts?.backoffMs ?? [];
-  let lastBusy: unknown;
+  let lastSkip: unknown;
 
   // Every device is tried BEFORE any sleeping. Waiting on a busy device while
   // a free one sits next to it is the whole failure this exists to prevent.
@@ -143,22 +143,76 @@ export async function createOnFirstFreeDedicatedDevice<T>(
       try {
         return { result: await create(device), device };
       } catch (err) {
-        if (!(err instanceof MobileRunnerError && err.code === 'DEVICE_BUSY')) throw err;
-        lastBusy = err;
-        logger.info('[DEDICATED_DEVICE] Pinned device busy — trying the next one', {
-          serial: device.serial,
-          runnerUrl: device.runnerUrl,
-          tried: i + 1,
-          of: devices.length,
-          round,
-        });
+        const skip = classifySkip(err);
+        if (!skip) throw err;
+        lastSkip = err;
+        logger[skip === 'busy' ? 'info' : 'warn'](
+          skip === 'busy'
+            ? '[DEDICATED_DEVICE] Pinned device busy — trying the next one'
+            : '[DEDICATED_DEVICE] Pinned device UNREACHABLE — trying the next one (its host needs looking at)',
+          {
+            serial: device.serial,
+            runnerUrl: device.runnerUrl,
+            reason: skip,
+            error: err instanceof Error ? err.message : String(err),
+            tried: i + 1,
+            of: devices.length,
+            round,
+          },
+        );
       }
     }
-    if (round >= backoff.length) throw lastBusy;
+    if (round >= backoff.length) throw lastSkip;
     const waitMs = backoff[round] ?? 20_000;
     opts?.onRetry?.(round + 1, waitMs);
     await new Promise((r) => setTimeout(r, waitMs));
   }
+}
+
+/**
+ * Should this failure make us try the workspace's NEXT pinned device, or is it
+ * a real error that would repeat everywhere?
+ *
+ * Two kinds move on, and for different reasons:
+ *
+ *   'busy'        — DEVICE_BUSY. The device is fine, someone else holds it.
+ *   'unreachable' — the HOST could not be spoken to at all: `NETWORK_ERROR`
+ *                   (statusCode 0, what the client throws for a failed fetch)
+ *                   or a gateway status, i.e. nginx answered but the runner
+ *                   behind it did not.
+ *
+ * 'unreachable' was added 2026-08-11 after a JanaPost regression died on
+ * `NETWORK_ERROR: Failed to reach mobile runner: fetch failed` while its SECOND
+ * pinned emulator sat idle and healthy. Only DEVICE_BUSY advanced back then, so
+ * a second device bought protection against contention but none against a cell
+ * being briefly unreachable — which is the more common way a host fails.
+ * Verified after the fact: nothing arrived in either cell's nginx access log at
+ * the failing minute, and the same workspace ran fine 15 minutes later.
+ *
+ * Deliberately NOT here: everything else, including A11Y_AGENT_UNAVAILABLE.
+ * That one is a genuine defect of a specific device (cell2 served it 100% of
+ * the time for four hours on 2026-08-10 because its agent APK was never
+ * installed). Failing over would have hidden that behind a working cell1 and
+ * nobody would have looked. A broken cell must stay loud; an unreachable one is
+ * transient by nature and worth routing around. Revisit only with a monitor
+ * that reports a silently-skipped device, not just a green run.
+ */
+function classifySkip(err: unknown): 'busy' | 'unreachable' | null {
+  if (!(err instanceof MobileRunnerError)) return null;
+  if (err.code === 'DEVICE_BUSY') return 'busy';
+  if (err.code === 'NETWORK_ERROR') return 'unreachable';
+  // A gateway status with NO runner code — nginx answered but the runner behind
+  // it did not (mid-deploy, crashed, still booting), so another cell can serve.
+  //
+  // The `!err.code` half is load-bearing, not defensive: the runner ITSELF
+  // answers 503 for real device failures (`DEVICE_INIT_FAILED` — "device never
+  // came up"). Treating every 503 as "unreachable" made this function retry a
+  // genuine boot failure across every pinned device and then keep going through
+  // the backoff — caught by `does not retry a non-transient device failure`.
+  // A code means the runner formed the reply and it is telling us something real.
+  const gatewayStatus = err.statusCode === 502 || err.statusCode === 503 || err.statusCode === 504;
+  if (gatewayStatus && !err.code) return 'unreachable';
+  return null;
 }
 
 /** Test-only: clear the resolver cache between cases. */
