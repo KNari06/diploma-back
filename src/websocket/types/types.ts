@@ -1930,6 +1930,21 @@ export interface PreviewRunStepPayload {
   failedReason?: string;
   timestamp?: string;
   /**
+   * Mobile runs only. The runner located this step's element from the
+   * SCREENSHOT rather than the a11y tree — lower trust, since there are no
+   * labels to confirm the match against. The editor already badges this on the
+   * Find path; carrying it here makes a Run say the same thing instead of
+   * showing an identical green tick for a real node hit and a pixel guess.
+   */
+  visionMode?: boolean;
+  /**
+   * Mobile runs only, and only when > 1: how many times the runner dispatched
+   * this step's command to the device. A repeat dispatch is not idempotent for
+   * navigation — a tap sent twice navigates twice. Instrumentation for the
+   * TC-32 double-tap, whose retry path is still unidentified.
+   */
+  dispatchCount?: number;
+  /**
    * Present when a user-authored web trigger fired for this step — either
    * bundled into the step's own 'running' emit (DOM-overlay conditions,
    * checked pre-step) or sent as a standalone additive emit carrying no

@@ -592,7 +592,13 @@ const MOBILE_RUN_DRAFT_STEPS_TOOL: ChatCompletionTool = {
                 type: 'string',
                 description:
                   'Value for input steps. Use {{param_<name>}} placeholder for ' +
-                  'passwords, OTPs, tokens — never the literal secret.',
+                  'passwords, OTPs, tokens — never the literal secret. ' +
+                  'To CLEAR a field (empty it, e.g. "clear the search and check ' +
+                  'the full list returns"), author {type:"type", value:"", ' +
+                  'options:{clearField:true}} — an empty value is only a ' +
+                  'valid step WITH that flag, which is what distinguishes a ' +
+                  'deliberate clear from a value you forgot to fill in. Never ' +
+                  'emit an empty value without it.',
               },
               assertionText: {
                 type: 'string',
@@ -1316,8 +1322,9 @@ async function runLaunchApp(
       success: () => `Launched ${packageName}${clearData ? ' (cleared data)' : ''}.`,
       failure: (_r, msg) => `Could not launch ${packageName}: ${msg}`,
       mutating: true,
-      // Launch can take a few seconds (cold start). Give it the default 30s
-      // instead of the 8s interactive budget.
+      // Retry is allowed here: a cold start can drop the first call, and
+      // re-launching an already-running app is idempotent — unlike a tap, which
+      // is why every element-touching tool sets this true.
       interactive: false,
       abortSignal: opts?.abortSignal,
     },
@@ -1745,6 +1752,46 @@ export function summariseDraftChange(
   );
 }
 
+/** Step types whose `value` is the text to type. */
+const TEXT_INPUT_STEP_TYPES = new Set(['type', 'input_text', 'web_type']);
+
+/**
+ * True when a type-style step carries an EMPTY value without declaring that the
+ * emptiness is deliberate.
+ *
+ * An empty value has two completely different meanings — "clear this field" and
+ * "I forgot to fill this in" — and on the draft card they are indistinguishable,
+ * because both render as the greyed `e.g. user@example.com` placeholder.
+ * `options.clearField: true` is the declaration that separates them, and the
+ * runner's `intent-step-converter` uses exactly the same signal, so a draft that
+ * passes this check is one the replay path will also accept.
+ *
+ * NOT `options.replaceContent`, which this check first shipped with: that flag
+ * is the clear-then-type BEHAVIOUR, it defaults to on, and the editor serialises
+ * it as `true` on every step it builds — so keyed on it the runner-side twin of
+ * this check accepted every editor-authored step and a `type` whose value went
+ * missing silently became a field-wipe that reported passed. A flag that is
+ * always set cannot declare anything.
+ *
+ * Live on JanaPost TC-32 (2026-07-29): across three drafts — twice AFTER being
+ * told in plain language that the field was blank — the agent re-emitted `type`
+ * with an empty value and never reached for the flag, because nothing in the
+ * prompt or the tool schema had ever told it the flag existed. The prompt and
+ * schema now do; this is the enforcement point behind them, since a prompt rule
+ * alone has a poor record here.
+ */
+export function isAmbiguousEmptyTypeStep(
+  type: string,
+  step: { value?: unknown; options?: unknown },
+): boolean {
+  if (!TEXT_INPUT_STEP_TYPES.has(type)) return false;
+  // Only a PRESENT-but-empty string is the ambiguous case. An absent `value` on
+  // a non-input step is normal and not this check's business.
+  if (typeof step.value !== 'string' || step.value !== '') return false;
+  const clearField = (step.options as { clearField?: unknown } | undefined)?.clearField;
+  return clearField !== true;
+}
+
 /** The `web_*` step each native type should become inside a WebView. */
 /** `web_*` step types whose target must be a CSS selector, not a description. */
 const WEB_SELECTOR_STEP_TYPES = new Set<string>([
@@ -1927,6 +1974,33 @@ async function runMobileRunDraftSteps(
           `it is never valid as an assertion, because nothing resolves it at replay, ` +
           `so the check would silently pass forever. ` +
           `Replace it with the concrete text you expect to see on screen.`,
+      };
+    }
+
+    // A `type` step with an empty value is either a deliberate CLEAR or a
+    // field the model forgot to fill, and the two are indistinguishable on the
+    // card — it renders as the greyed placeholder either way. The runner's
+    // converter takes `options.clearField === true` as the deliberate
+    // signal and rejects the step otherwise, so catch it HERE, at draft time,
+    // where the agent can still fix it, instead of at replay as an
+    // "Unsupported step".
+    //
+    // Live on JanaPost TC-32 (2026-07-29): across three drafts — twice AFTER
+    // being told in plain language that the field was blank — the agent
+    // re-emitted `type` with an empty value and never reached for the flag,
+    // because nothing had ever told it the flag existed. A prompt rule alone
+    // has a poor record here, hence the hard rejection.
+    if (isAmbiguousEmptyTypeStep(type, step)) {
+      return {
+        ok: false,
+        content:
+          `Step #${i + 1} (${id}) is a \`${type}\` with an empty value and no ` +
+          `\`options.clearField\`. An empty value is only a real step when it means ` +
+          `"clear this field" — and that has to be explicit, or nobody reading the draft ` +
+          `can tell a deliberate clear from a value you forgot.\n` +
+          `If you meant to CLEAR it: \`{"type":"${type}","description":"…","value":"",` +
+          `"options":{"clearField":true}}\`.\n` +
+          `If you meant to type something: give it the value.`,
       };
     }
 
@@ -3774,7 +3848,24 @@ interface DispatchOpts {
   failure: (result: RunnerCommandResult | null, msg: string) => string;
   /** True for any tool that changes device state. Drops cached snapshot. */
   mutating: boolean;
-  /** Use 8s interactive timeout + noRetry. Off for slow things like launch_app. */
+  /**
+   * This tool drives the device, so its dispatch must NOT be retried — a
+   * re-sent tap is a second real tap. Off for slow things like launch_app.
+   *
+   * It used to ALSO select the runner client's 8s "interactive" budget, and
+   * that pairing was wrong for an agent. The 8s fail-fast exists so a human
+   * clicking Point/Find in the editor doesn't sit waiting; an authoring turn
+   * has no such constraint — the user is already watching a multi-second agent
+   * turn. On a content-heavy screen the runner's post-tap settle alone runs
+   * ~28s (JanaPost's Profile screen builds a 754-node Flutter inspector tree),
+   * so the tap landed in 40ms and the call 408'd anyway. The agent, told the
+   * action failed, concluded the screen was "unreadable" and abandoned the
+   * turn — three times in one session, ~10 of 45 minutes of agent wall-clock,
+   * and the failure is invisible as an agent-quality problem because the agent
+   * behaved CORRECTLY given what it was told.
+   *
+   * Now maps to `noRetry` only; the timeout comes from `defaultTimeoutMs`.
+   */
   interactive: boolean;
   abortSignal?: AbortSignal;
 }
@@ -3864,7 +3955,10 @@ async function dispatchSingleCommand(
       bb.mobileSessionId,
       [command],
       {
-        interactive: opts.interactive,
+        // The agent gets the DEFAULT (30s) budget, never the 8s interactive
+        // one, but keeps no-retry. See DispatchOpts.interactive.
+        interactive: false,
+        noRetry: opts.interactive,
         signal: opts.abortSignal,
         userId: bb.userId,
       },
