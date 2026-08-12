@@ -164,6 +164,22 @@ describe('createOnFirstFreeDedicatedDevice', () => {
     expect(create).toHaveBeenCalledTimes(2);
   });
 
+  // 2026-08-12: cell1's qai-adb wedged and JanaPost lost 17 runs in a row —
+  // each waiting the full 180 s client timeout — while its second emulator on
+  // cell2 was answering adb instantly. A wedged runner still completes the TCP
+  // handshake and serves /health, so it produces TIMEOUT, not NETWORK_ERROR:
+  // the likelier failure was the uncovered one.
+  it('moves to the next device on TIMEOUT (accepted, never answered)', async () => {
+    const create = jest.fn()
+      .mockRejectedValueOnce(
+        new MobileRunnerError('Request timed out after 180000ms: POST /api/sessions', 408, 'TIMEOUT'),
+      )
+      .mockResolvedValueOnce('sess');
+    const r = await createOnFirstFreeDedicatedDevice([DEV_1, DEV_2], create);
+    expect(r).toEqual({ result: 'sess', device: DEV_2 });
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
   it('moves on for a gateway status with no runner code (nginx up, runner not)', async () => {
     const create = jest.fn()
       .mockRejectedValueOnce(new MobileRunnerError('Bad Gateway', 502))
