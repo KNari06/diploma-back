@@ -166,6 +166,13 @@ export interface MobileBindingHints {
 export interface MobileIntentStepOptions {
   timeout?: number;
   replaceContent?: boolean;
+  /**
+   * The step's EMPTY value is deliberate: "empty this field". The only signal
+   * the runner's `intent-step-converter` accepts for an empty `type`/`web_type`
+   * — deliberately not `replaceContent`, which is the clear-then-type behaviour
+   * and defaults to on, so it can never declare intent.
+   */
+  clearField?: boolean;
   pressEnter?: boolean;
   /**
    * Opt-in per-step AI VISUAL check (mirror of the runner's
@@ -375,7 +382,23 @@ export interface MobileStepResult {
   success: boolean;
   error?: string;
   screenshot?: string; // base64
-  resolvedVia?: 'compiled' | 'exact_label' | 'exact_text' | 'partial' | 'coordinates' | 'llm' | 'vision' | 'thinking' | 'soft_score' | 'passthrough' | 'skipped' | 'unresolved' | 'low_confidence';
+  resolvedVia?: 'compiled' | 'exact_label' | 'exact_text' | 'partial' | 'coordinates' | 'llm' | 'vision' | 'vision_coordinates' | 'thinking' | 'soft_score' | 'passthrough' | 'skipped' | 'unresolved' | 'low_confidence';
+  /**
+   * True when the runner located the element from the SCREENSHOT rather than
+   * the a11y tree. Lower trust — there are no labels to confirm the match
+   * against — so the editor badges it. Previously surfaced only on the Find
+   * path, which meant a Run showed an identical green tick for a real node hit
+   * and a pixel guess.
+   */
+  visionMode?: boolean;
+  /**
+   * How many times the runner DISPATCHED this step to the device. Absent when 1
+   * (the normal case). `> 1` means a retry path re-sent a command that had
+   * already reached the device — which for navigation is not idempotent.
+   * Instrumentation for the TC-32 double-tap, whose retry path was never
+   * identified. See the runner's IntentStepResult.dispatchCount.
+   */
+  dispatchCount?: number;
   /**
    * Why the step was not executed. `resolvedVia: 'skipped'` is ambiguous — six
    * producers share it (client abort, run timeout, unsupported step, `store`

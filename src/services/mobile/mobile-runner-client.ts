@@ -594,7 +594,28 @@ export class MobileRunnerClient {
   async executeBatchCommands(
     sessionId: string,
     commands: unknown[],
-    opts?: { interactive?: boolean; timeoutMs?: number; signal?: AbortSignal; userId?: string },
+    opts?: {
+      interactive?: boolean;
+      timeoutMs?: number;
+      signal?: AbortSignal;
+      userId?: string;
+      /**
+       * Suppress the transport retry independently of `interactive`.
+       *
+       * These were one flag, which forced an unwanted trade on the mobile AGENT:
+       * it needs no-retry (re-sending a mutating tap is its own bug) but must
+       * NOT inherit the 8s interactive budget, which exists so a human clicking
+       * Point/Find in the editor doesn't wait. On a content-heavy screen the
+       * runner's post-tap settle alone is ~28s (JanaPost Profile builds a
+       * 754-node Flutter tree), so every agent tap 408'd while the tap had in
+       * fact landed — and the agent, told the action failed, then reported the
+       * screen "unreadable" and abandoned the turn. Three dead turns in one
+       * session, ~10 of 45 minutes of agent wall-clock.
+       *
+       * Defaults to `interactive` so existing callers are unchanged.
+       */
+      noRetry?: boolean;
+    },
   ): Promise<{ results: unknown[] }> {
     return this.request<{ results: unknown[] }>(
       'POST',
@@ -605,7 +626,7 @@ export class MobileRunnerClient {
           ?? (opts?.interactive ? CLIENT_CONFIG.interactiveTimeoutMs : CLIENT_CONFIG.defaultTimeoutMs),
         // Interactive commands must not retry — a failed tap should not
         // be silently retried (user may have already moved on).
-        noRetry: opts?.interactive,
+        noRetry: opts?.noRetry ?? opts?.interactive,
         signal: opts?.signal,
         userId: opts?.userId,
       },

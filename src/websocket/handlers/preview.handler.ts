@@ -5766,6 +5766,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               screenshot: stepResult.screenshot,
               durationMs: stepResult.durationMs,
               timestamp: new Date().toISOString(),
+              // Trust signals about HOW the step resolved/ran. This emit is a
+              // hand-picked field list, so anything not named here never
+              // reaches the editor no matter what the runner computed.
+              // `visionMode` = located from pixels, not the a11y tree (lower
+              // trust); `dispatchCount` = the command was sent to the device
+              // more than once, which for a tap means it navigated twice.
+              ...(stepResult.visionMode ? { visionMode: true } : {}),
+              ...(typeof stepResult.dispatchCount === 'number' && stepResult.dispatchCount > 1
+                ? { dispatchCount: stepResult.dispatchCount }
+                : {}),
               // Advisory warnings from the runner (e.g. WebView debugging
               // missing on release APK). Only attached when present.
               ...(stepResult.warnings && stepResult.warnings.length > 0

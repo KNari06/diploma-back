@@ -21,7 +21,7 @@
  * false-positive/false-negative risk actually lives.
  */
 
-import { isWebViewHostActivity, looksLikeProseNotCssSelector, resolveForegroundActivity, summariseDraftChange } from '../tools';
+import { isAmbiguousEmptyTypeStep, isWebViewHostActivity, looksLikeProseNotCssSelector, resolveForegroundActivity, summariseDraftChange } from '../tools';
 import type { MobileIntentStep } from '@/services/mobile/mobile-runner.types';
 
 const s = (
@@ -279,5 +279,64 @@ describe('looksLikeProseNotCssSelector', () => {
   it('ignores empty / whitespace input (handled by the missing-selector branch)', () => {
     expect(looksLikeProseNotCssSelector('')).toBe(false);
     expect(looksLikeProseNotCssSelector('   ')).toBe(false);
+  });
+});
+
+describe('isAmbiguousEmptyTypeStep', () => {
+  it('rejects the empty-value type step the agent kept re-emitting on TC-32', () => {
+    // Three drafts, twice after being told in plain language it was blank.
+    expect(isAmbiguousEmptyTypeStep('type', { value: '' })).toBe(true);
+  });
+
+  it('accepts an empty value once the clear is declared', () => {
+    expect(isAmbiguousEmptyTypeStep('type', {
+      value: '', options: { clearField: true },
+    })).toBe(false);
+  });
+
+  it('still rejects when clearField is present but not true', () => {
+    // `false`, and any non-true value, leave the step ambiguous — the runner's
+    // converter reads the same signal, so accepting these here would just move
+    // the rejection to replay.
+    for (const clearField of [false, 'true', 1, null, undefined]) {
+      expect(isAmbiguousEmptyTypeStep('type', { value: '', options: { clearField } }))
+        .toBe(true);
+    }
+  });
+
+  // `replaceContent` is the clear-then-type BEHAVIOUR and defaults to on — the
+  // editor serialises it as `true` on every step it builds. Keyed on it, this
+  // check (and its runner-side twin) waved through every editor-authored step,
+  // so a `type` whose value went missing became a silent field-wipe that
+  // reported passed. It must not stand in for the declaration.
+  it('rejects an empty value carrying only replaceContent: true', () => {
+    expect(isAmbiguousEmptyTypeStep('type', {
+      value: '', options: { replaceContent: true },
+    })).toBe(true);
+  });
+
+  it('covers the runner aliases and the web twin', () => {
+    for (const type of ['type', 'input_text', 'web_type']) {
+      expect(isAmbiguousEmptyTypeStep(type, { value: '' })).toBe(true);
+    }
+  });
+
+  it('leaves a normal typed value alone', () => {
+    expect(isAmbiguousEmptyTypeStep('type', { value: 'Филиал' })).toBe(false);
+  });
+
+  it('does not fire on a whitespace value — that is a real (if odd) input, not an empty one', () => {
+    expect(isAmbiguousEmptyTypeStep('type', { value: ' ' })).toBe(false);
+  });
+
+  it('ignores step types whose value is not typed text', () => {
+    for (const type of ['click', 'tap', 'ai_check', 'assert', 'scroll']) {
+      expect(isAmbiguousEmptyTypeStep(type, { value: '' })).toBe(false);
+    }
+  });
+
+  it('ignores a type step with no value field at all', () => {
+    // Absent is a different defect from present-and-empty; not this check's job.
+    expect(isAmbiguousEmptyTypeStep('type', {})).toBe(false);
   });
 });

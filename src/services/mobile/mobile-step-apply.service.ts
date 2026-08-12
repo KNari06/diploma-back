@@ -316,6 +316,10 @@ export class MobileStepApplyService {
     // Only for steps WITHOUT a compiled plan (first apply / manual adds).
     if (!hasCompiled && description && LINT_TYPES.has(rawStepType)) {
       const lintActionType = LINT_ACTION_TYPE_MAP[rawStepType] || 'tap';
+      // Flipped the instant the batch dispatch is issued. Read by the catch to
+      // decide whether the runSteps fallback is safe: before dispatch it is the
+      // point of the fallback, after dispatch it is a second real action.
+      let dispatchedToDevice = false;
 
       try {
         const lintResult = await client.lintElement(sessionId, description, lintActionType, undefined, {
@@ -409,6 +413,14 @@ export class MobileStepApplyService {
             commands.push({ type: RAW_CMD_MAP[rawStepType] || 'tap', params: { ...coordParams }, ...visionFlag });
           }
 
+          // From here on the device HAS been driven. Anything that throws below
+          // must not be retried by the runSteps fallback — see the catch.
+          //
+          // The generous budget below makes the race rare; this flag makes the
+          // damage impossible. Both are needed: a timeout can always be beaten
+          // by a slow enough screen, and the failure mode it leaves behind is a
+          // SECOND real action, not a retry.
+          dispatchedToDevice = true;
           // These commands carry `intent` (+ a deliberately demoted
           // `coordsConfidence`), so the runner re-resolves before dispatching
           // and then runs its post-action stability wait. That is a resolve
@@ -471,13 +483,55 @@ export class MobileStepApplyService {
           };
         }
 
-        // Lint didn't resolve — fall through to runSteps
+        // Lint didn't resolve — nothing was dispatched, so falling through to
+        // runSteps is safe and is the whole point of the fallback.
       } catch (lintError) {
-        logger.warn('[MOBILE_STEP_APPLY] Lint path failed, falling back to runSteps', {
+        const message = lintError instanceof Error ? lintError.message : String(lintError);
+
+        // The fallback is only sound when the lint path did NOT touch the
+        // device. Once `executeBatchCommands` has been called, the tap/type is
+        // already on its way to the app, and a throw here — overwhelmingly a
+        // TIMEOUT while the runner was still waiting for the screen to settle —
+        // does not mean it failed to land. Re-running it through runSteps
+        // re-RESOLVES the same intent against the screen the first action just
+        // navigated to, which is a second, different action.
+        //
+        // Live on JanaPost TC-32 (2026-08-07), one authored step:
+        //   21:05:19  tapByText "FAQ" -> HIT            (lint path; landed)
+        //   ~29s of Flutter tree settle, dispatch times out
+        //   21:05:45  [MOBILE_STEP_APPLY] falling back to runSteps
+        //   21:05:54  tapByText "Қолданбаны негізгі пайдалану" -> HIT
+        //   21:05:57  run-steps: 1/1 passed
+        // One step, two taps, two screens, reported PASSED — and the run then
+        // failed two steps later looking for a search field that only exists on
+        // the screen the first tap had correctly reached.
+        //
+        // A retry is not "making sure it worked"; for navigation it is not
+        // idempotent. Surface the uncertainty instead.
+        if (dispatchedToDevice) {
+          logger.error('[MOBILE_STEP_APPLY] Dispatch failed AFTER the device was driven — not falling back', {
+            sessionId,
+            error: message,
+          });
+          return {
+            success: false,
+            stepResult: {
+              success: false,
+              error:
+                `The step was sent to the device but the result did not come back in time (${message}). `
+                + 'It may already have taken effect, so it was NOT retried — retrying a tap that landed '
+                + 'navigates twice. Re-run the step to continue.',
+              durationMs: Date.now() - applyStart,
+            },
+            status: 'failed',
+          };
+        }
+
+        logger.warn('[MOBILE_STEP_APPLY] Lint path failed before dispatch, falling back to runSteps', {
           sessionId,
-          error: lintError instanceof Error ? lintError.message : String(lintError),
+          error: message,
         });
-        // Fall through
+        // Fall through — safe, nothing reached the device.
       }
     }
 
