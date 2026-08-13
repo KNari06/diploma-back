@@ -1,0 +1,55 @@
+# Verify the QAIT connection BEFORE you wire up a build — GitHub Actions.
+#
+# Add this workflow FIRST, run it once, and only then add the publish workflow.
+# It takes about twenty seconds: no Flutter, no build, no upload.
+#
+# WHY BOTHER WITH A SEPARATE WORKFLOW
+# A publish job can fail for two completely different reasons — the key or the
+# network is wrong, or the build is wrong — and in a failed publish job those
+# look identical. This job removes the first possibility, so that if the publish
+# job later fails, you already know it is the build. When we ran the equivalent
+# job against our own pipeline it caught two unrelated setup problems in
+# seconds, neither of which would have been legible in a failed build.
+#
+# It also does NOT consume QAIT's upload window (one upload per project per five
+# minutes), so you can run it as often as you like while sorting out access.
+#
+# Prerequisites:
+#   1. QAIT_CI_KEY stored as a repository secret
+#   2. ci/qait-publish.sh committed to your repo
+#
+# Run it from the Actions tab → "QAIT connection check" → "Run workflow".
+
+name: QAIT connection check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # curl and jq are both preinstalled on GitHub-hosted runners, so there is
+      # nothing to install. Invoked via `bash` because a file added through the
+      # GitHub web UI, or committed from Windows, can arrive without its
+      # executable bit.
+      - name: Check the QAIT key and network
+        env:
+          QAIT_CI_KEY: ${{ secrets.QAIT_CI_KEY }}
+        run: bash ./ci/qait-publish.sh --check
+
+# Expected output when everything is in order:
+#
+#   qait: checking https://api.qait.dev ...
+#   qait: key OK — project <your-project-id>
+#   qait: checking https://qaiprodappsc3f4ef.blob.core.windows.net ...
+#   qait: blob storage reachable (HTTP 400)
+#   qait: all checks passed
+#
+# "HTTP 400" from blob storage means REACHABLE — you got an answer from the
+# server. A hang or timeout there means a proxy or firewall is blocking the
+# upload host, which is the one people forget to allowlist: the API can be
+# reachable while the binary upload itself hangs.
