@@ -201,6 +201,17 @@ function classifySkip(err: unknown): 'busy' | 'unreachable' | null {
   if (!(err instanceof MobileRunnerError)) return null;
   if (err.code === 'DEVICE_BUSY') return 'busy';
   if (err.code === 'NETWORK_ERROR') return 'unreachable';
+  // TIMEOUT — the request was ACCEPTED and then never answered. Added
+  // 2026-08-12, after cell1's `qai-adb` wedged at 06:00 UTC and JanaPost lost 17
+  // regression runs in a row, each burning the full 180 s client timeout, while
+  // its second emulator on cell2 answered `adb devices` instantly throughout.
+  //
+  // This is the LIKELIER way a cell dies, not the rarer one: NETWORK_ERROR means
+  // the connection never opened, whereas a wedged runner still completes the TCP
+  // handshake and still serves `/health` — it only stops answering anything that
+  // needs adb. Covering NETWORK_ERROR alone (the first version of this function)
+  // left the more common failure uncovered.
+  if (err.code === 'TIMEOUT') return 'unreachable';
   // A gateway status with NO runner code — nginx answered but the runner behind
   // it did not (mid-deploy, crashed, still booting), so another cell can serve.
   //
