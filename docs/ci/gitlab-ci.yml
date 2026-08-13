@@ -1,0 +1,41 @@
+# Publish a Flutter Android build to QAIT — GitLab CI.
+#
+# Copy this job into .gitlab-ci.yml, or paste the script lines into a build job
+# you already have. Prerequisites:
+#   1. lib/main_qait.dart exists (see main_qait.dart in this folder)
+#   2. QAIT_CI_KEY is a CI/CD variable — Settings → CI/CD → Variables,
+#      with Masked AND Protected ticked
+#   3. ci/qait-publish.sh is committed to your repo and executable
+#
+# Note the build flags: --debug and --target. QAIT drives Flutter through the
+# Dart VM Service, which a release build does not expose, and it needs the
+# driver extension that main_qait.dart compiles in. A plain
+# `flutter build apk --release` is rejected at upload time.
+
+qait:publish:
+  stage: deploy
+  image: ghcr.io/cirruslabs/flutter:stable
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  before_script:
+    # jq is what the publish script uses to read the API responses.
+    - apt-get update -qq && apt-get install -y -qq jq
+  script:
+    # Quoted because the descriptor contains ": ", which YAML would otherwise
+    # read as a mapping and reject.
+    - 'flutter pub add "dev:flutter_driver:{sdk: flutter}"'
+    - flutter build apk --debug --target=lib/main_qait.dart
+    - ./ci/qait-publish.sh build/app/outputs/flutter-apk/app-debug.apk
+
+# ── Several environments? ──────────────────────────────────────────
+# Publish each flavour into its own QAIT variant lane. Create the lanes first
+# in the QAIT web app (project → Mobile Settings), then:
+#
+#    qait:publish:staging:
+#      extends: qait:publish
+#      script:
+#        - 'flutter pub add "dev:flutter_driver:{sdk: flutter}"'
+#        - flutter build apk --debug --flavor staging --target=lib/main_qait.dart
+#        - ./ci/qait-publish.sh --variant Staging build/app/outputs/flutter-apk/app-staging-debug.apk
+#
+# One key covers every lane in the project — the lane is chosen per upload.

@@ -1,0 +1,72 @@
+# Publish a Flutter Android build to QAIT — GitHub Actions.
+#
+# Copy this job into .github/workflows/, or paste the two QAIT steps into a
+# workflow you already have. Prerequisites:
+#   1. lib/main_qait.dart exists (see main_qait.dart in this folder)
+#   2. QAIT_CI_KEY is stored as a repository secret
+#   3. ci/qait-publish.sh is committed to your repo and executable
+#
+# Note the build flags: --debug and --target. QAIT drives Flutter through the
+# Dart VM Service, which a release build does not expose, and it needs the
+# driver extension that main_qait.dart compiles in. A plain
+# `flutter build apk --release` is rejected at upload time.
+
+name: Publish build to QAIT
+
+on:
+  push:
+    branches: [main]
+
+# Only ever one publish in flight. QAIT allows one upload per project per
+# 5 minutes, and that window is consumed even by a SUCCESSFUL upload — so two
+# merges to main within five minutes would make the second job fail with
+# HTTP 429, which reads like a broken integration rather than a rate limit.
+# Superseding the older run is the correct behaviour anyway: you want the
+# newest build published, not the one that happened to start first.
+concurrency:
+  group: qait-publish
+  cancel-in-progress: true
+
+# NOTE ON SECRETS: this triggers on push to main, which a fork cannot do, so
+# QAIT_CI_KEY is never exposed to untrusted code. If you ever add a
+# `pull_request` trigger, exclude forks explicitly — a fork PR would otherwise
+# get to read the key.
+
+jobs:
+  qait:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Add the Flutter driver dependency
+        # Quoted because the descriptor contains ": ", which YAML would
+        # otherwise read as a mapping and reject.
+        run: 'flutter pub add "dev:flutter_driver:{sdk: flutter}"'
+
+      - name: Build the QAIT debug APK
+        run: flutter build apk --debug --target=lib/main_qait.dart
+
+      # Invoked via `bash` rather than `./…` on purpose: a file added through
+      # the GitHub web UI, or committed from Windows, can arrive without its
+      # executable bit and would fail with "Permission denied".
+      # curl and jq are both preinstalled on GitHub-hosted runners.
+      - name: Publish to QAIT
+        env:
+          QAIT_CI_KEY: ${{ secrets.QAIT_CI_KEY }}
+        run: bash ./ci/qait-publish.sh build/app/outputs/flutter-apk/app-debug.apk
+
+# ── Several environments? ──────────────────────────────────────────
+# Publish each flavour into its own QAIT variant lane. Create the lanes first
+# in the QAIT web app (project → Mobile Settings), then:
+#
+#      - name: Publish staging build to QAIT
+#        env:
+#          QAIT_CI_KEY: ${{ secrets.QAIT_CI_KEY }}
+#        run: bash ./ci/qait-publish.sh --variant Staging build/app/outputs/flutter-apk/app-debug.apk
+#
+# One key covers every lane in the project — the lane is chosen per upload.
