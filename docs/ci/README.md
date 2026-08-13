@@ -10,6 +10,7 @@ Everything you need is in this folder:
 |---|---|
 | [`qait-publish.sh`](qait-publish.sh) | The publish script. Commit it to your repo — it does the work. |
 | [`main_qait.dart`](main_qait.dart) | The Flutter entrypoint that makes a build drivable. Flutter apps only. |
+| [`github-actions-check.yml`](github-actions-check.yml) | **Add this one first.** A 20-second GitHub Actions workflow that verifies the key and the network, and builds nothing. |
 | [`github-actions.yml`](github-actions.yml) | Ready-to-paste GitHub Actions job. |
 | [`gitlab-ci.yml`](gitlab-ci.yml) | Ready-to-paste GitLab CI job. |
 
@@ -107,12 +108,31 @@ Never commit the key, never paste it into a pipeline file, never `echo` it.
 | CI system | Where |
 |---|---|
 | GitHub Actions | Settings → Secrets and variables → Actions → New repository secret, named `QAIT_CI_KEY` |
-| GitLab CI | Settings → CI/CD → Variables → `QAIT_CI_KEY`, tick **Masked** and **Protected** |
+| GitLab CI | Settings → CI/CD → Variables → `QAIT_CI_KEY`, tick **Masked** (see the note below before ticking **Protected**) |
 | Bitbucket | Repository settings → Repository variables → tick **Secured** |
 | Jenkins | Credentials → Secret text, bound with `withCredentials` |
 
 If your repository accepts pull requests from forks, make sure the publish job
 does **not** run on fork-triggered builds — otherwise a PR can read the secret.
+
+> **GitLab only — the "Protected" tick has a catch.** A *protected* variable is
+> handed only to jobs running on a **protected branch or tag**. If the branch
+> that publishes your build isn't protected, GitLab silently omits the variable
+> and the job fails with:
+>
+> ```
+> qait: QAIT_CI_KEY is not set — add it as a CI secret
+> ```
+>
+> which reads as "the variable didn't save" even though it is sitting right
+> there in the settings page. So:
+>
+> - publishing from a **protected** branch (usually `main`) → tick Protected;
+> - publishing from any **unprotected** branch → leave Protected **unticked**,
+>   or protect that branch first.
+>
+> **Masked is a separate setting and you always want it** — it is what keeps the
+> key out of job logs. Nothing about the catch above applies to it.
 
 ## Step 4 — check the key and the network *before* wiring the pipeline
 
@@ -138,10 +158,22 @@ qait: all checks passed
 answer from the server. A hang or timeout means a proxy or firewall is in the
 way, and that is a conversation with your network team, not with QAIT.
 
-Run this from inside a CI job too, not just your laptop. Self-hosted runners
-behind a corporate proxy are the usual place this fails, and the blob host is
-the one people forget to allowlist: the API can be reachable while the upload
-itself hangs.
+**Run this from inside a CI job too, not just your laptop** — that is what
+actually matters, because your runner's network is not your laptop's.
+[`github-actions-check.yml`](github-actions-check.yml) is a ready-made workflow
+that does exactly this and nothing else: add it, run it once from the Actions
+tab, and you have proved the key, the secret wiring and both hosts before any
+build exists to go wrong.
+
+It is worth the extra step because a publish job can fail for two unrelated
+reasons — the key/network is wrong, or the build is wrong — and in a failed
+publish job those look the same. Ruling out the first makes the second
+diagnosable. It also does not consume the upload window, so you can re-run it
+freely while sorting out access.
+
+Self-hosted runners behind a corporate proxy are the usual place this fails, and
+the blob host is the one people forget to allowlist: the API can be reachable
+while the upload itself hangs.
 
 ## Step 5 — add it to the pipeline
 
@@ -219,6 +251,7 @@ the fix.
 | `UPGRADE_REQUIRED` | Workspace is not on a paid plan | Upgrade |
 | `WRITE_DENIED` | The key's owner lost write access to the project | Re-grant access, or regenerate the key from an account that has it |
 | `413` / too large | Over 500 MB | Reduce the build, or talk to QAIT support |
+| `QAIT_CI_KEY is not set` | The variable exists but wasn't given to this job — on GitLab, almost always a **Protected** variable on an unprotected branch | See the note in Step 3. Not a QAIT error: the job never reached us |
 
 A **non-JSON response** or a timeout is almost never QAIT — it means a proxy
 answered instead of us. Re-run `--check` from the same runner.

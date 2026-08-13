@@ -4,7 +4,10 @@
 # you already have. Prerequisites:
 #   1. lib/main_qait.dart exists (see main_qait.dart in this folder)
 #   2. QAIT_CI_KEY is a CI/CD variable — Settings → CI/CD → Variables,
-#      with Masked AND Protected ticked
+#      with Masked ticked. Tick Protected ONLY if the branch this job runs on
+#      is a protected branch — a protected variable is withheld from jobs on
+#      unprotected branches, and the job then fails with
+#      "QAIT_CI_KEY is not set", which looks like the variable was never saved.
 #   3. ci/qait-publish.sh is committed to your repo and executable
 #
 # Note the build flags: --debug and --target. QAIT drives Flutter through the
