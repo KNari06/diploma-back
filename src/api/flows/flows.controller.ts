@@ -400,6 +400,45 @@ export async function listFlows(req: AuthenticatedRequest, res: Response): Promi
 }
 
 /**
+ * Search flows by name across a whole project (owner-scoped).
+ * Backs the /repository test-case search box.
+ * GET /api/v1/flows/search?projectId=…&q=…&limit=…
+ */
+export async function searchFlows(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { projectId, q, limit } = req.query;
+
+    if (!projectId || typeof projectId !== 'string') {
+      res.status(400).json({ success: false, error: 'projectId is required' });
+      return;
+    }
+
+    const query = typeof q === 'string' ? q.trim() : '';
+    if (!query) {
+      // Blank query is a no-op search, not an error.
+      res.json({ success: true, data: [], timestamp: new Date() });
+      return;
+    }
+
+    const userId = getUserId(req);
+
+    // Clamp the page size: default 100, hard cap 500 so a broad match can't
+    // return an unbounded result set.
+    const parsedLimit = typeof limit === 'string' ? parseInt(limit, 10) : NaN;
+    const safeLimit = Number.isFinite(parsedLimit)
+      ? Math.min(Math.max(parsedLimit, 1), 500)
+      : 100;
+
+    const flows = await FlowService.searchByProject(projectId, userId, query, safeLimit);
+
+    res.json({ success: true, data: flows, timestamp: new Date() });
+  } catch (error) {
+    logger.error('[FLOWS_API] Failed to search flows', { error });
+    handleError(res, error, 'Failed to search flows');
+  }
+}
+
+/**
  * Update a flow
  */
 export async function updateFlow(req: AuthenticatedRequest, res: Response): Promise<void> {

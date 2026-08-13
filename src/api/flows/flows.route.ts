@@ -12,6 +12,7 @@ import {
     getFlow,
     listFlows,
     reorderFlows,
+    searchFlows,
     updateFlow,
 } from './flows.controller';
 
@@ -152,6 +153,44 @@ router.post('/', requireAuth, createFlow);
  *         description: Flows reordered
  */
 router.post('/reorder', requireAuth, reorderFlows);
+
+/**
+ * @swagger
+ * /api/v1/flows/search:
+ *   get:
+ *     summary: Search a project's flows by name (owner-scoped)
+ *     description: |
+ *       Case-insensitive substring match on flow name across every folder in the
+ *       project. Backs the Repository page test-case search box.
+ *     tags: [Flows]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: projectId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *       - in: query
+ *         name: q
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Search query (matched against flow name)
+ *       - in: query
+ *         name: limit
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           default: 100
+ *           maximum: 500
+ *     responses:
+ *       200:
+ *         description: Matching flows (may be empty)
+ */
+// NOTE: must be registered BEFORE `/:id` so "search" is not captured as an id.
+router.get('/search', requireAuth, searchFlows);
 
 /**
  * @swagger

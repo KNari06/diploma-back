@@ -12,6 +12,7 @@ import type {
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 import { normaliseVariantOverride, normaliseHostOverride } from '@/services/mobile/project-mobile-app.helper';
+import { searchFlowsByProjectQuery } from './db/flow.db';
 
 /**
  * Service for managing test flows
@@ -100,6 +101,47 @@ export class FlowService {
     }
 
     return this.mapToTestFlow(data);
+  }
+
+  /**
+   * Search a project's flows by name (case-insensitive substring).
+   *
+   * Owner-scoped, project-scoped via the module join — mirrors the Repository
+   * tree's flow reads so search results match exactly what the tree shows.
+   * Backs the `/repository` test-case search box. Returns [] for a blank query.
+   *
+   * @param projectId - project to scope to
+   * @param userId - owner scope
+   * @param query - raw user query (wildcards are escaped so % and _ match literally)
+   * @param limit - max rows to return (already clamped by the caller)
+   * @returns Matching flows, name-ascending
+   */
+  static async searchByProject(
+    projectId: string,
+    userId: string,
+    query: string,
+    limit: number
+  ): Promise<TestFlow[]> {
+    const trimmed = (query || '').trim();
+    if (!trimmed) return [];
+
+    // Escape ilike wildcards (and the escape char) so a user typing "%" or "_"
+    // searches for that literal character instead of a wildcard.
+    const pattern = trimmed.replace(/[\\%_]/g, (c) => `\\${c}`);
+
+    const { data, error } = await searchFlowsByProjectQuery({
+      projectId,
+      userId,
+      pattern,
+      limit,
+    });
+
+    if (error) {
+      logger.error('[FLOW_SERVICE] Failed to search flows', { error, projectId });
+      throw new Error(`Failed to search flows: ${error.message}`);
+    }
+
+    return (data || []).map(this.mapToTestFlow);
   }
 
   /**
