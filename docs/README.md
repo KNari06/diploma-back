@@ -37,6 +37,13 @@
 - [**Enhanced Fuzzing Details**](./api/ENHANCED_FUZZING_DETAILS.md) - детальная информация о failed tests
 - [**Waitlist API**](./api/waitlist-api.md) - регистрация в waitlist для раннего доступа
 
+### 🔁 CI/CD интеграция (для клиентов)
+
+- [**Публикация билдов из CI/CD**](./ci/README.md) - 📦 NEW! Гайд, который отдаём клиенту: как его пайплайн публикует Android/Flutter билд в QAIT
+- [**qait-publish.sh**](./ci/qait-publish.sh) - готовый скрипт публикации (три вызова + `--check` для проверки ключа и сети)
+- [**main_qait.dart**](./ci/main_qait.dart) - Flutter entrypoint с driver extension (без изменения продового `main.dart`)
+- [**GitHub Actions**](./ci/github-actions.yml) / [**GitLab CI**](./ci/gitlab-ci.yml) - готовые к вставке джобы
+
 ### 💻 Разработка
 
 - [**Руководство разработчика**](./development/README.md) - как разрабатывать
