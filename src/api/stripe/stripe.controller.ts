@@ -2,8 +2,7 @@ import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
 import { EmailService } from '@/services/core/email.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
-import { PlanService } from '@/services/core/plan.service';
-import { ReferralService } from '@/services/core/referral.service';
+import { WorkspaceCreditsService } from '@/services/core/workspace-credits.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import Stripe from 'stripe';
@@ -289,9 +288,6 @@ export const handleWebhook = async (req: Request, res: Response): Promise<void> 
       'customer.subscription.deleted',
       'invoice.payment_succeeded',
       'invoice.payment_failed',
-      // Refunds reverse the referral reward — without this a partner keeps the
-      // commission on money the customer took back.
-      'charge.refunded',
     ]);
 
     if (!handledEventTypes.has(event.type)) {
@@ -311,9 +307,6 @@ export const handleWebhook = async (req: Request, res: Response): Promise<void> 
         break;
       case 'invoice.payment_failed':
         await handleInvoicePaymentFailed(event);
-        break;
-      case 'charge.refunded':
-        await handleChargeRefunded(event);
         break;
       default:
         logger.info('[STRIPE_WEBHOOK] Event type ignored', { type: event.type });
@@ -395,6 +388,10 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
     ? new Date(subscription.current_period_end * 1000).toISOString()
     : null;
   const subscriptionPlanLabel = plan?.name || plan?.code || 'pro';
+  const latestInvoiceId =
+    typeof subscription.latest_invoice === 'string'
+      ? subscription.latest_invoice
+      : subscription.latest_invoice?.id || null;
 
   // Upsert subscription record
   const subscriptionData: Record<string, any> = {
@@ -417,10 +414,10 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
     onConflict: 'stripe_subscription_id',
   });
 
-  // Update Stripe-specific user columns. The plan/tier mirrors
-  // (plan_id / plan / plan_status + user_credits) are owned by the single
-  // funnel PlanService.setUserPlan, called below — NOT written inline here.
+  // Update user plan
   const userUpdateData: Record<string, any> = {
+    plan: isActive ? 'pro' : 'free',
+    plan_status: isActive ? 'paid' : null,
     current_period_end: currentPeriodEnd,
     cancel_at_period_end: subscription.cancel_at_period_end ?? false,
     stripe_price_id: priceId,
@@ -435,34 +432,20 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
           status: 'inactive',
           credits_included: 0,
         },
-    // Intentionally does NOT write last_credits_invoice_id: that field belongs to
-    // the invoice-payment handler's bookkeeping, and this handler never grants
-    // credits. Writing it here previously could falsely mark an invoice as
-    // "already credited" before the grant ran.
+    last_credits_invoice_id: latestInvoiceId,
     updated_at: new Date().toISOString(),
   };
+
+  if (isActive && plan?.id) {
+    userUpdateData.plan_id = plan.id;
+  } else if (!isActive) {
+    userUpdateData.plan_id = null;
+  }
 
   await supabaseAdmin
     .from('users')
     .update(userUpdateData)
     .eq('id', user.id);
-
-  // Funnel the plan/tier mirror through PlanService so users.{plan_id,plan,
-  // plan_status} and user_credits.{subscription_plan,subscription_status,
-  // grace_limit} stay in sync. Active → 'pro' (paid). Inactive only downgrades
-  // to 'free' on a TERMINAL state (canceled / incomplete_expired); transient
-  // dunning (past_due / unpaid) keeps the plan intact so the user retains
-  // access during the retry window — Stripe sends another event if it
-  // ultimately cancels.
-  if (isActive) {
-    await PlanService.setUserPlan(user.id, 'pro', { status: 'paid', source: 'stripe:subscription' });
-  } else if (subscription.status === 'canceled' || subscription.status === 'incomplete_expired') {
-    await PlanService.setUserPlan(user.id, 'free', {
-      status: null,
-      skipDowngradeGuard: true,
-      source: 'stripe:subscription:terminal',
-    });
-  }
 
   const planCode = plan?.code || 'unknown';
 
@@ -586,11 +569,19 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     return;
   }
 
-  // NOTE: idempotency is enforced solely by the stripe_transactions
-  // UNIQUE(stripe_invoice_id) barrier + credits_granted flag below. We do NOT
-  // gate on user.last_credits_invoice_id here: that field is also written by the
-  // subscription-event handler (which never grants credits), so a same-invoice
-  // subscription event arriving first could falsely short-circuit the grant.
+  if (user.last_credits_invoice_id === invoice.id) {
+    logger.info('[STRIPE_WEBHOOK] Invoice already processed', {
+      userId: user.id,
+      invoiceId: invoice.id,
+    });
+    return;
+  }
+
+  let priceId =
+    invoice.lines?.data?.[0]?.price?.id ||
+    // @ts-ignore
+    invoice.lines?.data?.[0]?.pricing?.price_details?.price?.id ||
+    null;
 
   const subscriptionId =
     typeof invoice.subscription === 'string'
@@ -600,25 +591,17 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
         invoice.parent?.subscription_details?.subscription ||
         null;
 
-  // Resolve the priceId that determines which plan's credits to grant.
-  // Order matters for correctness, NOT just for null-filling:
-  // 1) For a subscription invoice, the SUBSCRIPTION's current item price is
-  //    authoritative. invoice.lines.data[0] is unreliable — on a plan change /
-  //    proration the invoice carries multiple lines (an unused-time credit line
-  //    for the old price + a remaining-time line for the new price) and Stripe
-  //    does not guarantee the line you want is index [0]. Trusting [0] can grant
-  //    the WRONG tier's credits.
-  // 2) Only for a one-off (no subscription) do we read invoice lines, and even
-  //    then we skip proration/credit/$0 lines.
-  // 3) Last resort: the user's stored price id.
-  let priceId: string | null = null;
+  if (!priceId && subscriptionId) {
+    if (!stripe) {
+      logger.error('[STRIPE_WEBHOOK] Stripe not configured');
+      return;
+    }
 
-  if (subscriptionId && stripe) {
     try {
       const subscription = await stripe.subscriptions.retrieve(subscriptionId, {
         expand: ['items.data.price'],
       });
-      priceId = subscription.items?.data?.[0]?.price?.id ?? null;
+      priceId = subscription.items?.data?.[0]?.price?.id;
     } catch (error) {
       logger.error('[STRIPE_WEBHOOK] Failed to fetch subscription for price', {
         subscriptionId,
@@ -626,26 +609,6 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
       });
     }
   }
-
-  if (!priceId) {
-    const lines = invoice.lines?.data ?? [];
-    const lineprice = (l: any) => l?.price?.id || l?.pricing?.price_details?.price?.id || null;
-    // Prefer a positive-amount, non-proration line; fall back progressively.
-    const chosen =
-      lines.find((l: any) => (l.amount ?? 0) > 0 && !l.proration && lineprice(l)) ||
-      lines.find((l: any) => (l.amount ?? 0) > 0 && lineprice(l)) ||
-      lines[0];
-    priceId = chosen ? lineprice(chosen) : null;
-
-    if (lines.length > 1) {
-      logger.info('[STRIPE_WEBHOOK] Multi-line invoice — chosen priceId for grant', {
-        invoiceId: invoice.id,
-        chosenPriceId: priceId,
-        candidates: lines.map((l: any) => ({ price: lineprice(l), amount: l.amount, proration: l.proration })),
-      });
-    }
-  }
-
   if (!priceId && user.stripe_price_id) {
     priceId = user.stripe_price_id;
   }
@@ -658,27 +621,8 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
         .maybeSingle()
     : { data: null };
 
-  // plans-desync guard: a PAID invoice whose price has no matching plans row
-  // means the plans table is out of sync with Stripe (new/rotated price, or an
-  // un-replaced placeholder price id). The old code only warned and continued —
-  // which recorded the transaction as 'succeeded' and granted ZERO credits, and
-  // because the barrier row was then committed, no retry could ever heal it.
-  // THROW here (BEFORE the transaction INSERT below) so Stripe retries with
-  // backoff (~3 days), giving an operator time to seed/fix the plans row so a
-  // later retry grants correctly — and crucially no 'succeeded' row is recorded.
-  if (priceId && !plan && (invoice.amount_paid ?? 0) > 0) {
-    logger.error('[STRIPE_WEBHOOK] Paid invoice for unknown price — plans table desync; failing for retry', {
-      priceId,
-      invoiceId: invoice.id,
-      userId: user.id,
-      eventId: event.id,
-      amountPaid: invoice.amount_paid,
-    });
-    throw new Error(`No plan row for paid Stripe price ${priceId} (invoice ${invoice.id})`);
-  }
   if (!plan && priceId) {
-    // Non-paid (e.g. $0/trial) invoice with no plan — log but don't hard-fail.
-    logger.warn('[STRIPE_WEBHOOK] Plan not found for price (non-paid invoice)', { priceId, invoiceId: invoice.id });
+    logger.warn('[STRIPE_WEBHOOK] Plan not found for price', { priceId });
   }
 
   const creditsPerPeriod = plan?.credits_per_period || 0;
@@ -694,6 +638,7 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
   // A recurring renewal must RESET credits to the period allotment, not stack
   // them. The first charge / upgrade adds; every `subscription_cycle` resets.
   const billingReason = (invoice as Stripe.Invoice).billing_reason;
+  const isRenewalCycle = billingReason === 'subscription_cycle';
 
   const transactionData: Record<string, any> = {
     user_id: user.id,
@@ -723,128 +668,83 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
   // granting. (The old code did a separate SELECT-then-act check and granted
   // before the upsert, so two concurrent retries could both pass the check and
   // double-grant.)
-  // Insert the barrier row with credits_granted=false. The row existing is NOT
-  // proof credits landed; credits_granted is the real "delivered" flag so a
-  // failed/crashed grant self-heals on Stripe's retry instead of being swallowed.
   const { error: transactionError } = await supabaseAdmin
     .from('stripe_transactions')
-    .insert({ ...transactionData, credits_granted: false });
+    .insert(transactionData);
 
   if (transactionError) {
     if (transactionError.code === '23505') {
-      // A row already exists for this invoice. If its grant already completed,
-      // this is a true duplicate. If not, fall through and re-attempt the grant
-      // (recovers a prior transient failure or crash between INSERT and grant).
-      const { data: existing } = await supabaseAdmin
-        .from('stripe_transactions')
-        .select('credits_granted')
-        .eq('stripe_invoice_id', invoice.id)
-        .maybeSingle();
-
-      if (existing?.credits_granted) {
-        logger.info('[STRIPE_WEBHOOK] Duplicate invoice ignored (credits already granted)', {
-          invoiceId: invoice.id,
-          eventId: event.id,
-          userId: user.id,
-        });
-        return;
-      }
-      logger.warn('[STRIPE_WEBHOOK] Invoice row exists but credits not granted — re-attempting', {
+      logger.info('[STRIPE_WEBHOOK] Duplicate invoice ignored (already recorded)', {
         invoiceId: invoice.id,
+        eventId: event.id,
         userId: user.id,
       });
-      // fall through to grant
-    } else {
-      // Could not record the transaction — throw so Stripe retries the whole event.
-      logger.error('[STRIPE_WEBHOOK] Failed to record transaction', {
-        invoiceId: invoice.id,
-        userId: user.id,
-        error: transactionError.message,
-      });
-      throw new Error(`Failed to record stripe transaction for invoice ${invoice.id}`);
+      return;
     }
+    // Could not record the transaction — do NOT grant credits, so a Stripe
+    // retry can re-attempt the whole thing rather than granting un-recorded.
+    logger.error('[STRIPE_WEBHOOK] Failed to record transaction; skipping credit grant', {
+      invoiceId: invoice.id,
+      userId: user.id,
+      error: transactionError.message,
+    });
+    return;
   }
 
-  // First charge / one-off ADDS the allotment; a recurring/period event RESETS
-  // to the allotment (no rollover). subscription_update (proration / mid-period
-  // plan change) is a period event too — reset, NOT a second full add.
-  const isPeriodReset =
-    billingReason === 'subscription_cycle' || billingReason === 'subscription_update';
+  logger.info('[STRIPE_WEBHOOK] Transaction saved', {
+    invoiceId: invoice.id,
+    userId: user.id,
+    amount: transactionData.amount,
+    currency: transactionData.currency,
+  });
 
-  // Referred users get a per-plan credit bonus on the SAME money (2x on pro_19,
-  // less on the larger plans). Resolved BEFORE the grant because it changes the
-  // amount — unlike the partner reward below, which is fire-and-forget. Degrades
-  // to `creditsPerPeriod` on any fault, so a referral fault never withholds the
-  // credits the user paid for. The `referral_bonus_*` metadata below is what
-  // makes the per-plan window count work — dropping it re-bonuses forever.
-  const bonus = invoice.id && creditsPerPeriod > 0 && !isBusinessPlanCode
-    ? await ReferralService.resolveInvoiceCredits({
-        userId: user.id,
-        invoiceId: invoice.id,
-        planCode,
-        planCredits: creditsPerPeriod,
-      })
-    : { credits: creditsPerPeriod, bonusApplied: false, multiplier: 1 };
+  if (creditsPerPeriod > 0 && !isBusinessPlanCode) {
+    logger.info('[STRIPE_WEBHOOK] Adding credits on invoice payment', {
+      userId: user.id,
+      credits: creditsPerPeriod,
+      invoiceId: invoice.id,
+    });
 
-  const creditsToGrant = bonus.credits;
-
-  if (creditsToGrant > 0 && !isBusinessPlanCode) {
-    const grantMetadata: Record<string, unknown> = {
-      invoice_id: invoice.id,
-      event_type: event.type,
-      ...(bonus.bonusApplied
-        ? {
-            referral_bonus_invoice: invoice.id,
-            referral_bonus_plan: planCode,
-            referral_bonus_multiplier: bonus.multiplier,
-            referral_base_credits: creditsPerPeriod,
-          }
-        : {}),
-    };
-    const bonusSuffix = bonus.bonusApplied ? ` (referral ${bonus.multiplier}x)` : '';
-
-    const result = isPeriodReset
+    // First charge / one-off ADDS the allotment; a recurring cycle RESETS the
+    // balance to the allotment (no rollover) — otherwise B2C credits stack every
+    // month. Mirrors the B2B renewPlan vs upgradeToPlan branch above.
+    const result = isRenewalCycle
       ? await UserCreditsService.resetToPlanCredits(
           user.id,
-          creditsToGrant,
-          `Subscription renewal - ${planCode} plan${bonusSuffix}`,
-          grantMetadata
+          creditsPerPeriod,
+          `Subscription renewal - ${planCode} plan`,
+          { invoice_id: invoice.id, event_type: event.type }
         )
       : await UserCreditsService.addCredits(
           user.id,
-          creditsToGrant,
+          creditsPerPeriod,
           'purchase',
-          `Subscription payment - ${planCode} plan${bonusSuffix}`,
-          grantMetadata
+          `Subscription payment - ${planCode} plan`,
+          { invoice_id: invoice.id, event_type: event.type }
         );
 
-    // On failure THROW so handleWebhook returns 500 and Stripe retries; the
-    // credits_granted flag stays false so the retry re-attempts (not swallowed).
-    if (!result.success) {
-      logger.error('[STRIPE_WEBHOOK] Credit grant failed — throwing for Stripe retry', {
+    if (result.success) {
+      logger.info('[STRIPE_WEBHOOK] Credits added after invoice payment', {
         userId: user.id,
-        credits: creditsToGrant,
+        credits: creditsPerPeriod,
+        newBalance: result.newBalance,
         invoiceId: invoice.id,
       });
-      throw new Error(`Credit grant failed for invoice ${invoice.id}`);
+    } else {
+      logger.error('[STRIPE_WEBHOOK] Failed to add credits', {
+        userId: user.id,
+        credits: creditsPerPeriod,
+        invoiceId: invoice.id,
+      });
     }
-    logger.info('[STRIPE_WEBHOOK] Credits granted', {
-      userId: user.id,
-      credits: creditsToGrant,
-      baseCredits: creditsPerPeriod,
-      referralBonus: bonus.bonusApplied,
-      newBalance: result.newBalance,
-      invoiceId: invoice.id,
-      mode: isPeriodReset ? 'reset' : 'add',
-    });
   }
 
-  // Provision B2B plan credits on the USER account (credits belong to the user,
-  // NOT the workspace). Maps plan codes from the Stripe `plans` table to
-  // WORKSPACE_PLANS slugs for the credit + grace allotment.
+  // V16: Provision workspace credits for B2B plans.
+  // Maps plan codes from Stripe `plans` table to WORKSPACE_PLANS slugs.
   // Supports both legacy 'business' and new B2B plan codes.
-  // Pilot is admin-only (assignPilot), not purchasable via Stripe.
-  const B2B_PLAN_MAP: Record<string, 'small_business' | 'middle_business' | 'enterprise'> = {
+  // Pilot is admin-only (assignPilot), not purchasable via Stripe
+  type StripePurchasablePlan = 'small_business' | 'middle_business' | 'enterprise';
+  const B2B_PLAN_MAP: Record<string, StripePurchasablePlan> = {
     business: 'small_business',         // Legacy business → Small Business (29K)
     Business: 'small_business',
     small_business: 'small_business',   // $1,000/mo → 29K credits
@@ -852,57 +752,65 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     enterprise: 'enterprise',           // $2,990/mo → 200K credits
   };
 
-  const b2bPlanSlug = B2B_PLAN_MAP[planCode];
-  const isBusinessPlan = !!b2bPlanSlug;
+  const workspacePlanSlug = B2B_PLAN_MAP[planCode];
+  const isBusinessPlan = !!workspacePlanSlug;
 
   if (isBusinessPlan) {
-    const { WORKSPACE_PLANS } = await import('@/services/core/token-calculator.service');
-    const planConfig = WORKSPACE_PLANS[b2bPlanSlug];
+    try {
+      // Find the workspace where this user is the owner
+      const { data: ownerMembership } = await supabaseAdmin
+        .from('workspace_members')
+        .select('workspace_id')
+        .eq('user_id', user.id)
+        .eq('role', 'owner')
+        .eq('status', 'active')
+        .maybeSingle();
 
-    // First charge / upgrade ADDS; a recurring/period event RESETS to allotment.
-    const result = await UserCreditsService.grantBusinessPlan(
-      user.id,
-      b2bPlanSlug,
-      planConfig.credits,
-      planConfig.graceLimit,
-      isPeriodReset ? 'renew' : 'upgrade',
-      isPeriodReset
-        ? `Subscription renewal - ${b2bPlanSlug} plan`
-        : `Subscription payment - ${b2bPlanSlug} plan`,
-      { invoice_id: invoice.id, event_type: event.type }
-    );
+      if (ownerMembership) {
+        const workspaceId = ownerMembership.workspace_id;
 
-    // On failure THROW so handleWebhook returns 500 and Stripe retries; the
-    // credits_granted flag stays false so the retry re-attempts (not swallowed).
-    if (!result.success) {
-      logger.error('[STRIPE_WEBHOOK] B2B credit grant failed — throwing for Stripe retry', {
+        // First charge / upgrade ADDS the plan credits; a recurring cycle RESETS
+        // to the period allotment (otherwise the balance stacks every month).
+        const result = isRenewalCycle
+          ? await WorkspaceCreditsService.renewPlan(workspaceId, workspacePlanSlug)
+          : await WorkspaceCreditsService.upgradeToPlan(workspaceId, workspacePlanSlug);
+
+        if (result) {
+          logger.info('[STRIPE_WEBHOOK] B2B workspace plan provisioned', {
+            workspaceId,
+            userId: user.id,
+            plan: workspacePlanSlug,
+            mode: isRenewalCycle ? 'renew' : 'upgrade',
+            credits: result.credits_balance,
+            graceLimit: result.grace_limit,
+            invoiceId: invoice.id,
+          });
+        } else {
+          logger.error('[STRIPE_WEBHOOK] upgradeToPlan returned null', {
+            workspaceId,
+            userId: user.id,
+            plan: workspacePlanSlug,
+            invoiceId: invoice.id,
+          });
+        }
+      } else {
+        logger.warn('[STRIPE_WEBHOOK] No owned workspace found for B2B plan user', {
+          userId: user.id,
+          plan: workspacePlanSlug,
+          invoiceId: invoice.id,
+        });
+      }
+    } catch (wsError) {
+      logger.error('[STRIPE_WEBHOOK] Exception provisioning B2B workspace credits', {
+        error: wsError instanceof Error ? wsError.message : String(wsError),
         userId: user.id,
-        plan: b2bPlanSlug,
+        plan: workspacePlanSlug,
         invoiceId: invoice.id,
       });
-      throw new Error(`B2B credit grant failed for invoice ${invoice.id}`);
+      // Don't fail the webhook - user credits were already handled
     }
-
-    logger.info('[STRIPE_WEBHOOK] B2B plan credits granted to user', {
-      userId: user.id,
-      plan: b2bPlanSlug,
-      mode: isPeriodReset ? 'renew' : 'upgrade',
-      credits: planConfig.credits,
-      graceLimit: planConfig.graceLimit,
-      newBalance: result.newBalance,
-      invoiceId: invoice.id,
-    });
   }
 
-  // Grant succeeded (or nothing to grant). Flip the barrier row to granted so a
-  // future duplicate delivery short-circuits, and only THEN finalize plan state.
-  await supabaseAdmin
-    .from('stripe_transactions')
-    .update({ credits_granted: true })
-    .eq('stripe_invoice_id', invoice.id);
-
-  // Stripe-specific user columns only. The plan/tier mirror is funneled
-  // through PlanService.setUserPlan below for the personal (non-B2B) case.
   const userUpdateData: Record<string, any> = {
     last_credits_invoice_id: invoice.id,
     updated_at: new Date().toISOString(),
@@ -913,26 +821,17 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     },
   };
 
+  if (plan?.id) {
+    userUpdateData.plan_id = plan.id;
+    userUpdateData.plan = isBusinessPlan ? (workspacePlanSlug || 'business') : 'pro';
+    userUpdateData.plan_status = 'paid';
+  }
+
   if (priceId) {
     userUpdateData.stripe_price_id = priceId;
   }
 
-  // B2B credits/tier now live on the USER account (granted above via
-  // grantBusinessPlan, which also set user_credits.subscription_plan). But
-  // pricing_plans only knows free/pro/ultra, so a B2B slug can't be resolved by
-  // the PlanService facade — keep the legacy users.{plan,plan_status} text mirror
-  // inline for B2B; route the personal 'pro' plan through the single funnel so
-  // plan_id + user_credits.subscription_plan stay in sync.
-  if (plan && isBusinessPlan) {
-    userUpdateData.plan = b2bPlanSlug || 'business';
-    userUpdateData.plan_status = 'paid';
-  }
-
   await supabaseAdmin.from('users').update(userUpdateData).eq('id', user.id);
-
-  if (plan && !isBusinessPlan) {
-    await PlanService.setUserPlan(user.id, 'pro', { status: 'paid', source: 'stripe:invoice' });
-  }
 
   // Branded purchase confirmation — fire-and-forget so a mail failure never
   // breaks webhook processing (Stripe still sends its own receipt).
@@ -942,38 +841,6 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
   // Stripe still sends its own receipt for every charge.
   const isFirstOrOneOff =
     !billingReason || billingReason === 'subscription_create' || billingReason === 'manual' || billingReason === 'subscription_update';
-
-  // Referral reward — revenue share: the referring partner earns a % (default
-  // 50%) of the REAL amount paid, for the referred user's first N monthly
-  // payments (default 2), then 0%. Fires on every paid B2C invoice (first charge
-  // AND renewals); the window is enforced inside the service by COUNTING prior
-  // reward rows, not by the billing reason, and per-invoice idempotency is the
-  // ledger's ON CONFLICT on stripe_invoice_id.
-  //
-  // B2B is EXCLUDED. The 50% rate was sized against B2C tickets ($19–$99, so at
-  // most ~$99 per referral over the window); the same rate on an enterprise
-  // invoice is ~$1,495/month — an order of magnitude outside what the referral
-  // economics were set for. It also matches the user-side bonus above, which
-  // already skips business plans. A B2B referral should be a deliberate,
-  // separately-priced arrangement, not an accident of this percentage.
-  // Best-effort: never fails the webhook (service swallows). No-op unless enabled.
-  if (invoice.id && (invoice.amount_paid ?? 0) > 0 && !isBusinessPlanCode) {
-    void ReferralService.rewardOnPayment({
-      userId: user.id,
-      invoiceId: invoice.id,
-      amountPaidMinorUnits: invoice.amount_paid ?? 0,
-      currency: invoice.currency || 'usd',
-    });
-  } else if (invoice.id && (invoice.amount_paid ?? 0) > 0 && isBusinessPlanCode) {
-    // Log rather than drop silently: if a partner ever does bring a B2B customer
-    // we want it visible, not invisible.
-    logger.info('[STRIPE_WEBHOOK] B2B invoice — referral reward intentionally skipped', {
-      userId: user.id,
-      planCode,
-      invoiceId: invoice.id,
-    });
-  }
-
   if (user.email && isFirstOrOneOff) {
     EmailService.sendPlanPurchasedEmail({
       recipientEmail: user.email,
@@ -981,9 +848,7 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
       planName: subscriptionPlanLabel,
       amountCents: transactionData.amount,
       currency: transactionData.currency,
-      // The GRANTED amount, not the plan's base — a referred user's receipt must
-      // match the credits actually in their balance.
-      creditsIncluded: creditsToGrant || undefined,
+      creditsIncluded: creditsPerPeriod || undefined,
       frontendUrl: env.FRONTEND_URL || 'http://localhost:3000',
     })
       .then((result) => {
@@ -1003,38 +868,6 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
         })
       );
   }
-}
-
-/**
- * A charge was refunded (fully or partially) — reverse the referral reward for
- * the invoice behind it.
- *
- * Only the referral ledger is touched here. Credits are deliberately NOT clawed
- * back: they may already be spent, and a negative balance is a worse failure
- * than an unearned grant. The partner's owed balance, by contrast, is money we
- * have not paid out yet, so correcting it is both possible and right.
- *
- * Delegates to the service, which reverses proportionally and is idempotent per
- * refund. Best-effort — a refund must never fail the webhook.
- */
-async function handleChargeRefunded(event: Stripe.Event): Promise<void> {
-  const charge = event.data.object as Stripe.Charge;
-  const invoiceId = typeof charge.invoice === 'string' ? charge.invoice : charge.invoice?.id;
-
-  if (!invoiceId) {
-    // A charge with no invoice is a one-off payment outside the subscription
-    // flow — no reward was ever written for it.
-    logger.info('[STRIPE_WEBHOOK] Refunded charge has no invoice — nothing to reverse', {
-      chargeId: charge.id,
-    });
-    return;
-  }
-
-  await ReferralService.reverseRewardOnRefund({
-    invoiceId,
-    refundedAmountMinorUnits: charge.amount_refunded ?? 0,
-    originalAmountMinorUnits: charge.amount ?? 0,
-  });
 }
 
 async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {
@@ -1063,13 +896,6 @@ async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {
     return;
   }
 
-  // Payment failure is dunning, NOT a plan change: deliberately clear ONLY the
-  // plan_status flag (and the subscription JSON) while leaving users.plan_id and
-  // the user_credits mirror intact, so the user retains access during Stripe's
-  // retry window. A genuine cancellation arrives later as a subscription event
-  // (handleSubscriptionEvent → PlanService.setUserPlan('free')). This is NOT
-  // routed through the plan facade on purpose — the facade owns full plan/tier
-  // transitions, not a transient status flag flip.
   await supabaseAdmin
     .from('users')
     .update({

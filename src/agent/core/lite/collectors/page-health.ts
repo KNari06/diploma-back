@@ -33,9 +33,29 @@ export interface PageHealth {
   rateLimited: boolean;
   /** Console errors collected in the window. */
   consoleErrorCount: number;
+  /**
+   * A few actual console-error TEXTS (already truncated + capped).
+   *
+   * The count alone told the agent "3 things broke" without saying what, so it
+   * could neither tell an analytics 404 apart from a TypeError in checkout nor
+   * put anything useful in a bug report. The texts are what make the signal
+   * actionable. Empty when nothing was collected or the caller passed none.
+   *
+   * Optional so a hand-built PageHealth (tests, other producers) stays valid —
+   * making it required would force every construction site to care about a
+   * purely additive diagnostic field.
+   */
+  consoleErrorSamples?: string[];
   /** Flow landed on a login/auth URL after starting elsewhere (logged out). */
   sessionLost: boolean;
 }
+
+/** How many console-error texts reach the prompt. Enough to spot a pattern,
+ *  few enough that a looping error can't crowd out the rest of the context. */
+const MAX_CONSOLE_SAMPLES = 3;
+
+/** Per-message cap — one stack trace can be thousands of characters. */
+const MAX_CONSOLE_SAMPLE_LENGTH = 200;
 
 const SERVER_ERROR_MIN = 500;
 const RATE_LIMIT_STATUS = 429;
@@ -45,6 +65,11 @@ export interface PageHealthInput {
   networkErrorsSince: readonly NetworkError[];
   /** Console error count delta for the window. */
   consoleErrorCount: number;
+  /**
+   * Console-error texts for the same window. Optional so existing callers
+   * (and tests) keep working — they simply get the old count-only behaviour.
+   */
+  consoleErrorTexts?: readonly string[];
   /** URL the flow started this action/round on. */
   previousUrl?: string;
   /** Current URL after the action/round. */
@@ -107,6 +132,13 @@ export function classifyPageHealth(input: PageHealthInput): PageHealth {
     hasServerError,
     rateLimited,
     consoleErrorCount,
+    consoleErrorSamples: (input.consoleErrorTexts ?? [])
+      .slice(0, MAX_CONSOLE_SAMPLES)
+      .map((t) =>
+        t.length > MAX_CONSOLE_SAMPLE_LENGTH
+          ? `${t.slice(0, MAX_CONSOLE_SAMPLE_LENGTH)}…`
+          : t,
+      ),
     sessionLost,
   };
 }
@@ -134,7 +166,18 @@ export function formatPageHealth(h: PageHealth | undefined): string {
     lines.push(`- SESSION LOST: redirected to a login page mid-flow (likely logged out)`);
   }
   if (h.consoleErrorCount > 0) {
+    // Lead with the count, then the actual messages. A bare count is not
+    // actionable — the agent can't judge severity or write a bug report from
+    // "3", but it can from "TypeError: cart.total is undefined".
     lines.push(`- console errors: ${h.consoleErrorCount}`);
+    const samples = h.consoleErrorSamples ?? [];
+    for (const sample of samples) {
+      lines.push(`    · ${sample}`);
+    }
+    const hidden = h.consoleErrorCount - samples.length;
+    if (hidden > 0 && samples.length > 0) {
+      lines.push(`    · …and ${hidden} more`);
+    }
   }
   return lines.join('\n');
 }

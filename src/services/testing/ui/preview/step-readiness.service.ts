@@ -164,6 +164,7 @@ const NON_TARGETING_ACTIONS: Set<IntentActionType> = new Set([
   'wait',
   'wait_for',
   'ai_check',
+  'assert_no_console_errors',  // Reads collected console errors (no element target)
   'wait_for_email',  // V12: Email inbox polling (no element target)
   'dialog',          // V14: Pre-installs handler, no element target
   'download',        // V14: Waits for download event, no element target
@@ -2158,6 +2159,7 @@ const SKIP_LOOKAHEAD_AFTER: Set<IntentActionType> = new Set([
   'wait',
   'wait_for',
   'ai_check',
+  'assert_no_console_errors',
   'wait_for_email',
   'dialog',
   'download',

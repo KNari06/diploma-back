@@ -92,6 +92,24 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
       environmentBinding = resolved.binding;
     }
 
+    // Web-only: if the user picked a saved environment in the Create-test
+    // dialog, bind that environment resource to the initial test case so its
+    // `env.<KEY>` variables resolve on every run — not just its BASE_URL.
+    // Validated HERE, before `FlowService.create`, so a bad id 400s without
+    // orphaning a flow. Scoping is consistent with the dialog: the dropdown
+    // lists the user's own environments (listResources is user+project
+    // scoped), so getResource (user-scoped) resolves exactly what was offered.
+    let environmentBinding: ResourceBinding | null = null;
+    if (!isMobilePlatform && environmentResourceId) {
+      const { resolveEnvironmentBinding } = await import('@/services/testing/flows/environment-binding.service');
+      const resolved = await resolveEnvironmentBinding({ userId, projectId, environmentResourceId });
+      if (!resolved.ok) {
+        res.status(400).json({ success: false, error: 'Invalid environmentResourceId' });
+        return;
+      }
+      environmentBinding = resolved.binding;
+    }
+
     // Flutter host lane gate — runs BEFORE `FlowService.create`, not at the
     // test-case insert below, because by then the flow row exists and bailing
     // out would leave an orphan flow with no test case. A lane the project has
