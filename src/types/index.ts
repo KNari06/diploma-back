@@ -1166,7 +1166,6 @@ export type PlaywrightActionType =
   | 'assertUrl'         // Assert current URL matches
   | 'assertCount'       // Assert number of elements
   | 'assert'            // Generic assert dispatcher (visible/text/value/count/url/etc.)
-  | 'assertNoConsoleErrors' // Assert no console errors (deterministic, errors only)
   // AI-powered
   | 'aiCheck'           // AI-based assertion using LLM
   // Data extraction & evaluation

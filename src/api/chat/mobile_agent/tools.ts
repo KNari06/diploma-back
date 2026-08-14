@@ -1844,7 +1844,7 @@ const WEB_EQUIVALENT_STEP: Record<string, string> = {
 export const ACCEPTED_STEP_TYPES = new Set<string>([
   // canonical (mirror of MobileIntentActionType — mobile-runner.types.ts:42-62)
   'click', 'type', 'scroll', 'press', 'hover',
-  'assert', 'ai_check', 'assert_no_console_errors', 'extract_text', 'navigate', 'wait', 'wait_for', 'screenshot',
+  'assert', 'ai_check', 'extract_text', 'navigate', 'wait', 'wait_for', 'screenshot',
   'select', 'check', 'uncheck', 'toggle', 'open', 'close',
   'open_app', 'close_app', 'open_notifications',
   'swipe', 'long_press', 'double_tap', 'drag', 'pinch',
@@ -2816,30 +2816,6 @@ function toRunnerCommandInner(step: MobileIntentStep): Record<string, unknown> {
           // its soft default so legacy steps without the flag don't suddenly
           // start wiping app data.
           ...(opts?.hard === true ? { hard: true } : {}),
-        },
-      };
-    }
-
-    case 'assert_no_console_errors': {
-      // Deterministic WebView console check. Targets no element and carries no
-      // assertionText, so it must NOT fall into the assert block below (which
-      // resolves an element from the assertion text). Mirrors the saved-replay
-      // converter in the runner's intent-step-converter.ts.
-      const o = (step.options ?? {}) as {
-        consoleIgnorePatterns?: string[];
-        consoleIncludeNetworkErrors?: boolean;
-        consoleNetworkMinStatus?: number;
-        timeout?: number;
-      };
-      return {
-        type: 'assert_no_console_errors',
-        params: {
-          ...(Array.isArray(o.consoleIgnorePatterns) ? { ignorePatterns: o.consoleIgnorePatterns } : {}),
-          ...(o.consoleIncludeNetworkErrors === true ? { includeNetworkErrors: true } : {}),
-          ...(typeof o.consoleNetworkMinStatus === 'number'
-            ? { networkMinStatus: o.consoleNetworkMinStatus }
-            : {}),
-          ...(typeof o.timeout === 'number' ? { timeout: o.timeout } : {}),
         },
       };
     }

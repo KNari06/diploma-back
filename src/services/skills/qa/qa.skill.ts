@@ -1101,7 +1101,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
                 id: { type: 'string', description: 'Unique step ID (UUID). Keep existing IDs for unchanged steps, generate new UUIDs for new steps.' },
                 type: {
                   type: 'string',
-                  enum: ['type', 'click', 'wait', 'assert', 'navigate', 'select', 'hover', 'scroll', 'press', 'check', 'uncheck', 'toggle', 'open', 'close', 'ai_check', 'wait_for', 'upload', 'assert_no_console_errors'],
+                  enum: ['type', 'click', 'wait', 'assert', 'navigate', 'select', 'hover', 'scroll', 'press', 'check', 'uncheck', 'toggle', 'open', 'close', 'ai_check', 'wait_for', 'upload'],
                   description: 'Action type for this step',
                 },
                 description: { type: 'string', description: 'Human-readable description of what this step does' },
@@ -1236,7 +1236,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
                 id: { type: 'string', description: 'Unique step ID (UUID)' },
                 type: {
                   type: 'string',
-                  enum: ['type', 'click', 'wait', 'assert', 'navigate', 'select', 'hover', 'scroll', 'press', 'check', 'uncheck', 'toggle', 'open', 'close', 'ai_check', 'wait_for', 'upload', 'assert_no_console_errors'],
+                  enum: ['type', 'click', 'wait', 'assert', 'navigate', 'select', 'hover', 'scroll', 'press', 'check', 'uncheck', 'toggle', 'open', 'close', 'ai_check', 'wait_for', 'upload'],
                   description: 'Action type for this step',
                 },
                 description: { type: 'string', description: 'What this step does' },
@@ -1324,7 +1324,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
                 id: { type: 'string', description: 'Unique step ID (UUID)' },
                 type: {
                   type: 'string',
-                  enum: ['type', 'click', 'wait', 'assert', 'navigate', 'select', 'hover', 'scroll', 'press', 'check', 'uncheck', 'toggle', 'open', 'close', 'ai_check', 'wait_for', 'upload', 'assert_no_console_errors'],
+                  enum: ['type', 'click', 'wait', 'assert', 'navigate', 'select', 'hover', 'scroll', 'press', 'check', 'uncheck', 'toggle', 'open', 'close', 'ai_check', 'wait_for', 'upload'],
                   description: 'Action type for this step',
                 },
                 description: { type: 'string', description: 'What this step does' },

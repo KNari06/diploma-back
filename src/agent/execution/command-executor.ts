@@ -35,11 +35,6 @@ import { typeWithOptionalClear } from './step-options/clear-before-type';
 import { fillWithOptionalAppend } from './step-options/append-fill';
 import { tryPinnedCssLocator } from './step-options/pinned-css-locator';
 import { tryOpenAnchorAsNewTab } from '@/services/testing/ui/preview/new-tab-opener';
-import { ReplayConsoleCollector, type ReplayConsoleError } from './replay-console-collector';
-import {
-  buildConsoleChannelHint,
-  detectConsoleAssertion,
-} from '@/services/testing/ui/preview/console-assertion-detector';
 import {
   buildGlobWaitPayload,
   buildRegexWaitPayload,
@@ -327,28 +322,6 @@ export class CommandExecutor {
    * iterates it; rebuilding from the Map per call would be wasteful.
    */
   private redactValues: readonly string[] = [];
-  /**
-   * Console-error collector for `assertNoConsoleErrors` (and the console
-   * channel of `aiCheck`). Bound to the BrowserContext, not to `this.page`,
-   * because the executor swaps `this.page` on every tab switch — see
-   * replay-console-collector.ts. Created lazily on first use so runs that
-   * never assert on the console pay nothing.
-   */
-  private consoleCollector?: ReplayConsoleCollector;
-  /**
-   * Whether the collector was armed WITH network listeners. Network listeners
-   * bind at construction, so this cannot change later in the run — tracked so
-   * a later network-aware step can warn instead of silently reporting zero.
-   */
-  private consoleNetworkArmed = false;
-  /**
-   * Epoch ms marking the start of the CURRENT step, set at the top of every
-   * executeCommand. `assertNoConsoleErrors` uses it to decide what "since the
-   * previous step" means when scope is 'step'.
-   */
-  private currentStepStartedAt: number = Date.now();
-  /** Epoch ms of the previous step boundary — the lower bound for scope:'step'. */
-  private previousStepStartedAt: number = 0;
 
   constructor(
     page: Page,
@@ -525,13 +498,6 @@ export class CommandExecutor {
     // auto-applied heal of THIS step charges 1 credit and flips this true; any
     // second heal path on the same step then sees it and does not re-charge.
     this.currentStepHealCharged = false;
-
-    // Advance the step window for `assertNoConsoleErrors` scope:'step'. The
-    // PREVIOUS boundary is the lower bound, so the assertion covers everything
-    // the preceding step produced (including async errors that land while this
-    // assertion step is being dispatched) — not an empty zero-width window.
-    this.previousStepStartedAt = this.currentStepStartedAt;
-    this.currentStepStartedAt = Date.now();
 
     const { action, value, url, timeout, continueOnError, description } = command;
 
@@ -2179,114 +2145,6 @@ export class CommandExecutor {
           break;
 
         // ═══════════════════════════════════════════════════════════════
-        // CONSOLE ERRORS (deterministic assertion — no LLM)
-        // ═══════════════════════════════════════════════════════════════
-        case 'assertNoConsoleErrors': {
-          // Console errors are exact data. Judging them with a model would add
-          // latency, cost and non-determinism to a comparison that is just
-          // "is this filtered list empty?" — so this path never calls an LLM.
-          // The `console` aiContextMode channel exists for the fuzzy variant.
-          // Capture BEFORE arming: distinguishes "collector already running,
-          // genuinely saw zero errors" from "we just switched it on, so zero
-          // means nothing was watching".
-          const hadConsoleCollectorBefore = this.isConsoleCollectorArmed();
-          const meta = isIntentCommand ? intentCommand.intentMeta : undefined;
-          const scope = meta?.consoleScope ?? 'step';
-          const ignorePatterns = meta?.consoleIgnorePatterns ?? [];
-          const collector = this.ensureConsoleCollector({
-            includeNetworkErrors: meta?.consoleIncludeNetworkErrors,
-            networkMinStatus: meta?.consoleNetworkMinStatus,
-          });
-
-          if (!collector) {
-            // Could not attach (context died). Fail-soft: do not fail the step
-            // on our own observability gap — an assertion that cannot see is
-            // not an assertion that failed.
-            logger.warn('[COMMAND_EXECUTOR] assertNoConsoleErrors skipped — collector unavailable', {
-              stepId: meta?.stepId,
-            });
-            break;
-          }
-
-          // Collection is armed lazily, so a scope:'run' assertion can only
-          // honestly cover "since arming". When this step armed the collector
-          // itself, there is no history to judge — say so rather than
-          // reporting a green "no errors" that means "nothing was watching".
-          // Purely "was collection already running?" — do NOT also require an
-          // empty error list. A page can log an error synchronously during the
-          // very same tick we attach, and treating that as "not armed" would
-          // suppress the honesty warning on a run that DID observe something.
-          const armedThisStep = !hadConsoleCollectorBefore;
-
-          const since = scope === 'run' ? 0 : this.previousStepStartedAt;
-          const raw = collector.getErrorsSince(since);
-
-          // Compile EAGERLY inside the try. Constructing the RegExp lazily
-          // inside the returned closure put the throw outside this catch — an
-          // invalid pattern (a bare '(' is easy to type) then crashed the whole
-          // step instead of degrading to a substring match.
-          const matchers = ignorePatterns.map((p) => {
-            try {
-              const re = new RegExp(p, 'i');
-              return { test: (t: string) => re.test(t), source: p };
-            } catch {
-              const lowered = p.toLowerCase();
-              return { test: (t: string) => t.toLowerCase().includes(lowered), source: p };
-            }
-          });
-
-          const offending = raw.filter((e) => !matchers.some((m) => m.test(e.text)));
-
-          logger.info('[COMMAND_EXECUTOR] assertNoConsoleErrors evaluated', {
-            stepId: meta?.stepId,
-            scope,
-            windowStart: since,
-            total: raw.length,
-            ignored: raw.length - offending.length,
-            offending: offending.length,
-            dropped: collector.getDroppedCount(),
-            armedThisStep,
-          });
-
-          if (offending.length > 0) {
-            // Show a bounded sample — a page in an error loop can produce
-            // hundreds, and the message goes into the run report verbatim.
-            const SAMPLE = 5;
-            const sample = offending
-              .slice(0, SAMPLE)
-              .map((e, i) => {
-                const where = e.location ? ` (${e.location})` : '';
-                const kind =
-                  e.source === 'pageerror' ? 'uncaught'
-                  : e.source === 'network' ? 'network'
-                  : 'console.error';
-                // Redact: a console error can echo a submitted credential.
-                return `  ${i + 1}. [${kind}] ${this.redactString(e.text)}${where}`;
-              })
-              .join('\n');
-            const more = offending.length > SAMPLE ? `\n  …and ${offending.length - SAMPLE} more` : '';
-            const droppedNote = collector.getDroppedCount() > 0
-              ? `\n(${collector.getDroppedCount()} earlier errors were dropped by the retention cap)`
-              : '';
-            const scopeNote = meta?.consoleIncludeNetworkErrors ? ' (including network failures)' : '';
-            throw new Error(
-              `Console error assertion failed${scopeNote}: found ${offending.length} console error(s)` +
-                `${scope === 'step' ? ' during this step' : ' during this run'}:\n${sample}${more}${droppedNote}`
-            );
-          }
-
-          if (armedThisStep && scope === 'run') {
-            logger.warn(
-              '[COMMAND_EXECUTOR] assertNoConsoleErrors scope:run passed, but collection only started at this step — earlier errors were not observed',
-              { stepId: meta?.stepId }
-            );
-          }
-
-          logger.info('Assertion passed: no console errors', { scope, ignored: raw.length - offending.length });
-          break;
-        }
-
-        // ═══════════════════════════════════════════════════════════════
         // V3: AI CHECK (LLM-based assertion)
         // ═══════════════════════════════════════════════════════════════
         case 'aiCheck': {
@@ -2407,66 +2265,6 @@ export class CommandExecutor {
               });
             }
 
-            // Console channel (fallback for FUZZY console assertions, e.g.
-            // "no payment-related errors"). Opt-in via aiContextMode: a plain
-            // "no console errors" belongs in the deterministic
-            // assertNoConsoleErrors step, which needs no model.
-            let consoleErrors: string[] | undefined;
-            // Auto-attach: an assertion that is plainly ABOUT the console gets
-            // the console channel even when the author left the context mode at
-            // its default. Without this the model can only answer "I cannot see
-            // the console" — a dead end the author has no way to act on. The
-            // detector is conservative (it refuses assertions about errors
-            // VISIBLE on the page), so this cannot hijack a working DOM check.
-            const consoleVerdict = detectConsoleAssertion(intentCommand.intentMeta.assertionText);
-            const wantsConsole = contextMode.includes('console') || consoleVerdict.isConsoleAssertion;
-            if (wantsConsole) {
-              const wasArmed = this.isConsoleCollectorArmed();
-              const collector = this.ensureConsoleCollector();
-              if (!collector) {
-                // Leave undefined, NOT []. `[]` would tell the model
-                // "confirmed absence" when we simply failed to look.
-                logger.warn('[COMMAND_EXECUTOR] aiCheck console channel requested but collector unavailable', {
-                  stepId: intentCommand.intentMeta.stepId,
-                });
-              } else if (!wasArmed) {
-                // Armed only just now: nothing was listening while the page did
-                // its work, so an empty list is ignorance, not absence. Sending
-                // `[]` here would let the model confidently PASS "there are no
-                // console errors" on data we never collected — the worst
-                // possible outcome for a test tool. Stay undefined; the guard
-                // below turns this into an actionable failure instead.
-                logger.warn(
-                  '[COMMAND_EXECUTOR] aiCheck console channel armed only at this step — no history to report',
-                  { stepId: intentCommand.intentMeta.stepId },
-                );
-              } else {
-                consoleErrors = collector
-                  .getErrorsSince(this.previousStepStartedAt)
-                  .map((e) => {
-                    const kind =
-                      e.source === 'pageerror' ? 'uncaught'
-                      : e.source === 'network' ? 'network'
-                      : 'console.error';
-                    return `[${kind}] ${e.text}`;
-                  });
-              }
-            }
-
-            // A console assertion we cannot actually answer must fail with a
-            // POINTER, not with the model's dead-end "cannot be verified from
-            // the provided HTML…". This is the exact case a user hit: the
-            // wording was right, the step type was wrong, and nothing said so.
-            if (consoleVerdict.isConsoleAssertion && consoleErrors === undefined) {
-              const hint = buildConsoleChannelHint(consoleVerdict.isPlainNoErrors);
-              logger.info('[COMMAND_EXECUTOR] aiCheck is a console assertion but console data is unavailable', {
-                stepId: intentCommand.intentMeta.stepId,
-                matchedTerm: consoleVerdict.matchedTerm,
-                isPlainNoErrors: consoleVerdict.isPlainNoErrors,
-              });
-              throw new Error(hint);
-            }
-
             // Evaluate AI check
             const aiCheckResult = await evaluateAiCheck({
               assertionText: intentCommand.intentMeta.assertionText,
@@ -2474,7 +2272,6 @@ export class CommandExecutor {
               html,
               a11yTree,
               screenshotBase64,
-              consoleErrors,
               // The assertion + page HTML go to a third-party LLM, and an
               // authored assertion can quote page text containing a credential
               // ("Welcome back, <email>"). Mask before it leaves the machine.
@@ -3666,64 +3463,6 @@ export class CommandExecutor {
    */
   getRedactValues(): readonly string[] {
     return this.redactValues;
-  }
-
-  /**
-   * Lazily create + start the console collector, bound to the active page's
-   * BrowserContext so it survives the `this.page` reassignments that tab
-   * switches perform.
-   *
-   * Lazily is a deliberate trade-off with a known limitation: errors logged
-   * BEFORE the first console assertion in a flow are not captured, because
-   * nothing was listening yet. That is the honest behaviour for a
-   * scope:'step' assertion (which only ever looks at the window since the
-   * previous step) but it means scope:'run' really means "since the first
-   * console assertion". `assertNoConsoleErrors` states this in its failure
-   * message rather than implying whole-run coverage it doesn't have.
-   *
-   * Callers that DO want whole-run coverage can call this early (e.g. right
-   * after the executor is constructed) to arm collection from the start.
-   */
-  ensureConsoleCollector(opts?: { includeNetworkErrors?: boolean; networkMinStatus?: number }): ReplayConsoleCollector | undefined {
-    if (this.consoleCollector) {
-      // Network listeners are attached at construction, so a collector armed
-      // WITHOUT them can never retroactively report network errors. Say so
-      // instead of quietly returning a collector that will report zero — a
-      // silent "no network errors" on unwatched traffic is the same class of
-      // lie as an empty console list from an unarmed collector.
-      if (opts?.includeNetworkErrors && !this.consoleNetworkArmed) {
-        logger.warn(
-          '[COMMAND_EXECUTOR] Network errors requested but collection was armed earlier without them — this step cannot report network failures',
-          { hint: 'Put the network-aware console step earlier, or enable it on the first console step of the run.' },
-        );
-      }
-      return this.consoleCollector;
-    }
-    try {
-      const context = this.page.context();
-      this.consoleNetworkArmed = !!opts?.includeNetworkErrors;
-      this.consoleCollector = new ReplayConsoleCollector(context, {
-        enabled: this.consoleNetworkArmed,
-        minStatus: opts?.networkMinStatus,
-        sameSiteOnly: true,
-        // The run's start URL is the app under test; third-party failures are
-        // filtered against it.
-        baseUrl: this.metadata.url || this.page.url(),
-      });
-      this.consoleCollector.start();
-      return this.consoleCollector;
-    } catch (err) {
-      // Fail-soft (invariant #11): never break a run over observability.
-      logger.warn('[COMMAND_EXECUTOR] Could not start console collector', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return undefined;
-    }
-  }
-
-  /** True once console collection has actually been armed for this run. */
-  private isConsoleCollectorArmed(): boolean {
-    return !!this.consoleCollector;
   }
 
   /**

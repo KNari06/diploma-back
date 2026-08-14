@@ -375,9 +375,6 @@ export type IntentActionType =
   | 'close'
   // V3: AI-powered assertion
   | 'ai_check'
-  // Deterministic console-error assertion (no LLM). Errors only — warnings
-  // are intentionally out of scope, see replay-console-collector.ts.
-  | 'assert_no_console_errors'
   // V5: URL wait (Momentic-like matchers + auto-insert support)
   | 'wait_for'
   // V6: File upload
@@ -1239,38 +1236,8 @@ export interface StepOptions {
    * - 'html+a11y': HTML + accessibility tree (no screenshot)
    * - 'html+screenshot': HTML + screenshot
    * - 'html+a11y+screenshot': HTML + accessibility tree + screenshot (default, most comprehensive)
-   * - '…+console' variants: additionally supply collected console errors.
-   *   Only for FUZZY console assertions ("no payment-related errors"); a plain
-   *   "no console errors" should use the assert_no_console_errors step type.
    */
-  aiContextMode?:
-    | 'html'
-    | 'screenshot'
-    | 'html+a11y'
-    | 'html+screenshot'
-    | 'html+a11y+screenshot'
-    | 'console'
-    | 'html+console'
-    | 'html+a11y+screenshot+console';
-  /**
-   * `assert_no_console_errors`: which slice of the run to judge.
-   * 'step' (default) = since the previous step; 'run' = everything collected.
-   */
-  consoleScope?: 'step' | 'run';
-  /**
-   * `assert_no_console_errors`: patterns whose matching errors are ignored.
-   * Each entry is tried as a RegExp, falling back to case-insensitive
-   * substring match. Lets a flow tolerate known third-party noise.
-   */
-  consoleIgnorePatterns?: string[];
-  /**
-   * `assert_no_console_errors`: also fail on failed requests / HTTP 5xx
-   * (same-site only). Opt-in — third-party and 4xx noise is excluded by
-   * default so the assertion stays usable on real sites.
-   */
-  consoleIncludeNetworkErrors?: boolean;
-  /** Minimum HTTP status treated as an error (default 500). */
-  consoleNetworkMinStatus?: number;
+  aiContextMode?: 'html' | 'screenshot' | 'html+a11y' | 'html+screenshot' | 'html+a11y+screenshot';
   /**
    * URL matcher configuration for wait_for step (V5)
    * Supports Momentic-like matchers (substring/glob/regex/domain) + internal changedFrom for auto-insert

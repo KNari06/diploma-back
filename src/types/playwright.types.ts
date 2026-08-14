@@ -54,7 +54,6 @@ export type PlaywrightStepType =
   | 'assertValue'       // Assert input has value
   | 'assertUrl'         // Assert current URL matches
   | 'assertCount'       // Assert number of elements
-  | 'assertNoConsoleErrors' // Assert no console errors (deterministic, errors only)
   // Data extraction & evaluation
   | 'extract'           // Extract data from element
   | 'evaluate'          // Execute JS in browser context
