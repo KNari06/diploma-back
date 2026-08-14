@@ -2804,7 +2804,7 @@ function confirmationRequired(message: string): SkillResult {
 export const VALID_STEP_TYPES = new Set([
   'type', 'click', 'wait', 'assert', 'navigate', 'select', 'hover',
   'scroll', 'press', 'check', 'uncheck', 'toggle', 'open', 'close',
-  'ai_check', 'wait_for', 'upload',
+  'ai_check', 'wait_for', 'upload', 'assert_no_console_errors',
 ]);
 
 /**

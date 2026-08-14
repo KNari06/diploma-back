@@ -41,6 +41,7 @@ const SKIP_INJECT_AFTER_TYPES: Set<IntentActionType> = new Set([
   'wait',
   'wait_for',
   'ai_check',
+  'assert_no_console_errors',  // Reads collected console errors — no element, no navigation
   'wait_for_email',  // V12: Already a waiting action
   'dialog',          // V14: Non-targeting — pre-installs handler, no navigation
   'download',        // V14: Non-targeting — waits for download event, no navigation

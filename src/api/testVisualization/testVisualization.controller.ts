@@ -923,6 +923,7 @@ function mapIntentTypeToPlaywright(intentType: string): PlaywrightStepType {
     case 'wait_for_email': return 'waitForSelector';
     case 'assert':
     case 'ai_check':     return 'assert';
+    case 'assert_no_console_errors': return 'assert';
     case 'upload':       return 'custom';
     case 'drag_and_drop': return 'custom';
     case 'dialog':       return 'custom';
