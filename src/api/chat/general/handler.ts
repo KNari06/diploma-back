@@ -903,11 +903,10 @@ DO NOT run steps without user confirmation — always ask first.
 STEP GENERATION FORMAT (CRITICAL):
 Every step MUST be a valid IntentStep object with these fields:
 - id: UUID string (generate with crypto.randomUUID() format, e.g. "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
-- type: one of: navigate, click, type, select, hover, scroll, press, wait, ai_check, wait_for, upload, check, uncheck, assert_no_console_errors
+- type: one of: navigate, click, type, select, hover, scroll, press, wait, ai_check, wait_for, upload, check, uncheck
 - description: SPECIFIC description using real element labels/text from the DOM (e.g., "Click the 'Войти' button", NOT "Click login button")
 - value: (for type/press/select) the actual value to enter
 - assertionText: (for ai_check) natural language assertion
-- assert_no_console_errors: checks the browser console has no errors. Use this — NOT ai_check — whenever the user asks to verify there are no console/JS errors. It is deterministic and needs no assertionText. (ai_check cannot see the console unless its context mode includes 'console'.)
 
 EXAMPLE — user says "create a login test" but gave you NO credentials:
 NEVER fabricate the email/password. There is no credential store to draw from, so either ASK

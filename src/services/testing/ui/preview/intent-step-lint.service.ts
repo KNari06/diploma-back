@@ -102,7 +102,6 @@ const ACTION_TO_ELEMENT_TYPES: Record<string, string[]> = {
   close: ['button', 'div', 'summary', 'details'],
   // V3: AI-powered assertion
   ai_check: [],
-  assert_no_console_errors: [],
   // V5: URL wait
   wait_for: [],
   // V12: Email inbox (no element target)
@@ -752,7 +751,7 @@ export class IntentStepLintService {
       const domNodes = snapshot.domNodes ?? [];
 
       // Non-targeting actions — page-level steps that don't target a specific DOM element
-      if (!isScrollContainerResolve && ['navigate', 'wait', 'wait_for', 'ai_check', 'assert_no_console_errors', 'scroll', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
+      if (!isScrollContainerResolve && ['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
         return {
           status: 'resolved',
           message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -1124,7 +1123,7 @@ export class IntentStepLintService {
     });
 
     // Non-targeting actions don't need element resolution
-    if (!isScrollContainerResolve && ['navigate', 'wait', 'wait_for', 'ai_check', 'assert_no_console_errors', 'scroll', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
+    if (!isScrollContainerResolve && ['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
       return {
         status: 'resolved',
         message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -1220,7 +1219,7 @@ export class IntentStepLintService {
     //   - Hash routing: normalizer strips hash. Known limitation, same as
     //     evidence-shortcut.
     // ═══════════════════════════════════════════════════════════════════════════
-    const NON_TARGETING_FOR_URL_GUARD = new Set(['navigate', 'wait', 'wait_for', 'ai_check', 'assert_no_console_errors', 'scroll', 'switch_tab', 'close_tab', 'open_tab', 'wait_for_email']);
+    const NON_TARGETING_FOR_URL_GUARD = new Set(['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab', 'wait_for_email']);
     if (!NON_TARGETING_FOR_URL_GUARD.has(stepDraft.type)) {
       // Priority order matters. `evidence.pageUrl` is set by the recorder at
       // capture time (the URL the user was actually on when they clicked) and
@@ -2146,7 +2145,7 @@ export function isEvidenceShortcutNodeCompatible(
 ): { ok: boolean; reason?: string } {
   // Evidence shortcut is only meaningful for actions that target a specific element.
   // For non-targeting actions, accept by default.
-  if (step.type === 'navigate' || step.type === 'wait' || step.type === 'wait_for' || step.type === 'ai_check' || step.type === 'assert_no_console_errors' || step.type === 'wait_for_email') {
+  if (step.type === 'navigate' || step.type === 'wait' || step.type === 'wait_for' || step.type === 'ai_check' || step.type === 'wait_for_email') {
     return { ok: true };
   }
 

@@ -8,8 +8,6 @@ import { logger, logAiCheckError } from '@/utils/core/logger';
 import { recordSource, resolvePlaceholders } from '@/utils/interpolation/resolve-placeholders';
 import { collectSecretValues, redactWithValues } from '@/utils/interpolation/redact-secrets';
 import { logIntentResolveApply } from './intent-resolve-audit';
-import { buildConsoleChannelHint, detectConsoleAssertion } from './console-assertion-detector';
-import { isSameSite } from '@/utils/security/url-safety';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Frame, FrameLocator, Locator, Page } from 'playwright';
@@ -375,7 +373,7 @@ const POST_ACTION_SETTLE_TIMEOUT = STEP_APPLY_CONFIG.postActionSettleTimeoutMs;
 const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click', 'upload']);
 
 // V11: Actions that don't target elements — skip modal check
-const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'timeout', 'scroll', 'wait_for', 'ai_check', 'assert_no_console_errors', 'wait_for_email', 'dialog', 'download']);
+const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'timeout', 'scroll', 'wait_for', 'ai_check', 'wait_for_email', 'dialog', 'download']);
 
 // Actions that mutate DOM and require a fresh snapshot for the next step's lint.
 // After these, we invalidate the cached snapshot so hover→click sequences get fresh nodes.
@@ -3494,24 +3492,6 @@ export class PreviewStepApplyService {
     // fresh object — never mutate from a caller's reference.
     const decisionTrace: StepDecisionTrace = {};
     const traceTimingStart = Date.now();
-
-    // Console-assertion windowing. Marked at the START of each step, not at the
-    // end of the previous one: applyStep has many exit points (early returns,
-    // _buildFailureResult, throws), so an end-of-step hook would be missed by
-    // most of them. Marking on entry gives the same boundary with one call.
-    //
-    // Observation steps are EXEMPT — an ai_check / assert_no_console_errors
-    // performs no page action, so advancing the boundary for them would close
-    // the window on the very errors they exist to inspect.
-    if (stepDraft.type !== 'ai_check' && stepDraft.type !== 'assert_no_console_errors') {
-      try {
-        const { getPreviewDevToolsRegistry } = await import('./preview-devtools-collector.service');
-        getPreviewDevToolsRegistry().get(previewSessionId)?.markStepBoundary();
-      } catch {
-        // Best-effort (invariant #11): windowing is observability, never a
-        // reason to fail a step. Losing it degrades to whole-session scope.
-      }
-    }
     const setTrace = (patch: Partial<StepDecisionTrace>): void => {
       Object.assign(decisionTrace, patch);
     };
@@ -4068,129 +4048,6 @@ export class PreviewStepApplyService {
       }
 
       // ═══════════════════════════════════════════════════════════════════════
-      // Handle assert_no_console_errors (deterministic — no LLM)
-      // ═══════════════════════════════════════════════════════════════════════
-      // Reuses the preview session's existing DevTools console collector (the
-      // same feed backing the editor's Console tab), so what the assertion
-      // judges is exactly what the user can see there. Errors only — warnings
-      // never fail the step.
-      if (stepDraft.type === 'assert_no_console_errors') {
-        const scope = stepDraft.options?.consoleScope || 'step';
-        const ignorePatterns = stepDraft.options?.consoleIgnorePatterns || [];
-
-        try {
-          const { getPreviewDevToolsRegistry } = await import('./preview-devtools-collector.service');
-          const devtools = previewSessionId
-            ? getPreviewDevToolsRegistry().get(previewSessionId)
-            : undefined;
-
-          if (!devtools) {
-            // No collector for this session — we cannot see the console at all.
-            // Report that honestly instead of returning a green "no errors".
-            logger.warn('[PREVIEW_APPLY] assert_no_console_errors: no devtools collector for session', {
-              previewSessionId,
-            });
-            return {
-              success: false,
-              error:
-                'Console errors could not be checked: DevTools console collection is not active for this preview session.',
-              attempts: 1,
-            };
-          }
-
-          const matchers = ignorePatterns.map((p) => {
-            try {
-              const re = new RegExp(p, 'i');
-              return (t: string) => re.test(t);
-            } catch {
-              const lowered = p.toLowerCase();
-              return (t: string) => t.toLowerCase().includes(lowered);
-            }
-          });
-
-          // Errors only (product decision) — 'warn' is explicitly excluded.
-          // scope 'run' = whole session; 'step' (default) = since the previous
-          // step boundary. Without the window a first-paint error would fail an
-          // assertion placed 15 steps later.
-          const consoleTexts = (scope === 'run'
-            ? devtools.getConsoleEntries()
-            : devtools.getConsoleEntriesSinceStepBoundary())
-            .filter((e) => e.level === 'error')
-            .map((e) => `${e.text}${e.location ? ` (${e.location})` : ''}`);
-
-          // Network failures are OPT-IN and same-site only, mirroring the
-          // replay collector: blocked third-party beacons and tolerated 4xx
-          // would otherwise make this permanently red on healthy apps.
-          let networkTexts: string[] = [];
-          if (stepDraft.options?.consoleIncludeNetworkErrors) {
-            const minStatus = stepDraft.options?.consoleNetworkMinStatus ?? 500;
-            const pageUrl = page.url();
-            networkTexts = devtools
-              .getNetworkItems()
-              .filter((n) => {
-                const failed = n.phase === 'error' || (typeof n.status === 'number' && n.status >= minStatus);
-                if (!failed) return false;
-                if (!isSameSite(n.url, pageUrl)) return false;
-                // A cancelled request is not an app failure.
-                return !(n.error || '').includes('ERR_ABORTED');
-              })
-              .map((n) =>
-                n.phase === 'error'
-                  ? `${n.method} ${n.url} failed: ${n.error || 'request failed'}`
-                  : `HTTP ${n.status} ${n.method} ${n.url}`,
-              );
-          }
-
-          const allErrors = [...consoleTexts, ...networkTexts];
-          const offending = allErrors.filter((t) => !matchers.some((m) => m(t)));
-
-          logger.info('[PREVIEW_APPLY] assert_no_console_errors evaluated', {
-            previewSessionId,
-            scope,
-            totalErrors: allErrors.length,
-            ignored: allErrors.length - offending.length,
-            offending: offending.length,
-          });
-
-          if (offending.length > 0) {
-            const SAMPLE = 5;
-            const sample = offending
-              .slice(0, SAMPLE)
-              .map((t, i) => `  ${i + 1}. ${t}`)
-              .join('\n');
-            const more =
-              offending.length > SAMPLE ? `\n  …and ${offending.length - SAMPLE} more` : '';
-            return {
-              success: false,
-              error: `Found ${offending.length} console error(s):\n${sample}${more}`,
-              appliedStep: stepDraft,
-              urlChanged: false,
-              url: page.url(),
-              attempts: 1,
-            };
-          }
-
-          return {
-            success: true,
-            appliedStep: stepDraft,
-            urlChanged: false,
-            url: page.url(),
-            attempts: 1,
-          };
-        } catch (error) {
-          logger.error('[PREVIEW_APPLY] assert_no_console_errors failed', {
-            previewSessionId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          return {
-            success: false,
-            error: `Console error check failed: ${error instanceof Error ? error.message : String(error)}`,
-            attempts: 0,
-          };
-        }
-      }
-
-      // ═══════════════════════════════════════════════════════════════════════
       // V3: Handle ai_check assertions
       // ═══════════════════════════════════════════════════════════════════════
       if (stepDraft.type === 'ai_check') {
@@ -4282,65 +4139,6 @@ export class PreviewStepApplyService {
             }
           }
 
-          // Console channel — opt-in via the `console` context mode, for FUZZY
-          // console assertions only ("no payment-related errors"). A plain
-          // "no console errors" belongs in assert_no_console_errors above.
-          // Stays `undefined` when not requested or unavailable: an empty array
-          // would tell the model "confirmed absence" when we never looked.
-          let aiCheckConsoleErrors: string[] | undefined;
-          // Auto-attach when the assertion is plainly ABOUT the console, even
-          // if the author left the context mode at its default — otherwise the
-          // model can only answer "I cannot see the console", which the author
-          // has no way to act on. Unlike the replay path there is no lazy-arming
-          // caveat here: the preview session's DevTools collector runs for the
-          // whole session, so an empty list really does mean "none observed".
-          const consoleVerdict = detectConsoleAssertion(stepDraft.assertionText || '');
-          if (contextMode.includes('console') || consoleVerdict.isConsoleAssertion) {
-            try {
-              const { getPreviewDevToolsRegistry } = await import('./preview-devtools-collector.service');
-              const devtools = previewSessionId
-                ? getPreviewDevToolsRegistry().get(previewSessionId)
-                : undefined;
-              if (devtools) {
-                // Step-scoped, mirroring the replay executor. Feeding the
-                // model the whole session would make it judge errors the flow
-                // produced minutes ago as if they belonged to this step.
-                aiCheckConsoleErrors = devtools
-                  .getConsoleEntriesSinceStepBoundary()
-                  .filter((e) => e.level === 'error')
-                  .map((e) => `${e.text}${e.location ? ` (${e.location})` : ''}`);
-              } else {
-                logger.warn('[PREVIEW_APPLY] ai_check console channel requested but no collector', {
-                  previewSessionId,
-                });
-              }
-            } catch (consoleErr) {
-              logger.warn('[PREVIEW_APPLY] ai_check console channel unavailable', {
-                previewSessionId,
-                error: consoleErr instanceof Error ? consoleErr.message : String(consoleErr),
-              });
-            }
-          }
-
-          // A console assertion we cannot actually answer must fail with a
-          // POINTER to the right step type, not with the model's dead-end
-          // "cannot be verified from the provided HTML…".
-          if (consoleVerdict.isConsoleAssertion && aiCheckConsoleErrors === undefined) {
-            logger.info('[PREVIEW_APPLY] ai_check is a console assertion but console data is unavailable', {
-              previewSessionId,
-              matchedTerm: consoleVerdict.matchedTerm,
-              isPlainNoErrors: consoleVerdict.isPlainNoErrors,
-            });
-            return {
-              success: false,
-              error: buildConsoleChannelHint(consoleVerdict.isPlainNoErrors),
-              appliedStep: stepDraft,
-              urlChanged: false,
-              url: page.url(),
-              attempts: 1,
-            };
-          }
-
           // Evaluate AI check — wrap in tracking context so the LLM call shows
           // up in the user's AI activity feed labelled as 'ai-check'.
           // Hoist `assertionText` so TS narrowing isn't lost across the closure.
@@ -4378,7 +4176,6 @@ export class PreviewStepApplyService {
                   html,
                   a11yTree,
                   screenshotBase64,
-                  consoleErrors: aiCheckConsoleErrors,
                 }),
             ),
           );

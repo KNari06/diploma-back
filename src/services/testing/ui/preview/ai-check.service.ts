@@ -30,21 +30,6 @@ export interface AiCheckInput {
   /** Screenshot base64 (JPEG, optional) */
   screenshotBase64?: string;
   /**
-   * Console errors observed in the assertion's window, pre-formatted one per
-   * line. Supplied only when the step's context mode includes `console`.
-   *
-   * This is the FALLBACK channel for fuzzy console assertions ("no
-   * payment-related errors"). A plain "there are no console errors" should use
-   * the deterministic `assertNoConsoleErrors` step instead — exact data does
-   * not need a model's opinion.
-   *
-   * An EMPTY ARRAY is meaningful and distinct from `undefined`: it means "we
-   * looked and there were none", which lets the model pass a negative
-   * assertion. `undefined` means the channel was never collected, and the
-   * model is told not to guess.
-   */
-  consoleErrors?: readonly string[];
-  /**
    * Resolved `secrets.*` values active for this run (from
    * `executor.getRedactValues()`). The assertion text and the page HTML are
    * sent to a third-party LLM, and an authored assertion can legitimately
@@ -80,8 +65,6 @@ export interface AiCheckResult {
     html: boolean;
     a11y: boolean;
     screenshot: boolean;
-    /** True when the console-error channel was supplied (even if empty). */
-    console: boolean;
   };
   /** Optional: data-agent-ref values that support the explanation (for UI highlight) */
   highlightRefs?: string[];
@@ -138,11 +121,6 @@ Your job is to determine if a user's assertion is TRUE or FALSE based on the pro
    - Example: "Buy button is blue" → evaluate from screenshot, not HTML
 
 4. **Be Precise**: If the assertion is ambiguous or context is insufficient, set pass:false and explain why.
-
-4b. **Console Errors**: Assertions about console errors, JS errors, or uncaught exceptions MUST be evaluated ONLY from the "CONSOLE ERRORS" section.
-   - If that section is present and lists errors → judge the assertion against those exact entries.
-   - If that section is present and says "None observed" → that is a CONFIRMED ABSENCE. An assertion like "there are no console errors" PASSES. Do not treat it as missing data.
-   - If that section is ABSENT entirely → console state was not captured. Set pass:false, and say the console channel was not enabled for this step. NEVER infer console errors from HTML, the accessibility tree, or a screenshot — error text rendered on the page is not a console error.
 
 5. **Short Explanations**: Keep explanations concise (1-2 sentences) for CI/report readability.
 
@@ -203,20 +181,6 @@ function buildUserPrompt(input: AiCheckInput, truncatedFlags: { html: boolean; a
     prompt += `\n`;
   }
 
-  // Console channel. An empty array is deliberately rendered as an explicit
-  // "none observed" line rather than omitted — omission is indistinguishable
-  // from "not collected", and the model must be able to tell the difference to
-  // pass a negative assertion ("there are no console errors").
-  if (input.consoleErrors) {
-    if (input.consoleErrors.length > 0) {
-      prompt += `# CONSOLE ERRORS (${input.consoleErrors.length} observed during this step):\n`;
-      prompt += input.consoleErrors.map((e, i) => `${i + 1}. ${e}`).join('\n');
-      prompt += `\n\n`;
-    } else {
-      prompt += `# CONSOLE ERRORS:\nNone observed during this step. Console error collection WAS active, so this is a confirmed absence, not missing data.\n\n`;
-    }
-  }
-
   prompt += `Now evaluate the assertion and return JSON.`;
 
   return prompt;
@@ -271,7 +235,6 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
     hasHtml: !!input.html,
     hasA11y: !!input.a11yTree,
     hasScreenshot: !!input.screenshotBase64,
-    consoleErrorCount: input.consoleErrors?.length,
   });
 
   try {
@@ -285,10 +248,6 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
       html: !!input.html,
       a11y: !!input.a11yTree && input.a11yTree.length > 0,
       screenshot: !!input.screenshotBase64,
-      // `!!` would be wrong here: an EMPTY array is a real, usable artifact
-      // ("we watched the console and saw nothing"). Only `undefined` means
-      // the channel was never collected.
-      console: input.consoleErrors !== undefined,
     };
 
     // Truncate HTML if too large
@@ -395,7 +354,6 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
         html: !!input.html,
         a11y: !!input.a11yTree,
         screenshot: !!input.screenshotBase64,
-        console: input.consoleErrors !== undefined,
       },
       highlightRefs: [],
     };
