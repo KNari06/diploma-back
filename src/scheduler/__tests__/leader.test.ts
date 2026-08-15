@@ -16,7 +16,16 @@ jest.mock('@/config/infrastructure/queues', () => ({
   },
 }));
 
-jest.mock('@/config/environment/env', () => ({ env: { QUEUE_PREFIX: 'test:' } }));
+jest.mock('@/config/environment/env', () => ({
+  env: {
+    QUEUE_PREFIX: 'test:',
+    SUPABASE_URL: 'https://test.supabase.co',
+    SUPABASE_ANON_KEY: 'test-anon-key',
+    SUPABASE_SERVICE_ROLE_KEY: 'test-service-role-key',
+    SUPABASE_BUCKET_NAME: 'test-bucket',
+    OPENAI_API_KEY: 'test-openai-key',
+  },
+}));
 
 jest.mock('@/utils/core/logger', () => ({
   logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },

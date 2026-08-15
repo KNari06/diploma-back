@@ -30,7 +30,16 @@ jest.mock('@/config/environment/env', () => ({
 // import chain doesn't open a real connection.
 jest.mock('@/db/supabase', () => ({ supabaseAdmin: {}, supabase: {} }));
 
+jest.mock('@/services/core/project.service', () => ({
+  ProjectService: { getProject: jest.fn() },
+}));
+
 import { startMobileExploration } from '../session.controller';
+import { ProjectService } from '@/services/core/project.service';
+
+const TEST_PROJECT_ID = 'c1b7587e-12d4-4b85-a2da-1be1b0e56a44';
+const TEST_USER_ID = 'ee6e06a7-fbac-4d5e-9e2e-884d8ca0bfa9';
+const mockGetProject = ProjectService.getProject as jest.Mock;
 
 function mockRes() {
   const res: Record<string, jest.Mock> = {};
@@ -41,8 +50,8 @@ function mockRes() {
 
 function mockReq(over: { user?: unknown; params?: unknown; body?: unknown } = {}) {
   return {
-    user: 'user' in over ? over.user : { id: 'u-123456789' },
-    params: over.params ?? { projectId: 'p-1' },
+    user: 'user' in over ? over.user : { id: TEST_USER_ID },
+    params: over.params ?? { projectId: TEST_PROJECT_ID },
     body: over.body ?? { platform: 'android', appId: 'com.demo.app', runnerSessionId: 'sess-1', goal: 'checkout' },
   } as unknown as import('express').Request;
 }
@@ -50,6 +59,7 @@ function mockReq(over: { user?: unknown; params?: unknown; body?: unknown } = {}
 beforeEach(() => {
   jest.clearAllMocks();
   addMobileExplorationJob.mockResolvedValue({ id: 'job-1' });
+  mockGetProject.mockResolvedValue({ id: TEST_PROJECT_ID });
 });
 
 describe('startMobileExploration', () => {
@@ -79,8 +89,8 @@ describe('startMobileExploration', () => {
       runnerSessionId: 'sess-1',
       appId: 'com.demo.app',
       platform: 'android',
-      projectId: 'p-1',
-      userId: 'u-123456789',
+      projectId: TEST_PROJECT_ID,
+      userId: TEST_USER_ID,
       runnerSocketUrl: 'ws://runner:4100', // from env, not the client hint
     }));
     const body = res.json.mock.calls[0][0];
