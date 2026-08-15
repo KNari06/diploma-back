@@ -691,7 +691,7 @@ describe('CdpSnapshotService — real Chromium integration', () => {
   // be 2-3x worse on both paths but the RATIO should hold.
   // ──────────────────────────────────────────────────────────────────
   describe('SPEED comparison — CDP vs evaluate on dense synthetic DOM', () => {
-    it('CDP path is at least 3x faster than evaluate on a 5000-element page', async () => {
+    it('CDP does not regress under evaluate, per element, on a 5000-element page', async () => {
       // Build a dense page programmatically — 5000 visible buttons +
       // attributes that force the evaluate path through every cascade
       // (icon classes, descendants, etc.). This is the kind of page
@@ -737,34 +737,62 @@ describe('CdpSnapshotService — real Chromium integration', () => {
         const evalSnap = await SnapshotCollector.collect(evalPage);
         const evalMs = Date.now() - evalStart;
 
+        const cdpCount = cdpSnap.elements.length;
+        const evalCount = evalSnap.elements.length;
+        const cdpMsPerElement = cdpMs / Math.max(1, cdpCount);
+        const evalMsPerElement = evalMs / Math.max(1, evalCount);
+
         // Telemetry — surfaces in Jest output via console.log so we
-        // can EYEBALL the actual ratio when running the test, even
-        // when assertion passes by a wide margin.
+        // can EYEBALL the real numbers when running the test, even
+        // when the assertion passes by a wide margin.
         // eslint-disable-next-line no-console
         console.log('[SPEED]', {
           cdpMs,
           evalMs,
-          ratio: (evalMs / Math.max(1, cdpMs)).toFixed(2) + 'x',
-          cdpElements: cdpSnap.elements.length,
-          evalElements: evalSnap.elements.length,
+          cdpElements: cdpCount,
+          evalElements: evalCount,
+          cdpMsPerElement: cdpMsPerElement.toFixed(3),
+          evalMsPerElement: evalMsPerElement.toFixed(3),
+          perElementRatio: (evalMsPerElement / Math.max(0.001, cdpMsPerElement)).toFixed(2) + 'x',
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           cdpPhases: (cdpSnap as any).__cdpPhaseTimings,
         });
 
-        // Assertion: CDP must NOT be slower than evaluate on dense pages.
-        // We deliberately don't assert "10× faster" because the WIN is
-        // proportional to evaluate-path complexity, which is MUCH
-        // heavier on real-world pages (juz40-class 11k DOM with deep
-        // ancestor walks, framework detection, obstacleFacts) than on
-        // a flat synthetic 5000-button grid. On synthetic the CDP
-        // transport (~250ms) eats most of the budget; on real dense
-        // pages evaluate's 12-16s vs CDP's 1-2s gives the 10× claim.
+        // ── The two paths do NOT collect the same set on a dense page ──
         //
-        // Contract here: CDP not regressing under evaluate. ANY worse
-        // than evaluate would mean the cap/filter logic is broken
-        // (which is exactly the regression Q5 audit caught — uncapped
-        // Tier-2 made CDP 30× slower). Headroom for CI noise: ×1.5.
-        expect(cdpMs).toBeLessThan(evalMs * 1.5);
+        // Measured 2026-08-15 on this exact fixture (5000 buttons, 281 of
+        // them inside a 1280×720 viewport):
+        //
+        //   evaluate → 581 = 281 buttons (EXACTLY the in-viewport ones)
+        //                  + 150 <i> + 150 <span>  (Tier-2, capped at 300)
+        //   CDP      → 1500 = buttons up to MAX_TOTAL_ELEMENTS, Tier-2 = 0
+        //
+        // That difference is by design on the CDP side: below-the-fold
+        // elements MUST survive (invariant #18 and the "preserves
+        // below-the-fold buttons after page scroll" test above), whereas the
+        // evaluate path restricts Tier-1 to the viewport. Assert the
+        // divergence rather than let it silently distort a timing number.
+        expect(cdpCount).toBeGreaterThan(evalCount);
+
+        // Contract: CDP must not regress under evaluate — measured PER
+        // ELEMENT, because comparing raw wall-clock across two collections
+        // of different size is not a speed comparison at all. This assertion
+        // spent months failing for that reason: CDP looked "2× slower" while
+        // returning 2.6× the elements, i.e. ~1.3× FASTER per element.
+        //
+        // Per-element cost is what the regression this guards would actually
+        // move — the Q5 audit's uncapped Tier-2 made CDP 30× slower without
+        // returning 30× more elements. Do NOT loosen this back into a raw
+        // wall-clock ratio, and do not widen the multiplier to make a red run
+        // green; the number to look at first is cdpMsPerElement above.
+        // Headroom for CI noise: ×1.5.
+        //
+        // Deliberately NOT asserted: absolute speed. The WIN is proportional
+        // to evaluate-path complexity, which is far heavier on real pages
+        // (juz40-class 11k DOM, deep ancestor walks, framework detection)
+        // than on a flat synthetic grid where CDP transport (~300ms) eats
+        // most of the budget.
+        expect(cdpMsPerElement).toBeLessThan(evalMsPerElement * 1.5);
       } finally {
         await evalPage.close();
       }
