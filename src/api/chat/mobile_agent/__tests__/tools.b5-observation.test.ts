@@ -18,18 +18,20 @@ jest.mock('@/services/mobile/mobile-runner-client', () => ({
   getMobileRunnerClient: jest.fn(),
 }));
 
-// Stub the queues module. Importing it for real opens live Redis connections at
-// module load — a QueueEvents per queue, ~72 sockets — and with no Redis running
-// ioredis retries them forever. That storm starves this file's own event loop:
-// the suite took 147s and 12 tests failed as 10s TIMEOUTS, which reads exactly
-// like a slow test but is not. `tools.ts` reaches it through the planner →
-// openai service → tracker chain noted above.
+// Stub the queues module.
 //
-// Same stub as a dozen other suites here; see
-// src/utils/core/__tests__/redis-cache.test.ts for the canonical version.
-// The stub is built INSIDE the factory: jest.mock is hoisted above the imports,
-// so a `mock…` const declared at module scope is still in its TDZ when the
-// factory runs.
+// `queues.ts` no longer opens Redis sockets under NODE_ENV=test (it swaps the
+// BullMQ constructors for inert stubs), and that fix removed ~thousands of
+// ECONNREFUSED retries across the lane. It is NOT sufficient for this file:
+// without the stub below this suite still takes 143s and fails 12 tests as 10s
+// timeouts, versus 3.0s and 22/22 with it. Why the source fix doesn't fully
+// cover this one is not yet understood — this file also mocks
+// `@/config/environment/env` with a partial object, which is the obvious
+// suspect and the first thing to check.
+//
+// So: belt AND braces. Do not remove this stub on the grounds that the source
+// is fixed — that is exactly what was tried, and the suite went straight back
+// to 143s. Measure the file ALONE, without the stub, before touching it.
 jest.mock('@/config/infrastructure/queues', () => ({
   redisConnection: {
     get: jest.fn(),
@@ -43,6 +45,7 @@ jest.mock('@/config/infrastructure/queues', () => ({
   },
   connection: { host: 'localhost', port: 6379 },
 }));
+
 
 // PII redactor + wrapper run on REAL implementations — we want to see
 // their effect on the logs tool's output. Env defaults the flag ON.
