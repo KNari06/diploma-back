@@ -38,6 +38,34 @@ describe('HealthCheckAggregatorService', () => {
       expect(cats).toEqual(['console_errors', 'network_errors']);
       expect(cats).not.toContain('js_exceptions');
     });
+
+    it('marks both mobile checks not_available instead of falsely passing them', () => {
+      // Regression guard: mobile runs used to render a green "2 Passed:
+      // Console Errors · Network Errors" even though the runner captures
+      // neither signal for native apps.
+      const result = HealthCheckAggregatorService.aggregateFromTestResult(
+        { logs: [], network_logs: [], errors: [] },
+        { isMobile: true },
+      );
+      expect(result.findings.map((f) => f.severity)).toEqual([
+        'not_available',
+        'not_available',
+      ]);
+      for (const f of result.findings) {
+        expect(f.unavailableReason).toBeTruthy();
+      }
+    });
+
+    it('still grades mobile network entries when a WebView run captured some', () => {
+      // CDP attaches on an Android WebView context switch, so real entries do
+      // occur — those must be graded, not written off as unavailable.
+      const result = HealthCheckAggregatorService.aggregateFromTestResult(
+        { logs: [], network_logs: [{ url: '/api', status: 503 }], errors: [] },
+        { isMobile: true },
+      );
+      const net = result.findings.find((f) => f.category === 'network_errors')!;
+      expect(net.severity).toBe('fail');
+    });
   });
 
   // ── checkConsoleLogs (via aggregateFromTestResult) ────────────────────────
@@ -48,12 +76,12 @@ describe('HealthCheckAggregatorService', () => {
         .findings.find((f) => f.category === 'console_errors')!;
     }
 
-    it('pass when logs is null', () => {
-      expect(check(null).severity).toBe('pass');
+    it('reports not_available rather than pass when logs is null', () => {
+      expect(check(null).severity).toBe('not_available');
     });
 
-    it('pass when logs is not an array', () => {
-      expect(check('some string').severity).toBe('pass');
+    it('reports not_available rather than pass when logs is not an array', () => {
+      expect(check('some string').severity).toBe('not_available');
     });
 
     it('pass when there are no [error] entries', () => {
@@ -94,8 +122,8 @@ describe('HealthCheckAggregatorService', () => {
         .findings.find((f) => f.category === 'network_errors')!;
     }
 
-    it('pass when network_logs is null', () => {
-      expect(check(null).severity).toBe('pass');
+    it('reports not_available rather than pass when network_logs is null', () => {
+      expect(check(null).severity).toBe('not_available');
     });
 
     it('pass when there are no 4xx/5xx responses', () => {
@@ -219,12 +247,46 @@ describe('HealthCheckAggregatorService', () => {
   describe('buildHealthSummary', () => {
     it('returns all-zero summary for empty input', () => {
       const s = HealthCheckAggregatorService.buildHealthSummary([]);
-      expect(s).toEqual({ totalChecks: 0, passed: 0, warnings: 0, failures: 0, findings: [] });
+      expect(s).toEqual({ totalChecks: 0, passed: 0, warnings: 0, failures: 0, notAvailable: 0, findings: [] });
     });
 
     it('skips undefined items in the input array', () => {
       const s = HealthCheckAggregatorService.buildHealthSummary([undefined, undefined]);
       expect(s.totalChecks).toBe(0);
+    });
+
+    it('lets a real observation win the merge over not_available', () => {
+      // not_available ranks BELOW pass: if any execution actually observed the
+      // signal, that observation is what the user should see.
+      const s = HealthCheckAggregatorService.buildHealthSummary([
+        {
+          findings: [{ category: 'console_errors', severity: 'not_available', message: 'n/a' }],
+          checkedAt: 'x',
+        },
+        {
+          findings: [{ category: 'console_errors', severity: 'pass', message: 'ok' }],
+          checkedAt: 'x',
+        },
+      ]);
+      expect(s.findings).toHaveLength(1);
+      expect(s.findings[0].severity).toBe('pass');
+      expect(s.passed).toBe(1);
+      expect(s.notAvailable).toBe(0);
+    });
+
+    it('counts not_available separately from passed', () => {
+      const s = HealthCheckAggregatorService.buildHealthSummary([
+        {
+          findings: [
+            { category: 'console_errors', severity: 'not_available', message: 'n/a' },
+            { category: 'network_errors', severity: 'not_available', message: 'n/a' },
+          ],
+          checkedAt: 'x',
+        },
+      ]);
+      expect(s.notAvailable).toBe(2);
+      expect(s.passed).toBe(0);
+      expect(s.totalChecks).toBe(2);
     });
 
     it('counts pass / warning / fail correctly', () => {

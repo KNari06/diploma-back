@@ -54,7 +54,42 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     /** V3: Assertion text for ai_check */
     assertionText?: string;
     /** V3: AI context mode for ai_check */
-    aiContextMode?: 'html' | 'screenshot' | 'html+a11y' | 'html+screenshot' | 'html+a11y+screenshot';
+    aiContextMode?:
+      | 'html'
+      | 'screenshot'
+      | 'html+a11y'
+      | 'html+screenshot'
+      | 'html+a11y+screenshot'
+      // Console errors as an additional evidence channel. Only meaningful for
+      // fuzzy assertions ("no payment-related errors"); a plain "no console
+      // errors" should use the deterministic assertNoConsoleErrors step.
+      | 'console'
+      | 'html+console'
+      | 'html+a11y+screenshot+console';
+    /**
+     * `assertNoConsoleErrors` — which slice of the run to judge.
+     *  - 'step' (default): errors since the previous step boundary. Scopes the
+     *    failure to what the flow just did.
+     *  - 'run': every error collected since console collection was armed.
+     */
+    consoleScope?: 'step' | 'run';
+    /**
+     * `assertNoConsoleErrors` — regex/substring patterns whose matching errors
+     * are IGNORED. Real apps log third-party noise (analytics blockers,
+     * favicon 404s) that would make the assertion permanently red. Each entry
+     * is tried as a RegExp and falls back to a case-insensitive substring when
+     * it isn't valid regex syntax.
+     */
+    consoleIgnorePatterns?: string[];
+    /**
+     * `assertNoConsoleErrors` — also fail on failed requests / HTTP 5xx.
+     * OPT-IN: many healthy apps fire tolerated 4xx and blocked third-party
+     * beacons, so counting network noise by default would make the assertion
+     * permanently red. Filtered to same-site requests.
+     */
+    consoleIncludeNetworkErrors?: boolean;
+    /** Minimum HTTP status treated as an error (default 500). */
+    consoleNetworkMinStatus?: number;
     /** Iframe selector for actions within iframes */
     iframeSelector?: string;
     /** V6: Original action type for lookahead checks */
@@ -162,6 +197,11 @@ function mapActionType(intentAction: IntentActionType): string {
     // V3: AI check
     case 'ai_check':
       return 'aiCheck'; // New runtime action for AI-based assertions
+    // Deterministic console-error assertion (no LLM).
+    // NOTE: this case is load-bearing — `default:` below returns 'click', so a
+    // missing entry here would silently turn the assertion into a click.
+    case 'assert_no_console_errors':
+      return 'assertNoConsoleErrors';
     // V5: URL wait
     case 'wait_for':
       return 'waitFor'; // SPA-safe URL waiting
@@ -324,6 +364,13 @@ export function convertIntentStepToCommand(
         assertionText: step.assertionText,
         aiContextMode: step.options?.aiContextMode || 'html+a11y+screenshot',
       }),
+      // Deterministic console-error assertion config
+      ...(step.type === 'assert_no_console_errors' && {
+        consoleScope: step.options?.consoleScope || 'step',
+        consoleIgnorePatterns: step.options?.consoleIgnorePatterns,
+        consoleIncludeNetworkErrors: step.options?.consoleIncludeNetworkErrors,
+        consoleNetworkMinStatus: step.options?.consoleNetworkMinStatus,
+      }),
       // V12: Email inbox metadata
       ...(step.type === 'wait_for_email' && step.options?.emailFilter && {
         emailFilter: step.options.emailFilter,
@@ -410,6 +457,11 @@ export function convertIntentStepToCommand(
     case 'ai_check':
       // For ai_check, no additional command fields needed
       // All data is in intentMeta (assertionText, aiContextMode)
+      break;
+
+    case 'assert_no_console_errors':
+      // Targets no element and needs no selector — all config
+      // (consoleScope, consoleIgnorePatterns) rides in intentMeta.
       break;
 
     case 'wait_for':

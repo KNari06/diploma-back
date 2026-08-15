@@ -23,7 +23,7 @@ function bug(overrides: Partial<EnrichedBug> = {}): EnrichedBug {
 }
 
 function health(findings: HealthSummary['findings'] = []): HealthSummary {
-  return { totalChecks: findings.length, passed: 0, warnings: 0, failures: 0, findings };
+  return { totalChecks: findings.length, passed: 0, warnings: 0, failures: 0, notAvailable: 0, findings };
 }
 
 /** Default: a clean completed run — 1 passed, 0 failed. */

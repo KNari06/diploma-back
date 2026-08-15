@@ -24,7 +24,7 @@ const RUNNER_COMMAND_TYPES = new Set([
   'install_app', 'launch_app', 'close_app', 'go_back', 'go_home', 'dismiss',
   'biometric', 'otp', 'permission_dialog', 'set_clipboard', 'get_clipboard',
   'send_push_notification', 'set_network_condition', 'clear_network_condition',
-  'ai_visual_check', 'open_url', 'open_notifications', 'upload_file',
+  'ai_visual_check', 'assert_no_console_errors', 'open_url', 'open_notifications', 'upload_file',
   'get_logs', 'get_network_logs', 'get_app_info', 'get_app_cache',
   'check_package', 'tap_notification', 'dismiss_notification',
   'clear_all_notifications', 'assert_notification', 'switch_context',

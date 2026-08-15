@@ -120,6 +120,9 @@ export type MobileIntentActionType =
   // Web-compatible actions (mapped to mobile commands by runner)
   | 'click' | 'type' | 'scroll' | 'press' | 'hover'
   | 'assert' | 'ai_check' | 'extract_text' | 'navigate' | 'wait' | 'screenshot'
+  // Deterministic WebView console check (no LLM, no element). Passes on a
+  // native screen — there is no console there to inspect.
+  | 'assert_no_console_errors'
   | 'select' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'wait_for'
   // Mobile-specific actions
   | 'open_app'           // launch app by package/bundle ID

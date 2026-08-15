@@ -1081,12 +1081,22 @@ export type HealthCheckCategory =
   | 'broken_images'
   | 'page_responsive';
 
-export type HealthCheckSeverity = 'pass' | 'warning' | 'fail';
+/**
+ * `not_available` means "we could not observe this signal on this platform",
+ * NOT "we observed nothing wrong". It exists because the two are visually
+ * identical to a user and were previously both rendered as a green pass —
+ * e.g. every mobile run reported "Network Errors: passed" while the runner
+ * has never captured a single mobile network entry. It never blocks a release
+ * verdict (only `fail` does) and is never counted as passed.
+ */
+export type HealthCheckSeverity = 'pass' | 'warning' | 'fail' | 'not_available';
 
 export interface HealthCheckFinding {
   category: HealthCheckCategory;
   severity: HealthCheckSeverity;
   message: string;
+  /** Why the signal was unavailable. Set only when severity is `not_available`. */
+  unavailableReason?: string;
   details?: Array<{ url?: string; status?: number; count?: number; text?: string }>;
 }
 
@@ -1100,6 +1110,8 @@ export interface HealthSummary {
   passed: number;
   warnings: number;
   failures: number;
+  /** Checks that could not be observed on this platform — see HealthCheckSeverity. */
+  notAvailable: number;
   findings: HealthCheckFinding[];
 }
 
