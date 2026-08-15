@@ -31,6 +31,17 @@ export interface AITrackingContext {
   runId?: string;
   /** User who initiated the operation */
   userId?: string;
+  /**
+   * The id a caller passed to `AIUsageTracker.beginSession`, when that id is
+   * not derivable from `testId`/`runId` — a chat session id, an analysis key.
+   *
+   * Without it the tracker computes its own synthetic key, which cannot match
+   * the caller's id, so `record()` files calls under a different session than
+   * `endSession` closes: the explicit session ends empty (returning null and
+   * logging "no AI calls") while the real records wait for the sweep. Set this
+   * wherever you call `beginSession` with an id of your own.
+   */
+  sessionId?: string;
   /** High-level operation category */
   operationType?: 'lite-test' | 'pro-test' | 'chat' | 'test-plan' | 'api-test' | 'analysis' | 'regression' | 'import';
 

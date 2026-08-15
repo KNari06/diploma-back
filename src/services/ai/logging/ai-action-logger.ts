@@ -81,6 +81,31 @@ function synthesiseSummary(
 let _skipCount = 0;
 let _successCount = 0;
 
+/** Re-surface the skip total at `warn` every N skips. See `recordAILog`. */
+const SKIP_REPORT_EVERY = 100;
+
+/**
+ * Process-global attribution counters.
+ *
+ * A skipped call is AI spend we paid for and cannot attribute to anyone, so the
+ * ratio here is the honest confidence interval on every per-customer cost
+ * number we publish. It was previously a module-local `let`, unexported and
+ * unreadable from anywhere — which meant nobody could tell whether "skipped"
+ * meant a handful of startup calls or half the platform's spend.
+ */
+export function getAILogAttributionStats(): {
+  recorded: number;
+  skipped: number;
+  skippedPct: number;
+} {
+  const total = _successCount + _skipCount;
+  return {
+    recorded: _successCount,
+    skipped: _skipCount,
+    skippedPct: total === 0 ? 0 : Math.round((_skipCount / total) * 1000) / 10,
+  };
+}
+
 /**
  * Record one AI call. Reads source/action/entity/iteration from the active
  * AITrackingContext (set via withAIContext + withAILogFields).
@@ -92,6 +117,13 @@ export function recordAILog(input: RecordAILogInput): void {
   const ctx = getAIContext();
   if (!ctx?.userId) {
     _skipCount += 1;
+    // After the first 10 this used to drop to `debug` forever, so in prod a
+    // systemic attribution failure was indistinguishable from silence. Keep the
+    // per-call line quiet, but re-surface the running total periodically —
+    // unattributed calls are spend we cannot bill to anyone.
+    if (_skipCount % SKIP_REPORT_EVERY === 0) {
+      logger.warn('[AI_LOG] AI calls are being recorded without attribution', getAILogAttributionStats());
+    }
     const level = _skipCount <= 10 ? 'info' : 'debug';
     logger[level]('[AI_LOG] Skipping AI log (no userId in AITrackingContext)', {
       provider: input.provider,

@@ -112,7 +112,7 @@ Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 | …trace AI cost / token usage | `src/services/ai/cost/`, `src/services/ai/tracking/` |
 | …measure / eval the chat authoring agent | [src/scripts/chat-eval/](src/scripts/chat-eval/) — **read its README first**. See [api/chat/CLAUDE.md](src/api/chat/CLAUDE.md) § Evaluating |
 | …author a LOGIN test bound to a stored credential | [api/chat/CLAUDE.md](src/api/chat/CLAUDE.md) § Authoring a LOGIN test |
-| …check DB schema | `supabase-migrations/supabase-schema.sql` |
+| …check DB schema | `supabase-migrations/supabase-schema.sql` — **bootstrap only, not current**; see [critical-patterns.md §10](.claude/rules/critical-patterns.md) |
 | …add/change a **prod** env var (not just `env.ts`) | See "Env vars: local vs prod" below — prod env lives in `qait-infra/azure/terraform/.env`, NOT here |
 | …read a runtime trace / log | `test_logs/<feature>/<YYYY-MM-DD_HH-MM-SS>_<testId>.jsonl` — `editor/`, `chat_test/`. Auto-pruned after `EDITOR_LOG_RETENTION_DAYS` (default 3) |
 

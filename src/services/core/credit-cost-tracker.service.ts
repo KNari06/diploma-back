@@ -9,7 +9,17 @@ import { UserCreditsService } from './user-credits.service';
  * IMPORTANT:
  * - Only deduct credits for TESTS (intelligent, api)
  * - Standard mode removed - all UI tests use intelligent mode
- * - NEVER deduct credits for chat messages
+ *
+ * COST RECORDING IS CURRENTLY BROKEN ON THE HOT PATH. `deductStepCredit` below
+ * hardcodes `costUSD: 0` and its signature accepts no cost argument, so the
+ * `credit_transactions.cost_usd` column — which does exist in prod — reads 0 on
+ * 97.1% of deduction rows (20,448 of 21,051, measured 2026-08-13). Real cost is
+ * captured out-of-band per LLM call in `ai_usage_events`; join on user/entity
+ * rather than trusting `cost_usd` here.
+ *
+ * NOTE: the previous version of this comment claimed chat is never charged.
+ * That is false — `test_type = 'chat'` accounts for 365 deductions at 1 credit
+ * each. Chat IS billed, via api/chat/shared/utils.ts.
  */
 
 // ═══════════════════════════════════════════════════════════════════════════

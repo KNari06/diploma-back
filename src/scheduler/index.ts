@@ -18,6 +18,7 @@ import { ExpiringPlansJob } from '@/jobs/expiring-plans.job';
 import { TelegramTaskSweepJob } from '@/jobs/telegram-task-sweep.job';
 import { StaleRunReaperJob } from '@/jobs/stale-run-reaper.job';
 import { AiCallLogsRetentionJob } from '@/jobs/ai-call-logs-retention.job';
+import { isLLMIOPersistEnabled } from '@/services/ai/logging/llm-io-persistence';
 import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
 import { TestSchedulerJobHandler } from '@/jobs/test-scheduler.job';
 import { logger } from '@/utils/core/logger';
@@ -58,7 +59,17 @@ async function main(): Promise<void> {
 
   // Daily TTL sweep for ai_call_logs (redacted LLM I/O store). Same
   // single-instance reasoning as the sweeps above.
-  AiCallLogsRetentionJob.start();
+  //
+  // Gated on the store's own flag. `20260605_create_ai_call_logs.sql` has never
+  // been applied, so with the flag off the table does not exist and this sweep
+  // just throws once a day against a table nothing writes to — a standing false
+  // alarm that teaches people to ignore retention warnings. The sweep only has
+  // meaning when the store it drains is switched on; tie it to that.
+  if (isLLMIOPersistEnabled()) {
+    AiCallLogsRetentionJob.start();
+  } else {
+    logger.info('[SCHEDULER] ai_call_logs retention sweep not started — LLM_IO_PERSIST_ENABLED is off');
+  }
 
   // Daily "plan expiring in 3 days" reminder. Emails paid users whose
   // current_period_end is within 3 days; per-period dedup marker prevents
