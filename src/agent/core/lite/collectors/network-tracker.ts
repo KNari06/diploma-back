@@ -221,7 +221,13 @@ export class NetworkTracker {
       } else if (status >= 400 && status < 500) {
         // P1: Enhanced validation error capture with full body parsing
         try {
-          const body = await response.json().catch(() => null);
+          const raw = await response.text().catch(() => '');
+          let body: any = null;
+          try {
+            body = raw ? JSON.parse(raw) : null;
+          } catch {
+            // Keep the raw response body below when it is not valid JSON.
+          }
           const message = body?.message || body?.error?.message || `HTTP ${status}`;
           const errors = body?.errors || (body?.error ? [body.error] : []);
 
@@ -254,7 +260,7 @@ export class NetworkTracker {
             iteration: this.currentIteration,
             // P1: Enhanced fields
             requestBody,
-            responseBody: body,
+            responseBody: body ?? raw,
             headers,
             fieldErrors: fieldErrors.length > 0 ? fieldErrors : undefined,
             rateLimitInfo: rateLimitInfo || undefined,
