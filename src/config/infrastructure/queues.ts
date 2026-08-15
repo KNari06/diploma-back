@@ -5,9 +5,73 @@ import type { AllureImportJobData } from '@/services/allure-import/allure-import
 import { handleQueueError } from '@/utils/core/error-handler';
 import { logQueueEvent, logger } from '@/utils/core/logger';
 import { VisualAnomalySweepFeature } from '../features/visual-anomaly-sweep';
-import { Queue, QueueEvents } from 'bullmq';
+import { Queue as BullQueue, QueueEvents as BullQueueEvents } from 'bullmq';
 import IORedis from 'ioredis';
 import { env } from '../environment/env';
+
+// ═══════════════════════════════════════════════════════════════════════
+// Importing this module must not open sockets in a test process
+//
+// Constructing the 14 Queues and 9 QueueEvents below makes BullMQ connect
+// each one IMMEDIATELY. Measured with `--detectOpenHandles`: 72 open handles
+// from a single import, three per construction, plus the connect() and timer
+// further down.
+//
+// In Jest, with no Redis running, ioredis then retries forever and the storm
+// starves the event loop of the whole process. Two consequences, both of
+// which cost real diagnosis time because neither looks like its cause:
+//   • Suites that merely IMPORT this file get slow and fail as 10s TIMEOUTS.
+//     `tools.b5-observation` took 147s and failed 12 tests; stubbed, it takes
+//     3.0s and passes 22/22. It reads as a flaky test, and was twice
+//     misdiagnosed as CPU contention — it reproduces at --runInBand, where
+//     there is no parallelism to contend.
+//   • The run never exits ("Jest did not exit one second after the test run
+//     has completed"), which in CI is a job that hangs to its timeout and so
+//     reports neither pass nor fail. That is what kept qai-backend ungated.
+//
+// So under NODE_ENV=test both constructors are swapped for an inert stub.
+// Everything else about the module is unchanged: the exports exist with the
+// same names, `QUEUE_NAMES` and the job types are real, and the `.on(...)`
+// listener registrations below still run (against no-ops).
+//
+// IS_TEST is false in api/worker/scheduler, so production builds exactly the
+// objects it always did — this is not a behaviour change outside tests.
+//
+// Why not lazy getters for everyone, which would be the tidier fix? Because
+// that WOULD change production: the listeners at the bottom of this file
+// register at module load, so a queue nobody happens to touch would silently
+// stop logging its events. Making that safe is a bigger change than this one
+// and belongs on its own branch —
+// .claude/deferred/20260815-importing-queues-opens-72-redis-sockets.md
+// ═══════════════════════════════════════════════════════════════════════
+const IS_TEST = process.env.NODE_ENV === 'test';
+
+/**
+ * Stands in for a BullMQ Queue / QueueEvents without touching the network.
+ * Any property reads back as a chainable no-op, so `.on(...)`, `.add(...)`
+ * and friends work without anyone special-casing them. `then` is explicitly
+ * absent so `await`ing one of these resolves instead of hanging.
+ */
+function inertBullStub(name: string): any {
+  const stub: any = new Proxy(
+    { name, __inert: true },
+    {
+      get(target: any, prop: string | symbol) {
+        if (prop in target) return target[prop];
+        if (prop === 'then') return undefined;
+        return () => stub;
+      },
+    },
+  );
+  return stub;
+}
+
+const InertCtor = function (this: unknown, name: string) {
+  return inertBullStub(name);
+} as unknown as typeof BullQueue;
+
+const Queue = (IS_TEST ? InertCtor : BullQueue) as typeof BullQueue;
+const QueueEvents = (IS_TEST ? InertCtor : BullQueueEvents) as unknown as typeof BullQueueEvents;
 
 // ═══════════════════════════════════════════════════════════════════════
 // EXPLORATION JOB DATA
@@ -107,7 +171,10 @@ setTimeout(() => {
   if (_redisPasswordWarnCount > 0) {
     logger.warn(`Redis server does not require a password, but REDIS_PASSWORD is set (${_redisPasswordWarnCount} connections). Consider removing it from .env for local dev.`);
   }
-}, 5000);
+  // .unref() so this fire-and-forget log timer can never hold the process
+  // open on its own — it was one of the three non-socket handles keeping Jest
+  // alive after a green run.
+}, 5000).unref();
 
 // Redis connection configuration.
 //
@@ -171,8 +238,12 @@ redisConnection.on('reconnecting', (delay: number) => {
   logger.info(`🔄 Reconnecting to Redis in ${delay}ms...`);
 });
 
-// Connect to Redis (with error handling)
-redisConnection.connect()
+// Connect to Redis (with error handling).
+// Skipped under test for the reason at the top of this file: a Jest process
+// has no Redis, and the retry storm from this one call starves the event loop
+// for every suite that transitively imports this module.
+if (!IS_TEST) {
+  redisConnection.connect()
   .catch((error) => {
     redisAvailable = false;
     logger.warn('Failed to connect to Redis:', error.message);
@@ -183,6 +254,7 @@ redisConnection.connect()
       logger.warn('⚠️  Queue functionality will be limited. Make sure Redis is running.');
     }
   });
+}
 
 // Redis connection for BullMQ.
 // Note: BullMQ requires maxRetriesPerRequest to be null.
