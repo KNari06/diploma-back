@@ -85,8 +85,15 @@ jest.mock('@/services/mobile/session-runner-routing', () => ({
   runnerUrlToSocketUrl: jest.fn((u: string) => u.replace(/^http/, 'ws')),
 }));
 
+// `resolveDedicatedDevices` is PLURAL and returns a list — the multi-device work
+// renamed it, and this mock kept the old singular `resolveDedicatedDevice`. The
+// stub therefore didn't cover the name the controller actually calls, and every
+// test here died on `TypeError: resolveDedicatedDevices is not a function` at
+// session.controller.ts:513. Nothing caught it because the backend has no CI
+// gate yet — this is exactly the rot the gate exists to stop.
+// Keep the shape in step with the real module's exports, not with its history.
 jest.mock('@/services/mobile/dedicated-device.service', () => ({
-  resolveDedicatedDevice: jest.fn(async () => null),
+  resolveDedicatedDevices: jest.fn(async () => []),
 }));
 
 jest.mock('@/services/core/project.service', () => ({

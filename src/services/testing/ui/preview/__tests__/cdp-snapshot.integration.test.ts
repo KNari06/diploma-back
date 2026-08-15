@@ -14,8 +14,8 @@
  *     - hard-timeout race when Playwright actually owns the page lifecycle
  *
  *   This file fills that gap with a `chromium.launch()` per test suite,
- *   mirroring the patterns in `snapshot-collector.shadow-dom.test.ts`
- *   and `network-tracker.interception.test.ts`.
+ *   mirroring the patterns in `snapshot-collector.shadow-dom.integration.test.ts`
+ *   and `network-tracker.interception.integration.test.ts`.
  *
  * Test isolation:
  *   - One Browser shared across all tests (beforeAll/afterAll) — launching

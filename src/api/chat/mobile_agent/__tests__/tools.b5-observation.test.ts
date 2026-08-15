@@ -18,6 +18,32 @@ jest.mock('@/services/mobile/mobile-runner-client', () => ({
   getMobileRunnerClient: jest.fn(),
 }));
 
+// Stub the queues module. Importing it for real opens live Redis connections at
+// module load — a QueueEvents per queue, ~72 sockets — and with no Redis running
+// ioredis retries them forever. That storm starves this file's own event loop:
+// the suite took 147s and 12 tests failed as 10s TIMEOUTS, which reads exactly
+// like a slow test but is not. `tools.ts` reaches it through the planner →
+// openai service → tracker chain noted above.
+//
+// Same stub as a dozen other suites here; see
+// src/utils/core/__tests__/redis-cache.test.ts for the canonical version.
+// The stub is built INSIDE the factory: jest.mock is hoisted above the imports,
+// so a `mock…` const declared at module scope is still in its TDZ when the
+// factory runs.
+jest.mock('@/config/infrastructure/queues', () => ({
+  redisConnection: {
+    get: jest.fn(),
+    set: jest.fn(),
+    del: jest.fn(),
+    publish: jest.fn(),
+    subscribe: jest.fn(),
+    on: jest.fn(),
+    scanStream: jest.fn(),
+    pipeline: jest.fn(),
+  },
+  connection: { host: 'localhost', port: 6379 },
+}));
+
 // PII redactor + wrapper run on REAL implementations — we want to see
 // their effect on the logs tool's output. Env defaults the flag ON.
 // Also include the Supabase / OpenAI envs the module-init chain expects

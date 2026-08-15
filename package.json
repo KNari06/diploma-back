@@ -35,13 +35,15 @@
     "viz:build": "ts-node -r tsconfig-paths/register scripts/pipeline-viz/build-graph.ts",
     "viz:watch": "ts-node -r tsconfig-paths/register scripts/pipeline-viz/build-graph.ts --watch",
     "viz:serve": "node scripts/pipeline-viz/serve.js",
-    "test": "jest --passWithNoTests",
-    "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage",
+    "test": "jest --selectProjects unit --passWithNoTests",
+    "test:watch": "jest --selectProjects unit --watch",
+    "test:coverage": "jest --selectProjects unit --coverage",
     "lint": "eslint src/**/*.ts",
     "lint:fix": "eslint src/**/*.ts --fix",
     "type-check": "tsc --noEmit",
-    "setup": "cp env.example .env && echo '✅ Created .env file. Please edit it with your credentials.'"
+    "setup": "cp env.example .env && echo '✅ Created .env file. Please edit it with your credentials.'",
+    "test:integration": "jest --selectProjects integration --runInBand --testTimeout=60000",
+    "test:all": "jest"
   },
   "keywords": [
     "qa",
