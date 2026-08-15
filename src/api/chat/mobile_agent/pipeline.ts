@@ -27,9 +27,14 @@ import { logger } from '@/utils/core/logger';
 import { env } from '@/config/environment/env';
 import { MobileBlackboard } from './blackboard';
 import { MobileDraftStepsCache } from '@/services/testing/mobile/mobile-draft-steps-cache';
-import { DRAFT_CLAIM_NUDGE, replyClaimsStepRevision } from './draft-claim-reconciliation';
+import {
+  DRAFT_CLAIM_NUDGE,
+  DRAFT_OFFER_NUDGE,
+  replyClaimsStepRevision,
+  replyOffersDraftInsteadOfEmitting,
+} from './draft-claim-reconciliation';
 import { buildMobileAgentSystemPrompt } from './prompts';
-import { MOBILE_AGENT_TOOLS, executeTool } from './tools';
+import { DEVICE_DRIVING_TOOLS, MOBILE_AGENT_TOOLS, executeTool } from './tools';
 import {
   emitMobileAgentThinking,
   emitMobileToolStep,
@@ -165,6 +170,13 @@ export interface RunMobileAgentPipelineOpts {
   history?: ChatCompletionMessageParam[];
 }
 
+/**
+ * How many successful device actions make a turn look like AUTHORING rather
+ * than a one-off look-at-this request. Three is a walk (open, navigate, act);
+ * one or two is someone checking a screen.
+ */
+const MIN_DRIVES_FOR_AUTHORING_NUDGE = 3;
+
 export async function runMobileAgentPipeline(
   blackboard: MobileBlackboard,
   opts?: RunMobileAgentPipelineOpts,
@@ -233,6 +245,7 @@ export async function runMobileAgentPipeline(
   let draftMeta: MobileDraftStepsMeta | undefined;
   // At most one draft-claim nudge per turn (see the exit branch below).
   let draftClaimNudged = false;
+  let draftOfferNudged = false;
   // Is there anything to REVISE — i.e. an artifact a step-level claim could
   // contradict? Either a draft is cached for this chat, or the editor is scoped
   // to a saved test case that already has steps (`buildOpenTestCaseBlock`
@@ -306,6 +319,61 @@ export async function runMobileAgentPipeline(
         // blind retry of the same user turn.
         messages.push({ role: 'assistant', content: reply });
         messages.push({ role: 'system', content: DRAFT_CLAIM_NUDGE });
+        continue;
+      }
+
+      // The agent walked the flow and then ended the turn with no draft. Same
+      // one-shot shape as the claim nudge above, and the same reasoning: the
+      // reply and the (missing) draft are both from this turn, so they can be
+      // reconciled before the turn is returned.
+      //
+      // Gated on having actually DRIVEN the device this turn, which is what
+      // separates "did the work, withheld the artifact" from an agent that is
+      // legitimately asking a question before touching anything. Nudging the
+      // latter would push it to draft from the user's sentence — the exact
+      // ungrounded-draft failure the grounding gate exists to stop.
+      //
+      // Why this is needed at all: one REFUSED mobile_run_draft_steps earlier in
+      // a chat is enough to stop the model calling that tool for the rest of the
+      // conversation. Live on TC-33 (2026-08-13) the split was total — 2 of 2
+      // fresh chats drafted, 4 of 4 chats holding a prior refusal never drafted
+      // again, including one that walked the whole flow, confirmed the thank-you
+      // screen, and closed with "If you want, I can … emit the draft cards".
+      //
+      // It first shipped keyed on that OFFER phrasing, which turned out to be
+      // the narrower half of the failure. On a clean chat with every earlier
+      // blocker fixed (2026-08-14) the agent walked Home → Profile → FAQ,
+      // scrolled, tapped Ия, reached "Thank you for your feedback!" — 16 tool
+      // calls, the whole flow — and closed with a 387-character REPORT of what
+      // it had seen. No offer, so no nudge, so no draft: an authoring request
+      // answered as if it were an exploration request. Reporting and offering
+      // are the same outcome (nothing the user can save), so the trigger is now
+      // the outcome, not the wording. The nudge text carries the escape hatch
+      // for a genuine look-at-this turn.
+      const droveDeviceThisTurn = blackboard
+        .getToolInvocations()
+        .some((t) => DEVICE_DRIVING_TOOLS.has(t.tool) && t.ok);
+      // `droveDeviceThisTurn` alone over-fires: "tap Profile and tell me
+      // what's there" drives the device, answers in prose, and legitimately
+      // authors nothing — nudging it costs an extra round-trip to be told so.
+      // A WALK is the signal, not a touch: authoring a flow takes several
+      // actions, exploration usually takes one.
+      const walkedThisTurn =
+        blackboard.getToolInvocations().filter((t) => DEVICE_DRIVING_TOOLS.has(t.tool) && t.ok)
+          .length >= MIN_DRIVES_FOR_AUTHORING_NUDGE;
+      if (!draftOfferNudged && !draftSteps && reply && walkedThisTurn) {
+        draftOfferNudged = true;
+        logger.warn('[MOBILE_AGENT_PIPELINE] Drove the device but emitted no draft', {
+          sessionId: blackboard.mobileSessionId,
+          chatSessionId: blackboard.chatSessionId,
+          round,
+          // Whether the reply OFFERED a draft or merely reported the walk is now
+          // only diagnostic — both end the turn with nothing the user can save.
+          offeredDraft: replyOffersDraftInsteadOfEmitting(reply),
+          replyPreview: reply.slice(0, 200),
+        });
+        messages.push({ role: 'assistant', content: reply });
+        messages.push({ role: 'system', content: DRAFT_OFFER_NUDGE });
         continue;
       }
       // Final "wrapping up" pulse so the UI shows the indicator approaching
