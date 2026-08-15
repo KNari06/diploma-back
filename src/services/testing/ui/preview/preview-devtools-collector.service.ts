@@ -760,6 +760,53 @@ export class PreviewDevToolsCollector {
   }
 
   /**
+   * Epoch ms marking the boundary between the PREVIOUS editor step and this
+   * one. Lives here because it is the only per-session object that survives
+   * across `applyStep` calls (applyStep is static and stateless).
+   *
+   * `undefined` = no boundary recorded yet (the first console assertion of a
+   * session), which callers must treat as "whole session", NOT as "nothing".
+   */
+  private stepBoundaryMs: number | undefined;
+
+  /**
+   * Record that a step just finished, so the NEXT console assertion knows
+   * which slice of console history belongs to the step before it.
+   */
+  markStepBoundary(): void {
+    this.stepBoundaryMs = Date.now();
+  }
+
+  /**
+   * Console entries since the previous step boundary.
+   *
+   * WHY THE WINDOW STARTS AT THE PREVIOUS BOUNDARY, NOT AT THIS STEP'S START:
+   * an `ai_check` / `assert_no_console_errors` step performs no page action of
+   * its own — it is a pure observation that runs immediately after the step
+   * that DID act. A window opening at this step's own start would therefore be
+   * empty almost every time, and the assertion would report a clean console
+   * for a page that had just thrown. The interesting errors are the ones the
+   * PREVIOUS step produced.
+   *
+   * Timestamps are ISO strings on `PreviewConsoleEntry`, so they are parsed
+   * rather than compared numerically. An unparseable timestamp is KEPT: an
+   * error we cannot place in time must not vanish from an assertion.
+   */
+  getConsoleEntriesSinceStepBoundary(): PreviewConsoleEntry[] {
+    const boundary = this.stepBoundaryMs;
+    if (boundary === undefined) return this.consoleCollector.getEntries();
+    return this.consoleCollector.getEntries().filter((e) => {
+      const t = Date.parse(e.timestamp);
+      return Number.isNaN(t) ? true : t >= boundary;
+    });
+  }
+
+  /** True once a step boundary has been recorded for this session. */
+  hasStepBoundary(): boolean {
+    return this.stepBoundaryMs !== undefined;
+  }
+
+  /**
    * Get network items
    */
   getNetworkItems(): PreviewNetworkItem[] {

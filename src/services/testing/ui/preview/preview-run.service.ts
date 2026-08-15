@@ -380,7 +380,7 @@ function detectInitialUrlMismatch(
 // ── Step-Level Retry ───────────────────────────────────────────────────────
 
 /** Step types that should NOT be retried on failure — either non-recoverable or LLM-evaluated */
-const NO_RETRY_STEP_TYPES = new Set(['ai_check', 'wait', 'timeout', 'wait_for_email', 'dialog', 'download', 'switch_tab', 'close_tab', 'open_tab']);
+const NO_RETRY_STEP_TYPES = new Set(['ai_check', 'assert_no_console_errors', 'wait', 'timeout', 'wait_for_email', 'dialog', 'download', 'switch_tab', 'close_tab', 'open_tab']);
 
 /** Wait time (ms) for DOM stability before retry attempt */
 const RETRY_SETTLE_MS = 1500;
@@ -1425,7 +1425,7 @@ export class PreviewRunService {
       const getActionCategory = (actionType: IntentActionType | string): string => {
         if (['click', 'open', 'close', 'toggle', 'select', 'dblclick'].includes(actionType)) return 'navigation';
         if (['type', 'press'].includes(actionType)) return 'input';
-        if (['assert', 'ai_check'].includes(actionType)) return 'assertion';
+        if (['assert', 'ai_check', 'assert_no_console_errors'].includes(actionType)) return 'assertion';
         return 'default';
       };
       // Category-aware lower floor. Navigation-class actions (click/open/toggle/

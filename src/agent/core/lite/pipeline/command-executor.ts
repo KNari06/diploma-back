@@ -237,13 +237,16 @@ export class CommandExecutor {
       this.lastHealthCheckTs = Date.now();
 
       const networkErrorsSince = this.integrations.networkTracker?.getErrorsSince(since) ?? [];
-      const consoleErrorCount = this.integrations.consoleCollector
-        ? this.integrations.consoleCollector.getErrorsSince(since).length
-        : 0;
+      // Fetch ONCE — we need both the count and the texts, and getErrorsSince
+      // rebuilds the array on every call.
+      const consoleErrorTexts = this.integrations.consoleCollector
+        ? this.integrations.consoleCollector.getErrorsSince(since)
+        : [];
 
       const health = classifyPageHealth({
         networkErrorsSince,
-        consoleErrorCount,
+        consoleErrorCount: consoleErrorTexts.length,
+        consoleErrorTexts,
         previousUrl,
         currentUrl,
         flowIsAuth: this.config.flowIsAuth,

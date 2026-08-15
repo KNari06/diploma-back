@@ -23,16 +23,19 @@ export class HealthCheckAggregatorService {
     }
 
     const findings: HealthCheckFinding[] = [];
+    const isMobile = !!opts?.isMobile;
 
-    // Console (logcat for mobile) + network apply to both platforms.
-    findings.push(this.checkConsoleLogs(testResult.logs));
-    findings.push(this.checkNetworkLogs(testResult.network_logs));
+    // Console + network apply to both platforms in principle, but on mobile
+    // neither signal is currently observable — see `checkConsoleLogs` /
+    // `checkNetworkLogs` for why each reports `not_available` there.
+    findings.push(this.checkConsoleLogs(testResult.logs, isMobile));
+    findings.push(this.checkNetworkLogs(testResult.network_logs, isMobile));
 
     // JS exceptions / broken images / page-responsive are WEB-only concepts.
     // Skip them for mobile: Flutter/native apps have no JS, no <img> resources,
     // no browser viewport — and `checkJsExceptions` would otherwise mislabel a
     // step/app failure in `errors` as an "unhandled JS exception".
-    if (!opts?.isMobile) {
+    if (!isMobile) {
       findings.push(this.checkJsExceptions(testResult.errors));
       findings.push(this.checkBrokenImages(testResult));
       findings.push(this.checkPageResponsive(testResult));
@@ -54,6 +57,7 @@ export class HealthCheckAggregatorService {
     let passed = 0;
     let warnings = 0;
     let failures = 0;
+    let notAvailable = 0;
 
     // Merge findings by category — take worst severity per category across executions
     const byCat = new Map<string, HealthCheckFinding>();
@@ -77,6 +81,7 @@ export class HealthCheckAggregatorService {
         case 'pass': passed++; break;
         case 'warning': warnings++; break;
         case 'fail': failures++; break;
+        case 'not_available': notAvailable++; break;
       }
     }
 
@@ -85,22 +90,50 @@ export class HealthCheckAggregatorService {
       passed,
       warnings,
       failures,
+      notAvailable,
       findings: mergedFindings,
     };
   }
 
+  // `not_available` ranks BELOW pass: if any execution actually observed the
+  // signal, that real observation must win the per-category merge over an
+  // execution that could not observe it at all.
   private static severityRank(severity: string): number {
     switch (severity) {
-      case 'fail': return 2;
-      case 'warning': return 1;
-      case 'pass': return 0;
+      case 'fail': return 3;
+      case 'warning': return 2;
+      case 'pass': return 1;
+      case 'not_available': return 0;
       default: return 0;
     }
   }
 
-  private static checkConsoleLogs(logs: any): HealthCheckFinding {
+  private static checkConsoleLogs(logs: any, isMobile = false): HealthCheckFinding {
+    // MOBILE: not observable. The runner only reads `logcat -d *:E` on the
+    // FAILURE path (ErrorEvidenceCollector.collectFailureEvidence), so a
+    // passing run has no logs at all; and what it does capture is unfiltered
+    // system-daemon noise (TcpSocketTracker, Netd) rather than the app under
+    // test. Grading that would produce false alarms, so we report the gap
+    // instead of inventing a verdict either way.
+    if (isMobile) {
+      return {
+        category: 'console_errors',
+        severity: 'not_available',
+        message: 'Not checked on mobile',
+        unavailableReason: 'Device logs are not captured for native app runs.',
+      };
+    }
+
+    // Absent data is NOT a pass — the collector should always have attached a
+    // console listener, so a missing array means the signal was lost, not that
+    // the run was clean.
     if (!logs || !Array.isArray(logs)) {
-      return { category: 'console_errors', severity: 'pass', message: 'No console errors' };
+      return {
+        category: 'console_errors',
+        severity: 'not_available',
+        message: 'No console data captured',
+        unavailableReason: 'The run recorded no console output to evaluate.',
+      };
     }
 
     const errors = logs.filter(
@@ -119,9 +152,30 @@ export class HealthCheckAggregatorService {
     };
   }
 
-  private static checkNetworkLogs(networkLogs: any): HealthCheckFinding {
+  private static checkNetworkLogs(networkLogs: any, isMobile = false): HealthCheckFinding {
+    // MOBILE: the runner populates network entries only from the CDP Network
+    // domain, which is attached exclusively on an Android WebView context
+    // switch — never for native Android, native iOS, or Flutter. Treat the
+    // absence as unknown rather than clean. When a WebView run DOES yield
+    // entries the check below still grades them, so this only fires on the
+    // (overwhelmingly common) empty case.
+    const hasEntries = Array.isArray(networkLogs) && networkLogs.length > 0;
+    if (isMobile && !hasEntries) {
+      return {
+        category: 'network_errors',
+        severity: 'not_available',
+        message: 'Not checked on mobile',
+        unavailableReason: 'Network traffic is not captured for native app runs.',
+      };
+    }
+
     if (!networkLogs || !Array.isArray(networkLogs)) {
-      return { category: 'network_errors', severity: 'pass', message: 'No network errors' };
+      return {
+        category: 'network_errors',
+        severity: 'not_available',
+        message: 'No network data captured',
+        unavailableReason: 'The run recorded no network activity to evaluate.',
+      };
     }
 
     const errors = networkLogs.filter(
