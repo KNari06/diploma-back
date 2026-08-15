@@ -13,6 +13,7 @@ import '../instrument';
 import { env } from '@/config/environment/env';
 import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
 import { ArtifactRetentionJob } from '@/jobs/artifact-retention.job';
+import { MobileOrphanSweepJob } from '@/jobs/mobile-orphan-sweep.job';
 import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
 import { ExpiringPlansJob } from '@/jobs/expiring-plans.job';
 import { TelegramTaskSweepJob } from '@/jobs/telegram-task-sweep.job';
@@ -83,6 +84,7 @@ async function main(): Promise<void> {
   if (ScreenshotCaptureFeature.isEnabled()) {
     ScreenshotCaptureFeature.logStatus();
     ArtifactRetentionJob.start();
+    MobileOrphanSweepJob.start();
   }
 
   // QAIT Tasker morning batch (Telegram task status check). Self-gates on
@@ -100,6 +102,7 @@ async function main(): Promise<void> {
       StaleRunReaperJob.stop();
       AiCallLogsRetentionJob.stop();
       ArtifactRetentionJob.stop();
+      MobileOrphanSweepJob.stop();
       ExpiringPlansJob.stop();
       TelegramTaskSweepJob.stop();
       await TestSchedulerJobHandler.waitForIdle();

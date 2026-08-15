@@ -11,8 +11,8 @@
 # job against our own pipeline it caught two unrelated setup problems in
 # seconds, neither of which would have been legible in a failed build.
 #
-# It also does NOT consume QAIT's upload window (one upload per project per five
-# minutes), so you can run it as often as you like while sorting out access.
+# It also does NOT consume one of the project's hourly publish slots, so you can
+# run it as often as you like while sorting out access.
 #
 # Prerequisites:
 #   1. QAIT_CI_KEY stored as a repository secret

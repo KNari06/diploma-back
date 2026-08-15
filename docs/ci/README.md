@@ -225,12 +225,21 @@ test suites.
 |---|---|
 | Max upload size | 500 MB |
 | Accepted files | `.apk`, `.aab`, `.ipa`, `.zip` |
-| Upload rate | **1 per project per 5 minutes** |
+| Publish rate | **30 per project per hour** (configurable per deployment) |
 | Named variant lanes | 3 per project and platform |
 
-The rate limit is worth planning around: **the 5-minute window is consumed even
-by a successful upload**, and a retry inside it cannot clear it. Publish on
-merges to your main branch rather than on every commit of every branch.
+The limit is a ceiling on a runaway pipeline, not a budget you are expected to
+spend: retention keeps only the 10 newest builds per lane, so publishing often
+does not accumulate storage. A retry immediately after a success — or after a
+rejected build — is fine, and a matrix that publishes several lanes in parallel
+is fine.
+
+What a 429 returns: `Retry-After` as a header **and** `retryAfterSeconds` in the
+JSON body, both counting down the remainder of the current hour.
+
+One publish at a time per project is serialised server-side. Parallel jobs are
+not rejected — they queue, for up to 90 seconds, then get a 429 telling them to
+retry. In practice a two-lane matrix simply takes twice one publish's time.
 
 ---
 
@@ -247,9 +256,10 @@ the fix.
 | `BUILD_UNVERIFIABLE` | The file could not be read, or its build mode is unknown | Check the pipeline uploaded the real artifact and the build completed |
 | `VERSION_IDENTITY_REQUIRED` | No commit SHA or version sent | Set `QAIT_COMMIT_SHA` |
 | `DUPLICATE_COMMIT` | This commit is already published in this lane | Nothing — the script treats it as success |
-| `RATE_LIMITED` | Second upload within 5 minutes | Wait out the window; retrying sooner cannot clear it |
+| `RATE_LIMITED` | Hourly publish quota spent, or another publish for this project is still running | Retry after `retryAfterSeconds` from the response body |
 | `UPGRADE_REQUIRED` | Workspace is not on a paid plan | Upgrade |
 | `WRITE_DENIED` | The key's owner lost write access to the project | Re-grant access, or regenerate the key from an account that has it |
+| `RATE_LIMITER_UNAVAILABLE` | A transient server-side outage; publishing is briefly refused rather than run unmetered | Retry in a minute |
 | `413` / too large | Over 500 MB | Reduce the build, or talk to QAIT support |
 | `QAIT_CI_KEY is not set` | The variable exists but wasn't given to this job — on GitLab, almost always a **Protected** variable on an unprotected branch | See the note in Step 3. Not a QAIT error: the job never reached us |
 

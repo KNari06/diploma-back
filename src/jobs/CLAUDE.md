@@ -196,6 +196,18 @@ in the worker):
 | --- | --- |
 | `ArtifactRetentionJob` ([artifact-retention.job.ts](artifact-retention.job.ts)) | Prunes `${userId}/step-screenshots/...` older than `SCREENSHOT_RETENTION_DAYS` |
 | `ExpiringPlansJob` ([expiring-plans.job.ts](expiring-plans.job.ts)) | Emails paid users whose plan expires within 3 days (see [../services/core/CLAUDE.md](../services/core/CLAUDE.md) → `sendPlanExpiringEmail`) |
+| `MobileOrphanSweepJob` ([mobile-orphan-sweep.job.ts](mobile-orphan-sweep.job.ts)) | Reclaims mobile build blobs no row references — a CI publish that dies between the PUT and `finalize` leaves an object nothing else collects. **Deletion is opt-in** (`MOBILE_ORPHAN_SWEEP_DELETE`, default off); until then it reports what it would reclaim |
+
+**The orphan sweep's reference check is deliberately over-broad, and must stay
+that way.** A blob survives if ANY of `mobile_app_builds.storage_path`,
+`settings.mobileApp.storagePath`, `settings.mobileApps[platform].storagePath`, or
+`settings.mobileAppVariants[platform][].latest.storagePath` names it, plus a 24h
+minimum age. `mobile_app_builds` alone is NOT sufficient — `pruneOldBuilds`
+deletes rows, so the legacy settings slot can outlive the row it was written
+from, and deleting that object breaks editor warm-up with an install failure.
+Both database reads fail CLOSED: if it cannot tell a live build from an orphan,
+it deletes nothing. Any new place that stores a `storagePath` must be added to
+`loadSettingsReferences`.
 
 > **New sweeps MUST be registered in all THREE scheduler entrypoints** —
 > [../scheduler/index.ts](../scheduler/index.ts) (local),

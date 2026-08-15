@@ -9,7 +9,7 @@
  */
 
 import { env } from '@/config/environment/env';
-import { QueueManager, redisConnection } from '@/config/infrastructure/queues';
+import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { getMobileRunnerClient, resolveRunnerUrlForHost } from '@/services/mobile/mobile-runner-client';
 import { normaliseHostOverride } from '@/services/mobile/project-mobile-app.helper';
@@ -18,21 +18,85 @@ import { PAID_FEATURE_LABELS } from '@/config/features/feature-labels';
 import type { FlutterHostPlatform, MobileIntentStep, MobilePlatform, MobileTestJobData, MobileTestMetadata } from '@/services/mobile/mobile-runner.types';
 import {
   MobileAppStorageService,
-  MobileAppMetadata,
   trimMobileBuildField,
 } from '@/services/storage/mobile-app-storage.service';
 import { CiRunService } from '@/services/mobile/ci-run.service';
+import * as CiUrlPublishService from '@/services/mobile/ci-url-publish.service';
 import { ALLOWED_UPLOAD_EXTENSIONS } from '@/services/mobile/mobile-app.service';
-import { ProjectService } from '@/services/core/project.service';
+import {
+  consumeRateLimit,
+  sendRateLimited,
+  sendRateLimiterUnavailable,
+} from '@/middleware/redis-rate-limit.middleware';
+import { CI_PUBLISH_LOCK, ciPublishRateLimit } from '@/config/features/ci-publish-limits';
+import { withRedisMutex } from '@/utils/core/redis-mutex';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import path from 'path';
 
-// ── Rate limit for APK uploads (1 per project per 5 min) ───────────
 
-const APK_UPLOAD_LOCK_PREFIX = 'ci_apk_upload:';
-const APK_UPLOAD_LOCK_TTL = 300; // 5 minutes
+
+// The appUrl branch is a complete build publish, so it shares the hourly quota
+// and the per-project mutex with `/ci/app/*` — see
+// `config/features/ci-publish-limits.ts`.
+
+/** Map a URL-publish failure onto the response. */
+function sendCiUrlPublishError(res: Response, err: CiUrlPublishService.CiUrlPublishError): void {
+  switch (err.kind) {
+    case 'write_denied':
+      res.status(403).json({
+        success: false,
+        error: 'Write access denied',
+        code: 'WRITE_DENIED',
+        message:
+          'The account this API key belongs to no longer has write access to the project. Re-grant access, or generate a new key from an account that has it.',
+      });
+      return;
+    case 'invalid_url':
+      res.status(400).json({ success: false, error: 'appUrl must be a valid http(s) URL.' });
+      return;
+    case 'blocked_host':
+      res.status(400).json({ success: false, error: err.message });
+      return;
+    case 'download_failed':
+      res.status(400).json({ success: false, error: `Failed to download build: HTTP ${err.status}` });
+      return;
+    case 'download_timeout':
+      res.status(408).json({ success: false, error: 'Build download timed out (2 min limit)' });
+      return;
+    case 'file_too_large':
+      res.status(400).json({
+        success: false,
+        error: `Build too large: ${Math.round(err.sizeBytes / 1024 / 1024)}MB (max ${Math.round(err.maxBytes / 1024 / 1024)}MB)`,
+      });
+      return;
+    case 'invalid_filename':
+      res.status(400).json({
+        success: false,
+        error: `Invalid file type: ${err.ext}. Allowed: ${ALLOWED_UPLOAD_EXTENSIONS.join(', ')}`,
+      });
+      return;
+    case 'duplicate_commit':
+      res.status(409).json({
+        success: false,
+        error: 'A build for this commit already exists in this project+platform+variant.',
+      });
+      return;
+    case 'build_record_failed':
+      res.status(500).json({
+        success: false,
+        error: `Failed to record build in version history: ${err.message}`,
+      });
+      return;
+    default:
+      // `download_error` — the upstream message is echoed deliberately, but
+      // only for a host that already passed the SSRF guard.
+      res.status(400).json({
+        success: false,
+        error: `Failed to process build from URL: ${err.message}`,
+      });
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TRIGGER CI RUN
@@ -159,176 +223,67 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
         return;
       }
 
-      // Rate limit: 1 APK upload per project per 5 min
-      const lockKey = `${APK_UPLOAD_LOCK_PREFIX}${projectId}`;
-      const lockResult = await redisConnection.set(lockKey, '1', 'EX', APK_UPLOAD_LOCK_TTL, 'NX');
-      if (lockResult !== 'OK') {
-        res.status(429).json({
-          success: false,
-          error: 'APK upload rate limited',
-          message: 'Only one APK upload per project per 5 minutes. Please wait and try again.',
-        });
+      // Same hourly publish quota as `/ci/app/upload-url` — this branch is a
+      // whole publish in one call, so it draws on the same budget.
+      const publishLimit = ciPublishRateLimit();
+      const verdict = await consumeRateLimit(publishLimit, projectId);
+      if (verdict.outcome === 'limited') {
+        sendRateLimited(
+          res,
+          verdict.retryAfterSec,
+          `Limit is ${publishLimit.max} build publishes per project per hour.`,
+        );
+        return;
+      }
+      if (verdict.outcome === 'unavailable') {
+        sendRateLimiterUnavailable(res, 'Build publishing is briefly unavailable. Try again shortly.');
         return;
       }
 
-      logger.info('[CI] Downloading APK from URL', { projectId, appUrl });
-
-      try {
-        // Download APK from URL
-        const appResponse = await fetch(appUrl, {
-          signal: AbortSignal.timeout(120_000), // 2 min timeout
-        });
-
-        if (!appResponse.ok) {
-          res.status(400).json({
-            success: false,
-            error: `Failed to download APK: HTTP ${appResponse.status}`,
-          });
-          return;
-        }
-
-        const contentLength = appResponse.headers.get('content-length');
-        const maxSize = 500 * 1024 * 1024; // 500MB
-        if (contentLength && parseInt(contentLength) > maxSize) {
-          res.status(400).json({
-            success: false,
-            error: `APK too large: ${Math.round(parseInt(contentLength) / 1024 / 1024)}MB (max 500MB)`,
-          });
-          return;
-        }
-
-        const arrayBuffer = await appResponse.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-
-        // Determine filename from URL
-        const urlPath = new URL(appUrl).pathname;
-        const originalName = path.basename(urlPath) || 'app.apk';
-
-        // Validate extension — single source of truth (shared with the editor
-        // upload path), so `.zip` (iOS simulator build) support can't diverge.
-        const ext = path.extname(originalName).toLowerCase();
-        if (!(ALLOWED_UPLOAD_EXTENSIONS as readonly string[]).includes(ext)) {
-          res.status(400).json({
-            success: false,
-            error: `Invalid file type: ${ext}. Allowed: ${ALLOWED_UPLOAD_EXTENSIONS.join(', ')}`,
-          });
-          return;
-        }
-
-        // Upload to Supabase Storage. The previous APK is NOT deleted
-        // here — old binaries live until `pruneOldBuilds` rotates them
-        // out, so historical CI runs can still be re-installed for
-        // debugging.
-        const multerLikeFile = {
-          buffer,
-          originalname: originalName,
-          size: buffer.length,
-        } as Express.Multer.File;
-
-        // Resolve the lane ONCE and use it for the storage path, the build
-        // row and the prune. This branch used to hardcode the literal
-        // 'default' lane while the RESOLVE branch below honours
-        // `getProjectDefaultVariant` — so a project that promoted a named
-        // variant (say `Production`) wrote every CI upload into `default` and
-        // then resolved from `Production`, never seeing its own CI builds.
-        const uploadVariantLabel = await MobileAppStorageService.getProjectDefaultVariant(
+      // Per-project mutex: this branch buffers the whole binary in the API
+      // process AND drives the same `project.settings` read-modify-write that
+      // `finalize` does. Waits rather than rejecting, so parallel lanes of one
+      // pipeline queue instead of failing. Released on EVERY exit path — the
+      // old hand-rolled version leaked the lock for 300s on three of them.
+      const published = await withRedisMutex(
+        {
+          key: `${CI_PUBLISH_LOCK.prefix}${projectId}`,
+          ttlSec: CI_PUBLISH_LOCK.ttlSec,
+          waitMs: CI_PUBLISH_LOCK.waitMs,
+          logTag: 'CI',
+        },
+        () => CiUrlPublishService.publishFromUrl({
           projectId,
-          platform,
-        );
-
-        const metadata = await MobileAppStorageService.uploadApp(multerLikeFile, {
           workspaceId,
-          projectId,
+          userId,
           platform,
-          variantLabel: uploadVariantLabel,
-        });
-        // Attach version identity onto the metadata so recordBuild +
-        // the legacy slot both carry it. uploadApp doesn't know about
-        // version fields (its signature is intentionally narrow).
-        if (versionName) metadata.versionName = versionName;
-        if (typeof versionCode === 'number') metadata.versionCode = versionCode;
-
-        // Record in `mobile_app_builds` BEFORE updating the legacy slot —
-        // if the insert fails we don't want a legacy pointer to a build
-        // that isn't audit-traceable.
-        const recorded = await MobileAppStorageService.recordBuild(
-          metadata,
-          { branch, commitSha, buildNumber, ciRunId, source: 'ci' },
-          { projectId, workspaceId, uploadedBy: userId, variantLabel: uploadVariantLabel },
-        );
-        if ('error' in recorded) {
-          await redisConnection.del(lockKey);
-          const isDup = recorded.error.code === '23505';
-          res.status(isDup ? 409 : 500).json({
-            success: false,
-            error: isDup
-              ? 'A build for this commit already exists in this project+platform+variant.'
-              : `Failed to record build in version history: ${recorded.error.message || 'unknown database error'}`,
-          });
-          return;
-        }
-        const buildRow = recorded;
-
-        // Update project settings (legacy slot — points at the newest
-        // upload so the editor warm-up resolves to the right binary).
-        await ProjectService.updateProject(projectId, userId, {
-          settings: {
-            mobileApp: metadata as unknown as Record<string, unknown>,
-          },
-        });
-
-        appStoragePath = metadata.storagePath;
-        appOriginalName = metadata.originalName;
-        appPackage = metadata.packageName;
-
-        logger.info('[CI] APK uploaded from URL', {
-          projectId,
           appUrl,
-          storagePath: appStoragePath,
-          size: buffer.length,
-          buildId: buildRow.id,
           versionName,
           versionCode,
           branch,
           commitSha,
-        });
+          buildNumber,
+          ciRunId,
+        }),
+      );
 
-        // Fire-and-forget prune — must not block CI response, must not
-        // throw. Trims storage to BUILD_HISTORY_LIMIT newest per
-        // (project, platform, variant); `ON DELETE SET NULL` keeps execution
-        // history rows intact. MUST use the same lane the build landed in, or
-        // it prunes a lane this upload never wrote to.
-        MobileAppStorageService.pruneOldBuilds(projectId, platform, uploadVariantLabel).catch((err) => {
-          logger.warn('[CI] pruneOldBuilds failed (non-fatal)', {
-            projectId,
-            platform,
-            variant: uploadVariantLabel,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        });
-      } catch (err) {
-        // Release rate limit lock on failure
-        await redisConnection.del(lockKey);
-
-        if (err instanceof Error && err.name === 'AbortError') {
-          res.status(408).json({
-            success: false,
-            error: 'APK download timed out (2 min limit)',
-          });
-          return;
-        }
-
-        logger.error('[CI] Failed to download/upload APK from URL', {
-          projectId,
-          appUrl,
-          error: err instanceof Error ? err.message : String(err),
-        });
-        res.status(400).json({
-          success: false,
-          error: `Failed to process APK from URL: ${err instanceof Error ? err.message : String(err)}`,
-        });
+      if (!published.acquired) {
+        sendRateLimited(
+          res,
+          published.retryAfterSec,
+          'Another build for this project is still being published. Retry shortly.',
+        );
         return;
       }
+
+      if (CiUrlPublishService.isCiUrlPublishError(published.value)) {
+        sendCiUrlPublishError(res, published.value);
+        return;
+      }
+
+      appStoragePath = published.value.storagePath;
+      appOriginalName = published.value.originalName;
+      appPackage = published.value.packageName;
     } else {
       // No fresh upload — use the Phase 5 resolver to pick the existing build.
       // Resolve WITHIN the project's configured default variant lane (same as

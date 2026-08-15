@@ -17,12 +17,12 @@ on:
   push:
     branches: [main]
 
-# Only ever one publish in flight. QAIT allows one upload per project per
-# 5 minutes, and that window is consumed even by a SUCCESSFUL upload — so two
-# merges to main within five minutes would make the second job fail with
-# HTTP 429, which reads like a broken integration rather than a rate limit.
-# Superseding the older run is the correct behaviour anyway: you want the
-# newest build published, not the one that happened to start first.
+# Only ever one publish in flight. This is no longer needed to dodge a rate
+# limit — QAIT serialises publishes per project server-side, and a job that
+# arrives while another is publishing waits rather than failing — but
+# superseding is still the behaviour you want: on two quick merges to main you
+# want the NEWEST build published, not whichever job started first. Publishing
+# both just spends quota to end up in the same place.
 concurrency:
   group: qait-publish
   cancel-in-progress: true

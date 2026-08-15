@@ -17,6 +17,7 @@ import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
 import { AiCallLogsRetentionJob } from '@/jobs/ai-call-logs-retention.job';
 import { ExpiringPlansJob } from '@/jobs/expiring-plans.job';
 import { TelegramTaskSweepJob } from '@/jobs/telegram-task-sweep.job';
+import { MobileOrphanSweepJob } from '@/jobs/mobile-orphan-sweep.job';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 
@@ -51,6 +52,16 @@ async function main(): Promise<void> {
   } catch (error) {
     failed = true;
     logger.error('[SCHEDULER_DAILY] AI call-logs retention failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  try {
+    const swept = await MobileOrphanSweepJob.tick();
+    logger.info('[SCHEDULER_DAILY] Mobile orphan sweep done', swept);
+  } catch (error) {
+    failed = true;
+    logger.error('[SCHEDULER_DAILY] Mobile orphan sweep failed', {
       error: error instanceof Error ? error.message : String(error),
     });
   }

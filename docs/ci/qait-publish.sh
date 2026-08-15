@@ -90,8 +90,20 @@ fail_from_body() {
   echo "" >&2
   case "$ecode" in
     RATE_LIMITED)
-      echo "  One build upload per project per 5 minutes. Retrying sooner cannot" >&2
-      echo "  clear it — wait out the window." >&2
+      # The server reports the exact wait in the body. Prefer it over a
+      # hardcoded number here: the limit is configurable per deployment, and
+      # this same code also covers "another publish for this project is still
+      # running", where the wait is seconds rather than the rest of the hour.
+      retry_after=$(printf '%s' "$body" | jq -r '.retryAfterSeconds // empty' 2>/dev/null)
+      if [ -n "$retry_after" ]; then
+        echo "  Publishing is rate limited. Retry in ${retry_after}s." >&2
+      else
+        echo "  Publishing is rate limited. Retry shortly." >&2
+      fi
+      exit 4 ;;
+    RATE_LIMITER_UNAVAILABLE)
+      echo "  QAIT briefly refused the publish rather than run it unmetered." >&2
+      echo "  This is transient — retry in a minute." >&2
       exit 4 ;;
     UPGRADE_REQUIRED|WRITE_DENIED)
       exit 3 ;;

@@ -86,6 +86,17 @@ const envSchema = z.object({
   // Read only via getMaxMobileVariants() so the source can later become a
   // per-project/admin setting without touching call sites.
   MAX_MOBILE_VARIANTS: z.string().transform(Number).default('3'),
+  // Max CI build publishes per project per hour, across `/ci/app/upload-url`
+  // and `/ci/run`'s appUrl branch. A ceiling on a runaway pipeline, NOT a
+  // storage budget — retention (BUILD_HISTORY_LIMIT) is what bounds stored
+  // builds. A full matrix is one publish per lane per platform, so this must
+  // stay comfortably above (named variants x platforms).
+  MAX_CI_PUBLISHES_PER_HOUR: z.string().transform(Number).default('30'),
+  // Orphan sweep: DELETING is opt-in. The job always reports what it would
+  // reclaim; flipping this lets it actually remove blobs that no row
+  // references. Default off so the numbers can be checked against production
+  // before anything deletes from storage.
+  MOBILE_ORPHAN_SWEEP_DELETE: z.string().transform(v => v === 'true').default('false'),
 
   // Redis
   REDIS_URL: z.string().default('redis://localhost:6379'),
