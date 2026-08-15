@@ -73,3 +73,72 @@ export const DRAFT_CLAIM_NUDGE =
   'array (every step the test should end up with, not only the ones you ' +
   'changed), then briefly tell the user what changed. If you did NOT actually ' +
   'revise anything, reply again WITHOUT claiming a step change.';
+
+/**
+ * Does this reply narrate a completed walk and OFFER a draft instead of emitting one?
+ *
+ * The sibling defect to the one above, and the more expensive of the two: not
+ * "claimed a change it didn't make" but "did the whole job and never produced
+ * the artifact".
+ *
+ * Measured on JanaPost TC-33 (2026-08-13). Once a chat contains even one
+ * REFUSED `mobile_run_draft_steps` call, the model stops calling that tool for
+ * the rest of the conversation and narrates instead. Across six live authoring
+ * attempts the split was total:
+ *
+ *     fresh chat                              → drafted (2 of 2)
+ *     chat holding a prior draft refusal      → never drafted again (4 of 4)
+ *
+ * The last of those walked Profile → FAQ → category → question → scroll → Yes,
+ * confirmed "Thank you for your feedback!" on the device, spent 15 tool calls
+ * and four minutes doing it — and closed with "If you want, I can walk it now
+ * and then emit the draft cards immediately." A rejected tool call is a strong
+ * negative example sitting in the context window, and the model generalises it
+ * into "that tool does not work here".
+ *
+ * So the reply shape to catch is an OFFER or a PROMISE to draft — "I can draft",
+ * "I'll emit the cards", "once X, I'll draft" — which is exactly what an agent
+ * says when it has the material and has learned not to reach for the tool.
+ *
+ * Same unicode-boundary rule as above (Hard invariant #15): `\b` never matches
+ * Cyrillic, and these chats run in ru/kk as often as en.
+ */
+const DRAFT_OFFER_RE =
+  /(?:^|[^\p{L}\p{N}])(?:can|could|shall|will|i'?ll|want me to|ready to|могу|смогу|готов|хотите|давайте|бол(?:ам|ады)|дайын)(?:[^\n]{0,60}?)(?:draft|emit|produce|create|generate|черновик|карточк|шаг|қадам|draft cards|step cards)/iu;
+
+const DRAFT_ARTIFACT_RE =
+  /(?:draft|черновик|қаралама)[^\n]{0,30}?(?:step|card|шаг|карточк|қадам)|(?:step|card|шаг|карточк|қадам)[^\n]{0,30}?(?:draft|черновик|қаралама)/iu;
+
+export function replyOffersDraftInsteadOfEmitting(reply: string | undefined): boolean {
+  if (!reply) return false;
+  const text = reply.trim();
+  if (!text) return false;
+  // Both halves required: the reply must be ABOUT a draft artifact and must be
+  // offering/promising rather than reporting. "I drafted the steps" (a real
+  // emission, narrated) matches the artifact half but not the offer half.
+  return DRAFT_OFFER_RE.test(text) && DRAFT_ARTIFACT_RE.test(text);
+}
+
+/**
+ * Pushed as a system message before the one extra round.
+ *
+ * States the permission explicitly, because the behaviour being corrected is
+ * learned helplessness about a tool the model believes is rejecting it — and
+ * names the gate that was actually fixed, so a model that remembers being
+ * refused has a concrete reason to try again. Backing out stays cheap: a false
+ * positive costs one LLM call.
+ */
+export const DRAFT_OFFER_NUDGE =
+  'You walked this flow on the device and then ended the turn without ' +
+  'producing the draft — either offering it as a follow-up, or just reporting ' +
+  'what you saw. Emitting the cards is the deliverable, not a follow-up the ' +
+  'user has to ask for — they cannot save anything from prose. ' +
+  'If the user only asked you to LOOK at something and there is no test to ' +
+  'author, ignore this message and answer them. Otherwise: ' +
+  'Call mobile_run_draft_steps NOW with the steps you just verified, using the ' +
+  'real labels you read on each screen, and include every action you had to ' +
+  'perform to reach them (a scroll you needed IS a step). If an earlier attempt ' +
+  'in this conversation was refused for not having walked the flow, that no ' +
+  'longer applies: the walk you performed counts, including from a previous ' +
+  'turn on this same device session. If you genuinely cannot draft, say exactly ' +
+  'which screen or element blocked you — do not offer.';

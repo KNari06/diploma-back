@@ -68,7 +68,15 @@ export const FlowPlanStepSchema = z.object({
 
 export const FlowPlanSchema = z
   .object({
-    goal: z.string().min(3).max(200),
+    // 200 was too tight for a real request. The planner restates the user's goal
+    // here, so the cap has to fit what a QA engineer actually types: the JanaPost
+    // TC-33 description ("Create a test case for the FAQ (Гид) screen. From
+    // Profile, open Гид. Open one of the FAQ categories …") is 254 chars, so the
+    // restatement overflowed and zod rejected the whole plan — three times in one
+    // live turn, burning 3 of the 30 tool rounds before the executor could start.
+    // The failure is silent to the user (the planner just returns nothing) and
+    // costs most on exactly the multi-screen flows that need the rounds.
+    goal: z.string().min(3).max(1000),
     // Steps are optional ONLY on the clarification path: when the goal is too
     // vague to plan (no target flow, no acceptance criteria), the planner
     // returns needsClarification=true + clarifyingQuestion and NO steps. On

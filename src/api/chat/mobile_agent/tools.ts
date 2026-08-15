@@ -47,6 +47,7 @@ import { logger } from '@/utils/core/logger';
 import type { MobileBlackboard } from './blackboard';
 import { generateFlowPlan, type ConcreteFlowPlan } from './planner';
 import { MobileDraftStepsCache } from '@/services/testing/mobile/mobile-draft-steps-cache';
+import { MobileSessionDriveLog } from '@/services/testing/mobile/mobile-session-drive-log';
 import {
   sanitizeMobileSteps,
   SECRET_OPTION_FIELDS,
@@ -190,14 +191,35 @@ const SCROLL_TOOL: ChatCompletionTool = {
     name: 'scroll',
     description:
       'Scroll the screen (or a specific scrollable container) in a direction. ' +
-      'Use this to bring offscreen elements into view before tapping them.',
+      'Use this to bring offscreen elements into view before tapping them. ' +
+      'IMPORTANT: `direction` is the direction your FINGER swipes, not the ' +
+      'direction the page travels — the two are opposites. To reveal content ' +
+      'BELOW what you can currently see (the usual case: reaching a button at ' +
+      'the bottom of a long page), use "up". Use "down" only to go back ' +
+      'towards the TOP of a page.',
     parameters: {
       type: 'object',
       properties: {
         direction: {
           type: 'string',
           enum: ['up', 'down', 'left', 'right'],
-          description: 'Scroll direction.',
+          description:
+            'The direction the FINGER swipes. "up" reveals content further ' +
+            'down the page; "down" goes back towards the top. Scrolling ' +
+            'towards an end you are already at does nothing.',
+        },
+        scrollUntil: {
+          type: 'string',
+          description:
+            'STRONGLY PREFERRED when you are scrolling in order to reach a ' +
+            'specific element: the exact on-screen label of that element, ' +
+            'copied from the tree (e.g. "Yes"), not a paraphrase and not the ' +
+            'word the request used. The runner then repeats a short scroll ' +
+            'until that element is actually on screen, and FAILS if it never ' +
+            'appears — instead of travelling a fixed distance that may stop ' +
+            'short and leave the next tap to fail. Authoring this on the ' +
+            'scroll step is what makes the saved test survive a different ' +
+            'screen size or a longer page.',
         },
         containerDescription: {
           type: 'string',
@@ -1006,6 +1028,31 @@ export async function executeTool(
   }
   incCounter('mobile_chat.tool_call', `${name}.${result.ok ? 'ok' : 'failed'}`);
   observeMs(`mobile_chat.tool_call_ms.${name}`, Date.now() - startedAt);
+
+  // Remember that this session has actually been driven, so the grounding gate
+  // still recognises the walk on a LATER turn — the blackboard is rebuilt every
+  // turn, the runner session is not. See MobileSessionDriveLog.
+  if (result.ok && DEVICE_DRIVING_TOOLS.has(name)) {
+    MobileSessionDriveLog.record(bb.mobileSessionId);
+  }
+
+  // A tool that THREW logs its reason above; a tool that returned ok:false did
+  // not, and that asymmetry is expensive. The refusal text is the whole
+  // diagnosis — which gate fired, which step was malformed — and it went only
+  // to the model, never to the log.
+  //
+  // Cost, measured: five consecutive live TC-33 authoring turns (2026-08-13)
+  // ended with `mobile_run_draft_steps.failed` in the metrics and no draft on
+  // screen. The counter said a draft was rejected three times in one turn; the
+  // log could not say why, so each diagnosis needed another ~10-minute run on
+  // the emulator. Truncated because a draft refusal embeds the offending steps.
+  if (!result.ok) {
+    logger.warn('[MOBILE_TOOLS] Tool refused', {
+      tool: name,
+      reason: result.content.slice(0, 600),
+      durationMs: Date.now() - startedAt,
+    });
+  }
   return result;
 }
 
@@ -1041,6 +1088,7 @@ async function runObserveMobilePage(
     const snap = await client.fetchUiState(bb.mobileSessionId, {
       includeTree: false,
       includeScreenshot: true,
+      timeoutMs: AGENT_OBSERVE_TIMEOUT_MS,
       signal: opts?.abortSignal,
       userId: bb.userId,
     });
@@ -1204,6 +1252,7 @@ async function runSwipe(
     failure: (_r, msg) => `Swipe ${direction} failed: ${msg}`,
     mutating: true,
     interactive: true,
+    detectNoOp: true,
     abortSignal: opts?.abortSignal,
   });
 }
@@ -1240,6 +1289,7 @@ async function runScroll(
     failure: (_r, msg) => `Scroll ${direction} failed: ${msg}`,
     mutating: true,
     interactive: true,
+    detectNoOp: true,
     abortSignal: opts?.abortSignal,
   });
 }
@@ -1815,6 +1865,227 @@ const WEB_SELECTOR_STEP_TYPES = new Set<string>([
  * and whose tokens are not all HTML tag names. `div span` (a real descendant
  * combinator) survives; `Pinduoduo marketplace card` does not.
  */
+/**
+ * Tool names that actually DRIVE the device (as opposed to reading it). Walking
+ * a flow means calling one of these; `observe_mobile_page` alone only ever shows
+ * the screen the agent already happens to be on.
+ */
+export const DEVICE_DRIVING_TOOLS = new Set([
+  'tap_element', 'type_text', 'swipe', 'scroll', 'press_key', 'launch_app',
+]);
+
+/** Draft step types that move the app from one screen to another. */
+const NAVIGATING_STEP_TYPES = new Set([
+  'click', 'tap', 'long_press', 'double_tap',
+]);
+
+/**
+ * Step types that address no element, so `description` — which exists to be
+ * resolved against the a11y tree — has nothing to hold. A `scroll` is defined
+ * by its direction, `go_back` by itself.
+ *
+ * Returns a human-readable label built from the step's own fields, or '' for
+ * types that DO target something (where a missing description is a real defect
+ * and must still bail the draft).
+ */
+export function describeTargetlessStep(
+  type: string,
+  raw: Record<string, unknown>,
+): string {
+  const opts = (raw.options && typeof raw.options === 'object' ? raw.options : {}) as
+    Record<string, unknown>;
+  const direction = typeof opts.direction === 'string' ? opts.direction : undefined;
+
+  // Assertions carry their content in `assertionText` (or `value` for
+  // assert_text) — `description` is not their target, and the runner resolves
+  // an assertion through `expectedText ?? value ?? description` anyway. The
+  // empty-assertion guard further down already backfills assertionText FROM
+  // description; this is the same relationship read the other way, and without
+  // it a perfectly well-formed ai_check kills the whole draft.
+  //
+  // Run-proved twice on TC-33 (2026-08-13): `Step #6 (6) is missing
+  // "description"` and then, after the gesture backfill landed,
+  // `Step #5 (5) is missing "description"` — the assertion, still uncovered.
+  if (type === 'assert' || type === 'ai_check' || type === 'assert_text' || type === 'assert_visible') {
+    const assertion = typeof raw.assertionText === 'string' ? raw.assertionText.trim() : '';
+    const value = typeof raw.value === 'string' ? raw.value.trim() : '';
+    const content = assertion || value;
+    if (content) return content.length > 120 ? `${content.slice(0, 117)}…` : content;
+    return '';
+  }
+
+  switch (type) {
+    case 'scroll':
+      return direction ? `Scroll ${direction}` : 'Scroll';
+    case 'swipe':
+      return direction ? `Swipe ${direction}` : 'Swipe';
+    case 'go_back':
+      return 'Go back';
+    case 'go_home':
+      return 'Go to home screen';
+    case 'wait':
+    case 'wait_for': {
+      const ms = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : undefined;
+      return ms ? `Wait ${ms}ms` : 'Wait';
+    }
+    case 'screenshot':
+      return 'Take a screenshot';
+    case 'rotate': {
+      const o = typeof opts.rotateOrientation === 'string' ? opts.rotateOrientation : undefined;
+      return o ? `Rotate to ${o}` : 'Rotate device';
+    }
+    case 'press':
+    case 'press_key': {
+      const key = typeof raw.value === 'string' && raw.value.trim() ? raw.value.trim() : undefined;
+      return key ? `Press ${key}` : 'Press key';
+    }
+    default:
+      return '';
+  }
+}
+
+/**
+ * True when a draft plans a walk across screens the agent never actually took.
+ *
+ * The pipeline EAGER-INJECTS one snapshot into the system prompt before the turn
+ * starts (see `RunMobileAgentPipelineOpts.snapshot`), so the agent always has the
+ * screen it is standing on — and nothing else. Every later screen is behind a tap
+ * it has to perform. If a draft contains two or more navigating steps and the
+ * agent drove the device ZERO times this turn, then by construction it never saw
+ * the screen step 2 targets: that description was written from the user's
+ * sentence, not from the app.
+ *
+ * Why >= 2 and not >= 1: one tap can be authored honestly from the injected
+ * screen, because its target is visible right there. The second tap is the first
+ * one that must aim at a screen only reachable by performing the first — so two
+ * is the smallest draft that PROVES the agent guessed.
+ *
+ * Live on JanaPost TC-33 (2026-08-13): given a plain-English description, the
+ * agent returned a complete 5-step draft in ~20s having made zero device calls
+ * (runner log for the whole turn: 83 video-stream frames, nothing else). Step 3
+ * was `One FAQ category accordion on the FAQ screen` — no element is called that.
+ * Rewriting the prompt to remove the contradiction that caused it (it had been
+ * told twice NOT to drive the device for a test-case request) did NOT change the
+ * behaviour: the very next run was again zero device calls. Hence a hard gate —
+ * see `.claude/lessons/20260727-a-prompt-rule-is-not-an-enforcement-point.md`.
+ *
+ * An unresolvable description is not a cosmetic problem: the runner falls back to
+ * a guessed screenshot coordinate and taps that pixel, which reports PASSED on
+ * the wrong screen. This is the authoring-side half of the TC-32 false green.
+ */
+export function isUngroundedMultiScreenDraft(
+  steps: readonly { type: string }[],
+  toolInvocations: readonly { tool: string; ok: boolean }[],
+  /**
+   * Successful drives on the SAME runner session from earlier turns. The walk
+   * and the draft routinely land in different turns ("create a test for X" then
+   * "now emit the steps"), and the blackboard is rebuilt each turn — so
+   * counting only this turn refuses drafts that are genuinely grounded.
+   * Run-proved on TC-33 (2026-08-13): the gate fired twice in one turn against
+   * an agent that had walked the entire flow one message earlier, and the
+   * re-walk it demanded failed because the device was no longer on Profile.
+   * Defaults to 0 so existing callers and tests keep the old, stricter reading.
+   */
+  priorSessionDrives = 0,
+): boolean {
+  const navSteps = steps.filter((s) => NAVIGATING_STEP_TYPES.has(s.type)).length;
+  if (navSteps < 2) return false;
+  const drives =
+    toolInvocations.filter((t) => DEVICE_DRIVING_TOOLS.has(t.tool) && t.ok).length +
+    Math.max(0, priorSessionDrives);
+  // The agent starts on the eager-injected screen, so the FIRST navigating step
+  // is free — its target is visible where it already stands. Every step after
+  // that targets a screen reachable only by performing the previous one, so N
+  // navigating steps need at least N-1 real drives.
+  //
+  // This counts rather than merely asking "did it move at all" (the original
+  // `.some()`), because live on JanaPost TC-33 (2026-08-13) one tap bought a
+  // whole draft: the agent tapped Profile, correctly wrote step 2 from the label
+  // it now saw (`FAQ row in Profile`), and then invented steps 3 and 4 —
+  // `One FAQ category accordion on the FAQ screen` and `Ия button in the
+  // feedback question` — for two screens it had never opened. The gate passed
+  // because a single successful drive satisfied it.
+  return drives < navSteps - 1;
+}
+
+/** Device gestures that move the viewport rather than change screen. */
+const VIEWPORT_MOVING_TOOLS = new Set(['scroll', 'swipe']);
+const VIEWPORT_MOVING_STEP_TYPES = new Set(['scroll', 'swipe']);
+
+/**
+ * The agent scrolled to reach something, then authored the tap but not the scroll.
+ *
+ * A draft has to reproduce the walk on a fresh device. A scroll feels like looking
+ * rather than doing, so it is the action that gets dropped — and dropping it is
+ * invisible until replay, where nothing has scrolled, the target is off-screen, the
+ * finder misses, and the runner taps a guessed pixel and reports PASSED.
+ *
+ * Run-proved on JanaPost TC-33 (2026-08-13). The agent walked Profile → FAQ →
+ * category → question, scrolled once to reach the feedback control, tapped Yes, saw
+ * the thank-you, and emitted six steps with no scroll among them. Replaying it:
+ *   Resolver: vision: coordinate fallback for "Yes button" → (1000, 3000) conf=0.7
+ *   tap: would-refuse coords fallback for "Yes button" at (1000, 3000)
+ * Step 6 passed having tapped nothing; step 7's assertion then failed honestly. One
+ * missing step, and the visible symptom was an unrelated-looking red assertion.
+ *
+ * Advisory rather than a refusal, deliberately: a scroll performed only to look
+ * around is legitimately absent from a draft, and forcing a scroll step into a
+ * flow that does not need one can scroll PAST the target and break a working test.
+ * The agent knows which of the two it did; the gate does not. If a later live run
+ * shows the advisory being ignored, this is the place to harden it — the same
+ * evidence-first progression `isUngroundedMultiScreenDraft` went through.
+ */
+export function draftOmitsAScrollTheAgentPerformed(
+  steps: readonly { type: string }[],
+  toolInvocations: readonly { tool: string; ok: boolean }[],
+): boolean {
+  const scrolled = toolInvocations.some((t) => VIEWPORT_MOVING_TOOLS.has(t.tool) && t.ok);
+  if (!scrolled) return false;
+  return !steps.some((s) => VIEWPORT_MOVING_STEP_TYPES.has(s.type));
+}
+
+/**
+ * Step types that DO something to the app, as opposed to checking it.
+ * An assertion is not coverage — a draft can hold three of them and still not
+ * reach the screen they describe.
+ */
+const ACTION_STEP_TYPES = new Set<string>([
+  'click', 'tap', 'double_tap', 'long_press', 'hover', 'press', 'press_key',
+  'type', 'type_text', 'input_text', 'select', 'check', 'uncheck', 'toggle',
+  'scroll', 'swipe', 'drag', 'go_back', 'go_home', 'navigate', 'open', 'open_app',
+]);
+
+/**
+ * Did the draft author materially less than the agent actually performed?
+ *
+ * The agent always drives more than it authors — exploratory taps, a mis-tap it
+ * corrected, going back to re-read a label. So this is deliberately loose: it
+ * fires only when the draft holds fewer than HALF the successful device actions
+ * of the turn, and only once there are enough actions for that ratio to mean
+ * anything. The point is to catch a draft that covers the tail of a flow while
+ * silently dropping how the agent GOT there, not to police step-for-step parity.
+ *
+ * Run-proved on JanaPost TC-33 (2026-08-14). With every earlier blocker fixed,
+ * the agent walked Home → Profile → FAQ → category → scroll → Ия, reached the
+ * thank-you state, and emitted a 3-step draft: two FAQ category taps and an
+ * ai_check. Real labels, correctly read off the device — and no Profile tap, no
+ * FAQ tap, no scroll, no Ия tap. Saved as-is it would start from whatever screen
+ * the device happened to be on, which is exactly the false-green shape the
+ * missing-scroll advisory already covers for one specific step type. This is
+ * that check generalised: `draftOmitsAScrollTheAgentPerformed` is the special
+ * case where the omitted action is the scroll.
+ */
+export function draftCoversFewerActionsThanPerformed(
+  steps: readonly { type: string }[],
+  toolInvocations: readonly { tool: string; ok: boolean }[],
+): { omitted: boolean; performed: number; authored: number } {
+  const performed = toolInvocations.filter((t) => DEVICE_DRIVING_TOOLS.has(t.tool) && t.ok).length;
+  const authored = steps.filter((s) => ACTION_STEP_TYPES.has(s.type)).length;
+  // Below 4 the ratio is noise: 1 authored vs 3 performed is an ordinary walk.
+  const omitted = performed >= 4 && authored * 2 < performed;
+  return { omitted, performed, authored };
+}
+
 export function looksLikeProseNotCssSelector(selector: string): boolean {
   const s = selector.trim();
   if (!s) return false;
@@ -1896,9 +2167,39 @@ async function runMobileRunDraftSteps(
     }
     const id = typeof r.id === 'string' && r.id.trim() ? r.id.trim() : `step_${i + 1}`;
     const type = typeof r.type === 'string' ? r.type.trim() : '';
-    const description = typeof r.description === 'string' ? r.description.trim() : '';
+    // `description` is a TARGET — the text the runner resolves to an element.
+    // Steps that address no element have nothing to put there, so demanding one
+    // rejects a correct draft over a field that is meaningless for that type.
+    //
+    // That rejection is not cheap. A refused draft is a negative example the
+    // model keeps in context, and live on TC-33 (2026-08-13) one refusal was
+    // enough to stop it calling the tool for the rest of the conversation —
+    // 4 of 4 chats holding a refusal never drafted again. Losing a whole
+    // 6-step draft because a `scroll` carried no target is exactly that trap,
+    // and it got more likely the moment the prompt started asking for scroll
+    // steps explicitly.
+    //
+    // So backfill a human-readable label from what the step actually says
+    // (direction / key / duration) and let it through. Element-targeting types
+    // are untouched: a `tap` with no description IS incomplete and still bails.
+    const rawDescription = typeof r.description === 'string' ? r.description.trim() : '';
+    const description = rawDescription || describeTargetlessStep(type, r);
     if (!type) return { ok: false, content: `Step #${i + 1} (${id}) is missing "type".` };
-    if (!description) return { ok: false, content: `Step #${i + 1} (${id}) is missing "description".` };
+    // Name the TYPE. Without it this refusal is undiagnosable from the log —
+    // "Step #6 is missing description" says nothing about whether the field is
+    // even meaningful for that step, and it cost two live runs to learn that
+    // the offenders were a gesture and then an assertion. Say what to put there
+    // too: a refusal the model cannot act on just burns the draft.
+    if (!description) {
+      return {
+        ok: false,
+        content:
+          `Step #${i + 1} (${id}, type "${type}") is missing "description" — the text the ` +
+          `runner resolves against the screen (visible label / resId / accessibility-id). ` +
+          `Re-emit the COMPLETE step array with that field filled from a label you actually ` +
+          `read on the device.`,
+      };
+    }
     if (!ACCEPTED_STEP_TYPES.has(type)) {
       return {
         ok: false,
@@ -2041,6 +2342,45 @@ async function runMobileRunDraftSteps(
     steps.push(step);
   }
 
+  // GROUNDING GATE — a multi-screen draft from an agent that never moved the
+  // device is guesswork, and it is rejected here rather than shipped.
+  //
+  // This is a hard rejection, not an advisory, because the prompt route was
+  // tried first and measurably failed: after the contradictory "do NOT drive the
+  // flow for a test-case request" wording was removed and replaced with an
+  // explicit HARD RULE to walk the flow, the very next live run still made zero
+  // device calls. See `isUngroundedMultiScreenDraft` for the full evidence.
+  if (
+    isUngroundedMultiScreenDraft(
+      steps,
+      bb.getToolInvocations(),
+      MobileSessionDriveLog.count(bb.mobileSessionId),
+    )
+  ) {
+    return {
+      ok: false,
+      content:
+        `This draft spans more screens than you have actually visited this turn, so its ` +
+        `later steps are aimed at screens you have never seen and their descriptions are ` +
+        `paraphrases of the request rather than labels read off the app.\n` +
+        `WALK IT NOW, IN THIS TURN. Do not reply, do not ask permission, do not offer ` +
+        `the user options — walking the app is part of authoring and is always allowed. ` +
+        `Call \`tap_element\` on the next target, \`observe_mobile_page\` to see where ` +
+        `you landed, tap the next thing, observe again — through to the last screen this ` +
+        `test needs. Then re-emit the draft with the real labels you read on each screen.\n` +
+        `Asking "shall I walk the flow?" is the one answer that cannot help: it is the ` +
+        `work you were asked to do, the device is already in front of you, and the user ` +
+        `has no way to do it for you.\n` +
+        `Why this is refused rather than warned: a description no element matches cannot ` +
+        `be resolved from the accessibility tree at replay, so the runner falls back to a ` +
+        `guessed screenshot coordinate and taps whatever pixel is there — which reports ` +
+        `PASSED on the wrong screen. A test built that way looks green and proves nothing.\n` +
+        `Only stop and tell the user if the DEVICE blocks you — an element genuinely absent ` +
+        `after you looked, a login you cannot perform, a permission dialog you cannot ` +
+        `dismiss. "I have not walked it yet" is not a blocker; it is the next action.`,
+    };
+  }
+
   // WebView interaction ADVISORY — deliberately a warning, not a rejection.
   //
   // A native tap on a WebView screen is UNRELIABLE, not impossible. The runner
@@ -2094,6 +2434,42 @@ async function runMobileRunDraftSteps(
         `Assertions need none of this: an \`ai_check\` with ` +
         `\`options.aiCheckSource:"screenshot"\` reads pixels and works over a WebView.`;
     }
+  }
+
+  // Missing-scroll ADVISORY — see `draftOmitsAScrollTheAgentPerformed` for the
+  // TC-33 run that proved it. Warning rather than rejection because only the
+  // agent knows whether its scroll was navigation or just looking around.
+  let missingScrollAdvisory = '';
+  if (draftOmitsAScrollTheAgentPerformed(steps, bb.getToolInvocations())) {
+    missingScrollAdvisory =
+      `\n\n⚠️ You scrolled on the device this turn, but no step in this draft scrolls. ` +
+      `If any step targets something you could only see AFTER that scroll, the draft is ` +
+      `missing it: on a fresh device nothing has scrolled, the target is off-screen, the ` +
+      `finder misses, and the runner taps a guessed screenshot coordinate and reports ` +
+      `PASSED without touching your element — a green step that did nothing, usually ` +
+      `surfacing later as a confusing failed assertion.\n` +
+      `Re-emit with the scroll included, in the position you performed it (\`type:"scroll"\`, ` +
+      `and the SAME \`direction\` you used live — the value is the direction your finger ` +
+      `swipes, so "up" is what reveals content further down a page).\n` +
+      `Leave it out only if the scroll was purely exploratory and no step depends on it.`;
+  }
+
+  // Coverage ADVISORY — the general case of the scroll one above. Same reason
+  // for warning rather than rejecting: only the agent knows which of its
+  // actions were the test and which were it finding its way.
+  const coverage = draftCoversFewerActionsThanPerformed(steps, bb.getToolInvocations());
+  if (coverage.omitted) {
+    missingScrollAdvisory +=
+      `\n\n⚠️ You performed ${coverage.performed} actions on the device this turn but ` +
+      `authored only ${coverage.authored}. A saved test starts from a FRESH app on the ` +
+      `screen the app opens to — it does not inherit the screen you happen to be looking ` +
+      `at now. Any navigation you did to reach these steps has to BE a step, or the run ` +
+      `starts in the wrong place and every later target misses.\n` +
+      `Re-emit the COMPLETE array: every tap, type and scroll from the app's starting ` +
+      `screen through to the final check, in the order you performed them, using the ` +
+      `labels you read on each screen.\n` +
+      `Keep it as-is only if the actions you left out were genuinely not part of the test ` +
+      `(a mis-tap you corrected, or looking around before starting).`;
   }
 
   // Persist draft in the cache BEFORE running. If the run errors out
@@ -2196,7 +2572,8 @@ async function runMobileRunDraftSteps(
         `They are shown in the chat as editable steps — the user can adjust them, ` +
         `then confirm in the UI to run on the device.` +
         summariseDraftChange(previousDraftSteps, steps) +
-        webViewAdvisory,
+        webViewAdvisory +
+        missingScrollAdvisory,
       data: draftStepsPayload,
     };
   }
@@ -2284,7 +2661,14 @@ async function runMobileRunDraftSteps(
     const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
       commands,
-      { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
+      {
+        interactive: false,
+        // The batch carries N steps but the client would budget it like one
+        // command — see draftRunTimeoutMs.
+        timeoutMs: draftRunTimeoutMs(commands.length),
+        signal: opts?.abortSignal,
+        userId: bb.userId,
+      },
     );
     runnerResults = results ?? [];
   } catch (err) {
@@ -2311,6 +2695,7 @@ async function runMobileRunDraftSteps(
       const snap = await client.fetchUiState(bb.mobileSessionId, {
         includeTree: false,
         includeScreenshot: true,
+        timeoutMs: AGENT_OBSERVE_TIMEOUT_MS,
         signal: opts?.abortSignal,
         userId: bb.userId,
       });
@@ -2353,7 +2738,8 @@ async function runMobileRunDraftSteps(
           `screen changed — some steps likely ran (e.g. a login that navigated ` +
           `before the response came back). Call observe_mobile_page to see the ` +
           `current screen. The draft is still shown in the chat for editing; ` +
-          `the user can re-run or save it.`,
+          `the user can re-run or save it.` +
+          missingScrollAdvisory,
         data: draftStepsPayload,
       };
     }
@@ -2369,7 +2755,14 @@ async function runMobileRunDraftSteps(
 
   return {
     ok: summary.failed === 0,
-    content: summary.report,
+    // The advisories have to ride the RUN path too, not just the author-only
+    // one. "Create a test case …" resolves to author-and-run, so that is the
+    // branch a real authoring turn actually takes — attaching guidance only to
+    // the `!shouldRun` return means the agent never sees it in the case it was
+    // written for. Caught live on TC-33 (2026-08-13): the missing-scroll
+    // advisory was wired to the author-only return, the turn ran the draft, and
+    // the advisory could not fire even though its condition held.
+    content: summary.report + webViewAdvisory + missingScrollAdvisory,
     data: { runnerResults, summary, ...draftStepsPayload },
   };
 }
@@ -2707,6 +3100,26 @@ function toRunnerCommandInner(step: MobileIntentStep): Record<string, unknown> {
         type: 'scroll',
         params: {
           direction: (step.options as { direction?: string } | undefined)?.direction ?? 'down',
+          // Prefer scroll-until-present when the author named a target: the
+          // runner then repeats a short, gesture-safe scroll until that text is
+          // in the tree, instead of travelling a guessed distance. No single
+          // distance works — measured on JanaPost TC-33, half a viewport stops
+          // short of the target and more than that gets claimed by Android as a
+          // system gesture, with the step reporting PASSED either way.
+          ...(() => {
+            const u = (step.options as { scrollUntil?: string } | undefined)?.scrollUntil?.trim();
+            return u ? { scrollUntil: u } : {};
+          })(),
+          // Deliberately NO `amount`. A fixed distance cannot be right for
+          // every screen: measured on JanaPost TC-33, half a viewport stops one
+          // button-row short of the target, while 0.8 and 1.0 travel far enough
+          // that Android claims the swipe as a system gesture and the app never
+          // moves — and the step reports PASSED either way. Forcing 1 here
+          // re-imposed the worse of those on every authored draft, overriding
+          // the runner's safer default.
+          //
+          // `scrollUntil` is the real answer: it asks whether the target is on
+          // screen instead of guessing how far to travel.
         },
       };
 
@@ -3867,6 +4280,27 @@ interface DispatchOpts {
    * Now maps to `noRetry` only; the timeout comes from `defaultTimeoutMs`.
    */
   interactive: boolean;
+  /**
+   * Re-read the screen after a SUCCESSFUL dispatch and tell the agent when
+   * nothing actually moved.
+   *
+   * For a blind gesture (scroll/swipe) the runner injects an `adb swipe` and
+   * reports success unconditionally — success means "the gesture was sent",
+   * never "the screen responded". Scrolling towards an end you are already at
+   * is therefore indistinguishable from scrolling that worked, and the agent
+   * has no way to learn it is stuck.
+   *
+   * Measured on JanaPost TC-33 (2026-08-13): the agent wanted the feedback
+   * control below a long FAQ answer, chose `direction: "down"` (viewport
+   * sense) where the runner wanted `"up"` (finger sense), and got
+   * "Scrolled down." ten times while the Flutter tree stayed byte-for-byte
+   * identical. That burned 24 of the turn's 30 tool rounds — the authoring
+   * turn died of a silent no-op, not of a cap that was too low.
+   *
+   * Only set this for gestures whose no-op is silent AND plausible. A tap
+   * does not need it: a tap that resolves nothing already fails loudly.
+   */
+  detectNoOp?: boolean;
   abortSignal?: AbortSignal;
 }
 
@@ -3905,6 +4339,7 @@ async function reobserveAfterInconclusive(
     const snap = await client.fetchUiState(bb.mobileSessionId, {
       includeTree: false,
       includeScreenshot: true,
+      timeoutMs: AGENT_OBSERVE_TIMEOUT_MS,
       signal: opts.abortSignal,
       userId: bb.userId,
     });
@@ -3936,6 +4371,158 @@ async function reobserveAfterInconclusive(
   }
 }
 
+/**
+ * After a successful blind gesture, re-read the screen and report when nothing
+ * moved. Returns a note to append to the tool result, or null when the screen
+ * did change (or we cannot tell).
+ *
+ * The re-read is close to free in round terms: a mutating dispatch has just
+ * called `invalidateSnapshot()`, so the agent's next `observe_mobile_page`
+ * would fetch anyway. Storing the fresh snapshot here means that observe is
+ * served from cache instead — we pay one ~400ms ui-state read and give the
+ * agent back a truthful result in the SAME round.
+ *
+ * Silent on any failure: this is an advisory, and a broken advisory must never
+ * turn a successful action into a reported failure.
+ */
+async function describeNoOpIfScreenUnchanged(
+  bb: MobileBlackboard,
+  client: Awaited<ReturnType<typeof getMobileRunnerClientForSession>>,
+  preTree: string | undefined,
+  opts: DispatchOpts,
+): Promise<string | null> {
+  if (!preTree) return null;
+  try {
+    const snap = await client.fetchUiState(bb.mobileSessionId, {
+      includeTree: false,
+      includeScreenshot: true,
+      timeoutMs: AGENT_OBSERVE_TIMEOUT_MS,
+      signal: opts.abortSignal,
+      userId: bb.userId,
+    });
+    if (!snap?.formattedTree) return null;
+    bb.setSnapshot(snap);
+    if (snap.formattedTree !== preTree) return null;
+
+    const direction =
+      typeof opts.args.direction === 'string' ? opts.args.direction : undefined;
+    const opposite =
+      direction === 'up' ? 'down'
+      : direction === 'down' ? 'up'
+      : direction === 'left' ? 'right'
+      : direction === 'right' ? 'left'
+      : undefined;
+
+    return (
+      'WARNING: the screen did not change — this gesture did nothing. ' +
+      'The device accepted it, but no content moved, so you are already at ' +
+      'that end of the scrollable area. Repeating it will not help.' +
+      (opposite
+        ? ` If you were trying to reach something you cannot see yet, the direction is probably inverted: try "${opposite}".`
+        : '')
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Per-action budget for an AUTHORING turn — deliberately larger than the runner
+ * client's 30s default, and scoped to this dispatch so no other caller changes.
+ *
+ * Why 30s is not enough. Measured live on JanaPost TC-33 (2026-08-13): the agent
+ * tapped a FAQ question, the runner logged `tapByText … HIT`, and the backend
+ * still reported a timeout — because between the tap landing and the reply, the
+ * runner did nothing but rebuild the Flutter inspector tree 82 times in 30s
+ * (~366ms each on a 1123-node screen). That is NOT one slow settle: the tap
+ * settle ceiling is 3000ms × 1.6 = 4.8s and a non-stable result is explicitly
+ * non-fatal. It is the sum of many INDEPENDENT forced rebuilds along one command
+ * path — `step-dispatcher` probe/rescue reads, `smart-step-wait` ×2,
+ * `ui-stability`'s poll, `recording-coordinator`, `text-verification` — each
+ * calling `getA11yTree(true)`.
+ *
+ * So the real defect is redundant tree reads in the runner, and this constant
+ * does not fix it; it stops the backend abandoning a tap that already succeeded
+ * while that is fixed. See
+ * `.claude/deferred/20260813-one-runner-command-rebuilds-the-flutter-tree-dozens-of-times.md`.
+ *
+ * The cost of the larger budget is that a genuinely-absent element now takes 60s
+ * to report failure instead of 30s — on the authoring path only, where the user
+ * is already watching a multi-second agent turn. That is the same trade the
+ * 8s → 30s change made and accepted.
+ */
+const AGENT_ACTION_TIMEOUT_MS = 60_000;
+
+/**
+ * Per-READ budget for an AUTHORING turn — the sibling of the constant above,
+ * and the asymmetry that outlived it.
+ *
+ * The write path was raised to 60s once the runner was measured rebuilding a
+ * 1123-node Flutter tree dozens of times per command. Every READ on the same
+ * screen kept the runner client's 8s default, which is sized for the editor's
+ * interactive Point/Find — where a human is waiting and a fast miss beats a
+ * slow answer. The agent has the opposite trade: nobody is watching an
+ * individual read, and a timed-out read costs the whole turn.
+ *
+ * Run-proved on JanaPost TC-33 (2026-08-13). A clean authoring turn — fresh
+ * chat, login green, no interference — walked Profile → FAQ and then died on:
+ *
+ *     Runner error 408: Request timed out after 8000ms:
+ *     GET /api/sessions/…/ui-state
+ *
+ * with the agent reporting "I hit a device timeout right after opening FAQ, so
+ * I couldn't finish authoring the last steps yet." The capture it was waiting
+ * on is the same a11y dump the 60s constant already accounts for; only the
+ * budget differed. 8s is not "a busy emulator spiking", it is this screen's
+ * normal cost.
+ *
+ * Deliberately NOT changing the client default: 8s stays right for the editor.
+ * Scoped here, like the action budget, so no other caller moves.
+ */
+const AGENT_OBSERVE_TIMEOUT_MS = 30_000;
+
+/**
+ * Budget for running a DRAFT — the third sibling, and the one the other two
+ * made wrong by fixing themselves.
+ *
+ * The two constants above budget a SINGLE runner command. A draft run is not
+ * one command: it posts the whole authored array as one batch, and the runner
+ * serialises it, paying each step's settle in turn. The client had no
+ * per-batch notion, so all N steps shared the 30s `defaultTimeoutMs` sized for
+ * one — which the comment on `executeBatchCommands` already measured at ~28s
+ * for a single tap on this very app.
+ *
+ * So the budget was under water at two steps and hopeless at six, and the
+ * failure was maximally misleading: the steps DID run on the device, the HTTP
+ * reply just never arrived in time. The agent was told
+ *
+ *     Could not run the draft: Request timed out after 30000ms:
+ *     POST /api/commands/…/batch
+ *     6 steps were cached for save, but none executed.
+ *
+ * Run-proved on JanaPost TC-33 (2026-08-13): the authoring turn had by then
+ * done everything right — walked the flow, emitted a complete 6-step draft with
+ * real device labels — and this timeout turned that success into a refusal.
+ * The draft tool is also where the missing-scroll advisory rides, so a turn
+ * that timed out here lost its only feedback channel and the next turn repeated
+ * the same omission.
+ *
+ * Scaled per step rather than raised to a flat number: a 20-step draft is not
+ * more patient than a 6-step one, it is 3x longer. The floor keeps a 1-step
+ * draft at today's budget; the ceiling stops a pathological array from pinning
+ * a connection for the rest of the turn.
+ */
+const DRAFT_RUN_PER_STEP_MS = AGENT_ACTION_TIMEOUT_MS;
+// 10 min: a draft of 10 steps — longer than any TC in this suite — still gets
+// its full per-step budget, so the ceiling only ever bites a pathological
+// array. Set to 5 min first, which silently clamped a 6-step draft back under
+// water and would have reintroduced the exact bug this budget exists to fix.
+export const DRAFT_RUN_MAX_MS = 600_000;
+export function draftRunTimeoutMs(stepCount: number): number {
+  const budget = Math.max(1, stepCount) * DRAFT_RUN_PER_STEP_MS;
+  return Math.min(budget, DRAFT_RUN_MAX_MS);
+}
+
 async function dispatchSingleCommand(
   bb: MobileBlackboard,
   command: unknown,
@@ -3950,14 +4537,27 @@ async function dispatchSingleCommand(
   // invalidateSnapshot() before the failure paths run.
   const preFingerprint = bb.getSnapshot()?.fingerprint;
 
+  // Rendered tree BEFORE the command, for `detectNoOp`. The FINGERPRINT cannot
+  // answer "did the screen move": it is a screen-IDENTITY key, deliberately
+  // layout-insensitive (sorted tuples, capped at 80 leaves), so a list that
+  // scrolls stays the same screen and keeps the same fingerprint — which is
+  // exactly what it is designed to do. The formatted tree is the scroll-
+  // sensitive signal, and on a Flutter app it holds only the app's own widget
+  // tree (no status-bar clock), so an exact comparison does not drift.
+  const preTree = bb.getSnapshot()?.formattedTree;
+
   try {
     const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
       [command],
       {
-        // The agent gets the DEFAULT (30s) budget, never the 8s interactive
-        // one, but keeps no-retry. See DispatchOpts.interactive.
+        // The agent never gets the 8s interactive budget, but keeps no-retry.
+        // See DispatchOpts.interactive. The explicit `timeoutMs` overrides the
+        // client's 30s default for THIS path only — see AGENT_ACTION_TIMEOUT_MS
+        // for the measurement that showed 30s is short of one command's real
+        // cost on a large Flutter screen.
         interactive: false,
+        timeoutMs: AGENT_ACTION_TIMEOUT_MS,
         noRetry: opts.interactive,
         signal: opts.abortSignal,
         userId: bb.userId,
@@ -3980,6 +4580,12 @@ async function dispatchSingleCommand(
     });
 
     if (ok && result) {
+      if (opts.detectNoOp) {
+        const noOpNote = await describeNoOpIfScreenUnchanged(bb, client, preTree, opts);
+        if (noOpNote) {
+          return { ok: true, content: `${opts.success(result)}\n${noOpNote}`, data: result };
+        }
+      }
       return { ok: true, content: opts.success(result), data: result };
     }
 
@@ -4101,6 +4707,7 @@ async function ensureScreenDims(
     const fresh = await (await getMobileRunnerClientForSession(bb.mobileSessionId)).fetchUiState(bb.mobileSessionId, {
       includeTree: false,
       includeScreenshot: false,
+      timeoutMs: AGENT_OBSERVE_TIMEOUT_MS,
       signal,
       userId: bb.userId,
     });
@@ -4414,6 +5021,7 @@ async function runTakeScreenshot(
     const res = await client.fetchUiState(bb.mobileSessionId, {
       includeTree: false,
       includeScreenshot: true,
+      timeoutMs: AGENT_OBSERVE_TIMEOUT_MS,
       userId: bb.userId,
       signal: opts?.abortSignal,
     });

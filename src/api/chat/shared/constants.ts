@@ -14,6 +14,27 @@ export const CONSTANTS = {
   FUZZING_TIMEOUT: 30000, // 30 seconds
   AUTO_EMBED_TIMEOUT: 30000, // 30 seconds (increased from 5s to allow more messages to embed)
   CHAT_REQUEST_TIMEOUT: 180000, // 3 minutes (180 seconds) - increased from 30s to allow OpenAI retries
+  /**
+   * Watchdog for the MOBILE AGENT authoring turn specifically.
+   *
+   * `CHAT_REQUEST_TIMEOUT` is sized for a conversational turn — "long enough for
+   * OpenAI retries". A mobile authoring turn is a different animal: since the
+   * grounding gate requires the agent to WALK the flow before drafting, the turn
+   * contains N real device round-trips, and on a content-heavy Flutter screen a
+   * single tap plus its settle costs 35-60s of wall clock.
+   *
+   * Measured live on JanaPost TC-33 (2026-08-13): the agent walked
+   * Profile → FAQ → category → question with ZERO device timeouts, and was then
+   * killed mid-walk by the 180s watchdog — `Pipeline failed … durationMs: 180011`,
+   * `[CHAT] Request timed out (watchdog) duration: 181681`. Nothing was wrong; the
+   * flow simply needs more than three minutes to walk. At ~50s per action a 3-step
+   * walk is already at the ceiling, so any deeper flow could never be authored.
+   *
+   * Scoped to the `mobile_agent` intent rather than raising the shared constant,
+   * because every other chat surface is conversational and a 3-minute ceiling is
+   * a feature there — it is what stops a hung LLM call spinning the UI forever.
+   */
+  MOBILE_AGENT_REQUEST_TIMEOUT: 600000, // 10 minutes
 
   // Test plan expiration
   TEST_PLAN_EXPIRY_HOURS: 72, // 3 days

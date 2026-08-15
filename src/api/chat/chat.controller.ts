@@ -1007,13 +1007,22 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // instead of leaving the user on an infinite "Updating…". Covers EVERY
     // handler, present and future.
     let watchdog: NodeJS.Timeout | undefined;
+    // A mobile-agent AUTHORING turn walks the app on a real device before it can
+    // draft anything, so it is bounded by device round-trips (35-60s each on a
+    // heavy Flutter screen), not by LLM latency. The conversational 3-minute
+    // ceiling killed a perfectly healthy TC-33 walk mid-flight — see
+    // CONSTANTS.MOBILE_AGENT_REQUEST_TIMEOUT. Every other intent keeps the short
+    // budget, where a 3-minute cap is what stops a hung call spinning the UI.
+    const requestTimeoutMs = parsedIntent?.intent === 'mobile_agent'
+      ? CONSTANTS.MOBILE_AGENT_REQUEST_TIMEOUT
+      : CONSTANTS.CHAT_REQUEST_TIMEOUT;
     const timeoutGuard = new Promise<never>((_, reject) => {
       watchdog = setTimeout(() => {
         // Signal the in-flight handler to stop work, then reject the race so the
         // catch sends an honest timeout response.
         abortController?.abort();
-        reject(new Error(`Request timeout after ${CONSTANTS.CHAT_REQUEST_TIMEOUT / 1000}s`));
-      }, CONSTANTS.CHAT_REQUEST_TIMEOUT);
+        reject(new Error(`Request timeout after ${requestTimeoutMs / 1000}s`));
+      }, requestTimeoutMs);
       if (typeof watchdog.unref === 'function') watchdog.unref();
     });
     try {
