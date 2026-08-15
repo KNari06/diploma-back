@@ -145,17 +145,27 @@ describe('SnapshotCollector - Shadow DOM Support', () => {
   });
 
   describe('Slotted Content', () => {
+    // The slotted children below are INTERACTIVE (<button>, <a href>) on purpose.
+    // The collector only emits interactive elements — a bare <span> is never in the
+    // snapshot no matter how it is slotted, so a <span> fixture cannot reach the
+    // isSlotted/slotName code at all and asserts nothing about slot detection.
+    // (It also has to stay that way: the collector must emit exactly what the
+    // recorder's PROBE_AT_POINT_FN would capture — see preview/CLAUDE.md invariant #5.)
+    //
+    // Look elements up BY TAG, not by name alone. The custom-element host inherits
+    // the text of everything it slots, so a name-only find() matches the HOST — whose
+    // assignedSlot is legitimately null — and reads as a slot-detection failure.
     it('should detect slotted content', async () => {
       await page.setContent(`
         <custom-button id="host">
-          <span id="slotted-content">Click me</span>
+          <button id="slotted-content">Click me</button>
         </custom-button>
         <script>
           class CustomButton extends HTMLElement {
             constructor() {
               super();
               const shadow = this.attachShadow({ mode: 'open' });
-              shadow.innerHTML = '<button><slot></slot></button>';
+              shadow.innerHTML = '<div class="wrap"><slot></slot></div>';
             }
           }
           customElements.define('custom-button', CustomButton);
@@ -166,21 +176,25 @@ describe('SnapshotCollector - Shadow DOM Support', () => {
       await page.waitForTimeout(500);
 
       const snapshot = await SnapshotCollector.collect(page);
-      const slottedSpan = snapshot.elements.find(el =>
-        el.tag === 'span' && el.name.includes('Click me')
+      const slottedButton = snapshot.elements.find(el =>
+        el.tag === 'button' && el.name.includes('Click me')
       );
 
-      expect(slottedSpan).toBeDefined();
-      expect(slottedSpan?.isSlotted).toBe(true);
-      expect(slottedSpan?.slotName).toBe('default');
-      expect(slottedSpan?.isInsideShadowDOM).toBe(false); // Light DOM content
+      expect(slottedButton).toBeDefined();
+      expect(slottedButton?.isSlotted).toBe(true);
+      expect(slottedButton?.slotName).toBe('default');
+      expect(slottedButton?.isInsideShadowDOM).toBe(false); // Light DOM content
+
+      // The host projects the child but is not itself slotted.
+      const host = snapshot.elements.find(el => el.tag === 'custom-button');
+      expect(host?.isSlotted).toBe(false);
     });
 
     it('should detect named slots', async () => {
       await page.setContent(`
         <custom-card id="host">
-          <span slot="title">Card Title</span>
-          <span slot="content">Card Content</span>
+          <button slot="title">Card Title</button>
+          <a slot="content" href="#more">Card Content</a>
         </custom-card>
         <script>
           class CustomCard extends HTMLElement {
@@ -202,18 +216,18 @@ describe('SnapshotCollector - Shadow DOM Support', () => {
       await page.waitForTimeout(500);
 
       const snapshot = await SnapshotCollector.collect(page);
-      const titleSpan = snapshot.elements.find(el =>
-        el.name.includes('Card Title')
+      const title = snapshot.elements.find(el =>
+        el.tag === 'button' && el.name.includes('Card Title')
       );
-      const contentSpan = snapshot.elements.find(el =>
-        el.name.includes('Card Content')
+      const content = snapshot.elements.find(el =>
+        el.tag === 'a' && el.name.includes('Card Content')
       );
 
-      expect(titleSpan?.isSlotted).toBe(true);
-      expect(titleSpan?.slotName).toBe('title');
+      expect(title?.isSlotted).toBe(true);
+      expect(title?.slotName).toBe('title');
 
-      expect(contentSpan?.isSlotted).toBe(true);
-      expect(contentSpan?.slotName).toBe('content');
+      expect(content?.isSlotted).toBe(true);
+      expect(content?.slotName).toBe('content');
     });
   });
 

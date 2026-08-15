@@ -12,6 +12,39 @@ import {
 } from '../element-resolver.service';
 import type { IntentStep, InteractiveNode } from '../preview.types';
 
+// Mock the Redis connection the queues module owns. Importing the real module
+// opens live Redis connections at module load — 72 sockets and a 5s timer — and
+// nothing here ever closes them, so Jest passed all 48 tests and then never
+// exited ("Jest did not exit one second after the test run has completed",
+// observed idling ~12 minutes). A hung CI job is not green, it is nothing.
+//
+// The resolver never touches Redis itself; it arrives transitively, by two
+// separate paths, which is why mocking the queues module (where both end) is the
+// fix rather than mocking either path:
+//   element-resolver.service → ai-provider.service → openai/gemini.service
+//     → ai-action-logger → websocket.service → test-executed-steps-redis.service
+//   element-resolver.service → honesty-guard-deps → redis-cache
+// Same reason as src/utils/core/__tests__/redis-cache.test.ts.
+//
+// The stub is built INSIDE the factory rather than in a `mock…` const above it:
+// jest.mock is hoisted above the imports, so the factory runs while requiring
+// element-resolver.service — before any module-scope const is initialized —
+// and an out-of-scope reference fails with "Cannot access … before
+// initialization". Nothing here needs to reach the stub from a test.
+jest.mock('@/config/infrastructure/queues', () => ({
+  redisConnection: {
+    get: jest.fn(),
+    set: jest.fn(),
+    del: jest.fn(),
+    publish: jest.fn(),
+    subscribe: jest.fn(),
+    on: jest.fn(),
+    scanStream: jest.fn(),
+    pipeline: jest.fn(),
+  },
+  connection: { host: 'localhost', port: 6379 },
+}));
+
 // Mock LLM services used by selectElementWithLLM / rescueWithGeminiFlash
 jest.mock('@/services/ai/core/openai.service');
 jest.mock('@/services/ai/core/gemini.service');
