@@ -72,6 +72,26 @@ export interface BlobStore {
 
   /** One-time client-direct upload target (bypasses the API request-size limit). */
   createSignedUploadUrl(storagePath: string): Promise<SignedUploadTarget>;
+
+  /**
+   * Enumerate objects under a prefix. OPTIONAL — a store without it simply
+   * cannot be swept, and callers must handle its absence rather than assume.
+   *
+   * This is the primitive whose absence made orphaned uploads invisible: every
+   * other method addresses ONE known path, so nothing could answer "what is
+   * actually in the container?" and an object with no database row was
+   * unreachable by any code path — including the code meant to clean it up.
+   */
+  list?(prefix: string): AsyncIterable<BlobListEntry>;
+}
+
+/** One object as returned by {@link BlobStore.list}. */
+export interface BlobListEntry {
+  /** Canonical storagePath, directly comparable to `mobile_app_builds.storage_path`. */
+  storagePath: string;
+  sizeBytes: number;
+  /** Server-side creation time, or null when the provider does not report one. */
+  createdAt: Date | null;
 }
 
 /**

@@ -22,6 +22,7 @@ import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import {
   BlobNotFoundError,
+  type BlobListEntry,
   type BlobStatResult,
   type BlobStore,
   type SignedUploadTarget,
@@ -55,6 +56,25 @@ export class AzureBlobStore implements BlobStore {
       env.AZURE_CLIENT_ID ? { managedIdentityClientId: env.AZURE_CLIENT_ID } : undefined,
     );
     this.service = new BlobServiceClient(`https://${account}.blob.core.windows.net`, credential);
+  }
+
+  /**
+   * Enumerate every blob under `prefix`, newest-agnostic, paged by the SDK.
+   *
+   * `prefix` is a canonical storagePath prefix (`mobile-apps/<ws>/<project>/`);
+   * the container segment is stripped on the way in and restored on the way out
+   * so callers only ever deal in canonical paths — the same mapping `blobName`
+   * applies for single-object operations.
+   */
+  async *list(prefix: string): AsyncIterable<BlobListEntry> {
+    const container = this.service.getContainerClient(this.container);
+    for await (const blob of container.listBlobsFlat({ prefix: this.blobName(prefix) })) {
+      yield {
+        storagePath: `${CONTAINER_PREFIX}${blob.name}`,
+        sizeBytes: Number(blob.properties.contentLength ?? 0),
+        createdAt: blob.properties.createdOn ?? blob.properties.lastModified ?? null,
+      };
+    }
   }
 
   /** Map the canonical `storagePath` to an Azure blob name. */

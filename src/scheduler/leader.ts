@@ -32,6 +32,7 @@ import { env } from '@/config/environment/env';
 import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
 import { AiCallLogsRetentionJob } from '@/jobs/ai-call-logs-retention.job';
 import { ArtifactRetentionJob } from '@/jobs/artifact-retention.job';
+import { MobileOrphanSweepJob } from '@/jobs/mobile-orphan-sweep.job';
 import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
 import { ExpiringPlansJob } from '@/jobs/expiring-plans.job';
 import { TelegramTaskSweepJob } from '@/jobs/telegram-task-sweep.job';
@@ -94,6 +95,7 @@ export function startSchedulerBundle(): void {
   if (ScreenshotCaptureFeature.isEnabled()) {
     ScreenshotCaptureFeature.logStatus();
     ArtifactRetentionJob.start();
+    MobileOrphanSweepJob.start();
   }
 }
 
@@ -107,6 +109,7 @@ export function stopSchedulerBundle(): void {
   ExpiringPlansJob.stop();
   TelegramTaskSweepJob.stop();
   ArtifactRetentionJob.stop();
+  MobileOrphanSweepJob.stop();
 }
 
 /**

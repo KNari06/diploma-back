@@ -15,7 +15,7 @@
 | [ci.route.ts](ci.route.ts) | **CI-key-gated** routes, mounted separately at `/api/v1/mobile/ci`. Ends in a terminal 404 |
 | [mobile.controller.ts](mobile.controller.ts) | Editor upload/finalize, app info, variants — thin, delegates to `services/mobile/mobile-app.service.ts` |
 | [ci-app.controller.ts](ci-app.controller.ts) | CI build publish: `upload-url`, `finalize`, `whoami` |
-| [ci.controller.ts](ci.controller.ts) | CI test runs: `POST /ci/run`, `GET /ci/run/:runId/status` |
+| [ci.controller.ts](ci.controller.ts) | CI test runs: `POST /ci/run`, `GET /ci/run/:runId/status`. Its `appUrl` publish branch lives in `services/mobile/ci-url-publish.service.ts` |
 | [ci-key.controller.ts](ci-key.controller.ts) | Generate / revoke / status for a project's CI API key (JWT-gated — a human creates the key) |
 | [session.controller.ts](session.controller.ts) | Device session lifecycle: warmup, tap/swipe/type, apply, run-on-session, exploration |
 | [companion.route.ts](companion.route.ts) · [companion.controller.ts](companion.controller.ts) | Companion relay — mixed auth, applied per route inside the router |
@@ -60,7 +60,8 @@ Three calls. The binary never transits the backend.
 POST /ci/app/upload-url
   → requireCiApiKey  (indexed hash lookup → services/mobile/db/ci-auth.db.ts,
                       then owner not-deleted + approved)
-  → isPaidUser → per-project Redis lock (1 per 5 min)
+  → isPaidUser → publish quota (MAX_CI_PUBLISHES_PER_HOUR, default 30/project/h)
+  → NO mutex — minting a URL is cheap, and matrix lanes must not block
   → ci-app-publish.service.ts createCiUploadUrl
       (write-access check; lane = getProjectDefaultVariant, NOT literal 'default')
   → { uploadUrl, storagePath, requiredHeaders }
@@ -68,7 +69,8 @@ POST /ci/app/upload-url
 PUT <uploadUrl>   client → storage directly, carrying every requiredHeaders entry
 
 POST /ci/app/finalize
-  → per-storagePath mutex (released on every terminal outcome)
+  → per-storagePath mutex (reject: a resubmission is a duplicate, not a queue)
+  → per-PROJECT mutex (wait up to 90s: parallel lanes queue, they do not fail)
   → finalizeMobileAppUpload({ source:'ci', enforceBuildContract:true })
   → parse (FORCED) → build-contract gate → recordBuild → settings merge
   → 201, then fire-and-forget pruneOldBuilds(resolved lane)
@@ -88,13 +90,30 @@ GET /ci/whoami → per-IP limiter → requireCiApiKey → { projectId } only
 3. **`autoBootAndInstall` is NOT fired** on the CI path — there is no emulator at
    publish time. `pruneOldBuilds` IS, with the *resolved* lane, or it prunes a lane
    the upload never wrote to.
-4. **A failed finalize deletes its orphaned object** — nothing else collects it
-   (paths are unique per call; `pruneOldBuilds` only reclaims storage for rows it
-   prunes). **Except** when the path is outside the project's own tree: that case
-   fires precisely when a caller supplies someone else's path, so deleting would
-   make finalize a cross-tenant delete primitive.
+4. **A failed finalize deletes its orphaned object** — `pruneOldBuilds` only
+   reclaims storage for rows it prunes, and paths are unique per call.
+   **Except** when the path is outside the project's own tree: that case fires
+   precisely when a caller supplies someone else's path, so deleting would make
+   finalize a cross-tenant delete primitive. The backstop for everything this
+   misses — a pipeline that dies between the PUT and the finalize, so no code
+   path ever runs — is `MobileOrphanSweepJob`
+   ([../../jobs/mobile-orphan-sweep.job.ts](../../jobs/mobile-orphan-sweep.job.ts)),
+   which compares the container against the database directly.
 5. **`whoami` returns `projectId` only.** Its output lands in CI logs, which are
    public for open-source repositories.
+6. **Two publishes for one project must never overlap** — hold the per-project
+   mutex (`ci_publish_lock:<projectId>`) around anything that finalizes a build.
+   `finalizeMobileAppUpload` reads `project.settings`, spends 13-26s parsing,
+   then writes a patch rebuilt from that snapshot, and `updateProject` merges
+   settings SHALLOWLY — so overlapping publishes silently drop one lane's entry
+   from `mobileAppVariants`, and the affected lane then resolves to the wrong
+   binary with nothing in the logs. The old 1-per-5-minutes upload gate was the
+   only thing preventing the overlap; the mutex replaces it. Any future path
+   that finalizes a build needs the same lock. Rate limiting is NOT a
+   substitute — it bounds frequency, not overlap.
+7. **Redis mutexes here release by compare-and-delete**
+   ([redis-mutex.ts](../../utils/core/redis-mutex.ts)), never a bare `del`: a
+   holder that outlives its TTL would otherwise delete the NEXT holder's lock.
 
 **The build contract** ([flutter-build-contract.ts](../../services/mobile/flutter-build-contract.ts)
 + [flutter-driver-static-detect.ts](../../services/mobile/flutter-driver-static-detect.ts))
@@ -126,5 +145,12 @@ identity. See the ADR: [CI auth via a separate router + upload-time build contra
   timeout below the mutex TTL means a client 504s while the server works on.
 - **The editor and CI upload paths share `mobile-app.service.ts`.** A change
   there hits both; only `enforceBuildContract` and `source` differ.
-- Manual testing steps, including the per-project rate limit that will 429 your
-  second test run, are in [TESTING.md](../../../TESTING.md) § 7.
+- **The publish limiter fails CLOSED (503), the `whoami` limiter fails OPEN.**
+  The first mints signed storage-WRITE URLs whose orphans nothing collects; the
+  second is read-only. Both go through
+  [redis-rate-limit.middleware.ts](../../middleware/redis-rate-limit.middleware.ts) —
+  note it checks `QueueManager.isRedisAvailable()` BEFORE issuing a command,
+  because ioredis buffers commands while disconnected and a bare try/catch
+  would stall the request instead of failing fast.
+- Manual testing steps, including how to clear the publish counter and the
+  per-project mutex between runs, are in [TESTING.md](../../../TESTING.md) § 7.

@@ -14,9 +14,21 @@
  * would be a straight IDOR.
  */
 
-import { redisConnection } from '@/config/infrastructure/queues';
 import { PAID_FEATURE_LABELS } from '@/config/features/feature-labels';
+import {
+  CI_FINALIZE_LOCK,
+  CI_PUBLISH_LOCK,
+  ciPublishRateLimit,
+  CI_WHOAMI_RATE_LIMIT,
+} from '@/config/features/ci-publish-limits';
+import {
+  consumeRateLimit,
+  createRedisRateLimiter,
+  sendRateLimited,
+  sendRateLimiterUnavailable,
+} from '@/middleware/redis-rate-limit.middleware';
 import { isPaidUser } from '@/services/core/plan-access.service';
+import { RedisMutexUnavailableError, withRedisMutex } from '@/utils/core/redis-mutex';
 import * as CiAppPublishService from '@/services/mobile/ci-app-publish.service';
 import type { CiProject } from '@/services/mobile/ci-app-publish.service';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
@@ -35,35 +47,19 @@ import {
 } from './mobile-request.helpers';
 import { sendMobileAppError } from './mobile-error-mapper';
 
-// ── Rate limits ────────────────────────────────────────────────────
+// Limits and mutex shapes live in `config/features/ci-publish-limits.ts` —
+// `/ci/run`'s appUrl branch needs the same ones, and a constant exported from
+// one controller into another couples two HTTP layers for no reason.
 //
-// `upload-url` reuses the project-wide APK upload lock (1 per project per
-// 5 min) that `/ci/run`'s appUrl branch already takes — both are "this project
-// is publishing a binary".
+// The short version of what they replaced: ONE `SET NX EX 300` key
+// (`ci_apk_upload:`) served as both a rate limit and an in-flight mutex, and
+// was never released on the success path — so a SUCCESSFUL publish locked the
+// project out for the next five minutes.
 //
-// SHARP EDGE, inherited and deliberately not papered over here: the lock is
-// held for its full 300s TTL on the SUCCESS path too. A job that fails at the
-// PUT and retries inside 5 minutes gets a 429 it cannot clear. Documented for
-// customers in docs/ci/; changing it means separating "rate limit" from
-// "in-flight mutex", which is a behaviour change to the existing /ci/run path.
-const APK_UPLOAD_LOCK_PREFIX = 'ci_apk_upload:';
-const APK_UPLOAD_LOCK_TTL = 300; // 5 minutes
-
-// `finalize` is the expensive call — a download of up to 500 MB, an inflate,
-// and a parse — so it gets its own MUTEX keyed per storagePath (not a rate
-// limit: it is released on every terminal outcome). `isPaidUser` is a plan
-// check, not a throttle, and does not substitute for this.
-const FINALIZE_LOCK_PREFIX = 'ci_apk_finalize:';
-const FINALIZE_LOCK_TTL = 600; // 10 minutes — ceiling for download+parse
-
-// `whoami` is reachable pre-auth and runs a `projects` query BEFORE any
-// credential is validated, and there is no global rate limiter in this app
-// (index.ts's is commented out). That makes it an unmetered DB-load
-// amplifier, so it carries a cheap per-IP limit. Keys are 256-bit, so brute
-// force and enumeration are not the concern here — load is.
-const WHOAMI_RATE_PREFIX = 'ci_whoami_rate:';
-const WHOAMI_RATE_WINDOW = 60; // seconds
-const WHOAMI_RATE_MAX = 30;
+// The quota is counted ONCE per publish, at the admission point (`upload-url`,
+// and `/ci/run`'s appUrl branch, which is a whole publish in one call). It is
+// NOT counted again at `finalize` — that is the second half of an
+// already-counted publish.
 
 /** Paid-plan gate — mobile testing is a Pro feature, same as `/ci/run`. */
 async function requirePaidCiUser(userId: string, res: Response): Promise<boolean> {
@@ -118,37 +114,35 @@ export async function createCiAppUploadUrl(req: Request, res: Response): Promise
     return;
   }
 
-  const lockKey = `${APK_UPLOAD_LOCK_PREFIX}${project.id}`;
-  const lockResult = await redisConnection.set(lockKey, '1', 'EX', APK_UPLOAD_LOCK_TTL, 'NX');
-  if (lockResult !== 'OK') {
-    res.status(429).json({
-      success: false,
-      error: 'Build upload rate limited',
-      code: 'RATE_LIMITED',
-      message: 'Only one build upload per project per 5 minutes. Please wait and try again.',
-    });
+  // Counted AFTER the auth and plan gates, so an unentitled caller cannot
+  // burn an entitled project's quota. Every accepted attempt costs a slot,
+  // including ones that go on to fail validation: reaching this point has
+  // already cost several database reads, which is exactly the load the limit
+  // exists to bound.
+  const publishLimit = ciPublishRateLimit();
+  const verdict = await consumeRateLimit(publishLimit, project.id);
+  if (verdict.outcome === 'limited') {
+    sendRateLimited(
+      res,
+      verdict.retryAfterSec,
+      `Limit is ${publishLimit.max} build publishes per project per hour.`,
+    );
+    return;
+  }
+  if (verdict.outcome === 'unavailable') {
+    sendRateLimiterUnavailable(res, 'Build publishing is briefly unavailable. Try again shortly.');
     return;
   }
 
-  let result;
-  try {
-    result = await CiAppPublishService.createCiUploadUrl({
-      project,
-      filename,
-      platform: pickPlatform(req.body?.platform),
-      declaredSize: parseContentLength(req.body?.contentLength),
-      variantLabel: trimmedString(req.body?.variant),
-    });
-  } catch (err) {
-    // Free the lock on an unexpected failure too — otherwise a transient error
-    // costs the project its whole 5-minute upload window for nothing.
-    await redisConnection.del(lockKey);
-    throw err;
-  }
+  const result = await CiAppPublishService.createCiUploadUrl({
+    project,
+    filename,
+    platform: pickPlatform(req.body?.platform),
+    declaredSize: parseContentLength(req.body?.contentLength),
+    variantLabel: trimmedString(req.body?.variant),
+  });
 
   if ('kind' in result) {
-    // Free the lock — no URL was issued, so nothing is in flight.
-    await redisConnection.del(lockKey);
     sendCiPublishError(res, result);
     return;
   }
@@ -194,72 +188,130 @@ export async function finalizeCiAppUpload(req: Request, res: Response): Promise<
   const originalName = trimmedString(req.body?.originalName)
     ?? (storagePath.includes('/') ? storagePath.slice(storagePath.lastIndexOf('/') + 1) : storagePath);
 
-  // Per-object mutex, not a rate limit — released on every terminal outcome.
-  const lockKey = `${FINALIZE_LOCK_PREFIX}${storagePath}`;
-  const lockResult = await redisConnection.set(lockKey, '1', 'EX', FINALIZE_LOCK_TTL, 'NX');
-  if (lockResult !== 'OK') {
+  // Everything the locked section needs, parsed HERE so the helper is a pure
+  // function of its input and needs no `req`.
+  const finalizeInput: CiAppPublishService.CiFinalizeInput = {
+    project,
+    storagePath,
+    platform,
+    originalName,
+    packageName: trimmedString(req.body?.packageName),
+    versionName,
+    versionCode,
+    branch: trimMobileBuildField(req.body?.branch),
+    commitSha,
+    buildNumber: trimMobileBuildField(req.body?.buildNumber),
+    ciRunId: trimMobileBuildField(req.body?.ciRunId),
+    variantLabel: trimmedString(req.body?.variant),
+  };
+
+  // Two nested mutexes, each answering a different question.
+  //
+  // OUTER, per storagePath: "is this exact upload already being finalized?"
+  // Rejects immediately — a resubmission is a duplicate, not a queue.
+  //
+  // A Redis failure while ACQUIRING propagates as `RedisMutexUnavailableError`
+  // (a mutex that silently degrades to no mutex defeats itself), so map THAT to
+  // the same 503 the rate limiter uses for the same dependency. Errors raised
+  // by the body are deliberately NOT caught here: a dead database or a failed
+  // parse must keep its own status and reach error monitoring, not be reported
+  // to the customer as "the mutex is briefly unavailable".
+  let objectLock;
+  try {
+    objectLock = await withRedisMutex(
+      {
+        key: `${CI_FINALIZE_LOCK.prefix}${storagePath}`,
+        ttlSec: CI_FINALIZE_LOCK.ttlSec,
+        logTag: 'CI_APP',
+      },
+      async () => {
+        // INNER, per project: "is another publish for this project mid-flight?"
+        // Waits, because parallel lanes of one pipeline are the normal case.
+        // Serialises the settings read-modify-write and the variant-cap check.
+        const projectLock = await withRedisMutex(
+          {
+            key: `${CI_PUBLISH_LOCK.prefix}${project.id}`,
+            ttlSec: CI_PUBLISH_LOCK.ttlSec,
+            waitMs: CI_PUBLISH_LOCK.waitMs,
+            logTag: 'CI_APP',
+          },
+          () => finalizeUnderLock(res, finalizeInput),
+        );
+
+        if (!projectLock.acquired) {
+          sendRateLimited(
+            res,
+            projectLock.retryAfterSec,
+            'Another build for this project is still being published. Retry shortly.',
+          );
+        }
+      },
+    );
+  } catch (err) {
+    if (!(err instanceof RedisMutexUnavailableError)) throw err;
+    logger.error('[CI_APP] Publish mutex unavailable', {
+      projectId: project.id,
+      error: err.message,
+    });
+    if (!res.headersSent) {
+      sendRateLimiterUnavailable(res, 'Build publishing is briefly unavailable. Try again shortly.');
+    }
+    return;
+  }
+
+  if (!objectLock.acquired) {
     res.status(429).json({
       success: false,
       error: 'Finalize already in progress',
       code: 'FINALIZE_IN_PROGRESS',
       message: 'This upload is already being finalized. Wait for the first call to return.',
     });
+  }
+}
+
+/** The finalize body proper — runs holding both mutexes. */
+async function finalizeUnderLock(
+  res: Response,
+  input: CiAppPublishService.CiFinalizeInput,
+): Promise<void> {
+  const { project, commitSha } = input;
+
+  const result = await CiAppPublishService.finalizeCiUpload(input);
+
+  if ('kind' in result) {
+    if (result.kind === 'build_record_failed' && result.code === '23505') {
+      // Unique on (project_id, platform, variant_label, commit_sha) — the
+      // pipeline re-ran for a commit already published. A conflict, not an
+      // error the customer needs to fix.
+      res.status(409).json({
+        success: false,
+        error: 'Build already published',
+        code: 'DUPLICATE_COMMIT',
+        message: `A build for commit ${commitSha ?? '(unknown)'} already exists in this project, platform and variant.`,
+      });
+      return;
+    }
+    sendCiPublishError(res, result);
     return;
   }
 
-  try {
-    const result = await CiAppPublishService.finalizeCiUpload({
-      project,
-      storagePath,
-      platform,
-      originalName,
-      packageName: trimmedString(req.body?.packageName),
-      versionName,
-      versionCode,
-      branch: trimMobileBuildField(req.body?.branch),
-      commitSha,
-      buildNumber: trimMobileBuildField(req.body?.buildNumber),
-      ciRunId: trimMobileBuildField(req.body?.ciRunId),
-      variantLabel: trimmedString(req.body?.variant),
-    });
+  res.status(201).json({
+    success: true,
+    build: result.build,
+    mobileApp: result.mobileApp,
+    variant: result.variant,
+  });
 
-    if ('kind' in result) {
-      if (result.kind === 'build_record_failed' && result.code === '23505') {
-        // Unique on (project_id, platform, variant_label, commit_sha) — the
-        // pipeline re-ran for a commit already published. A conflict, not an
-        // error the customer needs to fix.
-        res.status(409).json({
-          success: false,
-          error: 'Build already published',
-          code: 'DUPLICATE_COMMIT',
-          message: `A build for commit ${commitSha ?? '(unknown)'} already exists in this project, platform and variant.`,
-        });
-        return;
-      }
-      sendCiPublishError(res, result);
-      return;
-    }
-
-    res.status(201).json({
-      success: true,
-      build: result.build,
-      mobileApp: result.mobileApp,
+  // Fire-and-forget: prune the SAME lane the build landed in. `autoBootAndInstall`
+  // is deliberately NOT fired — there is no emulator at publish time.
+  MobileAppStorageService.pruneOldBuilds(project.id, result.platform, result.variant).catch((err) => {
+    logger.warn('[CI_APP] pruneOldBuilds failed (non-fatal)', {
+      projectId: project.id,
+      platform: result.platform,
       variant: result.variant,
+      error: err instanceof Error ? err.message : String(err),
     });
-
-    // Fire-and-forget: prune the SAME lane the build landed in. `autoBootAndInstall`
-    // is deliberately NOT fired — there is no emulator at publish time.
-    MobileAppStorageService.pruneOldBuilds(project.id, result.platform, result.variant).catch((err) => {
-      logger.warn('[CI_APP] pruneOldBuilds failed (non-fatal)', {
-        projectId: project.id,
-        platform: result.platform,
-        variant: result.variant,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-  } finally {
-    await redisConnection.del(lockKey);
-  }
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -271,7 +323,7 @@ export async function finalizeCiAppUpload(req: Request, res: Response): Promise<
  *
  * This exists so an installer or a customer debugging a pipeline can check a
  * key. Validating via `upload-url` instead would orphan a storage object and
- * burn the 5-minute lock, so the first REAL build of the day would 429.
+ * consume one of the project's hourly publish slots.
  *
  * Returns `projectId` ONLY. `projectName` is customer data, and whoami's
  * output lands in CI logs — which are public for OSS repositories.
@@ -282,32 +334,10 @@ export async function ciWhoami(req: Request, res: Response): Promise<void> {
 
 /**
  * Per-IP limiter for `whoami`. Runs BEFORE `requireCiApiKey` so an unauthed
- * flood is capped before it reaches the DB. Fails OPEN on a Redis error — the
- * endpoint is harmless, and losing it because Redis blinked is worse.
+ * flood is capped before it reaches the DB.
  */
-export async function ciWhoamiRateLimit(
-  req: Request,
-  res: Response,
-  next: (err?: unknown) => void,
-): Promise<void> {
-  try {
-    const key = `${WHOAMI_RATE_PREFIX}${req.ip ?? 'unknown'}`;
-    const count = await redisConnection.incr(key);
-    if (count === 1) await redisConnection.expire(key, WHOAMI_RATE_WINDOW);
-    if (count > WHOAMI_RATE_MAX) {
-      res.status(429).json({
-        success: false,
-        error: 'Too many requests',
-        code: 'RATE_LIMITED',
-        message: `Limit is ${WHOAMI_RATE_MAX} requests per ${WHOAMI_RATE_WINDOW}s.`,
-      });
-      return;
-    }
-    next();
-  } catch (err) {
-    logger.warn('[CI_APP] whoami rate limit unavailable — failing open', {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    next();
-  }
-}
+export const ciWhoamiRateLimit = createRedisRateLimiter({
+  ...CI_WHOAMI_RATE_LIMIT,
+  keyOf: (req) => req.ip ?? 'unknown',
+  limitMessage: `Limit is ${CI_WHOAMI_RATE_LIMIT.max} requests per ${CI_WHOAMI_RATE_LIMIT.windowSec}s.`,
+});

@@ -7,17 +7,32 @@
  *   - Build identity (commitSha OR versionName/versionCode) is required.
  *   - A duplicate commit is a 409, not a 500.
  *   - `whoami` returns projectId ONLY — its output lands in CI logs, which are
- *     public for OSS repos — and is per-IP limited before it touches the DB.
- *   - Both write endpoints are paid-gated and rate limited.
+ *     public for OSS repos.
+ *   - Both write endpoints are paid-gated, and the publish quota is consumed
+ *     ONLY after the auth and plan gates.
+ *   - `upload-url` takes NO mutex (it mints a signed URL and nothing more), so
+ *     parallel matrix lanes do not block each other. `finalize` takes two:
+ *     per-object (reject) and per-project (wait).
+ *
+ * The limiter and the mutex have their own unit tests — see
+ * `middleware/__tests__/redis-rate-limit.middleware.test.ts` and
+ * `utils/core/__tests__/redis-mutex.test.ts`. Here they are stubbed so these
+ * tests speak about the CONTRACT, not about Redis.
  */
 
 jest.mock('@/config/infrastructure/queues', () => ({
-  redisConnection: {
-    set: jest.fn(),
-    del: jest.fn(),
-    incr: jest.fn(),
-    expire: jest.fn(),
-  },
+  redisConnection: { set: jest.fn(), del: jest.fn(), incr: jest.fn(), expire: jest.fn(), get: jest.fn(), eval: jest.fn() },
+  QueueManager: { isRedisAvailable: jest.fn().mockReturnValue(true) },
+}));
+
+jest.mock('@/middleware/redis-rate-limit.middleware', () => ({
+  ...jest.requireActual('@/middleware/redis-rate-limit.middleware'),
+  consumeRateLimit: jest.fn(),
+}));
+
+jest.mock('@/utils/core/redis-mutex', () => ({
+  ...jest.requireActual('@/utils/core/redis-mutex'),
+  withRedisMutex: jest.fn(),
 }));
 
 jest.mock('@/services/core/plan-access.service', () => ({ isPaidUser: jest.fn() }));
@@ -40,21 +55,16 @@ jest.mock('@/utils/core/logger', () => ({
   logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
 }));
 
-import { redisConnection } from '@/config/infrastructure/queues';
+import { consumeRateLimit } from '@/middleware/redis-rate-limit.middleware';
 import { isPaidUser } from '@/services/core/plan-access.service';
 import * as CiAppPublishService from '@/services/mobile/ci-app-publish.service';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
+import { RedisMutexUnavailableError, withRedisMutex } from '@/utils/core/redis-mutex';
 import { autoBootAndInstall } from '../session.controller';
-import {
-  ciWhoami,
-  ciWhoamiRateLimit,
-  createCiAppUploadUrl,
-  finalizeCiAppUpload,
-} from '../ci-app.controller';
+import { ciWhoami, createCiAppUploadUrl, finalizeCiAppUpload } from '../ci-app.controller';
 
-const redisSetMock = redisConnection.set as unknown as jest.Mock;
-const redisDelMock = redisConnection.del as unknown as jest.Mock;
-const redisIncrMock = redisConnection.incr as unknown as jest.Mock;
+const consumeMock = consumeRateLimit as jest.Mock;
+const mutexMock = withRedisMutex as jest.Mock;
 const isPaidUserMock = isPaidUser as jest.Mock;
 const createUrlMock = CiAppPublishService.createCiUploadUrl as jest.Mock;
 const finalizeMock = CiAppPublishService.finalizeCiUpload as jest.Mock;
@@ -68,6 +78,7 @@ function makeRes() {
   const res: any = {};
   res.status = jest.fn().mockReturnValue(res);
   res.json = jest.fn().mockReturnValue(res);
+  res.set = jest.fn().mockReturnValue(res);
   return res;
 }
 
@@ -78,12 +89,17 @@ function makeReq(body: Record<string, unknown> = {}) {
 /** Let the fire-and-forget prune promise settle. */
 const flush = () => new Promise((r) => setImmediate(r));
 
+/** Real mutex semantics, minus Redis: run the body, report acquired. */
+const passthroughMutex = async (_opts: unknown, fn: () => Promise<unknown>) => ({
+  acquired: true,
+  value: await fn(),
+});
+
 beforeEach(() => {
   jest.clearAllMocks();
   isPaidUserMock.mockResolvedValue(true);
-  redisSetMock.mockResolvedValue('OK');
-  redisDelMock.mockResolvedValue(1);
-  redisIncrMock.mockResolvedValue(1);
+  consumeMock.mockResolvedValue({ outcome: 'allowed' });
+  mutexMock.mockImplementation(passthroughMutex);
   pruneMock.mockResolvedValue(undefined);
   createUrlMock.mockResolvedValue({
     uploadUrl: 'https://storage.example/put',
@@ -114,12 +130,33 @@ describe('POST /ci/app/upload-url', () => {
     );
   });
 
-  it('403s a free-plan account before doing any work', async () => {
+  it('takes NO mutex — parallel matrix lanes must not block each other', async () => {
+    const res = makeRes();
+    await createCiAppUploadUrl(makeReq({ filename: 'app.apk' }), res);
+
+    expect(mutexMock).not.toHaveBeenCalled();
+  });
+
+  it('does NOT lock the project out after a successful publish', async () => {
+    // The original defect: the success path held a 300s lock, so an immediate
+    // retry 429'd. Nothing here may hold anything past the response.
+    const first = makeRes();
+    await createCiAppUploadUrl(makeReq({ filename: 'app.apk' }), first);
+    const second = makeRes();
+    await createCiAppUploadUrl(makeReq({ filename: 'app.apk' }), second);
+
+    expect(first.status).not.toHaveBeenCalledWith(429);
+    expect(second.status).not.toHaveBeenCalledWith(429);
+    expect(createUrlMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('403s a free-plan account before consuming a publish slot', async () => {
     isPaidUserMock.mockResolvedValue(false);
     const res = makeRes();
     await createCiAppUploadUrl(makeReq({ filename: 'app.apk' }), res);
 
     expect(res.status).toHaveBeenCalledWith(403);
+    expect(consumeMock).not.toHaveBeenCalled();
     expect(createUrlMock).not.toHaveBeenCalled();
   });
 
@@ -131,34 +168,26 @@ describe('POST /ci/app/upload-url', () => {
     expect(createUrlMock).not.toHaveBeenCalled();
   });
 
-  it('429s when the project already uploaded inside the rate-limit window', async () => {
-    redisSetMock.mockResolvedValue(null); // NX failed — lock already held
+  it('429s with a Retry-After once the hourly publish quota is spent', async () => {
+    consumeMock.mockResolvedValue({ outcome: 'limited', retryAfterSec: 1800 });
     const res = makeRes();
     await createCiAppUploadUrl(makeReq({ filename: 'app.apk' }), res);
 
     expect(res.status).toHaveBeenCalledWith(429);
+    expect(res.set).toHaveBeenCalledWith('Retry-After', '1800');
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'RATE_LIMITED', retryAfterSeconds: 1800 }),
+    );
     expect(createUrlMock).not.toHaveBeenCalled();
   });
 
-  it('releases the rate-limit lock when no URL was actually issued', async () => {
-    createUrlMock.mockResolvedValue({ kind: 'invalid_filename', ext: '.txt' });
+  it('503s rather than minting a storage-write URL it cannot meter', async () => {
+    consumeMock.mockResolvedValue({ outcome: 'unavailable' });
     const res = makeRes();
-    await createCiAppUploadUrl(makeReq({ filename: 'notes.txt' }), res);
+    await createCiAppUploadUrl(makeReq({ filename: 'app.apk' }), res);
 
-    expect(redisDelMock).toHaveBeenCalledWith('ci_apk_upload:proj-1');
-    expect(res.status).toHaveBeenCalledWith(400);
-  });
-
-  it('releases the rate-limit lock when the service throws unexpectedly', async () => {
-    // Otherwise a transient failure costs the project its whole 5-minute
-    // upload window for nothing.
-    createUrlMock.mockRejectedValue(new Error('storage unreachable'));
-    const res = makeRes();
-
-    await expect(createCiAppUploadUrl(makeReq({ filename: 'app.apk' }), res)).rejects.toThrow(
-      'storage unreachable',
-    );
-    expect(redisDelMock).toHaveBeenCalledWith('ci_apk_upload:proj-1');
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(createUrlMock).not.toHaveBeenCalled();
   });
 
   it('never lets the caller choose the project', async () => {
@@ -166,9 +195,7 @@ describe('POST /ci/app/upload-url', () => {
     const req = makeReq({ filename: 'app.apk', projectId: 'someone-elses-project' });
     await createCiAppUploadUrl(req, res);
 
-    expect(createUrlMock).toHaveBeenCalledWith(
-      expect.objectContaining({ project: PROJECT }),
-    );
+    expect(createUrlMock).toHaveBeenCalledWith(expect.objectContaining({ project: PROJECT }));
   });
 });
 
@@ -185,6 +212,30 @@ describe('POST /ci/app/finalize', () => {
       expect.objectContaining({ success: true, build: { id: 'build-1' }, variant: 'Production' }),
     );
     expect(pruneMock).toHaveBeenCalledWith('proj-1', 'android', 'Production');
+  });
+
+  it('runs under a per-object mutex that rejects, inside a per-project one that waits', async () => {
+    const res = makeRes();
+    await finalizeCiAppUpload(makeReq(okBody), res);
+
+    const [objectOpts] = mutexMock.mock.calls[0];
+    const [projectOpts] = mutexMock.mock.calls[1];
+
+    // Per storagePath: a resubmission of the SAME upload is a duplicate.
+    expect(objectOpts.key).toBe(`ci_apk_finalize:${STORAGE_PATH}`);
+    expect(objectOpts.waitMs ?? 0).toBe(0);
+
+    // Per project: serialises the settings read-modify-write, and WAITS so
+    // parallel lanes of one pipeline queue instead of failing.
+    expect(projectOpts.key).toBe('ci_publish_lock:proj-1');
+    expect(projectOpts.waitMs).toBeGreaterThan(0);
+  });
+
+  it('does not consume a second publish slot — the upload already paid for it', async () => {
+    const res = makeRes();
+    await finalizeCiAppUpload(makeReq(okBody), res);
+
+    expect(consumeMock).not.toHaveBeenCalled();
   });
 
   it('does NOT auto-boot an emulator — there is no device at publish time', async () => {
@@ -224,9 +275,7 @@ describe('POST /ci/app/finalize', () => {
     await finalizeCiAppUpload(makeReq(okBody), res);
 
     expect(res.status).toHaveBeenCalledWith(409);
-    expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ code: 'DUPLICATE_COMMIT' }),
-    );
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'DUPLICATE_COMMIT' }));
   });
 
   it('403s with WRITE_DENIED when the key owner lost project write access', async () => {
@@ -235,13 +284,11 @@ describe('POST /ci/app/finalize', () => {
     await finalizeCiAppUpload(makeReq(okBody), res);
 
     expect(res.status).toHaveBeenCalledWith(403);
-    expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ code: 'WRITE_DENIED' }),
-    );
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'WRITE_DENIED' }));
   });
 
-  it('429s a concurrent finalize of the same object', async () => {
-    redisSetMock.mockResolvedValue(null);
+  it('429s a concurrent finalize of the SAME object without waiting', async () => {
+    mutexMock.mockResolvedValueOnce({ acquired: false });
     const res = makeRes();
     await finalizeCiAppUpload(makeReq(okBody), res);
 
@@ -252,19 +299,41 @@ describe('POST /ci/app/finalize', () => {
     expect(finalizeMock).not.toHaveBeenCalled();
   });
 
-  it('releases the per-object mutex on both success and failure', async () => {
-    const lockKey = `ci_apk_finalize:${STORAGE_PATH}`;
+  it('429s when another publish for the project outlasts the wait window', async () => {
+    mutexMock
+      .mockImplementationOnce(passthroughMutex) // per-object: acquired
+      .mockResolvedValueOnce({ acquired: false }); // per-project: still busy
+    const res = makeRes();
+    await finalizeCiAppUpload(makeReq(okBody), res);
 
-    const okRes = makeRes();
-    await finalizeCiAppUpload(makeReq(okBody), okRes);
-    await flush();
-    expect(redisDelMock).toHaveBeenCalledWith(lockKey);
+    expect(res.status).toHaveBeenCalledWith(429);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'RATE_LIMITED' }),
+    );
+    expect(finalizeMock).not.toHaveBeenCalled();
+  });
 
-    redisDelMock.mockClear();
-    finalizeMock.mockResolvedValue({ kind: 'object_missing' });
-    const failRes = makeRes();
-    await finalizeCiAppUpload(makeReq(okBody), failRes);
-    expect(redisDelMock).toHaveBeenCalledWith(lockKey);
+  it('503s when the MUTEX itself cannot be reached', async () => {
+    mutexMock.mockRejectedValue(new RedisMutexUnavailableError('ci_publish_lock:proj-1', new Error('down')));
+    const res = makeRes();
+    await finalizeCiAppUpload(makeReq(okBody), res);
+
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'RATE_LIMITER_UNAVAILABLE' }),
+    );
+  });
+
+  it('does NOT dress a real finalize failure up as a transient 503', async () => {
+    // The regression this guards: a try/catch meant for the mutex once wrapped
+    // the whole locked body, so a dead database was reported to the customer as
+    // "Build publishing is briefly unavailable" and hidden from monitoring.
+    const realError = new Error('supabase unreachable');
+    finalizeMock.mockRejectedValue(realError);
+    const res = makeRes();
+
+    await expect(finalizeCiAppUpload(makeReq(okBody), res)).rejects.toBe(realError);
+    expect(res.status).not.toHaveBeenCalledWith(503);
   });
 
   it('does not prune when the publish failed', async () => {
@@ -294,35 +363,5 @@ describe('GET /ci/whoami', () => {
     const body = res.json.mock.calls[0][0];
     expect(body).toEqual({ success: true, projectId: 'proj-1' });
     expect(Object.keys(body)).not.toContain('projectName');
-  });
-
-  it('lets a request through under the per-IP limit', async () => {
-    redisIncrMock.mockResolvedValue(5);
-    const res = makeRes();
-    const next = jest.fn();
-    await ciWhoamiRateLimit(makeReq(), res, next);
-
-    expect(next).toHaveBeenCalled();
-    expect(res.status).not.toHaveBeenCalled();
-  });
-
-  it('429s once the per-IP limit is exceeded', async () => {
-    redisIncrMock.mockResolvedValue(31);
-    const res = makeRes();
-    const next = jest.fn();
-    await ciWhoamiRateLimit(makeReq(), res, next);
-
-    expect(res.status).toHaveBeenCalledWith(429);
-    expect(next).not.toHaveBeenCalled();
-  });
-
-  it('fails open when Redis is unavailable — losing the limiter beats losing the endpoint', async () => {
-    redisIncrMock.mockRejectedValue(new Error('redis down'));
-    const res = makeRes();
-    const next = jest.fn();
-    await ciWhoamiRateLimit(makeReq(), res, next);
-
-    expect(next).toHaveBeenCalled();
-    expect(res.status).not.toHaveBeenCalled();
   });
 });
