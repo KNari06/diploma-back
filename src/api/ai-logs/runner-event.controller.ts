@@ -1,5 +1,6 @@
 import { env } from '@/config/environment/env';
 import { aiLogBuffer } from '@/services/ai/logging/ai-log-buffer';
+import { normaliseRunnerEvent } from '@/services/ai/logging/runner-ai-log.service';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { Request, Response } from 'express';
@@ -12,7 +13,19 @@ import { Request, Response } from 'express';
  * the shared MOBILE_RUNNER_API_KEY header — keeping any DB credentials off
  * the runner.
  *
- * Storage: in-memory ring buffer + WebSocket broadcast. Nothing is persisted.
+ * Storage: in-memory ring buffer + WebSocket broadcast, and (via the buffer)
+ * the durable per-session cost ledger.
+ *
+ * Cost is NOT taken from the request. The runner never sent it, and this
+ * endpoint authenticates with one shared key, so body-supplied numbers are not
+ * a trustworthy basis for accounting. `normaliseRunnerEvent` derives cost from
+ * (provider, model, tokens) using the backend's own pricing table and clamps
+ * the numerics.
+ *
+ * KNOWN GAP: `user_id` / `workspace_id` are still taken verbatim and not checked
+ * against real membership. A per-event membership lookup would add a DB read to
+ * a per-LLM-call hot path, so it needs a cache rather than a naive query — see
+ * Gap C in .claude/plans/20260813-cost-attribution-instrumentation.md.
  */
 export const ingestRunnerEvent = async (req: Request, res: Response): Promise<void> => {
   const provided = (req.headers['x-runner-key'] || req.headers['authorization'] || '') as string;
@@ -54,12 +67,11 @@ export const ingestRunnerEvent = async (req: Request, res: Response): Promise<vo
     entity_type: body.entity_type ?? null,
     entity_id: body.entity_id ?? null,
     iteration: typeof body.iteration === 'number' ? body.iteration : null,
-    duration_ms: typeof body.duration_ms === 'number' ? body.duration_ms : null,
-    model: body.model ?? null,
-    provider: body.provider ?? null,
-    tokens_in: typeof body.tokens_in === 'number' ? body.tokens_in : null,
-    tokens_out: typeof body.tokens_out === 'number' ? body.tokens_out : null,
-    cost_usd: typeof body.cost_usd === 'number' ? body.cost_usd : null,
+    // Cost, tokens and duration are derived and clamped server-side rather than
+    // taken from the body — the runner does not send cost at all, and a shared
+    // API key means the numbers are not trustworthy input for an accounting
+    // ledger. See runner-ai-log.service.ts.
+    ...normaliseRunnerEvent(body),
     error: body.error ?? null,
   });
 

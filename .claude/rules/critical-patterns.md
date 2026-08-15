@@ -141,7 +141,11 @@ const messages = chatHistory.map((msg) => ({
 
 ## 10. Supabase field verification
 
-Before using a field in `.select()`, verify it exists in `supabase-migrations/supabase-schema.sql`. Querying a non-existent field returns no error — it silently returns `null`.
+Before using a field in `.select()`, verify it exists. Querying a non-existent field returns no error — it silently returns `null`.
+
+**`supabase-schema.sql` is the BOOTSTRAP, not the current schema.** Later `ALTER`s live in the dated migration files beside it, so a column can be live in prod and absent from that file — and vice versa, a column can be in a `.sql` nobody has run (which is what [.claude/migrations/](../../../.claude/migrations/README.md) tracks). Verify against the live DB, or read the bootstrap **plus** every dated migration that touches the table.
+
+Measured 2026-08-13: `credit_transactions` has **13** columns in prod (`balance_after`, `transaction_type`, `metadata`, `tokens_used`, `cost_usd`, `credits_calculated`, `test_type`, `is_grace_deduction`, …) against the **7** in `supabase-schema.sql:78`. A plan was written to "add a cost column" that had existed for months.
 
 ```typescript
 // CORRECT — verified fields

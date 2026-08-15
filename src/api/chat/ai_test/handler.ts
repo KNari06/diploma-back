@@ -103,10 +103,15 @@ export async function handlePlatformTest(
 ): Promise<void> {
   const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal, logger: functionLogger, mode, executionStrategy } = params;
 
+  // Hoisted out of `executePlatformTest` so the withAIContext wrapper below can
+  // put it on the context. record() must derive the SAME session id this passes
+  // to beginSession, or calls file under a synthetic key while endSession closes
+  // an empty one.
+  const sessionId = chatSessionId || `test-plan-${Date.now()}`;
+
   // Wrap entire test plan flow with AI tracking context
   const executePlatformTest = async () => {
     // Begin AI usage tracking session
-    const sessionId = chatSessionId || `test-plan-${Date.now()}`;
     AIUsageTracker.beginSession(sessionId, {
       workspaceId: workspace_id,
       userId,
@@ -1155,7 +1160,7 @@ export async function handlePlatformTest(
 
 // Execute platform test within AI tracking context
 return withAIContext(
-  { workspaceId: workspace_id, userId, operationType: 'test-plan' },
+  { workspaceId: workspace_id, userId, operationType: 'test-plan', sessionId },
   executePlatformTest
 );
 }

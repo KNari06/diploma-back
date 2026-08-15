@@ -583,7 +583,7 @@ export async function handleMobileAgent(
     const pipelineOpts = { abortSignal, snapshot, openTestCaseBlock, appKnowledgeBlock, appSkeletonBlock, history };
     const result = trackingSessionId && workspaceId
       ? await withAIContext(
-          { workspaceId, userId, operationType: 'chat' },
+          { workspaceId, userId, operationType: 'chat', sessionId: trackingSessionId ?? undefined },
           () => runMobileAgentPipeline(blackboard, pipelineOpts),
         )
       : await runMobileAgentPipeline(blackboard, pipelineOpts);

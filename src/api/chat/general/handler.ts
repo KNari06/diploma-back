@@ -1628,7 +1628,10 @@ You are inside the editor for the test case currently open in the preview. The
   // Execute agentic loop within AI tracking context
   if (workspaceId) {
     const agenticResult = await withAIContext(
-      { workspaceId, userId, operationType: 'chat' },
+      // `chatSessionId` is what trackingSessionId is derived from, and this
+      // branch only runs when workspaceId is set — so they are the same value
+      // here. record() must derive the id beginSession was given.
+      { workspaceId, userId, operationType: 'chat', sessionId: chatSessionId },
       executeAgenticLoop
     );
     gptResponse = agenticResult.gptResponse;

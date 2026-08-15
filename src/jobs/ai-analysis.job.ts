@@ -151,6 +151,9 @@ export class AIAnalysisJobHandler {
               testId,
               runId: runId ?? undefined,
               operationType: 'analysis',
+              // Matches the id passed to beginSession above; without it record()
+              // would key on testId and endSession would close an empty session.
+              sessionId: trackingSessionId,
             },
             () => aiService.analyzeTestResults(testResultData, {
               integrationContext: integrationContext || undefined,

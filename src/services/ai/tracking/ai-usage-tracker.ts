@@ -4,8 +4,8 @@
  * Automatically tracks all OpenAI/Gemini calls via interceptors.
  */
 
-import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { insertAIUsageLog, isSchemaDriftError } from './db/ai-usage-log.db';
 import { AI_PRICING, type AIModel } from '../cost/ai-cost-manager.service';
 import { getAIContext, type AITrackingContext } from './ai-context';
 
@@ -44,6 +44,15 @@ interface AIUsageSession {
   records: AIUsageRecord[];
   startedAt: number;
   pipelineMetrics?: Record<string, any>;
+  /**
+   * True when a caller opened this session via `beginSession` and is therefore
+   * responsible for closing it. The sweep treats the two kinds differently:
+   * an owned session must NOT be flushed out from under its owner just because
+   * the work is taking a while (regression runs routinely exceed 10 minutes),
+   * whereas an auto-created one has no owner and the sweep is its only path to
+   * the database. See `cleanup()`.
+   */
+  explicit?: boolean;
 }
 
 /**
@@ -55,6 +64,49 @@ interface AIUsageSession {
  */
 export class AIUsageTracker {
   private static sessions = new Map<string, AIUsageSession>();
+
+  /** Latch so schema drift is reported once per process, not once per session. */
+  private static schemaDriftReported = false;
+
+  /** How often orphaned sessions are swept and flushed. */
+  private static readonly SWEEP_INTERVAL_MS = 2 * 60 * 1000;
+
+  /**
+   * Self-starting sweep, one per process.
+   *
+   * `sessions` is a per-process static Map, so this CANNOT live in the
+   * scheduler — the scheduler makes no LLM calls and would sweep an empty map
+   * while the API and worker leaked. Every process that records usage needs its
+   * own timer, which is what a module-level static gives us. Same pattern as
+   * `TestExecutedStepsRedisService.cleanupTimer`.
+   *
+   * Before this existed, `cleanup()` was defined and documented as "should be
+   * called by a background job or cron" — and had no call site anywhere. Any
+   * session not explicitly ended (the majority; only 7 call sites pair
+   * begin/endSession) was therefore never flushed and never freed.
+   */
+  private static sweepTimer: ReturnType<typeof setInterval> | null = (() => {
+    // Never auto-start under Jest. The timer is registered at import time and
+    // outlives the suite that imported it inside a shared worker process, so it
+    // can fire in the MIDDLE of an unrelated test file and drive a real DB
+    // write through whatever that file has mocked `@/db/supabase` with. That is
+    // not hypothetical: it made `artifact-retention.job.test.ts` fail in the
+    // full run while passing in isolation. Tests call `cleanup()` directly.
+    if (process.env.NODE_ENV === 'test') return null;
+
+    const timer = setInterval(() => {
+      try {
+        AIUsageTracker.cleanup();
+      } catch (err) {
+        logger.warn('[AI_USAGE] Sweep failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }, AIUsageTracker.SWEEP_INTERVAL_MS);
+    // Never hold the event loop open for a usage sweep.
+    if (timer.unref) timer.unref();
+    return timer;
+  })();
 
   /**
    * Begin tracking session.
@@ -69,6 +121,7 @@ export class AIUsageTracker {
       context,
       records: [],
       startedAt: Date.now(),
+      explicit: true,
     });
 
     logger.debug('[AI_USAGE] Session started', {
@@ -95,8 +148,27 @@ export class AIUsageTracker {
       return;
     }
 
-    // Find session by testId or create synthetic key
-    const sessionId = ctx.testId || `${ctx.operationType || 'unknown'}-${ctx.userId}-${Date.now()}`;
+    // Find the session this call belongs to.
+    //
+    // The synthetic key MUST be stable for a given context. It previously ended
+    // in `Date.now()`, which minted a brand-new session for every single call
+    // that had no `testId` — each holding one record, each auto-created below,
+    // and none of them ever passed to `endSession`. The result was two bugs at
+    // once: those calls never reached `ai_usage_log` at all, and `sessions` grew
+    // without bound for the life of the process. Only the 7 call sites that
+    // pair beginSession/endSession were ever recorded; preview/editor element
+    // resolution, mobile runs, negative generation, exploration and self-heal
+    // were not.
+    //
+    // Keying on (operationType, workspace, user) instead means concurrent work
+    // by one user aggregates into a single session that the sweep below flushes
+    // on a ~10-minute cadence. For cost accounting that is the right shape, and
+    // the map is now bounded by active users rather than by call volume.
+    const sessionId =
+      ctx.sessionId ||
+      ctx.testId ||
+      ctx.runId ||
+      `${ctx.operationType || 'unknown'}-${ctx.workspaceId}-${ctx.userId ?? 'anon'}`;
     let session = this.sessions.get(sessionId);
 
     if (!session) {
@@ -109,6 +181,7 @@ export class AIUsageTracker {
         context: ctx,
         records: [],
         startedAt: Date.now(),
+        explicit: false,
       };
       this.sessions.set(sessionId, session);
     }
@@ -236,7 +309,7 @@ export class AIUsageTracker {
    */
   private static async flushToDatabase(session: AIUsageSession, summary: AIUsageSessionSummary): Promise<void> {
     try {
-      const { error } = await supabaseAdmin.from('ai_usage_log').insert({
+      await insertAIUsageLog({
         workspace_id: session.context.workspaceId,
         user_id: session.context.userId || null,
         test_id: session.context.testId || null,
@@ -252,57 +325,110 @@ export class AIUsageTracker {
         ...(session.pipelineMetrics && { pipeline_metrics: session.pipelineMetrics }),
       });
 
-      if (error) {
-        logger.error('[AI_USAGE] Failed to insert usage log', {
-          error: error.message,
-          workspaceId: session.context.workspaceId,
-        });
-        throw error;
-      }
+      this.schemaDriftReported = false;
 
       logger.debug('[AI_USAGE] Usage flushed to DB', {
         workspaceId: session.context.workspaceId,
         totalCostUSD: summary.totalCostUSD.toFixed(6),
       });
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+
+      // Schema drift is permanent, not transient: every later write fails the
+      // same way until a migration runs. Both callers of this method swallow
+      // the rejection into a log line, so without this branch the failure is
+      // indistinguishable from noise — which is how `run_id` silently cost us
+      // two months of AI cost data (see
+      // .claude/migrations/20260605_add_run_id_to_ai_usage_log.md). Report it
+      // once per process, unmistakably, rather than once per session forever.
+      if (isSchemaDriftError(message)) {
+        if (!this.schemaDriftReported) {
+          this.schemaDriftReported = true;
+          logger.error(
+            '[AI_USAGE] SCHEMA DRIFT — ai_usage_log writes are failing and ALL AI cost ' +
+              'attribution is being lost. The code is inserting a column the database ' +
+              'does not have; a migration has not been applied. This will not recover ' +
+              'on its own. See .claude/migrations/.',
+            { error: message, workspaceId: session.context.workspaceId },
+          );
+        }
+        throw error;
+      }
+
       logger.error('[AI_USAGE] Database flush error', {
-        error: error instanceof Error ? error.message : String(error),
+        error: message,
+        workspaceId: session.context.workspaceId,
       });
       throw error;
     }
   }
 
   /**
-   * Periodic cleanup for orphaned sessions (>10 min old).
-   * Should be called by a background job or cron.
+   * Periodic sweep. Runs on `sweepTimer`, once per process.
+   *
+   * Two ages on purpose:
+   *
+   * - **Auto-created sessions** (no `beginSession` caller) have no owner, so
+   *   this sweep is their ONLY route to the database. Flush them once they go
+   *   idle — `IDLE_MAX_AGE_MS`.
+   * - **Explicit sessions** belong to a caller that will `endSession` them.
+   *   Flushing one early splits a single logical operation across several
+   *   `ai_usage_log` rows and leaves `endSession` returning a summary covering
+   *   only the tail — and regression runs routinely exceed ten minutes, so the
+   *   short age would hit normal work, not just leaks. They are swept only at
+   *   `ORPHAN_MAX_AGE_MS`, where the owner has demonstrably failed to close
+   *   them and the leak matters more than the split.
+   *
+   * `startedAt` is never refreshed, so both ages measure total lifetime rather
+   * than idleness. That is what makes the distinction necessary: a busy
+   * 30-minute run and an abandoned one look identical by age alone.
    */
   static cleanup(): void {
     const now = Date.now();
-    const maxAge = 10 * 60 * 1000; // 10 minutes
+    /** Auto-created sessions: the sweep is their only flush path. */
+    const IDLE_MAX_AGE_MS = 10 * 60 * 1000;
+    /** Explicit sessions: long enough that only a genuine leak trips it. */
+    const ORPHAN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
     let cleanedCount = 0;
 
     for (const [sessionId, session] of this.sessions.entries()) {
-      if (now - session.startedAt > maxAge) {
-        logger.warn('[AI_USAGE] Cleaning up orphaned session', {
-          sessionId,
-          ageMs: now - session.startedAt,
-          recordCount: session.records.length,
-        });
+      const maxAge = session.explicit ? ORPHAN_MAX_AGE_MS : IDLE_MAX_AGE_MS;
+      if (now - session.startedAt <= maxAge) continue;
 
-        // Flush before removing
-        if (session.records.length > 0) {
-          const summary = this.aggregate(session);
-          this.flushToDatabase(session, summary).catch((err) => {
-            logger.error('[AI_USAGE] Failed to flush orphaned session', {
-              sessionId,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          });
-        }
+      const detail = {
+        sessionId,
+        ageMs: now - session.startedAt,
+        recordCount: session.records.length,
+        operationType: session.context.operationType,
+      };
 
-        this.sessions.delete(sessionId);
-        cleanedCount++;
+      if (session.explicit) {
+        // Reaching the orphan age IS anomalous: the owner never called
+        // endSession, so this is a leak worth naming.
+        logger.warn('[AI_USAGE] Orphaned explicit session — endSession was never called', detail);
+      } else {
+        // `debug`, not `warn`. This was a warn only because the sweep never
+        // actually ran, so reaching it meant something had gone wrong. It is
+        // now the NORMAL flush path for every auto-created session (chat,
+        // preview, exploration), and warning here would emit a line per active
+        // user per sweep forever, burying real warnings. The aggregate `info`
+        // below is the signal worth keeping.
+        logger.debug('[AI_USAGE] Sweeping idle session', detail);
       }
+
+      // Flush before removing.
+      if (session.records.length > 0) {
+        const summary = this.aggregate(session);
+        this.flushToDatabase(session, summary).catch((err) => {
+          logger.error('[AI_USAGE] Failed to flush swept session', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+
+      this.sessions.delete(sessionId);
+      cleanedCount++;
     }
 
     if (cleanedCount > 0) {
