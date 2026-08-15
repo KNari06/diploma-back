@@ -1,6 +1,6 @@
 /**
  * Integration tests for `revertDoctorFinding`. Uses the same in-memory
- * Supabase fake as `apply.service.integration.test.ts` — duplicated here
+ * Supabase fake as `apply.service.db.test.ts` — duplicated here
  * on purpose so the two suites stay independent (each test file cleans
  * its own mocks).
  *
