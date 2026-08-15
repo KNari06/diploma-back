@@ -77,6 +77,26 @@ describe('ScheduleService.calculateNextRun', () => {
     expect(next.getUTCHours()).toBe(4);
   });
 
+  it('resolves midnight in UTC', () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-06-15T12:00:00Z'));
+
+    const next = new Date(ScheduleService.calculateNextRun('0 0 * * *', 'UTC'));
+
+    expect(next.toISOString()).toBe('2026-06-16T00:00:00.000Z');
+    jest.useRealTimers();
+  });
+
+  it('resolves midnight in a non-UTC timezone', () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-06-15T12:00:00Z'));
+
+    const next = new Date(ScheduleService.calculateNextRun('0 0 * * *', 'Asia/Almaty'));
+
+    expect(next.toISOString()).toBe('2026-06-15T19:00:00.000Z');
+    jest.useRealTimers();
+  });
+
   // Regression (Bug #3): a LATE-hour cron in a positive-offset tz used to be
   // misclassified "unsatisfiable" because the DST-gap guard compared the
   // calendar DAY instead of HOUR:MINUTE — the Newton correction legitimately
