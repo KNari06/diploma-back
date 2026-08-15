@@ -1756,7 +1756,7 @@ export class SnapshotCollector {
                 isInsideShadowDOM = true;
                 shadowDepth++;
               }
-              current = current.parentNode;
+              current = current instanceof ShadowRoot ? current.host : current.parentNode;
             }
 
             // ✅ TASK 10: Fingerprint-based ref stability
