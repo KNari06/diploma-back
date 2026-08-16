@@ -117,6 +117,61 @@ export class ExplorationEngine {
   }
 
   /**
+   * Poll the caller's cancellation probe and, if it fires, flip the budget so
+   * every phase loop stops at its next check.
+   *
+   * Folded into `BudgetTracker` rather than carried as a separate flag because
+   * the survey BFS, the flow queue and the Sentinel extra-round all already
+   * gate on it — one signal, no new stop conditions to keep in sync.
+   *
+   * Best-effort: a throwing probe means "not cancelled". Killing a healthy run
+   * because a status read blipped would be strictly worse than a late stop.
+   */
+  private async checkCancelled(budget: BudgetTracker): Promise<boolean> {
+    if (budget.isCancelled()) return true;
+    if (!this.config.onCancelCheck) return false;
+    try {
+      if (await this.config.onCancelCheck()) {
+        budget.cancel();
+        logger.info('[EXPLORATION] Cancellation requested — stopping after in-flight work', {
+          explorationId: this.config.explorationId,
+        });
+        return true;
+      }
+    } catch { /* probe failure must never abort a healthy run */ }
+    return false;
+  }
+
+  /**
+   * Say so when the budget cap trimmed the unplanned tail.
+   *
+   * Silent narrowing is the failure mode this whole audit kept finding: the run
+   * looks complete while having deliberately skipped candidates. The user needs
+   * to know the field was narrowed on purpose (and that raising `maxFlows` or
+   * scoping the run is the lever) rather than assuming everything discovered
+   * was explored.
+   */
+  private warnIfUnplannedTrimmed(queue: FlowQueue, discovered: number): void {
+    if (queue.unplannedDropped <= 0) return;
+    logger.info('[EXPLORATION] Unplanned flows trimmed to protect the planned budget', {
+      explorationId: this.config.explorationId,
+      discovered,
+      queued: queue.size(),
+      dropped: queue.unplannedDropped,
+    });
+    this.emitProgress('strategizing', 'agent_warning', {
+      agent: 'strategist',
+      severity: 'info',
+      message:
+        `Discovered ${discovered} candidate flows — more than this run's budget of ` +
+        `${this.config.budget.maxFlows}. Prioritised the planned flows and set aside ` +
+        `${queue.unplannedDropped} unplanned one(s). Raise the flow budget or narrow the scope to change this.`,
+      discovered,
+      dropped: queue.unplannedDropped,
+    });
+  }
+
+  /**
    * Attach the dedup + per-page-fairness policies to a freshly built queue.
    * Called everywhere a FlowQueue is (re)created within a run so both
    * survey targeted-rebuilds and the Sentinel-driven extra round see the
@@ -329,6 +384,13 @@ export class ExplorationEngine {
       return builder.build(bb.tree, [], budget, this.config, startTime, []);
     }
 
+    // Cancelled during the survey? Stop before the Strategist LLM call and the
+    // whole flow phase — that is the bulk of the run's cost, and the partial
+    // tree is still worth returning.
+    if (await this.checkCancelled(budget)) {
+      return await this.buildCancelledResult(bb, [], budget, startTime, trace, onResultReady);
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // PHASE 1.5: STRATEGY (NEW)
     // Strategist sees full tree + all insights → AI-driven prioritization
@@ -344,8 +406,11 @@ export class ExplorationEngine {
     this.ensurePerPageBudget();
 
     // Build queue from Strategist output (AI-driven order, not static formula)
-    bb.queue = FlowQueue.fromStrategyOutput(allEntryPoints, bb.currentStrategy);
+    bb.queue = FlowQueue.fromStrategyOutput(allEntryPoints, bb.currentStrategy, {
+      maxFlows: this.config.budget.maxFlows,
+    });
     this.attachQueuePolicies(bb.queue, trace);
+    this.warnIfUnplannedTrimmed(bb.queue, allEntryPoints.length);
 
     // Log the full queue order for debugging prioritization
     trace.writeQueueOrder({
@@ -403,8 +468,11 @@ export class ExplorationEngine {
 
           // Rebuild queue with new entry points from targeted survey
           const updatedEntryPoints = bb.tree.getAllEntryPoints();
-          bb.queue = FlowQueue.fromStrategyOutput(updatedEntryPoints, bb.currentStrategy);
+          bb.queue = FlowQueue.fromStrategyOutput(updatedEntryPoints, bb.currentStrategy, {
+            maxFlows: this.config.budget.maxFlows,
+          });
           this.attachQueuePolicies(bb.queue, trace);
+          this.warnIfUnplannedTrimmed(bb.queue, updatedEntryPoints.length);
 
           logger.info('[EXPLORATION] Targeted survey complete', {
             newPages: updatedTree.getNodeCount(),
@@ -507,6 +575,13 @@ export class ExplorationEngine {
       timeUsedMs: Date.now() - startTime,
     });
 
+    // Cancelled during flow execution? Skip the Sentinel — a coverage score for
+    // a deliberately truncated run would be meaningless, and the flows that DID
+    // complete are still saved below.
+    if (await this.checkCancelled(budget)) {
+      return await this.buildCancelledResult(bb, flowTasks, budget, startTime, trace, onResultReady);
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // PHASE 2.5: COVERAGE EVALUATION (NEW)
     // Sentinel evaluates gaps, decides if another round is needed
@@ -580,6 +655,10 @@ export class ExplorationEngine {
                 names: flowTasks.map((t) => t.entryPoint.name),
                 goals: flowTasks.map((t) => t.entryPoint.goal),
               },
+              // The extra round is explicitly FOCUSED on the Sentinel's gaps, so
+              // an unbounded unplanned tail here would defeat the focus for the
+              // same reason it did in Phase 1.5.
+              maxFlows: this.config.budget.maxFlows,
             });
             this.attachQueuePolicies(bb.queue, trace);
 
@@ -681,11 +760,12 @@ export class ExplorationEngine {
     await ExplorationStorageService.clearCheckpoint(this.config.explorationId);
 
     this.emitProgress('complete', 'coverage_evaluated', {
-      // Runnable count — matches summary.flows / the panel / the history card.
-      // (The frontend's coverage_evaluated handler currently reads only the
-      // coverage fields, but keep this honest so a future consumer can't wire up
-      // a stale total. Raw testCases.length still feeds trace/log records above.)
-      testCases: result.summary.runnableTestCases,
+      // Persisted-row count — matches the history card, the chat reply and the
+      // completion event, so no surface can contradict another. (The frontend's
+      // coverage_evaluated handler currently reads only the coverage fields, but
+      // keep this honest so a future consumer can't wire up a stale total. Raw
+      // testCases.length still feeds trace/log records above.)
+      testCases: result.summary.persistedTestCases,
       flowsPassed: result.summary.flowsPassed,
       flowsFailed: result.summary.flowsFailed,
       flowsBlocked: result.summary.flowsBlocked,
@@ -759,6 +839,81 @@ export class ExplorationEngine {
       // Idempotent, so a normal-path close() already having run is fine.
       await trace.close();
     }
+  }
+
+  /**
+   * Build, persist and trace the PARTIAL result of a cancelled run.
+   *
+   * A cancelled run still saves what it found. The browser time and LLM calls
+   * are already spent, and the flows that completed are genuine, replayable
+   * test cases — throwing them away would punish the user for stopping a run
+   * that had already produced value.
+   *
+   * Like `markResumedRunSummary`, it refuses to fabricate a coverage score: the
+   * Sentinel never ran, so `coverageScore` stays undefined rather than being
+   * reported as 0, which would read as "assessed, scored nothing".
+   */
+  private async buildCancelledResult(
+    bb: ExplorationBlackboard,
+    flowTasks: Parameters<TestCaseBuilder['build']>[1],
+    budget: BudgetTracker,
+    startTime: number,
+    trace: ExplorationTraceService,
+    onResultReady?: (result: ExplorationResult) => Promise<{ savedCount: number; error?: string } | void>,
+  ): Promise<ExplorationResult> {
+    const builder = new TestCaseBuilder();
+    const result = builder.build(
+      bb.tree!,
+      flowTasks,
+      budget,
+      this.config,
+      startTime,
+      bb.queue?.remaining() ?? [],
+    );
+
+    result.summary.qualitySummary =
+      'This run was cancelled before it finished, so coverage was not assessed. Any flows that completed before the stop are saved below.';
+    result.summary.gaps = ['Coverage assessment skipped — run was cancelled'];
+    result.summary.recommendations = ['Re-run this exploration for a full assessment'];
+
+    // Persist the partial output through the SAME hook the normal path uses, so
+    // a cancelled run's test cases are saved and traced identically.
+    let persistError: string | undefined;
+    if (onResultReady) {
+      try {
+        const outcome = await onResultReady(result);
+        if (outcome) {
+          trace.writeTestCasesSaved({
+            requestedCount: result.testCases.length,
+            savedCount: outcome.savedCount,
+            projectId: this.config.projectId,
+            error: outcome.error,
+          });
+          persistError = outcome.error;
+        }
+      } catch (err) {
+        persistError = err instanceof Error ? err.message : String(err);
+      }
+    }
+
+    await ExplorationStorageService.clearCheckpoint(this.config.explorationId);
+
+    trace.writeExplorationEnd({
+      status: 'cancelled',
+      durationMs: result.durationMs,
+      testCasesCount: result.testCases.length,
+      summary: result.summary,
+      error: persistError,
+    });
+    await trace.close();
+
+    logger.info('[EXPLORATION] Exploration cancelled — partial result saved', {
+      explorationId: this.config.explorationId,
+      flowsExplored: result.summary.flowsExplored,
+      persistedTestCases: result.summary.persistedTestCases,
+    });
+
+    return result;
   }
 
   // ═══════════════════════════════════════════════════════════════════════

@@ -9,6 +9,7 @@ import {
   addToRegressionPlan,
   runDiscoveredTestCases,
   startExploration,
+  cancelExploration,
 } from './explorations.controller';
 
 const router = Router();
@@ -39,5 +40,9 @@ router.post('/:explorationId/add-to-regression', requireAuth, addToRegressionPla
 
 // Run the discovered test cases in one click (creates a throwaway plan + run)
 router.post('/:explorationId/run-discovered', requireAuth, runDiscoveredTestCases);
+
+// Stop a running exploration. No credit gate — cancelling must never be
+// blocked by a balance, and a cancelled run is not charged.
+router.post('/:explorationId/cancel', requireAuth, cancelExploration);
 
 export default router;

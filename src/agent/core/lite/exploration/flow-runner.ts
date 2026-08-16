@@ -195,6 +195,24 @@ export class FlowRunner {
     this.checkpointCallback = cb;
   }
 
+  /**
+   * Ask the caller whether the run has been cancelled and, if so, flip the
+   * budget — every loop condition here already gates on `isExhausted()`.
+   *
+   * Best-effort in both directions: no probe configured means no cancellation,
+   * and a throwing probe is swallowed. A transient status-read failure must
+   * never abort a healthy run; it only delays the stop to the next check.
+   */
+  private async pollCancellation(): Promise<void> {
+    if (!this.config.onCancelCheck || this.budget.isCancelled()) return;
+    try {
+      if (await this.config.onCancelCheck()) {
+        this.budget.cancel();
+        logger.info('[FLOW_RUNNER] Cancellation detected — draining queue, in-flight flows will finish');
+      }
+    } catch { /* a failed probe is not a cancellation */ }
+  }
+
   isLoginCompleted(): boolean {
     return this.loginCompleted;
   }
@@ -333,6 +351,13 @@ export class FlowRunner {
     // Process queue in a loop that re-checks after each flow completes,
     // so newly enqueued branch points get picked up.
     while ((!queue.isEmpty() || inFlight.size > 0) && !this.budget.isExhausted()) {
+      // Poll for cancellation once per iteration — i.e. after each flow
+      // completes. The loop conditions below all read `isExhausted()`, which
+      // `cancel()` satisfies, so setting the flag here is what makes a cancel
+      // land BETWEEN flows instead of only at the engine's phase boundaries
+      // (which would mean waiting out the entire flow phase). One indexed
+      // lookup per completed flow, against flows that take tens of seconds.
+      await this.pollCancellation();
       // Fill up concurrency slots from queue
       while (!queue.isEmpty() && !this.budget.isExhausted() && this.budget.canExploreMoreFlows()) {
         const entryPoint = queue.dequeue();

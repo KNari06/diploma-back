@@ -221,9 +221,11 @@ describe('TestCaseBuilder — summary counters', () => {
     expect(s.runnableTestCases).toBe(1);
   });
 
-  it('runnableTestCases excludes not_explored placeholders (card total == panel total)', () => {
+  it('runnableTestCases excludes not_explored placeholders (panel total)', () => {
     // testCases.length includes one placeholder per unexplored entry point;
-    // runnableTestCases must not — it is what the history card and panel show.
+    // runnableTestCases must not — it is what the results panel's flow list
+    // shows. (The history CARD reads persistedTestCases, which also counts the
+    // generated negatives — see the persistence-parity block below.)
     const explored = ep({ id: '1', name: 'Explored' });
     const skipped1 = ep({ id: '2', name: 'Skipped A' });
     const skipped2 = ep({ id: '3', name: 'Skipped B' });
@@ -358,6 +360,95 @@ describe('TestCaseBuilder — status mapping', () => {
     expect(positive!.steps.length).toBe(2);
     expect(positive!.blocker?.type).toBe('captcha');
     expect(positive!.name).toContain('BLOCKED');
+  });
+});
+
+describe('TestCaseBuilder — persistence parity (reported == written)', () => {
+  /**
+   * Mirrors `ExplorationStorageService.saveTestCases`' gate EXACTLY: a case is
+   * written iff it carries at least one step. Duplicated here on purpose — the
+   * real function needs Supabase, and the whole point of these tests is to
+   * catch the two rules drifting apart.
+   */
+  const wouldPersist = (tcs: Array<{ steps: unknown[] }>) =>
+    tcs.filter((tc) => Array.isArray(tc.steps) && tc.steps.length > 0);
+
+  it('persistedTestCases equals the number of rows saveTestCases would write', () => {
+    // A form flow generates an extra negative case. It is `explored:false` so it
+    // is absent from `flows`, but it HAS steps, so it persists — the divergence
+    // that made the history card under-report what the project received.
+    const e = ep({ id: '1', name: 'Signup', category: 'form_submission' });
+    const steps: DiscoveredStep[] = [
+      { stepNumber: 1, description: 'Filled "Email" (textbox)', action: 'fill', ref: 'email', value: 'a@b.com', pageUrl: 'https://ex.com' },
+      { stepNumber: 2, description: 'Clicked "Sign up" (button)', action: 'click', ref: 'submit', pageUrl: 'https://ex.com' },
+    ];
+    const builder = new TestCaseBuilder();
+    const r = builder.build(mockTree([e]), [task({ entryPoint: e, discoveredSteps: steps })], mockBudget(), cfg, Date.now() - 100, []);
+
+    expect(r.summary.negativeTestCases).toBe(1);
+    expect(r.summary.runnableTestCases).toBe(1);
+    // The contract: what we report written == what actually gets written.
+    expect(r.summary.persistedTestCases).toBe(wouldPersist(r.testCases).length);
+    expect(r.summary.persistedTestCases).toBe(2);
+  });
+
+  it('keeps negatives OUT of the explored/outcome counts — they never ran', () => {
+    const e = ep({ id: '1', name: 'Login', category: 'authentication' });
+    const steps: DiscoveredStep[] = [
+      { stepNumber: 1, description: 'Filled "Email" (textbox)', action: 'fill', ref: 'email', value: 'a@b.com', pageUrl: 'https://ex.com' },
+      { stepNumber: 2, description: 'Clicked "Log in" (button)', action: 'click', ref: 'submit', pageUrl: 'https://ex.com' },
+    ];
+    const builder = new TestCaseBuilder();
+    const r = builder.build(mockTree([e]), [task({ entryPoint: e, discoveredSteps: steps })], mockBudget(), cfg, Date.now() - 100, []);
+    const s = r.summary;
+    // A generated template must never be presented as a flow we verified.
+    expect(s.flows!.length).toBe(1);
+    expect(s.flowsExplored).toBe(1);
+    expect(s.flowsPassed + s.flowsFailed + s.flowsBlocked).toBe(s.flows!.length);
+    // ...nor inflate the not-explored bucket, which is about un-run FLOWS.
+    expect(s.flowsNotExplored).toBe(0);
+  });
+
+  it('reports zero persisted rows when nothing runnable was produced', () => {
+    // Billing and the "you were not charged" copy both gate on
+    // runnableTestCases; persistedTestCases must agree that nothing was written.
+    const e = ep({ id: '1', name: 'Dead', category: 'form_submission' });
+    const builder = new TestCaseBuilder();
+    const r = builder.build(
+      mockTree([e]),
+      [task({ entryPoint: e, status: 'timeout', goalAchieved: false, discoveredSteps: [] })],
+      mockBudget(), cfg, Date.now() - 100, [],
+    );
+    expect(r.summary.runnableTestCases).toBe(0);
+    expect(r.summary.negativeTestCases).toBe(0);
+    expect(r.summary.persistedTestCases).toBe(0);
+    expect(wouldPersist(r.testCases)).toHaveLength(0);
+  });
+
+  it('persistence parity holds across a mixed run (flows + negatives + placeholders)', () => {
+    const form = ep({ id: '1', name: 'Checkout', category: 'e_commerce' });
+    const nav = ep({ id: '2', name: 'Browse', category: 'navigation' });
+    const unexplored = ep({ id: '3', name: 'Never Ran' });
+    const formSteps: DiscoveredStep[] = [
+      { stepNumber: 1, description: 'Filled "Card" (textbox)', action: 'fill', ref: 'card', value: '4242', pageUrl: 'https://ex.com' },
+      { stepNumber: 2, description: 'Clicked "Pay" (button)', action: 'click', ref: 'pay', pageUrl: 'https://ex.com' },
+    ];
+    const builder = new TestCaseBuilder();
+    const r = builder.build(
+      mockTree([form, nav, unexplored]),
+      [
+        task({ entryPoint: form, discoveredSteps: formSteps }),
+        task({ entryPoint: nav, discoveredSteps: [{ stepNumber: 1, description: 'Clicked "Home" (link)', action: 'click', ref: 'home', pageUrl: 'https://ex.com' }] }),
+      ],
+      mockBudget(), cfg, Date.now() - 100, [unexplored],
+    );
+    const s = r.summary;
+    expect(s.runnableTestCases).toBe(2);   // two explored flows
+    expect(s.negativeTestCases).toBe(1);   // only the e_commerce form yields one
+    expect(s.persistedTestCases).toBe(3);
+    expect(s.persistedTestCases).toBe(wouldPersist(r.testCases).length);
+    // The placeholder is still excluded from everything that persists.
+    expect(r.testCases.length).toBeGreaterThan(s.persistedTestCases);
   });
 });
 

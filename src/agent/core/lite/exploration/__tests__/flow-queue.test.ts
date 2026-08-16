@@ -217,6 +217,63 @@ describe('FlowQueue — Strategist-driven ordering', () => {
     expect(q.remaining().map((e) => e.id)).toEqual(['a']);
   });
 
+  describe('unplanned budget cap', () => {
+    // Regression: a "registration"-scoped run on automationexercise.com
+    // discovered 181 entry points against maxFlows 30. Every unplanned one was
+    // enqueued after the planned ones, so the tail crowded out the flows the
+    // Strategist had actually chosen and the run produced brand-browsing tests.
+    const many = (n: number, prefix: string) =>
+      Array.from({ length: n }, (_, i) => ep({ id: `${prefix}${i}`, name: `${prefix} flow ${i}` }));
+
+    it('caps the unplanned tail at a share of maxFlows, keeping every planned flow', () => {
+      const planned = many(5, 'p');
+      const unplanned = many(176, 'u');
+      const q = FlowQueue.fromStrategyOutput(
+        [...planned, ...unplanned],
+        strategy(planned.map((e, i) => ({ id: e.id, priority: i + 1 }))),
+        { maxFlows: 30 },
+      );
+      const ids = q.remaining().map((e) => e.id);
+      // All 5 planned survive, in Strategist order, at the front.
+      expect(ids.slice(0, 5)).toEqual(['p0', 'p1', 'p2', 'p3', 'p4']);
+      // Tail is trimmed to ceil(30 * 0.3) = 9, not 176.
+      expect(ids.length).toBe(5 + 9);
+      expect(q.unplannedDropped).toBe(176 - 9);
+    });
+
+    it('does NOT cap when the Strategist produced no plan', () => {
+      // With an empty plan every entry point is "unplanned" — capping there
+      // would discard the whole run rather than a discretionary tail.
+      const entries = many(50, 'u');
+      const q = FlowQueue.fromStrategyOutput(entries, strategy([]), { maxFlows: 30 });
+      expect(q.remaining()).toHaveLength(50);
+      expect(q.unplannedDropped).toBe(0);
+    });
+
+    it('keeps the old enqueue-everything behaviour when maxFlows is omitted', () => {
+      const planned = many(2, 'p');
+      const unplanned = many(40, 'u');
+      const q = FlowQueue.fromStrategyOutput(
+        [...planned, ...unplanned],
+        strategy(planned.map((e, i) => ({ id: e.id, priority: i + 1 }))),
+      );
+      expect(q.remaining()).toHaveLength(42);
+      expect(q.unplannedDropped).toBe(0);
+    });
+
+    it('does not trim when the tail already fits the share', () => {
+      const planned = many(3, 'p');
+      const unplanned = many(4, 'u');
+      const q = FlowQueue.fromStrategyOutput(
+        [...planned, ...unplanned],
+        strategy(planned.map((e, i) => ({ id: e.id, priority: i + 1 }))),
+        { maxFlows: 30 },
+      );
+      expect(q.remaining()).toHaveLength(7);
+      expect(q.unplannedDropped).toBe(0);
+    });
+  });
+
   it('appends unplanned entries after planned ones', () => {
     const entries = [
       ep({ id: 'a', name: 'Xi' }),

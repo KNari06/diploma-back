@@ -29,8 +29,10 @@ const createRun = jest.fn();
 const completeMobileRun = jest.fn();
 const failRun = jest.fn();
 const saveMobileTestCasesFromSnapshot = jest.fn();
+// Polled on every non-completed outcome to tell a user cancel from a crash.
+const isRunCancelled = jest.fn();
 jest.mock('@/services/testing/exploration/exploration-storage.service', () => ({
-  ExplorationStorageService: { createRun, completeMobileRun, failRun, saveMobileTestCasesFromSnapshot },
+  ExplorationStorageService: { createRun, completeMobileRun, failRun, saveMobileTestCasesFromSnapshot, isRunCancelled },
 }));
 
 const mergeRunIntoSkeleton = jest.fn();
@@ -80,6 +82,7 @@ beforeEach(() => {
   // rollups (fingerprintVersion, coverageScore) ride on the `mobile` header.
   getExplorationResult.mockResolvedValue({ flows: [] });
   saveMobileTestCasesFromSnapshot.mockResolvedValue([]);
+  isRunCancelled.mockResolvedValue(false);
   mergeRunIntoSkeleton.mockResolvedValue(undefined);
   deductCreditsForTest.mockResolvedValue(undefined);
 });
@@ -119,7 +122,9 @@ describe('MobileExplorationRunJobHandler', () => {
     expect(getExplorationResult).toHaveBeenCalledWith('runner-run-9', { userId: 'u-1' });
     expect(saveMobileTestCasesFromSnapshot).toHaveBeenCalledWith(
       [{ name: 'login', mobile: { cases: [{ name: 'happy', intentSteps: [{ a: 1 }] }] } }],
-      'p-1', 'u-1', 'android',
+      // explorationId is passed so the rows carry it — without the stamp,
+      // /explorations/:id/test-cases returns nothing for a mobile run.
+      'p-1', 'u-1', 'android', 'expl-1',
     );
     // Count comes from saved ids, not the relay outcome.
     expect(completeMobileRun).toHaveBeenCalledWith('expl-1', expect.objectContaining({ testCasesCount: 3 }));
@@ -210,6 +215,44 @@ describe('MobileExplorationRunJobHandler', () => {
     expect(emitExplorationCompleted).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', explorationId: 'expl-1' }));
     expect(completeMobileRun).not.toHaveBeenCalled();
     expect(relayStop).toHaveBeenCalled();
+  });
+
+  it('reports a user cancel as cancelled, not failed', async () => {
+    // The relay ends as `stopped` for BOTH a user cancel and a crash, so the
+    // job asks the run row — which the cancel endpoint already flipped.
+    // Calling failRun here would bury a deliberate stop in failure metrics.
+    waitUntilDone.mockResolvedValue({ status: 'failed', errorMessage: 'stopped', testCasesCount: 0, summary: {}, reason: 'stopped' });
+    isRunCancelled.mockResolvedValue(true);
+
+    await MobileExplorationRunJobHandler.process(makeJob());
+
+    expect(failRun).not.toHaveBeenCalled();
+    expect(completeMobileRun).not.toHaveBeenCalled();
+    expect(emitExplorationCompleted).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'cancelled', explorationId: 'expl-1' }),
+    );
+  });
+
+  it('attaches chat actions so the finished message is not a dead end', async () => {
+    // The mobile live panel is component state: closing it removes every route
+    // back to the run unless the message carries its own buttons.
+    waitUntilDone.mockResolvedValue({ status: 'completed', testCasesCount: 0, summary: {}, reason: 'completed' });
+    getExplorationResult.mockResolvedValue({ flows: [] });
+    saveMobileTestCasesFromSnapshot.mockResolvedValue(['tc-1']);
+
+    await MobileExplorationRunJobHandler.process(makeJob());
+
+    expect(saveChatMessages).toHaveBeenCalledWith(
+      'chat-1',
+      [expect.objectContaining({
+        metadata: expect.objectContaining({
+          savedTestCaseIds: ['tc-1'],
+          actions: expect.arrayContaining([
+            expect.objectContaining({ kind: 'navigate', url: '/explorations/expl-1' }),
+          ]),
+        }),
+      })],
+    );
   });
 
   it('fails the run and rethrows if starting the runner throws (relay never constructed)', async () => {

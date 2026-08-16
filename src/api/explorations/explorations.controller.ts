@@ -20,6 +20,13 @@ import {
 import { normalizeEntryUrl } from '@/utils/validation/entry-url';
 import { preflightEntryUrl } from '@/services/testing/exploration/entry-preflight.service';
 import { projectBelongsToWorkspace } from '@/services/core/db/self-serve.db';
+import { hasProjectAccess } from '@/services/core/project-access.service';
+import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
+import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
+import {
+  fetchExplorationProjectUnscoped,
+  fetchWorkspaceProjectIds,
+} from '@/services/testing/exploration/db/exploration-run.db';
 
 interface AuthenticatedRequest extends Request {
   user?: { id: string; email: string; role: string };
@@ -29,6 +36,31 @@ function getUserId(req: AuthenticatedRequest): string {
   const userId = req.user?.id;
   if (!userId) throw new Error('User ID not found');
   return userId;
+}
+
+/**
+ * Resolve the project an exploration belongs to and authorize the caller
+ * against it — owner OR active workspace member, via the shared
+ * `hasProjectAccess` gate.
+ *
+ * Every read here used to filter `exploration_runs.user_id = caller`, while
+ * `/explorations/start` authorizes by WORKSPACE (`projectBelongsToWorkspace`
+ * has no owner requirement). A teammate could therefore start a run against a
+ * shared project and then get 404 on its results, and `run-discovered` silently
+ * dropped every case. Reads and writes now answer to the same rule.
+ *
+ * Returns the projectId on success, or null when the run is missing OR the
+ * caller may not see it — the caller renders both as 404, so this never
+ * discloses whether an exploration id exists in someone else's workspace.
+ */
+async function resolveAccessibleExploration(
+  explorationId: string,
+  userId: string,
+): Promise<string | null> {
+  const projectId = await fetchExplorationProjectUnscoped(explorationId);
+  if (!projectId) return null;
+  if (!(await hasProjectAccess(projectId, userId))) return null;
+  return projectId;
 }
 
 function handleError(res: Response, error: unknown, message: string): void {
@@ -50,28 +82,40 @@ export async function listExplorations(req: AuthenticatedRequest, res: Response)
     let query = supabaseAdmin
       .from('exploration_runs')
       .select('id, exploration_id, entry_url, project_id, status, summary, duration_ms, test_cases_count, started_at, completed_at')
-      .eq('user_id', userId)
       .order('started_at', { ascending: false })
       .limit(50);
 
     if (projectId && typeof projectId === 'string') {
-      // Filter by specific project
+      // Scope to one project the caller may read (owner or workspace member),
+      // rather than to rows they personally started — a shared project's runs
+      // belong to the team. The access gate REPLACES the `user_id` filter, so
+      // it must run before the query is issued, not alongside it.
+      if (!(await hasProjectAccess(projectId, userId))) {
+        res.status(403).json({ success: false, error: 'Project not found' });
+        return;
+      }
       query = query.eq('project_id', projectId);
     } else if (workspaceId && typeof workspaceId === 'string') {
-      // Filter by workspace — get all projects in workspace, then filter
-      const { data: projects } = await supabaseAdmin
-        .from('projects')
-        .select('id')
-        .eq('workspace_id', workspaceId)
-        .eq('user_id', userId);
+      // `workspaceId` is caller-supplied and was previously trusted: the branch
+      // only ever narrowed by `user_id`, so it was safe by accident. Dropping
+      // that filter without verifying membership would turn this into an IDOR
+      // (any workspace id → that workspace's runs), so verify FIRST.
+      if (!(await WorkspaceAccessService.isMember(userId, workspaceId))) {
+        res.status(403).json({ success: false, error: 'Workspace not found' });
+        return;
+      }
 
-      const projectIds = (projects || []).map(p => p.id);
-      if (projectIds.length > 0) {
-        query = query.in('project_id', projectIds);
-      } else {
+      const projectIds = await fetchWorkspaceProjectIds(workspaceId);
+      if (projectIds.length === 0) {
         res.json({ success: true, data: [] });
         return;
       }
+      query = query.in('project_id', projectIds);
+    } else {
+      // No scope given — fall back to the caller's own runs. Widening this to
+      // every project they can reach would need a membership lookup per
+      // workspace; the clients always send a scope.
+      query = query.eq('user_id', userId);
     }
 
     const { data, error } = await query;
@@ -97,11 +141,16 @@ export async function getExploration(req: AuthenticatedRequest, res: Response): 
     const { explorationId } = req.params;
     const userId = getUserId(req);
 
+    // Authorize by project access, not by who started the run.
+    if (!(await resolveAccessibleExploration(explorationId, userId))) {
+      res.status(404).json({ success: false, error: 'Exploration not found' });
+      return;
+    }
+
     const { data, error } = await supabaseAdmin
       .from('exploration_runs')
       .select('*')
       .eq('exploration_id', explorationId)
-      .eq('user_id', userId)
       .single();
 
     if (error || !data) {
@@ -124,15 +173,10 @@ export async function getExplorationTestCases(req: AuthenticatedRequest, res: Re
     const { explorationId } = req.params;
     const userId = getUserId(req);
 
-    // Verify ownership
-    const { data: run, error: runError } = await supabaseAdmin
-      .from('exploration_runs')
-      .select('project_id')
-      .eq('exploration_id', explorationId)
-      .eq('user_id', userId)
-      .single();
-
-    if (runError || !run) {
+    // Authorize by project access (owner or workspace member), not by who
+    // started the run.
+    const projectId = await resolveAccessibleExploration(explorationId, userId);
+    if (!projectId) {
       res.status(404).json({ success: false, error: 'Exploration not found' });
       return;
     }
@@ -151,11 +195,15 @@ export async function getExplorationTestCases(req: AuthenticatedRequest, res: Re
     // the project's entire history as if it had just found it. An empty list is
     // the honest answer — `run.test_cases_count` already tells the user how
     // many this run produced, so 0 rows next to "0 test cases" reads correctly.
+    //
+    // Rows are scoped to the run + its project, NOT to the caller: the cases
+    // were written under the id of whoever started the exploration, so a
+    // `user_id` filter returned an empty list to every teammate who could
+    // legitimately open the run. Access was already decided above.
     const { data: testCases, error } = await supabaseAdmin
       .from('intent_test_cases')
       .select('id, entry_point_id, name, description, start_url, steps_json, tags, priority, status, created_at')
-      .eq('project_id', run.project_id)
-      .eq('user_id', userId)
+      .eq('project_id', projectId)
       .eq('exploration_id', explorationId)
       .order('created_at', { ascending: true });
 
@@ -189,15 +237,9 @@ export async function addToRegressionPlan(req: AuthenticatedRequest, res: Respon
       return;
     }
 
-    // Verify exploration ownership
-    const { data: run } = await supabaseAdmin
-      .from('exploration_runs')
-      .select('project_id')
-      .eq('exploration_id', explorationId)
-      .eq('user_id', userId)
-      .single();
-
-    if (!run) {
+    // Authorize the exploration by project access, not by who started it.
+    const projectId = await resolveAccessibleExploration(explorationId, userId);
+    if (!projectId) {
       res.status(404).json({ success: false, error: 'Exploration not found' });
       return;
     }
@@ -215,12 +257,18 @@ export async function addToRegressionPlan(req: AuthenticatedRequest, res: Respon
       return;
     }
 
-    // Get the test cases to add
+    // Select the cases by the RUN's project rather than by `user_id`: the rows
+    // belong to whoever started the exploration, so an owner filter added none
+    // of them for a teammate. Scoping to `project_id` + `exploration_id` keeps
+    // the guard just as tight — a caller cannot smuggle in an arbitrary case id
+    // from another project, which a bare `.in(ids)` would have allowed once the
+    // ownership filter came off.
     const { data: testCases, error: tcError } = await supabaseAdmin
       .from('intent_test_cases')
       .select('id, name')
       .in('id', testCaseIds)
-      .eq('user_id', userId);
+      .eq('project_id', projectId)
+      .eq('exploration_id', explorationId);
 
     if (tcError || !testCases?.length) {
       res.status(400).json({ success: false, error: 'No valid test cases found' });
@@ -276,11 +324,16 @@ export async function getExplorationState(req: AuthenticatedRequest, res: Respon
     const { explorationId } = req.params;
     const userId = getUserId(req);
 
+    // Authorize by project access, not by who started the run.
+    if (!(await resolveAccessibleExploration(explorationId, userId))) {
+      res.status(404).json({ success: false, error: 'Exploration not found' });
+      return;
+    }
+
     const { data, error } = await supabaseAdmin
       .from('exploration_runs')
       .select('exploration_id, entry_url, status, config, summary, budget_used, duration_ms, test_cases_count, error_message, checkpoint, started_at, completed_at')
       .eq('exploration_id', explorationId)
-      .eq('user_id', userId)
       .single();
 
     if (error || !data) {
@@ -352,6 +405,57 @@ export async function runDiscoveredTestCases(req: AuthenticatedRequest, res: Res
       return;
     }
     handleError(res, error, 'Failed to run discovered test cases');
+  }
+}
+
+/**
+ * Cancel a running exploration.
+ *
+ * POST /api/v1/explorations/:explorationId/cancel
+ *
+ * The status flip IS the signal: the worker polls `isRunCancelled` at each
+ * phase boundary (the engine runs in another process, so an in-memory flag
+ * could never reach it). Cancellation is therefore cooperative — the run stops
+ * after its in-flight work rather than instantly — and whatever it discovered
+ * before stopping is still saved and left visible. The run is not charged.
+ *
+ * Returns 409 when the run is already terminal, rather than pretending to have
+ * stopped something that had already finished.
+ */
+export async function cancelExploration(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { explorationId } = req.params;
+    const userId = getUserId(req);
+
+    // Same gate as the reads: anyone who can see the run can stop it.
+    if (!(await resolveAccessibleExploration(explorationId, userId))) {
+      res.status(404).json({ success: false, error: 'Exploration not found' });
+      return;
+    }
+
+    const cancelled = await ExplorationStorageService.cancelRun(explorationId);
+    if (!cancelled) {
+      res.status(409).json({
+        success: false,
+        error: 'Exploration is not running — it already finished, failed, or was cancelled.',
+      });
+      return;
+    }
+
+    logger.info('[EXPLORATIONS_API] Exploration cancellation requested', { explorationId, userId });
+
+    res.json({
+      success: true,
+      data: {
+        explorationId,
+        status: 'cancelled',
+        // Set expectations: the worker stops at its next phase boundary, so the
+        // run can stay visibly active for a short while after this returns.
+        note: 'The run will stop shortly. Anything discovered before it stops is saved.',
+      },
+    });
+  } catch (error) {
+    handleError(res, error, 'Failed to cancel exploration');
   }
 }
 

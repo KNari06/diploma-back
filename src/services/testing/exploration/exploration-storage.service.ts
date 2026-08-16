@@ -14,7 +14,8 @@ import { toIntentTestCase } from '@/agent/core/lite/exploration/types';
  * Mirrors the CHECK in 20260802_exploration_runs_honest_failure_status.sql —
  * a value absent there fails the whole UPDATE (PostgREST rejects the row), so
  * keep the two in sync. Deliberately excludes `timed_out` / `cancelled`: those
- * are written by the stale sweep and the cancel path, not by `failRun`.
+ * are written by the stale sweep (`reapStaleRunningRuns`) and by `cancelRun`
+ * respectively, not by `failRun`.
  */
 export type ExplorationFailureStatus =
   | 'failed'
@@ -114,12 +115,16 @@ export class ExplorationStorageService {
           summary: result.summary,
           budget_used: result.budgetUsed,
           duration_ms: result.durationMs,
-          // Runnable cases only — this is what the history card shows and what
-          // actually persists. `result.testCases.length` also counts zero-step
-          // not_explored placeholders, which made the card's total ("34 tests")
-          // exceed the results panel's total ("All (22)"). Same source as
-          // summary.runnableTestCases and the chat "Test cases generated" line.
-          test_cases_count: result.summary.runnableTestCases,
+          // Rows this run actually WROTE — explored flows plus the generated
+          // negatives, which are `explored:false` but step-bearing and therefore
+          // persisted by `saveTestCases`. `result.testCases.length` over-counts
+          // (it includes zero-step not_explored placeholders, which made the
+          // card read "34 tests" against the panel's "All (22)"), while
+          // `runnableTestCases` UNDER-counts by one row per form flow — the card
+          // said 3 while `/explorations/:id/test-cases` returned 5. This column
+          // backs the history card, whose job is "what did this run add to my
+          // project", so it must equal the row count that endpoint returns.
+          test_cases_count: result.summary.persistedTestCases,
           completed_at: new Date().toISOString(),
         })
         .eq('exploration_id', explorationId);
@@ -171,6 +176,15 @@ export class ExplorationStorageService {
     projectId: string,
     userId: string,
     platform: 'android' | 'ios' | 'flutter',
+    /**
+     * The run that discovered these — same role as on the web path. Without it
+     * the mobile rows land with `exploration_id = NULL`, so
+     * `/explorations/:id/test-cases` (which filters on it, with no fallback by
+     * design) returns an empty list and the results panel shows nothing for a
+     * mobile run that actually saved cases. Optional so any caller that has no
+     * run id still compiles.
+     */
+    explorationId?: string,
   ): Promise<string[]> {
     const browserTag = platform === 'ios' ? 'mobile_ios' : platform === 'flutter' ? 'mobile_flutter' : 'mobile_android';
     const records: Array<Record<string, unknown>> = [];
@@ -216,6 +230,12 @@ export class ExplorationStorageService {
           status: 'draft',
           kind: 'standalone',
           source: 'exploration',
+          // Stamp the run so the results screen can list exactly this run's
+          // output. The web path has done this since 2026-08-03; mobile was
+          // left NULL, which made `/explorations/:id/test-cases` return nothing
+          // for a mobile run (that reader filters on the column and
+          // deliberately has no project-wide fallback).
+          exploration_id: explorationId ?? null,
         });
       }
     }
@@ -326,6 +346,108 @@ export class ExplorationStorageService {
         error: error instanceof Error ? error.message : String(error),
         explorationId,
       });
+    }
+  }
+
+  /**
+   * Flip a run to 'cancelled'. Idempotent by construction: the
+   * `status = 'running'` filter means a run that already finished (or was
+   * already cancelled) is untouched, so a double-click cannot rewrite a
+   * terminal row or resurrect a completed one.
+   *
+   * @returns true when THIS call performed the cancellation. False means the
+   *   run was already terminal — the caller reports that honestly instead of
+   *   claiming it stopped something.
+   */
+  static async cancelRun(explorationId: string): Promise<boolean> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('exploration_runs')
+        .update({
+          status: 'cancelled',
+          error_message: 'Cancelled by user',
+          completed_at: new Date().toISOString(),
+        })
+        .eq('exploration_id', explorationId)
+        .eq('status', 'running')
+        .select('exploration_id');
+
+      if (error) {
+        logger.error('[EXPLORATION_STORAGE] Failed to cancel run', {
+          error: error.message,
+          explorationId,
+        });
+        return false;
+      }
+      return (data?.length ?? 0) > 0;
+    } catch (error) {
+      logger.error('[EXPLORATION_STORAGE] Error cancelling run', {
+        error: error instanceof Error ? error.message : String(error),
+        explorationId,
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Record what a CANCELLED run produced, without touching its status.
+   *
+   * `completeRun` would stamp 'completed' over 'cancelled' and erase the fact
+   * that the user stopped it. The partial output still has to land, though —
+   * the flows that finished were saved to `intent_test_cases`, so the history
+   * card must show a matching count instead of 0.
+   */
+  static async recordCancelledRunOutput(
+    explorationId: string,
+    result: ExplorationResult,
+  ): Promise<void> {
+    try {
+      const { error } = await supabaseAdmin
+        .from('exploration_runs')
+        .update({
+          summary: result.summary,
+          budget_used: result.budgetUsed,
+          duration_ms: result.durationMs,
+          test_cases_count: result.summary.persistedTestCases,
+        })
+        .eq('exploration_id', explorationId)
+        .eq('status', 'cancelled');
+
+      if (error) {
+        logger.error('[EXPLORATION_STORAGE] Failed to record cancelled run output', {
+          error: error.message,
+          explorationId,
+        });
+      }
+    } catch (error) {
+      logger.error('[EXPLORATION_STORAGE] Error recording cancelled run output', {
+        error: error instanceof Error ? error.message : String(error),
+        explorationId,
+      });
+    }
+  }
+
+  /**
+   * Has this run been cancelled? Polled by the worker so a cancel issued on the
+   * API process reaches the engine, which runs in a different process and
+   * therefore cannot see an in-memory flag.
+   *
+   * Fails OPEN (returns false): a transient DB blip must not abort a healthy
+   * run the user never asked to stop. A missed poll just means the run stops at
+   * the next check.
+   */
+  static async isRunCancelled(explorationId: string): Promise<boolean> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('exploration_runs')
+        .select('status')
+        .eq('exploration_id', explorationId)
+        .maybeSingle();
+
+      if (error || !data) return false;
+      return (data as { status: string }).status === 'cancelled';
+    } catch {
+      return false;
     }
   }
 

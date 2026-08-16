@@ -464,9 +464,28 @@ export class TestCaseBuilder {
       (tc) => tc.testType === 'positive' && !(tc.explored && tc.steps.length > 0),
     ).length;
 
+    // Generated negative cases that will actually be WRITTEN. They are
+    // `explored:false` (never executed), so they are correctly absent from
+    // `flows` and from every outcome count — but they carry steps, so
+    // `saveTestCases` persists them just like any other case. Counting them
+    // here is what lets a surface report the true number of rows the project
+    // received without claiming these flows ran. The predicate mirrors the
+    // persistence gate exactly (`steps.length > 0`), so the two cannot drift.
+    const negativeTestCases = testCases.filter(
+      (tc) => tc.testType === 'negative' && tc.steps.length > 0,
+    ).length;
+
     return {
       pagesSurveyed: tree.getNodeCount(),
       entryPointsDiscovered: tree.getAllEntryPoints().length + branchPointCount,
+      // The two halves of the number above, reported separately because their
+      // sum is unreadable next to `pagesSurveyed`: "181 entry points / 2 pages"
+      // suggests 90 flows per page, when in truth the survey found 28 across
+      // those 2 pages and Scout contributed ~153 branch points DURING flows.
+      // Same total, but now a reader can tell breadth-of-survey from
+      // depth-of-exploration instead of inferring a broken survey.
+      surveyEntryPoints: tree.getAllEntryPoints().length,
+      branchEntryPoints: branchPointCount,
       // flowsExplored = the flows that actually produced a runnable test case,
       // i.e. exactly what `flows` holds. Same source as the outcome counts, so
       // passed + failed + blocked === flowsExplored always holds.
@@ -477,10 +496,15 @@ export class TestCaseBuilder {
       flowsSkipped,
       flowsNotExplored,
       totalStepsDiscovered: testCases.reduce((sum, tc) => sum + tc.steps.length, 0),
-      // Runnable test cases = what the panel shows and what actually persists
-      // (saveTestCases drops zero-step cases). Kept distinct from
-      // testCases.length, which still includes not_explored placeholders.
+      // Runnable test cases = what the panel's flow list shows. Kept distinct
+      // from testCases.length, which still includes not_explored placeholders.
       runnableTestCases: flows.length,
+      negativeTestCases,
+      // What actually lands in intent_test_cases: explored flows WITH steps plus
+      // the generated negatives (also step-bearing). Anything reporting "test
+      // cases added to your project" must read this, or it under-reports by one
+      // row per form flow.
+      persistedTestCases: flows.length + negativeTestCases,
       uniquePages: uniquePages.size,
       categories: Array.from(categories),
       pages,

@@ -18,9 +18,36 @@ export class BudgetTracker {
   private pagesSurveyed: number = 0;
   private mutexPromise: Promise<void> = Promise.resolve();
   private degradedTargets: Set<string> = new Set();
+  private cancelled: boolean = false;
 
   constructor(private readonly budget: ExplorationBudget) {
     this.startTime = Date.now();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CANCELLATION
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Request a cooperative stop. Every phase loop already gates on
+   * `isExhausted()`, so folding cancellation in here stops the survey BFS, the
+   * flow queue and the extra Sentinel round without threading a second signal
+   * through five call sites.
+   *
+   * Cooperative, NOT preemptive: an in-flight flow finishes its current step
+   * (a Playwright action cannot be safely torn out mid-action), so a cancel
+   * lands within roughly one step, not instantly. The partial result is still
+   * built and persisted — the work is already paid for, and discarding it would
+   * lose test cases the run genuinely discovered.
+   *
+   * One-way: a cancelled run never un-cancels.
+   */
+  cancel(): void {
+    this.cancelled = true;
+  }
+
+  isCancelled(): boolean {
+    return this.cancelled;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -29,6 +56,7 @@ export class BudgetTracker {
 
   isExhausted(): boolean {
     return (
+      this.cancelled ||
       this.isTimedOut() ||
       this.flowsCompleted >= this.budget.maxFlows ||
       this.pipelineRoundsUsed >= this.budget.maxTotalPipelineRounds
@@ -40,7 +68,10 @@ export class BudgetTracker {
   }
 
   canSurveyMorePages(): boolean {
-    return this.pagesSurveyed < this.budget.maxSurveyPages && !this.isTimedOut();
+    // Gates on `cancelled` as well as time: the survey BFS is the one loop that
+    // checks this instead of `isExhausted()`, so without it a cancel issued
+    // during Phase 1 would crawl to the page cap before stopping.
+    return this.pagesSurveyed < this.budget.maxSurveyPages && !this.isTimedOut() && !this.cancelled;
   }
 
   canExploreMoreFlows(): boolean {

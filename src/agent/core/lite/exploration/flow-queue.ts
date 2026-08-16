@@ -31,6 +31,23 @@ const COMPLEXITY_WEIGHT: Record<FlowComplexity, number> = {
   complex: 1,
 };
 
+/**
+ * Share of the flow budget that UNPLANNED entry points may consume when the
+ * Strategist produced a real plan.
+ *
+ * Why a cap and not a hard drop: the Strategist plan is an LLM output, so
+ * trusting it exclusively means one bad plan yields a near-empty suite. Why a
+ * cap at all: `fromStrategyOutput` used to enqueue every unplanned entry point
+ * after the planned ones, so on a site that discovers far more candidates than
+ * `maxFlows` (181 vs 30, measured on automationexercise.com) the tail crowded
+ * out the flows the Strategist actually chose — a run scoped to "registration"
+ * spent itself browsing brand pages.
+ *
+ * 0.3 keeps serendipitous discovery (the tail is where Scout branches land)
+ * while guaranteeing the planned flows get the majority of the budget.
+ */
+const UNPLANNED_BUDGET_SHARE = 0.3;
+
 /** Jaccard threshold for dedup on enqueue (goal text similarity) */
 const DEDUP_THRESHOLD = 0.5;
 
@@ -58,6 +75,12 @@ export class FlowQueue {
   private completed: Set<string> = new Set();
   private allGoals: Map<string, string> = new Map(); // id → goal (for dedup)
   private allNames: Set<string> = new Set();          // normalized names — dedup across all enqueued+completed
+  /**
+   * How many unplanned entry points the budget cap trimmed at construction.
+   * Surfaced so the run can SAY it narrowed the field instead of silently
+   * exploring less than it discovered.
+   */
+  unplannedDropped = 0;
   private mutexPromise: Promise<void> = Promise.resolve();
   private dedupTrace?: DedupTraceCallback;
   private saturationTrace?: PageSaturationTraceCallback;
@@ -99,7 +122,17 @@ export class FlowQueue {
   static fromStrategyOutput(
     entryPoints: EntryPoint[],
     strategy: StrategistOutput,
-    opts?: { excludeIds?: Iterable<string>; seedDedup?: { names?: Iterable<string>; goals?: Iterable<string> } },
+    opts?: {
+      excludeIds?: Iterable<string>;
+      seedDedup?: { names?: Iterable<string>; goals?: Iterable<string> };
+      /**
+       * The run's flow budget. When given (and the Strategist produced a plan),
+       * the UNPLANNED tail is capped at `UNPLANNED_BUDGET_SHARE` of it so it
+       * cannot crowd out the planned flows. Omit to keep the old
+       * enqueue-everything behaviour.
+       */
+      maxFlows?: number;
+    },
   ): FlowQueue {
     const q = new FlowQueue();
     const skipIds = new Set(strategy.skipFlows.map((s) => s.id));
@@ -152,8 +185,28 @@ export class FlowQueue {
     for (const ep of planned) {
       q.enqueueSync(ep, true);
     }
-    for (const ep of unplanned) {
+
+    // Cap the unplanned tail against the flow budget. Previously EVERY unplanned
+    // entry point was appended, so a site discovering far more candidates than
+    // it can run (181 vs maxFlows 30) let the tail consume slots the Strategist
+    // never asked for — the mechanism behind a "registration"-scoped run
+    // producing brand-browsing tests. The planned flows are already enqueued
+    // above, so the cap only ever trims the discretionary remainder.
+    //
+    // Only applies when there IS a plan: with an empty plan (Strategist failed
+    // or returned nothing) every entry point is "unplanned", and capping there
+    // would throw away the entire run rather than a tail.
+    const unplannedToEnqueue =
+      planned.length > 0 && opts?.maxFlows && opts.maxFlows > 0
+        ? unplanned.slice(0, Math.max(0, Math.ceil(opts.maxFlows * UNPLANNED_BUDGET_SHARE)))
+        : unplanned;
+
+    for (const ep of unplannedToEnqueue) {
       q.enqueueSync(ep, true);
+    }
+
+    if (unplannedToEnqueue.length < unplanned.length) {
+      q.unplannedDropped = unplanned.length - unplannedToEnqueue.length;
     }
     // Don't sort — planned order is intentional from Strategist
 

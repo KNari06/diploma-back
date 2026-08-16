@@ -25,6 +25,7 @@ import type { MobileExplorationJobData } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileExplorationRelay } from '@/services/mobile/mobile-exploration-relay';
 import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
+import { buildExplorationChatActions } from '@/services/testing/exploration/exploration-chat-actions';
 import { AppSkeletonService } from '@/services/testing/exploration/app-skeleton.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { ChatService } from '@/services/utils/chat.service';
@@ -32,6 +33,16 @@ import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.se
 import { MOBILE_STEP_CREDIT_MULTIPLIER } from '@/services/core/token-calculator.service';
 import { EXPLORATION_DISCOVERY_CREDITS } from '@/config/testing/intelligent-test-limits';
 import { logger } from '@/utils/core/logger';
+
+/**
+ * How often the job re-reads the run row to see whether the user cancelled.
+ *
+ * 5s: a mobile crawl runs for minutes and holds an emulator, so the cost of
+ * one indexed lookup is nothing next to leaving a device pinned after the user
+ * asked to stop. Not faster, because the runner still needs a moment to wind
+ * the agent down and a tighter poll would not shorten that.
+ */
+const CANCEL_POLL_INTERVAL_MS = 5_000;
 
 export class MobileExplorationRunJobHandler {
   static async process(job: Job<MobileExplorationJobData>): Promise<void> {
@@ -95,7 +106,45 @@ export class MobileExplorationRunJobHandler {
       });
       relay.start();
 
-      const outcome = await relay.waitUntilDone();
+      // Cross-process cancel. `POST /explorations/:id/cancel` flips the DB row
+      // on the API process; the crawl runs on the RUNNER, so neither an
+      // in-memory flag nor the web engine's BudgetTracker can reach it. Poll
+      // the row and forward the stop to the runner, which is the only actor
+      // that can actually halt the agent and free the emulator.
+      //
+      // Without this a mobile run could not be stopped at all: the endpoint
+      // marked it cancelled while the crawl kept going to its full budget,
+      // holding a device the whole time.
+      const cancelPoll = setInterval(() => {
+        void (async () => {
+          try {
+            if (!(await ExplorationStorageService.isRunCancelled(explorationId))) return;
+            clearInterval(cancelPoll);
+            logger.info('[MOBILE_EXPLORATION_JOB] Cancellation requested — stopping runner', {
+              explorationId, runnerRunId,
+            });
+            // Runner first (it owns the device); the relay teardown follows so
+            // we stop forwarding events for a run that is going away. Both are
+            // idempotent, and a failure here must not mask the user's intent.
+            await client.cancelExploration(runnerRunId, { userId }).catch((err) => {
+              logger.warn('[MOBILE_EXPLORATION_JOB] Runner cancel failed', {
+                explorationId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            });
+            relay?.stop();
+          } catch {
+            // A failed poll is not a cancellation — try again next tick.
+          }
+        })();
+      }, CANCEL_POLL_INTERVAL_MS);
+
+      let outcome;
+      try {
+        outcome = await relay.waitUntilDone();
+      } finally {
+        clearInterval(cancelPoll);
+      }
 
       // 4a. Persist + summarise.
       if (outcome.status === 'completed') {
@@ -103,14 +152,17 @@ export class MobileExplorationRunJobHandler {
         // no cases — fetch the final result snapshot and persist the
         // discovered cases ourselves (mirrors the web job's saveTestCases).
         let savedCount = 0;
+        // Hoisted out of the try below so the chat metadata can carry the
+        // persisted ids — they are the authoritative set of what landed.
+        let savedIds: string[] = [];
         let summary: Record<string, unknown> = outcome.summary;
         try {
           const snapshot = await client.getExplorationResult(runnerRunId, { userId });
           const flows = Array.isArray((snapshot as { flows?: unknown[] }).flows)
             ? (snapshot as { flows: Parameters<typeof ExplorationStorageService.saveMobileTestCasesFromSnapshot>[0] }).flows
             : [];
-          const savedIds = await ExplorationStorageService.saveMobileTestCasesFromSnapshot(
-            flows, projectId, userId, platform,
+          savedIds = await ExplorationStorageService.saveMobileTestCasesFromSnapshot(
+            flows, projectId, userId, platform, explorationId,
           );
           savedCount = savedIds.length;
 
@@ -208,16 +260,50 @@ export class MobileExplorationRunJobHandler {
               `**Mobile exploration complete**\n\n` +
               `Explored **${appId}** (${platform}).\n\n` +
               `- Test cases generated: ${savedCount}\n` +
+              // Same honesty fix as the web path: users read "N generated" as
+              // "N things I still have to save", go looking for a save button,
+              // and conclude the run was lost. They are drafts already.
+              (savedCount > 0
+                ? `\n${savedCount} test case(s) were **saved to your project as drafts** — open them below.\n\n`
+                : '\n') +
               `Exploration ID: \`${explorationId}\``,
-            metadata: { explorationId, mode: 'exploration', platform, appId, testCasesCount: savedCount },
+            metadata: {
+              explorationId,
+              mode: 'exploration',
+              platform,
+              appId,
+              testCasesCount: savedCount,
+              savedTestCaseIds: savedIds,
+              // Without these the finished message is a dead end: the mobile
+              // live panel is component state, so closing it removes every
+              // route back to the run. Same framework, same reasoning as web.
+              actions: buildExplorationChatActions(explorationId, savedCount),
+            },
           }]).catch(() => {});
         }
 
         logger.info('[MOBILE_EXPLORATION_JOB] completed', {
           explorationId, appId, platform, testCases: savedCount,
         });
+      } else if (await ExplorationStorageService.isRunCancelled(explorationId)) {
+        // 4b. Stopped on the user's request. The relay ends as `stopped`, which
+        // is indistinguishable here from a crash — so ASK the row, which the
+        // cancel endpoint already flipped. Writing `failRun` would relabel a
+        // deliberate stop as a failure and bury it in the failure metrics.
+        // The status stays 'cancelled'; nothing is charged (the charge only
+        // runs on the completed branch above).
+        logger.info('[MOBILE_EXPLORATION_JOB] cancelled by user', { explorationId, appId });
+        webSocketService.emitExplorationCompleted({
+          explorationId,
+          testCasesCount: 0,
+          summary: {},
+          status: 'cancelled',
+          timestamp: new Date().toISOString(),
+          chatSessionId,
+          userId,
+        });
       } else {
-        // 4b. Failed / never reported done.
+        // 4c. Failed / never reported done.
         const msg = outcome.errorMessage || 'Mobile exploration ended without completion';
         await ExplorationStorageService.failRun(explorationId, msg);
         webSocketService.emitExplorationCompleted({

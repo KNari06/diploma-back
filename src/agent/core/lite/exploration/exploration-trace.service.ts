@@ -121,7 +121,10 @@ export class ExplorationTraceService {
   }
 
   writeExplorationEnd(data: {
-    status: 'completed' | 'failed';
+    // 'cancelled' is a distinct outcome from both: the run neither finished its
+    // phases nor errored, so folding it into either would misreport why the
+    // trace stops early.
+    status: 'completed' | 'failed' | 'cancelled';
     durationMs: number;
     testCasesCount: number;
     summary: Record<string, any>;
