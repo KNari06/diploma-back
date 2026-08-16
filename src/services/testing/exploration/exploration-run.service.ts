@@ -3,9 +3,10 @@ import { NotFoundError, ValidationError } from '@/types';
 import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import {
-  fetchExplorationProject,
-  fetchOwnedTestCaseIds,
+  fetchExplorationProjectUnscoped,
+  fetchAccessibleTestCaseIds,
 } from '@/services/testing/exploration/db/exploration-run.db';
+import { hasProjectAccess } from '@/services/core/project-access.service';
 
 export interface RunDiscoveredResult {
   runId: string;
@@ -37,15 +38,20 @@ export class ExplorationRunService {
       throw new ValidationError('testCaseIds must be a non-empty array');
     }
 
-    const projectId = await fetchExplorationProject(explorationId, userId);
-    if (!projectId) {
+    // Authorize by project access (owner OR workspace member) rather than by
+    // who started the run — `/explorations/start` already admits any member, so
+    // an owner-only check here meant a teammate could start an exploration and
+    // then be unable to run what it found.
+    const projectId = await fetchExplorationProjectUnscoped(explorationId);
+    if (!projectId || !(await hasProjectAccess(projectId, userId))) {
       throw new NotFoundError('Exploration', explorationId);
     }
 
-    // Ownership + project scoping: only run cases the user actually owns in
-    // this project. Silently drops foreign/unknown ids rather than 403'ing
-    // the whole batch (the FE sends ids it just rendered).
-    const ownedIds = await fetchOwnedTestCaseIds(testCaseIds, projectId, userId);
+    // Project scoping: only run cases belonging to THIS exploration's project.
+    // Scoped by project rather than `user_id` for the same reason — the rows
+    // are owned by whoever started the run. Silently drops foreign/unknown ids
+    // rather than 403'ing the whole batch (the FE sends ids it just rendered).
+    const ownedIds = await fetchAccessibleTestCaseIds(testCaseIds, projectId);
     if (ownedIds.length === 0) {
       throw new ValidationError('No runnable test cases found for this exploration');
     }

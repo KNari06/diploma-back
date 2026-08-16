@@ -6,7 +6,7 @@
  * a sensitive value into the step.
  */
 
-import { commandToStep } from '../pipeline-step-extractor';
+import { commandToStep, extractDiscoveredSteps } from '../pipeline-step-extractor';
 import type { ExecutedCommand } from '../../pipeline/types';
 
 function exec(
@@ -207,5 +207,108 @@ describe('commandToStep — assert_text (deterministic assertion authoring)', ()
       '',
     );
     expect(step!.description).toBe('Result count shows one match');
+  });
+});
+
+describe('extractDiscoveredSteps — consecutive duplicate collapsing', () => {
+  /**
+   * Build a pipeline result of rounds, each holding the given commands.
+   * `pageSnapshotBefore` carries the URL the round ran on.
+   */
+  const rounds = (spec: Array<{ url: string; cmds: ExecutedCommand[] }>) =>
+    ({
+      rounds: spec.map((r) => ({
+        pageSnapshotBefore: `URL: ${r.url}\nTitle: t`,
+        commands: r.cmds,
+      })),
+    }) as any;
+
+  /** A click whose compiled plan pins the same element across rounds. */
+  const clickHM = () =>
+    exec('click_element', { ref: 'e5' }, { output: 'Clicked "(5) H&M" (a)' });
+
+  it('collapses the same click repeated across rounds (the reported bug)', async () => {
+    // Real prod case: the agent clicked "H&M" on /brand_products/Polo, landed on
+    // /Biba instead, and clicked "H&M" again — BOTH were saved as test steps, so
+    // the test replayed the agent's wandering.
+    const { steps } = await extractDiscoveredSteps(
+      rounds([
+        { url: 'https://ex.com/brand_products/Polo', cmds: [clickHM()] },
+        { url: 'https://ex.com/brand_products/Biba', cmds: [clickHM()] },
+      ]),
+    );
+    expect(steps).toHaveLength(1);
+    expect(steps[0].stepNumber).toBe(1);
+  });
+
+  it('collapses a repeated navigate to the same URL', async () => {
+    const nav = () => exec('navigate_to', { url: 'https://ex.com/a' });
+    const { steps } = await extractDiscoveredSteps(
+      rounds([{ url: 'https://ex.com', cmds: [nav(), nav()] }]),
+    );
+    expect(steps).toHaveLength(1);
+  });
+
+  it('keeps a repeat that is NOT consecutive — reopening a control is valid', async () => {
+    const { steps } = await extractDiscoveredSteps(
+      rounds([
+        {
+          url: 'https://ex.com',
+          cmds: [
+            exec('click_element', { ref: 'menu' }, { output: 'Clicked "Menu" (button)' }),
+            exec('click_element', { ref: 'item' }, { output: 'Clicked "Item" (a)' }),
+            exec('click_element', { ref: 'menu' }, { output: 'Clicked "Menu" (button)' }),
+          ],
+        },
+      ]),
+    );
+    expect(steps).toHaveLength(3);
+    expect(steps.map((s) => s.stepNumber)).toEqual([1, 2, 3]);
+  });
+
+  it('never collapses a repeated fill — retyping can be a deliberate correction', async () => {
+    const fill = () => exec('fill_field', { ref: 'e1', value: 'abc' }, { output: 'Filled "Email"' });
+    const { steps } = await extractDiscoveredSteps(
+      rounds([{ url: 'https://ex.com', cmds: [fill(), fill()] }]),
+    );
+    expect(steps).toHaveLength(2);
+  });
+
+  it('keeps step numbering contiguous after a collapse', async () => {
+    const { steps } = await extractDiscoveredSteps(
+      rounds([
+        { url: 'https://ex.com', cmds: [clickHM(), clickHM()] },
+        {
+          url: 'https://ex.com/next',
+          cmds: [exec('click_element', { ref: 'x' }, { output: 'Clicked "Next" (a)' })],
+        },
+      ]),
+    );
+    // No gap where the duplicate was removed.
+    expect(steps.map((s) => s.stepNumber)).toEqual([1, 2]);
+  });
+
+  it('points a fully-collapsed round at the surviving step, not null', async () => {
+    // stepsByRound feeds FlowRunner's network attribution; a null for a round
+    // that DID act would silently drop that round's captured calls.
+    const { stepsByRound } = await extractDiscoveredSteps(
+      rounds([
+        { url: 'https://ex.com/a', cmds: [clickHM()] },
+        { url: 'https://ex.com/b', cmds: [clickHM()] },
+      ]),
+    );
+    expect(stepsByRound).toEqual([0, 0]);
+  });
+
+  it('still drops failed commands', async () => {
+    const { steps } = await extractDiscoveredSteps(
+      rounds([
+        {
+          url: 'https://ex.com',
+          cmds: [exec('click_element', { ref: 'e1' }, { success: false, output: 'nope' })],
+        },
+      ]),
+    );
+    expect(steps).toHaveLength(0);
   });
 });

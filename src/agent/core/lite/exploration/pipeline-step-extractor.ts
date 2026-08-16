@@ -328,10 +328,69 @@ export async function attachCompiledPlan(
 }
 
 /**
+ * Identity of a step for consecutive-repeat detection.
+ *
+ * An agent that clicks the same control twice — because the first click did not
+ * land where it expected, or a round was retried — records BOTH clicks, and the
+ * saved test then replays the agent's wandering instead of the scenario. Keyed
+ * on what the step DOES (action + target + value), deliberately NOT on
+ * `pageUrl`: the observed repeat was the same click captured on two different
+ * pages (clicked "H&M" on /brand_products/Polo, landed on /Biba, clicked "H&M"
+ * again), so including the URL would treat those as distinct and miss it.
+ *
+ * `targetFingerprint.href`/`text` come from the compiled plan, so two clicks on
+ * the same element match even when their snapshot-local `ref` ids differ
+ * between rounds — `ref` alone is not stable across a re-render.
+ */
+function stepIdentity(step: DiscoveredStep): string {
+  const fp = (step.compiled as any)?.targetFingerprint;
+  const box = fp?.boundingBox;
+  // POSITION is part of the identity. A product listing has many "Add to cart"
+  // links sharing tag / href (`javascript:void();`) / text / role and even the
+  // same primary locator — they differ ONLY by where they sit. Two in a row are
+  // two different products, not a retry; without the box this would delete a
+  // real step. A true retry re-clicks the SAME element, so its box matches.
+  // Rounded to whole pixels so sub-pixel layout jitter can't defeat that match.
+  const position =
+    box && typeof box.x === 'number' && typeof box.y === 'number'
+      ? `${Math.round(box.x)},${Math.round(box.y)}`
+      : '';
+  const target = fp
+    ? `${fp.tag ?? ''}|${fp.href ?? ''}|${fp.text ?? ''}|${fp.role ?? ''}|${position}`
+    : `${step.ref ?? ''}|${step.selector ?? ''}`;
+  return [step.action, target, step.value ?? '', step.description ?? ''].join('§');
+}
+
+/**
+ * Should this step be dropped as an immediate repeat of the previous one?
+ *
+ * Only CONSECUTIVE repeats are collapsed. A test can legitimately hit the same
+ * control again later (open a menu, do something, reopen it) — dropping every
+ * later match would silently break those flows. Two identical actions back to
+ * back, though, are never intentional: the second is the agent retrying.
+ *
+ * `navigate` is included because the same URL twice in a row is pure noise, and
+ * it is the other repeat visible in the reported run.
+ */
+function isConsecutiveRepeat(step: DiscoveredStep, previous: DiscoveredStep | undefined): boolean {
+  if (!previous) return false;
+  if (step.action !== previous.action) return false;
+  // Only collapse actions that are idempotent to re-issue. A repeated `fill`
+  // may be a deliberate correction (clear + retype), and repeated `press`
+  // (e.g. ArrowDown twice) is meaningful input, not noise.
+  if (step.action !== 'click' && step.action !== 'navigate') return false;
+  return stepIdentity(step) === stepIdentity(previous);
+}
+
+/**
  * Extract DiscoveredStep[] from pipeline execution rounds, attaching a compiled
  * locator plan to each element-targeting step. Keeps ONLY successful commands
  * (failed ones are noise). `stepsByRound[i]` = index into `steps` of the LAST
  * step produced by round i (or null) — used by FlowRunner's network attribution.
+ *
+ * Consecutive duplicate clicks/navigations are collapsed — see
+ * `isConsecutiveRepeat`. Measured on a prod run: 11 of 34 discovered cases
+ * carried 32 such repeats, so the saved test re-played the agent's retries.
  */
 export async function extractDiscoveredSteps(
   result: TestPipelineResult,
@@ -351,8 +410,24 @@ export async function extractDiscoveredSteps(
 
       const step = commandToStep(executed, stepNumber + 1, roundPageUrl, secretKeyForKind);
       if (step) {
-        step.stepNumber = ++stepNumber;
+        // Compile BEFORE the repeat check — the fingerprint it attaches is what
+        // makes two clicks on the same element comparable across rounds.
         await attachCompiledPlan(step, executed, roundPageUrl, page);
+
+        if (isConsecutiveRepeat(step, steps[steps.length - 1])) {
+          // Point this round at the step the repeat collapsed into, so network
+          // attribution still resolves to a real index instead of null.
+          lastStepIdxInRound = steps.length - 1;
+          logger.debug('[PIPELINE_STEP_EXTRACTOR] Dropped consecutive duplicate step', {
+            action: step.action,
+            description: step.description,
+          });
+          continue;
+        }
+
+        // Numbering is assigned only to steps we KEEP, so the saved test has a
+        // contiguous 1..N sequence with no gaps where duplicates were removed.
+        step.stepNumber = ++stepNumber;
         steps.push(step);
         lastStepIdxInRound = steps.length - 1;
       }

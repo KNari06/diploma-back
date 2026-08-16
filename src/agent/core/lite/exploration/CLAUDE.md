@@ -213,8 +213,8 @@
    excluded for a STRUCTURAL reason (its replay cannot reproduce its own login), not
    out of caution, and widening that list would silently gut `e_commerce`/`crud`.
 
-25. **Every user-facing exploration COUNT derives from `summary.flows`, and `flows`
-   equals what PERSISTS.** `TestCaseBuilder.buildSummary` builds `flows` with ONE
+25. **Every user-facing exploration COUNT derives from `summary.flows` — but
+   `flows` is NOT everything that persists (see #27).** `TestCaseBuilder.buildSummary` builds `flows` with ONE
    filter — `tc.explored && tc.steps.length > 0`, the exact rule `saveTestCases`
    uses — and then derives `flowsPassed/Failed/Blocked` (`flows.filter(status)`),
    `flowsExplored` (`flows.length`) and `runnableTestCases` (`flows.length`) from
@@ -248,3 +248,82 @@
    with the visited count. Live (`page_discovered` events) still shows the survey count
    and jumps to the visited count on history load — correct direction, same live-vs-final
    pattern as the flow counts; do not try to stream flow-visited pages live.
+27. **"What we EXPLORED" and "what we WROTE" are two different numbers — pick the
+   one that answers the question.** Generated negative cases are `explored:false`
+   (nothing ever ran them) so they are correctly absent from `summary.flows` and from
+   every outcome count — but they carry 3 steps, and `saveTestCases` persists anything
+   step-bearing, so they DO become `intent_test_cases` rows. Reporting `flows.length`
+   as the test-case total therefore under-counted by one row per form flow: the history
+   card said 3 while the project gained 5 and `/explorations/:id/test-cases` (which
+   returns every row for the run) listed 5. Not an edge case — `FORM_CATEGORIES` is
+   `authentication` / `form_submission` / `user_management` / `e_commerce`.
+   `buildSummary` now emits three numbers: `runnableTestCases` (= `flows.length`,
+   explored flows — the panel's flow list), `negativeTestCases`, and
+   `persistedTestCases` (their sum = exactly what `saveTestCases` writes).
+   **Route each consumer by its question:** "what did my project receive" →
+   `persistedTestCases` (`exploration_runs.test_cases_count`, the chat "Test cases
+   generated" line + metadata, the WS completion event, `coverage_evaluated`); "what
+   did we actually explore" → `runnableTestCases`. **BILLING stays on
+   `runnableTestCases`** — a negative is a template derived from a flow already being
+   charged for, so billing on it would charge 10cr for a run where every real flow
+   failed, exactly the contradiction #9 exists to prevent. Negatives get their own
+   chat line rather than being folded into the explored total: a saved-but-unverified
+   case must never be presented as one we ran.
+28. **Exploration reads authorize on PROJECT ACCESS, not on who started the run.**
+   `/explorations/start` admits any workspace member (`projectBelongsToWorkspace` has
+   no owner requirement) while every read filtered `exploration_runs.user_id = caller`
+   — so a teammate could start a run against a shared project and then 404 on its own
+   results, with `run-discovered` silently dropping every case. All reads + cancel now
+   go through `resolveAccessibleExploration` → `hasProjectAccess` (owner OR active
+   member), and the row queries scope by `project_id` + `exploration_id` instead of
+   `user_id` (the rows are owned by whoever started the run). **The project bound is
+   load-bearing:** it is what stops a caller passing an id from another project once
+   the ownership filter is gone. **`listExplorations`' `workspaceId` comes from the
+   QUERY STRING** — it was safe only because of the `user_id` filter, so it now
+   verifies membership (`WorkspaceAccessService.isMember`) BEFORE widening; dropping
+   that filter without the check would have turned it into an IDOR.
+29. **Cancellation is cooperative, cross-process, and keeps the partial result.**
+   `POST /explorations/:id/cancel` flips `exploration_runs.status` — the flip IS the
+   signal, because the endpoint runs on the API process and the engine runs in the
+   worker, so no in-memory flag could reach it. The worker polls `isRunCancelled` via
+   `ExplorationConfig.onCancelCheck` at the engine's phase boundaries AND once per
+   `FlowRunner.runAll` iteration (after each flow completes). **Both are needed:** the
+   engine's two checks alone would make a cancel issued during Phase 2 wait out the
+   whole flow phase, because that phase is one `await`. The stop folds into
+   `BudgetTracker.cancel()` so `isExhausted()` stays the SINGLE stop condition for the
+   survey BFS, the flow queue and the Sentinel extra round (`canSurveyMorePages` gates
+   on it too — it checks time, not `isExhausted`, so it needed its own guard).
+   A cancelled run **still builds, saves and traces its partial output** (the browser
+   and LLM spend is already sunk; discarding real test cases would punish stopping),
+   keeps `status:'cancelled'` via `recordCancelledRunOutput` rather than being
+   relabelled `completed`, and is **never charged** — that asymmetry is deliberate, so
+   nobody lets a bad run burn its full budget to avoid an ambiguous charge. Like a
+   resume, it refuses to fabricate a coverage score: the Sentinel never ran, so
+   `coverageScore` stays undefined instead of reporting 0.
+30. **The UNPLANNED tail is capped against the flow budget, and the entry-point
+   count is reported in its two halves.** Measured on a real prod run
+   (automationexercise.com, `scopeHint:"registration"`): 181 entry points discovered
+   against `maxFlows: 30`, and the run produced brand-browsing tests instead of
+   registration ones — 44% of its saved cases had ≤1 real action
+   (`navigate → click → ai_check`, i.e. "the page loaded").
+   **Cause:** `fromStrategyOutput` enqueued planned flows first and then EVERY
+   unplanned entry point, so on a site discovering far more candidates than it can
+   run, the tail consumed the slots the Strategist chose. `scopeHint` could not save
+   it — the hint reaches four PROMPTS but no code path filters the queue, so it is
+   advisory only.
+   **Fix:** `opts.maxFlows` caps the unplanned tail at `UNPLANNED_BUDGET_SHARE`
+   (0.3) of the budget. A cap, NOT a hard drop: the plan is an LLM output, and
+   trusting it exclusively means one bad plan yields a near-empty suite. Applied at
+   all three `fromStrategyOutput` sites (Phase 1.5, its targeted-survey rebuild, and
+   the Sentinel's focused extra round — the focused round needs it for the same
+   reason). **Skipped when the plan is EMPTY** (Strategist failed / returned
+   nothing): every entry point is then "unplanned", and capping would discard the
+   whole run rather than a tail. `queue.unplannedDropped` records the trim and the
+   engine emits an `agent_warning` — a silently narrowed field is the exact
+   invisible-degradation class this audit keeps finding.
+   **Reporting:** `entryPointsDiscovered` stays (back-compat) but is now
+   accompanied by `surveyEntryPoints` + `branchEntryPoints`. The sum was unreadable
+   next to `pagesSurveyed` — "181 entry points / 2 pages" implies 90 per page, when
+   the survey found 28 across those 2 and Scout contributed ~153 branch points
+   DURING flows (`branchPointCount` is uncapped). Same total, but breadth-of-survey
+   is now distinguishable from depth-of-exploration.

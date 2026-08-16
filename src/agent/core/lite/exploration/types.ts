@@ -108,6 +108,18 @@ export interface ExplorationConfig {
   workspaceId?: string;
   /** Optional callback for real-time progress reporting */
   onProgress?: ExplorationProgressCallback;
+  /**
+   * Optional cancellation probe, polled between phases and between flow
+   * batches. Resolving `true` stops the run cooperatively: the engine finishes
+   * what is in flight, then builds and persists the PARTIAL result rather than
+   * discarding work the user already paid for.
+   *
+   * A cancel is issued on the API process while the engine runs in the worker,
+   * so this cannot be an in-memory flag — the job backs it with a DB read.
+   * Must never throw; the engine treats a rejection as "not cancelled" so a
+   * transient failure can't kill a healthy run.
+   */
+  onCancelCheck?: () => Promise<boolean>;
   /** Rate limiting configuration for external requests */
   rateLimiting?: RateLimitingConfig;
 }
@@ -761,8 +773,17 @@ export interface ExplorationResult {
 export interface ExplorationSummary {
   /** Total pages surveyed */
   pagesSurveyed: number;
-  /** Total entry points discovered */
+  /**
+   * Total entry points discovered = `surveyEntryPoints + branchEntryPoints`.
+   * Kept for back-compat; prefer the two components when displaying, since the
+   * sum reads as nonsense beside `pagesSurveyed` (181 vs 2 pages).
+   */
   entryPointsDiscovered: number;
+  /** Entry points found by the Phase 1 survey (bounded by `maxSurveyPages`). */
+  surveyEntryPoints: number;
+  /** Branch points Scout found DURING flow execution — uncapped, and the reason
+   * `entryPointsDiscovered` can dwarf the surveyed page count. */
+  branchEntryPoints: number;
   /** Total flows explored */
   flowsExplored: number;
   /** Successful flows */
@@ -781,12 +802,34 @@ export interface ExplorationSummary {
    */
   flowsNotExplored: number;
   /**
-   * Runnable test cases = `flows.length`. This is what the results panel renders
-   * and what actually persists (zero-step placeholders are dropped on save). Use
-   * this for user-facing "test cases" counts, NOT `testCases.length`, which still
-   * includes not_explored placeholders.
+   * Runnable test cases discovered from EXPLORED FLOWS = `flows.length`. This is
+   * what the results panel's flow list renders. Use this for user-facing "flows"
+   * counts, NOT `testCases.length`, which still includes not_explored placeholders.
+   *
+   * NOTE: this is deliberately NOT the number of rows written to
+   * `intent_test_cases` — generated negative cases also persist. Use
+   * `persistedTestCases` for anything that must match what the project received.
    */
   runnableTestCases: number;
+  /**
+   * Generated negative ("Empty Submit Validation") cases. These are `explored:
+   * false` — never executed — so they are excluded from `flows` and from every
+   * outcome count, but they DO carry steps and therefore DO persist as real
+   * `intent_test_cases` rows (see `saveTestCases`, which only drops step-less
+   * cases). Counted separately so a surface can report what the project actually
+   * received without pretending these flows ran.
+   */
+  negativeTestCases: number;
+  /**
+   * Total rows this run persists = `runnableTestCases + negativeTestCases`, i.e.
+   * exactly the cases passing `saveTestCases`'s `steps.length > 0` gate.
+   *
+   * This is the ONLY honest answer to "how many test cases did this run add to my
+   * project?". `runnableTestCases` alone under-reports by one row per form flow,
+   * so the history card said 3 while the project gained 5 and the `/test-cases`
+   * endpoint (which returns every row for the run) listed 5.
+   */
+  persistedTestCases: number;
   /** Total steps discovered */
   totalStepsDiscovered: number;
   /** Unique pages visited */

@@ -1467,7 +1467,11 @@ export interface ExplorationCompletedPayload {
   explorationId: string;
   testCasesCount: number;
   summary: Record<string, any>;
-  status: 'completed' | 'failed';
+  /**
+   * 'cancelled' is terminal like the other two, but distinct: the run stopped
+   * on user request, may still carry saved test cases, and was not charged.
+   */
+  status: 'completed' | 'failed' | 'cancelled';
   errorMessage?: string;
   timestamp: string;
   chatSessionId?: string;

@@ -11,6 +11,7 @@ import { DEFAULT_EXPLORATION_BUDGET } from '@/agent/core/lite/exploration/types'
 import { validateAuthFixture, isAuthFixtureNonEmpty } from '@/agent/core/lite/exploration/auth-fixture';
 import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
 import { classifyExplorationFailure } from '@/services/testing/exploration/classify-failure';
+import { buildExplorationChatActions } from '@/services/testing/exploration/exploration-chat-actions';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
@@ -22,6 +23,7 @@ import { logger } from '@/utils/core/logger';
 // this is for cost analytics only. The credit amount itself lives in
 // intelligent-test-limits.ts so the /start gate and this charge stay in sync.
 const EXPLORATION_DISCOVERY_COST_USD = 0.01;
+
 
 export class ExplorationRunJobHandler {
   static async process(job: Job<ExplorationJobData>): Promise<void> {
@@ -141,6 +143,11 @@ export class ExplorationRunJobHandler {
         preset,
         maxConcurrency: maxConcurrency || 2, // Default 2 to avoid OpenAI TPM rate limits
         rateLimiting,
+        // Cross-process cancel signal. The endpoint runs on the API process and
+        // flips the DB row; the engine runs here, so a DB read is the only way
+        // it can see the request. Polled at phase boundaries, not per step —
+        // this is one indexed lookup on a run that lasts minutes.
+        onCancelCheck: () => ExplorationStorageService.isRunCancelled(explorationId),
         onProgress: (event) => {
           webSocketService.emitExplorationProgress({
             explorationId,
@@ -202,8 +209,20 @@ export class ExplorationRunJobHandler {
         result = await engine.run(onResultReady);
       }
 
-      // Mark run as completed
-      await ExplorationStorageService.completeRun(explorationId, result);
+      // Did the user stop this run? Re-read rather than infer from the result:
+      // the cancel lands on the API process at an arbitrary moment, and only the
+      // row knows. Checked BEFORE completeRun so a cancelled run is never
+      // relabelled 'completed'.
+      const wasCancelled = await ExplorationStorageService.isRunCancelled(explorationId);
+
+      if (wasCancelled) {
+        // Keep the 'cancelled' status (completeRun would overwrite it) but
+        // record what the partial run actually produced, so the history card
+        // and the results panel still show the saved test cases.
+        await ExplorationStorageService.recordCancelledRunOutput(explorationId, result);
+      } else {
+        await ExplorationStorageService.completeRun(explorationId, result);
+      }
 
       // Charge the fixed discovery cost once, on success — but ONLY when the run
       // actually produced something. A zero-test-case run means the user got no
@@ -218,17 +237,16 @@ export class ExplorationRunJobHandler {
       // point, so a run that surveyed pages and then explored nothing (budget
       // exhausted, every flow blocked) would still bill — the exact case this
       // gate exists to catch. Count only cases with at least one replayable step.
-      // MUST be the same number the user is shown. Every user-facing count reads
-      // `summary.runnableTestCases` (chat reply, WS completion event, history
-      // card) — billing was the one consumer still filtering `result.testCases`
-      // itself, on the LOOSER `steps.length > 0` rule.
       //
-      // The two disagree on generated NEGATIVE cases: those carry 3 steps but
-      // `explored:false`, so they counted as billable while being excluded from
-      // the runnable total. A run where every flow failed but produced one
-      // negative case therefore charged 10 credits while telling the user it
-      // generated 0 test cases — the exact contradiction invariant #9 exists to
-      // prevent, reintroduced through a second source of truth.
+      // Billing tracks EXPLORED FLOWS (`runnableTestCases`), never the persisted
+      // row count. Generated negatives carry 3 steps and do persist, but nothing
+      // ever executed them — they are a template derived from a flow the user is
+      // already being charged for. Billing on them would charge 10 credits for a
+      // run where every real flow failed, which is the contradiction invariant #9
+      // exists to prevent. So: `persistedTestCases` answers "what did my project
+      // receive", `runnableTestCases` answers "what did we actually explore", and
+      // only the latter is billable. The no-charge chat copy below is gated on
+      // this same variable, so "you were not charged" can never contradict it.
       const billableTestCases = result.summary.runnableTestCases;
 
       // A RESUME must never charge again. `deductCreditsForTest` is not idempotent
@@ -236,7 +254,12 @@ export class ExplorationRunJobHandler {
       // so each of up to 3 resume attempts billed another 10 credits for the SAME
       // exploration — up to 40cr for one logical run. The fresh attempt is the one
       // that creates the run record, so it is the one that pays.
-      if (billableTestCases > 0 && !isResume) {
+      // A cancelled run is never charged, even if it explored flows before the
+      // stop. The user did not receive the run they asked for, and they keep
+      // whatever was discovered — that asymmetry is deliberate: it makes
+      // cancelling safe, so nobody lets a bad run burn its full budget just to
+      // avoid an ambiguous charge.
+      if (billableTestCases > 0 && !isResume && !wasCancelled) {
         try {
           await CreditCostTrackerService.deductCreditsForTest({
             userId,
@@ -272,33 +295,66 @@ export class ExplorationRunJobHandler {
         // charged" is always true when we say it — `result.testCases.length`
         // would be non-zero for a placeholder-only run and contradict the charge.
         const producedNothing = billableTestCases === 0;
-        const header = producedNothing
+        // Cancellation gets its own header: neither "Complete" (it wasn't) nor
+        // the no-test-cases diagnostic above (which blames the site for
+        // something the user chose to do), and it must say the work so far was
+        // kept, or the user assumes cancelling threw everything away.
+        const header = wasCancelled
+          ? `**Exploration cancelled**\n\n` +
+            `Stopped **${entryUrl}** at your request. ` +
+            `${producedNothing ? 'Nothing runnable had been discovered yet.' : 'Everything discovered before the stop was saved below.'} ` +
+            `You were not charged.\n\n`
+          : producedNothing
           ? `**Exploration finished — no test cases**\n\n` +
             `I reached **${entryUrl}** but couldn't derive any runnable tests. ` +
             `Common causes: the pages need a login (provide credentials), the content is ` +
             `static, or the flows were blocked. You were not charged.\n\n`
           : `**Exploration Complete**\n\n` + `Explored **${entryUrl}** autonomously.\n\n`;
-        // "Test cases generated" must equal what the results panel shows and what
-        // actually persists — `summary.runnableTestCases` (= flows.length), NOT
-        // `result.testCases.length`, which still counts zero-step not_explored
-        // placeholders. Reporting the raw length made the chat claim more tests
-        // than the panel listed ("34 generated" vs "All (22)"). The not-explored
-        // count is surfaced separately when non-zero rather than silently folded in.
+        // "Test cases generated" must equal what the run actually WROTE to the
+        // project — `summary.persistedTestCases`. NOT `result.testCases.length`,
+        // which counts zero-step not_explored placeholders that are dropped on
+        // save (that made the chat claim "34 generated" against a panel listing
+        // 22), and NOT `runnableTestCases`, which omits the generated negatives
+        // that do persist (that under-reported by one row per form flow, so the
+        // user was told 3 while `/test-cases` returned 5). The negatives get
+        // their own line rather than being folded in silently: they are real
+        // saved rows, but they were never executed, so presenting them as part
+        // of the explored total would overstate what we verified.
         const notExploredLine =
           summary.flowsNotExplored > 0
             ? `- Not explored (skipped/timed out): ${summary.flowsNotExplored}\n`
+            : '';
+        const negativeLine =
+          summary.negativeTestCases > 0
+            ? `- Validation cases generated (not executed): ${summary.negativeTestCases}\n`
             : '';
         const replyMessage =
           header +
           `**Results:**\n` +
           `- Pages surveyed: ${summary.pagesSurveyed}\n` +
-          `- Entry points discovered: ${summary.entryPointsDiscovered}\n` +
+          // Split, because "181 entry points" beside "2 pages surveyed" reads as
+          // a broken survey. Most of that total is Scout branch points found
+          // during flows, not candidates sitting on the surveyed pages.
+          `- Entry points discovered: ${summary.entryPointsDiscovered}` +
+          (summary.branchEntryPoints > 0
+            ? ` (${summary.surveyEntryPoints} from survey, ${summary.branchEntryPoints} found during flows)`
+            : '') +
+          `\n` +
           `- Flows explored: ${summary.flowsExplored}\n` +
           `- Passed: ${summary.flowsPassed} | Failed: ${summary.flowsFailed} | Blocked: ${summary.flowsBlocked}\n` +
-          `- Test cases generated: ${summary.runnableTestCases}\n` +
+          `- Test cases generated: ${summary.persistedTestCases}\n` +
+          negativeLine +
           notExploredLine +
           `- Total steps discovered: ${summary.totalStepsDiscovered}\n` +
           `- Duration: ${Math.round(result.durationMs / 1000)}s\n\n` +
+          // Say the cases are ALREADY saved. Users read "Test cases generated: N"
+          // as "N things I still have to save somewhere", go looking for a save
+          // button, find none (the results panel — and its "Run all tests" — is
+          // gone once closed), and conclude the run was lost. They are drafts in
+          // the project the moment the run ends; nothing is pending.
+          (savedIds.length > 0
+            ? `${savedIds.length} test case(s) were **saved to your project as drafts** — open them below.\n\n`
+            : '') +
           `Exploration ID: \`${explorationId}\``;
 
         ChatService.saveChatMessages(chatSessionId, [
@@ -309,11 +365,15 @@ export class ExplorationRunJobHandler {
               explorationId,
               mode: 'exploration',
               url: entryUrl,
-              // Runnable count — matches the panel, the history card, and the
-              // "Test cases generated" line above. `savedTestCaseIds` is the
-              // authoritative persisted set (may be shorter still on a resume).
-              testCasesCount: result.summary.runnableTestCases,
+              // Persisted-row count — matches the history card, the "Test cases
+              // generated" line above, and what `/explorations/:id/test-cases`
+              // returns. `savedTestCaseIds` remains the authoritative persisted
+              // set (shorter still on a resume — invariant #19).
+              testCasesCount: result.summary.persistedTestCases,
               savedTestCaseIds: savedIds,
+              // The only durable route back to this run — see
+              // buildExplorationChatActions for why the panel isn't one.
+              actions: buildExplorationChatActions(explorationId, savedIds.length),
             },
           },
         ]).catch(() => {});
@@ -322,10 +382,15 @@ export class ExplorationRunJobHandler {
       // Emit completion
       webSocketService.emitExplorationCompleted({
         explorationId,
-        // Runnable count — the frontend renders this as "N test cases discovered".
-        testCasesCount: result.summary.runnableTestCases,
+        // Persisted-row count — the frontend renders this as "N test cases
+        // discovered", and the user can open every one of them, so it must be
+        // the number of rows written (flows + generated negatives), matching the
+        // history card the same run produces.
+        testCasesCount: result.summary.persistedTestCases,
         summary: result.summary as any,
-        status: 'completed',
+        // Report the real outcome — a cancelled run rendered as 'completed'
+        // would show a success card for a run the user stopped.
+        status: wasCancelled ? 'cancelled' : 'completed',
         timestamp: new Date().toISOString(),
         chatSessionId,
         userId,
