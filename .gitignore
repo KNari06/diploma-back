@@ -213,6 +213,9 @@ build/
 # Test output
 test-results/
 coverage/
+# JUnit report for the CI Test summary widget — written by
+# scripts/jest-junit-reporter.js, only when the CI job asks for it.
+junit.xml
 
 # Trace logs (JSONL debug logs from lite mode / AI editor runs)
 test_logs/
