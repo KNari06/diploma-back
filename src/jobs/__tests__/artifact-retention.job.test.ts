@@ -2,6 +2,10 @@
  * Unit tests for ArtifactRetentionJob.tick — the per-step screenshot prune.
  * Verifies it removes files older than the cutoff, keeps recent ones, recurses
  * into subfolders, and only ever touches the step-screenshots subtree.
+ *
+ * Storage is stubbed AND `fs` is mocked: the same tick() prunes local editor
+ * logs off the real disk, which made this suite delete developer files and its
+ * count depend on the machine. See the fs mock below.
  */
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -52,10 +56,34 @@ jest.mock('@/config/features/screenshot-capture', () => ({
   },
 }));
 
+// The SAME tick() also prunes local editor logs — a real readdir + unlink on
+// `<cwd>/test_logs/editor`. Unmocked, this suite deleted 12 real trace logs on a
+// developer machine (2026-08-17) and `result.removed` became machine-dependent:
+// 2 in CI (fresh clone, no test_logs/) against 14 locally. An empty directory
+// pins the local half to exactly 0, so the assertions below are about the
+// STORAGE prune and nothing else. The local prune has its own suite, where fs is
+// mocked with actual files: artifact-retention-editor-logs.test.ts.
+jest.mock('fs', () => ({
+  promises: {
+    readdir: jest.fn(async () => [] as string[]),
+    stat: jest.fn(async () => {
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    }),
+    unlink: jest.fn(async () => undefined),
+  },
+}));
+
+const fsMock = jest.requireMock('fs') as {
+  promises: { readdir: jest.Mock; stat: jest.Mock; unlink: jest.Mock };
+};
+
 import { ArtifactRetentionJob } from '../artifact-retention.job';
 
 describe('ArtifactRetentionJob.tick', () => {
-  beforeEach(() => removeMock.mockClear());
+  beforeEach(() => {
+    removeMock.mockClear();
+    fsMock.promises.unlink.mockClear();
+  });
 
   it('removes expired files (and recurses) while keeping recent ones', async () => {
     const result = await ArtifactRetentionJob.tick();
@@ -69,6 +97,15 @@ describe('ArtifactRetentionJob.tick', () => {
     expect(removedPaths).toContain('userA/step-screenshots/testX/fail/old-fail.webp');
     // The recent file is never deleted.
     expect(removedPaths).not.toContain('userA/step-screenshots/testX/fresh.webp');
+  });
+
+  it('never unlinks a local file — the count above is the storage prune alone', async () => {
+    await ArtifactRetentionJob.tick();
+
+    // Guards the regression directly: if the fs mock is ever dropped, the local
+    // prune walks the developer's real test_logs/editor and this fails before
+    // `removed` starts drifting with whatever happens to be on the machine.
+    expect(fsMock.promises.unlink).not.toHaveBeenCalled();
   });
 
   it('skips when a previous sweep is still in flight', async () => {
