@@ -15,6 +15,11 @@ Runner: **Jest**, split into two lanes (`jest.config.js` → `projects`).
 `npm run test:all` runs both. `npm test` is the unit lane only, so a green
 `npm test` is the same thing CI checks.
 
+A red MR names the failing test in GitLab's **Test summary** widget: the CI job
+adds `--reporters=./scripts/jest-junit-reporter.js` (an in-repo reporter — jest
+has no built-in one, and `jest-junit` is a dependency this repo will not add for
+formatting) and uploads `junit.xml`. It is off in a local run; nothing to do.
+
 ## The `*.integration.test.ts` suffix means ONE thing: it needs real infrastructure
 
 That suffix is the *only* thing that selects the lane — there is no path list to

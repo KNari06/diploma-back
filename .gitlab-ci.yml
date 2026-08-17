@@ -136,11 +136,24 @@ test:
     # в самой команде. Прод здесь всегда ставился именно так.
     - npm ci --cache .npm --prefer-offline --no-audit --no-fund --ignore-scripts
     - echo "🧪 Running the unit lane..."
-    # Без JUnit-отчёта: у jest нет встроенного репортера, а тащить jest-junit
-    # ради оформления — это лишняя зависимость в дереве (см.
-    # ../.claude/rules/supply-chain.md). Падения видно в логе джобы;
-    # виджет MR можно добавить отдельно, если он реально понадобится.
-    - npm test -- --runInBand --ci --forceExit
+    # JUnit-отчёт делает СВОЙ репортёр (scripts/jest-junit-reporter.js), а не
+    # jest-junit: у jest нет встроенного (в отличие от vitest в трёх соседних
+    # репозиториях), а тянуть зависимость с транзитивами в дерево прод-сервиса
+    # ради форматирования — ровно тот размен, который запрещает
+    # ../.claude/rules/supply-chain.md. Локальный `npm test` не меняется:
+    # репортёр включается только этой строкой и пишет junit.xml.
+    #
+    # Репортёры идут ПОСЛЕДНИМИ: --reporters у jest — greedy-массив, он
+    # проглотит следующий позиционный аргумент как ещё один репортёр и упадёт
+    # с «Could not resolve a module for a custom reporter».
+    - npm test -- --runInBand --ci --forceExit --reporters=default --reporters=./scripts/jest-junit-reporter.js
+  artifacts:
+    # when: always — отчёт нужен именно на КРАСНОЙ джобе, иначе виджет пуст
+    # ровно тогда, когда он единственный полезен.
+    when: always
+    reports:
+      junit: junit.xml
+    expire_in: 1 week
 
 # ─────────────────────────────────────────────────────────────────
 # Azure OIDC Federated Identity (работает и на self-hosted runner)
