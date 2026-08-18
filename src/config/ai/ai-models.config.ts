@@ -184,6 +184,17 @@ export const AI_TASK_MODELS = {
   telegramTaskReconcile: AI_MODELS.fast,
 
   // ── Analysis ───────────────────────────────────────────────────────────
+  /**
+   * Regression Doctor step-fix agent — reads ONE failing step (authored step +
+   * runtime error + the screenshot taken at failure) and decides whether the
+   * test went stale or the application broke.
+   *
+   * Vision tier, and not negotiable: the screenshot is frequently the only
+   * signal separating "the button was renamed" from "the screen never loaded",
+   * and getting that distinction wrong is how a fix agent quietly deletes a
+   * real bug from the report.
+   */
+  regressionStepFix: AI_MODELS.vision,
   /** Page analysis with vision */
   pageAnalysisVision: AI_MODELS.vision,
   /** Fast element analysis */

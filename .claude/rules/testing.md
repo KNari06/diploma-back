@@ -32,10 +32,13 @@ maintain. So:
   run once produced 37 backend failures, 15 of which were pure starvation and
   passed cleanly when run alone. That is what this split exists to prevent.
 - **A test that needs nothing external must NOT carry the suffix**, even when
-  it is "integration-ish" in the looser sense below. Two files were misnamed under
-  this rule and renamed when the split landed (`allure-pipeline.test.ts`,
-  `apply.service.db.test.ts`); both are fully in-process and deterministic, and
-  belong in the gate.
+  it is "integration-ish" in the looser sense below. `allure-pipeline.test.ts` was
+  misnamed under this rule and renamed when the split landed: it is fully
+  in-process and deterministic, and belongs in the gate. (A second file,
+  `apply.service.db.test.ts`, was renamed at the same time and has since been
+  deleted — the Regression Doctor rewrite replaced its 600-line in-memory
+  Supabase fake with suites that mock the `db/` sublayer, which is what the mock
+  boundary below asks for.)
 
 ⚠️ **Terminology collision, on purpose.** This repo already used "integration
 test" for the `src/test/` files (real DB, supertest — see below). Those are NOT

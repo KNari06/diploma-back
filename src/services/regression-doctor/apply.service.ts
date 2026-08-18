@@ -1,62 +1,64 @@
 /**
  * ─────────────────────────────────────────────────────────────────────────────
- * Regression Doctor — Bulk Apply service (Phase-2 Slice B)
+ * Regression Doctor — Apply service
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Applies a single Doctor finding's `proposed_patch` to every affected
- * `intent_test_cases` row (or a user-selected subset). Writes a pre-apply
- * snapshot per test case so the change is auditable and (future) reversible.
+ * Applies a finding's proposed patch to the test case it came from (or, when
+ * the caller passes a subset, to the affected cases it selected), writing a
+ * pre-apply snapshot per test so the change is auditable and revertible.
  *
- * Design choices documented inline. Key non-obvious ones:
+ * The patch itself is built in `patch-applier.ts`; this file owns persistence:
  *
- *  1. **Per-test step lookup, not global index.** The finding's
- *     `targetStepIndex` is the index from ONE original failing test —
- *     different tests have different steps_json. We search each test case
- *     for a step that matches the finding's pattern (urlPattern +
- *     targetElementKey + errorShape context) and apply the patch at that
- *     location. If no match is found, we fall back to the finding's index
- *     when it's in-bounds, otherwise skip the test with a reason.
+ *  1. **Only `test_fix` findings are appliable.** `app_bug` and `unclear`
+ *     carry no patch by construction, and refusing them here means a stale
+ *     client that still shows an Apply button gets a 409 instead of a no-op.
  *
- *  2. **Optimistic concurrency via `updated_at`.** We snapshot
- *     `updated_at` when we read, then `.eq('updated_at', snap)` on the
- *     write. If the user edited the test case between read and write, the
- *     write hits 0 rows and we skip the test with `concurrent_edit`.
- *     Users never get their manual edits silently overwritten.
+ *  2. **The step is located by id, never by position** — see
+ *     `locateStepById`. A miss is a skip with a reason, not a guess.
  *
- *  3. **Per-test-case failure isolation.** Each test is processed
- *     independently inside a try/catch. A failure on one test case (RLS
- *     deny, missing row, concurrent edit) never blocks the other 14.
- *     Return shape carries per-test status so the UI can render a
- *     mixed-result summary ("Applied 13, skipped 2").
+ *  3. **Optimistic concurrency via `updated_at`.** We snapshot `updated_at` at
+ *     read time and gate the write on it. If the user edited the case in
+ *     between, the write hits 0 rows and we skip with `concurrent_edit` rather
+ *     than overwriting their work.
  *
- *  4. **Finding state machine.** Finding flips to `applied` iff at least
- *     one test case was successfully patched. A finding where all tests
- *     were skipped (e.g. all had concurrent edits) stays `open` so the
- *     user can retry later.
+ *  4. **Per-test-case failure isolation.** Each case is processed inside its
+ *     own try/catch, so an RLS deny or a missing row on one never blocks the
+ *     rest. The return shape carries per-test status for a mixed summary.
  *
- *  5. **Step ID preservation.** When modifying an existing step, keep its
- *     `id`. When inserting a new step, generate a fresh UUID. This keeps
- *     compiled plans / evidence / logs referencing steps by id stable
- *     across the patch.
+ *  5. **The finding flips to `applied` iff at least one case was patched.** All
+ *     skipped (e.g. every case concurrently edited) leaves it `open` to retry.
+ *
+ *  6. **Steps are written directly, not through `IntentTestCaseService`** —
+ *     deliberately, because that service's V16 merge would re-hydrate the
+ *     `compiled` plan the patch just dropped. The side effects that write path
+ *     normally performs are reproduced here: negatives are marked stale and the
+ *     flow-tree cache is invalidated.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import { randomUUID } from 'crypto';
-import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
-import type {
-  DriftProposedPatch,
-} from './drift-agent';
+import {
+  getFindingForApply,
+  getTestCaseForApply,
+  insertApplySnapshot,
+  markFindingApplied,
+  updateStepsJsonIfUnchanged,
+  deleteApplySnapshot,
+  markNegativesStaleForTestCase,
+  type FindingForApplyRow,
+} from './db/regression-doctor-apply.db';
+import {
+  applyStepPatch,
+  StepNotFoundError,
+  UnsupportedPatchError,
+} from './patch-applier';
+import type { StepPatch } from './types';
 
-// Per-test-case in-memory mutex — same pattern as
-// intent-test-case.service.ts. Lightweight; only contends when two
-// applies touch the same test case concurrently.
-//
-// Exported so the revert service can reuse the SAME map — otherwise an
-// Apply and a Revert on the same test case could race. The mutex has to
-// be shared by any code that writes `intent_test_cases.steps_json` on
-// behalf of the Doctor.
+// Per-test-case in-memory mutex — same pattern as intent-test-case.service.ts.
+// Exported so the revert service reuses the SAME map: an Apply and a Revert on
+// one test case must serialise, not race.
 const applyMutexes = new Map<string, Promise<void>>();
 
 /** @internal — exported for the revert service. */
@@ -81,11 +83,10 @@ export interface ApplyFindingInput {
   findingId: string;
   userId: string;
   /**
-   * Optional subset of test case ids to apply to. If omitted, we use the
-   * full `affected_test_ids` from the finding. When provided, the server
-   * intersects with `affected_test_ids` — unknown ids are dropped
-   * silently (not an error) so stale client state can't reach unrelated
-   * tests.
+   * Optional subset of test case ids. When omitted we use the finding's
+   * `affected_test_ids`. When provided, the server intersects with that list —
+   * unknown ids are dropped silently so stale client state cannot reach an
+   * unrelated test.
    */
   testCaseIds?: string[];
 }
@@ -99,13 +100,13 @@ export type SkipReason =
   | 'concurrent_edit'       // updated_at changed between read and write
   | 'test_case_missing'     // row not found
   | 'access_denied'         // user doesn't own it
-  | 'no_step_matched'       // pattern didn't resolve to a step
-  | 'step_out_of_bounds'    // targetStepIndex invalid for this test
-  | 'already_patched';      // exact same patch already present
+  | 'no_step_matched'       // the finding's step id is not in this test case
+  | 'patch_not_applicable'  // e.g. assertion patch on a non-ai_check step
+  | 'already_patched';      // resulting steps are byte-identical
 
 export interface ApplyFindingResult {
   findingId: string;
-  proposedPatch: DriftProposedPatch;
+  proposedPatch: StepPatch;
   totalRequested: number;
   results: PerTestOutcome[];
   findingStatus: 'open' | 'applied';
@@ -119,15 +120,8 @@ export async function applyDoctorFinding(input: ApplyFindingInput): Promise<Appl
   const { findingId, userId, testCaseIds } = input;
 
   // ─── 1. Load + validate the finding ───────────────────────────────────────
-  const { data: finding, error: findingErr } = await supabaseAdmin
-    .from('regression_doctor_findings')
-    .select('id, user_id, project_id, status, url_pattern, target_element_key, error_shape, proposed_patch, affected_test_ids')
-    .eq('id', findingId)
-    .maybeSingle();
+  const finding = await getFindingForApply(findingId);
 
-  if (findingErr) {
-    throw new Error(`Failed to load finding: ${findingErr.message}`);
-  }
   if (!finding) {
     throw new ApplyNotFoundError('Finding not found');
   }
@@ -137,38 +131,40 @@ export async function applyDoctorFinding(input: ApplyFindingInput): Promise<Appl
   if (finding.status !== 'open') {
     throw new ApplyConflictError(`Finding is ${finding.status}`);
   }
+  // A finding that blames the application has no patch, and must not acquire
+  // one: applying "a fix" to a real bug is how the bug stops being reported.
+  if (finding.verdict && finding.verdict !== 'test_fix') {
+    throw new ApplyConflictError(`Finding verdict is ${finding.verdict} — nothing to apply`);
+  }
   if (!finding.proposed_patch) {
     throw new ApplyConflictError('Finding has no proposed patch');
   }
+  if (!finding.step_id) {
+    throw new ApplyConflictError('Finding does not identify a step to patch');
+  }
 
-  const patch = finding.proposed_patch as DriftProposedPatch;
-  const affectedIds = Array.isArray(finding.affected_test_ids)
-    ? (finding.affected_test_ids as string[])
-    : [];
+  const patch = finding.proposed_patch as StepPatch;
+  const affectedIds = resolveAffectedIds(finding);
 
   if (affectedIds.length === 0) {
     throw new ApplyConflictError('Finding has no affected test cases');
   }
 
-  // Intersect user's requested subset with the finding's authoritative
-  // list. Unknown ids silently dropped — stale client state can't touch
-  // unrelated test cases.
   const affectedSet = new Set(affectedIds);
-  const requestedIds = Array.isArray(testCaseIds) && testCaseIds.length > 0
-    ? testCaseIds.filter((id) => affectedSet.has(id))
-    : affectedIds;
+  const requestedIds =
+    Array.isArray(testCaseIds) && testCaseIds.length > 0
+      ? testCaseIds.filter((id) => affectedSet.has(id))
+      : affectedIds;
 
   if (requestedIds.length === 0) {
     throw new ApplyConflictError('No test cases selected for apply');
   }
 
   // ─── 2. Process each test case ────────────────────────────────────────────
+  // Sequential on purpose: the bulk apply is not on a hot path, and serialising
+  // keeps error messages attributable to the test that produced them.
   const results: PerTestOutcome[] = [];
 
-  // Sequential processing — parallelizing would save latency but
-  // deflects meaningful error messages when one test case blocks a
-  // shared dependency (e.g. workspace rate limit). The bulk Apply is
-  // not on a hot path; correctness > speed for Slice B.
   for (const testCaseId of requestedIds) {
     try {
       const outcome = await withTestCaseMutex(testCaseId, () =>
@@ -176,14 +172,12 @@ export async function applyDoctorFinding(input: ApplyFindingInput): Promise<Appl
           testCaseId,
           userId,
           findingId,
-          finding,
+          stepId: finding.step_id!,
           patch,
         }),
       );
       results.push(outcome);
     } catch (err) {
-      // Unexpected error on this test case — record it and keep going.
-      // The Doctor panel will surface the message verbatim.
       logger.warn('[DOCTOR_APPLY] Per-test failure (non-fatal)', {
         findingId,
         testCaseId,
@@ -199,25 +193,21 @@ export async function applyDoctorFinding(input: ApplyFindingInput): Promise<Appl
 
   // ─── 3. Flip finding state iff at least one apply succeeded ───────────────
   const anyApplied = results.some((r) => r.status === 'applied');
-  let findingStatus: 'open' | 'applied' = finding.status as 'open';
+  let findingStatus: 'open' | 'applied' = 'open';
 
   if (anyApplied) {
-    const { error: updErr } = await supabaseAdmin
-      .from('regression_doctor_findings')
-      .update({
-        status: 'applied',
-        applied_at: new Date().toISOString(),
-        applied_by: userId,
-      })
-      .eq('id', findingId)
-      .eq('status', 'open'); // belt-and-suspenders; we already checked
-
-    if (updErr) {
-      logger.error('[DOCTOR_APPLY] Failed to mark finding applied', {
-        findingId, error: updErr.message,
+    const { written, error } = await markFindingApplied({ findingId, userId });
+    if (error) {
+      logger.error('[DOCTOR_APPLY] Failed to mark finding applied', { findingId, error });
+      // Not fatal — the patches are in place. The next apply/dismiss attempt
+      // surfaces the stale state via the `status !== open` check.
+    } else if (written === 0) {
+      // A concurrent request flipped it first. The patches landed either way,
+      // but this request did not perform the transition, so it must not claim
+      // it did.
+      logger.info('[DOCTOR_APPLY] Finding was already flipped by a concurrent apply', {
+        findingId,
       });
-      // Not fatal — patches are in place. Next dismiss/apply attempt
-      // will surface the stale state via the `status !== open` check.
     } else {
       findingStatus = 'applied';
     }
@@ -232,6 +222,29 @@ export async function applyDoctorFinding(input: ApplyFindingInput): Promise<Appl
   };
 }
 
+/**
+ * The authoritative apply list.
+ *
+ * `affected_test_ids` is the column the UI's subset selection is validated
+ * against. `test_case_id` is where the evidence came from and is always part of
+ * the list — a finding written before the column existed, or one whose array
+ * was never populated, must still be appliable to its own test case.
+ *
+ * **Fan-out beyond that one case does not work yet, by construction.** The
+ * patch is located by `step_id`, and a step id belongs to exactly one test
+ * case, so every extra id here resolves to `no_step_matched`. Today the writer
+ * only ever stores the evidence's own case, so nothing is broken; whoever
+ * widens this (the cross-test dedupe) has to give the finding a way to address
+ * the equivalent step in another case first.
+ */
+function resolveAffectedIds(finding: FindingForApplyRow): string[] {
+  const ids = new Set<string>(
+    Array.isArray(finding.affected_test_ids) ? finding.affected_test_ids : [],
+  );
+  if (finding.test_case_id) ids.add(finding.test_case_id);
+  return Array.from(ids);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-test-case work unit
 // ─────────────────────────────────────────────────────────────────────────────
@@ -240,25 +253,16 @@ async function applyToOneTestCase(params: {
   testCaseId: string;
   userId: string;
   findingId: string;
-  finding: {
-    project_id: string;
-    url_pattern: string;
-    target_element_key: string | null;
-    error_shape: string;
-  };
-  patch: DriftProposedPatch;
+  stepId: string;
+  patch: StepPatch;
 }): Promise<PerTestOutcome> {
-  const { testCaseId, userId, findingId, finding, patch } = params;
+  const { testCaseId, userId, findingId, stepId, patch } = params;
 
   // ── Load ──────────────────────────────────────────────────────────────────
-  const { data: row, error: readErr } = await supabaseAdmin
-    .from('intent_test_cases')
-    .select('id, user_id, project_id, steps_json, updated_at')
-    .eq('id', testCaseId)
-    .maybeSingle();
+  const { row, error: readErr } = await getTestCaseForApply(testCaseId);
 
   if (readErr) {
-    return { testCaseId, status: 'error', message: `read failed: ${readErr.message}` };
+    return { testCaseId, status: 'error', message: `read failed: ${readErr}` };
   }
   if (!row) {
     return { testCaseId, status: 'skipped', reason: 'test_case_missing' };
@@ -268,249 +272,121 @@ async function applyToOneTestCase(params: {
   }
 
   const before = Array.isArray(row.steps_json) ? (row.steps_json as IntentStep[]) : [];
-  const beforeUpdatedAt = row.updated_at as string;
-
-  // ── Find the target step ──────────────────────────────────────────────────
-  const matchIdx = locateTargetStep(before, finding, patch);
-  if (matchIdx == null) {
-    return { testCaseId, status: 'skipped', reason: 'no_step_matched' };
-  }
+  const beforeUpdatedAt = row.updated_at;
 
   // ── Build the patched array ───────────────────────────────────────────────
   let after: IntentStep[];
   let changeDescription: string;
   try {
-    const result = applyPatch(before, matchIdx, patch);
+    const result = applyStepPatch(before, stepId, patch);
     after = result.steps;
     changeDescription = result.description;
   } catch (err) {
-    if (err instanceof StepOutOfBoundsError) {
-      return { testCaseId, status: 'skipped', reason: 'step_out_of_bounds' };
+    if (err instanceof StepNotFoundError) {
+      return { testCaseId, status: 'skipped', reason: 'no_step_matched' };
+    }
+    if (err instanceof UnsupportedPatchError) {
+      logger.warn('[DOCTOR_APPLY] Patch not applicable to this test case', {
+        findingId,
+        testCaseId,
+        reason: err.message,
+      });
+      return { testCaseId, status: 'skipped', reason: 'patch_not_applicable' };
     }
     throw err;
   }
 
-  // No-op detection. If after === before (byte-identical JSON), we
-  // already-applied this patch. Report as skipped rather than writing
-  // a meaningless snapshot and bumping updated_at.
+  // No-op detection: this patch is already present. Reporting it as skipped
+  // avoids writing a meaningless snapshot and bumping `updated_at`.
   if (JSON.stringify(after) === JSON.stringify(before)) {
     return { testCaseId, status: 'skipped', reason: 'already_patched' };
   }
 
-  // ── Snapshot (insert first so if write fails we still have audit) ─────────
-  const { data: snapshotRow, error: snapErr } = await supabaseAdmin
-    .from('regression_doctor_apply_snapshots')
-    .insert({
-      finding_id: findingId,
-      test_case_id: testCaseId,
-      user_id: userId,
-      project_id: row.project_id,
-      steps_before: before,
-      before_updated_at: beforeUpdatedAt,
-      steps_after: after,
-      change_description: changeDescription,
-    })
-    .select('id')
-    .single();
+  // ── Snapshot first, so a failed write still leaves an audit trail ─────────
+  const { id: snapshotId, error: snapErr } = await insertApplySnapshot({
+    finding_id: findingId,
+    test_case_id: testCaseId,
+    user_id: userId,
+    project_id: row.project_id,
+    steps_before: before,
+    before_updated_at: beforeUpdatedAt,
+    steps_after: after,
+    change_description: changeDescription,
+  });
 
-  if (snapErr || !snapshotRow) {
-    return {
-      testCaseId,
-      status: 'error',
-      message: `snapshot failed: ${snapErr?.message ?? 'unknown'}`,
-    };
+  if (snapErr || !snapshotId) {
+    return { testCaseId, status: 'error', message: `snapshot failed: ${snapErr ?? 'unknown'}` };
   }
 
   // ── Optimistic write ──────────────────────────────────────────────────────
-  // If `updated_at` changed between our read and write, this UPDATE hits
-  // 0 rows and we report concurrent_edit. Supabase's default return is
-  // the updated row(s) — when none match, `.select()` returns [].
-  const { data: updated, error: updErr } = await supabaseAdmin
-    .from('intent_test_cases')
-    .update({ steps_json: after })
-    .eq('id', testCaseId)
-    .eq('updated_at', beforeUpdatedAt)
-    .select('id');
+  const { written, error: updErr } = await updateStepsJsonIfUnchanged({
+    testCaseId,
+    steps: after,
+    expectedUpdatedAt: beforeUpdatedAt,
+  });
 
   if (updErr) {
-    return { testCaseId, status: 'error', message: `write failed: ${updErr.message}` };
+    return { testCaseId, status: 'error', message: `write failed: ${updErr}` };
   }
-  if (!updated || updated.length === 0) {
-    // Race: someone updated this row after our read. The snapshot we
-    // wrote is now orphaned but harmless (it preserves the state at
-    // the time WE saw). Delete it so the audit trail isn't polluted.
-    await supabaseAdmin
-      .from('regression_doctor_apply_snapshots')
-      .delete()
-      .eq('id', snapshotRow.id);
+  if (written === 0) {
+    // Someone updated this row after our read. The snapshot we wrote documents
+    // an apply that never happened — drop it so the audit trail stays honest.
+    await deleteApplySnapshot(snapshotId);
     return { testCaseId, status: 'skipped', reason: 'concurrent_edit' };
   }
 
-  return {
-    testCaseId,
-    status: 'applied',
-    snapshotId: snapshotRow.id as string,
-    changeDescription,
-  };
-}
+  await runPostWriteSideEffects({ testCaseId, flowId: row.flow_id });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Target step resolution
-// ─────────────────────────────────────────────────────────────────────────────
+  return { testCaseId, status: 'applied', snapshotId, changeDescription };
+}
 
 /**
- * Given a test case's steps and the finding's pattern descriptor, return
- * the index of the step the patch should act upon.
+ * The two side effects every other `steps_json` writer performs.
  *
- * Strategy (highest priority first):
- *   1. Match by targetElementKey `"<tag>:<text>"` — tag in step.bindingHints
- *      and text in step.description.
- *   2. Match by description substring equivalence on targetElementKey's
- *      text portion.
- *   3. Fall back to finding.proposed_patch.targetStepIndex if it's within
- *      bounds of this test's steps array.
+ * Both are best-effort and neither may fail the apply: the patch has already
+ * landed, and a stale cache or an un-marked negative is a smaller problem than
+ * telling the user their applied fix errored.
  *
- * Returns null if nothing matches. The caller then records the test as
- * skipped with reason `no_step_matched` — users see it in the per-test
- * summary and can handle manually.
+ * - **Negatives:** a negative test is generated by mutating a parent's steps.
+ *   Patch the parent without marking them stale and they keep running against
+ *   a mutation of the step that no longer exists.
+ * - **Flow-tree cache:** the editor's flow view is cached per flow id and would
+ *   otherwise serve the pre-patch steps.
  */
-/** @internal — exported for unit tests only */
-export function locateTargetStep(
-  steps: IntentStep[],
-  finding: { target_element_key: string | null; url_pattern: string },
-  patch: DriftProposedPatch,
-): number | null {
-  if (steps.length === 0) return null;
+async function runPostWriteSideEffects(params: {
+  testCaseId: string;
+  flowId: string | null;
+}): Promise<void> {
+  const { testCaseId, flowId } = params;
 
-  const keyText = extractKeyText(finding.target_element_key);
-  const keyTag = extractKeyTag(finding.target_element_key);
+  const { count, error } = await markNegativesStaleForTestCase(testCaseId).catch((err) => ({
+    count: null,
+    error: err instanceof Error ? err.message : String(err),
+  }));
 
-  // Primary: exact match on description text + tag hint.
-  if (keyText) {
-    const idx = steps.findIndex((s) => {
-      if (!s || typeof s !== 'object') return false;
-      const desc = (s.description || '').toLowerCase();
-      if (!desc.includes(keyText.toLowerCase())) return false;
-      if (keyTag && s.bindingHints && typeof s.bindingHints === 'object') {
-        const hintTag = (s.bindingHints as { tag?: string }).tag;
-        if (hintTag && hintTag !== keyTag) return false;
-      }
-      return true;
-    });
-    if (idx >= 0) return idx;
+  if (error) {
+    logger.warn('[DOCTOR_APPLY] Failed to mark negatives stale (non-fatal)', { testCaseId, error });
+  } else if (count && count > 0) {
+    logger.info('[DOCTOR_APPLY] Marked negatives as stale', { testCaseId, staleCount: count });
   }
 
-  // Secondary: targetStepIndex from the patch if in bounds. This handles
-  // the case where the failing test's original step has been renamed but
-  // is still at the same position across tests.
-  if (typeof patch.targetStepIndex === 'number' && patch.targetStepIndex >= 0) {
-    if (patch.targetStepIndex < steps.length) return patch.targetStepIndex;
-    // insert_before can target index === steps.length (append at end).
-    if (patch.action === 'insert_before' && patch.targetStepIndex === steps.length) {
-      return patch.targetStepIndex;
-    }
-  }
-
-  return null;
-}
-
-function extractKeyText(key: string | null): string | null {
-  if (!key) return null;
-  const colon = key.indexOf(':');
-  return colon >= 0 ? key.slice(colon + 1).trim() : key.trim();
-}
-function extractKeyTag(key: string | null): string | null {
-  if (!key) return null;
-  const colon = key.indexOf(':');
-  return colon >= 0 ? key.slice(0, colon).trim().toLowerCase() : null;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Patch application
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** @internal — exported for unit tests only */
-export class StepOutOfBoundsError extends Error {}
-
-/** @internal — exported for unit tests only */
-export function applyPatch(
-  steps: IntentStep[],
-  idx: number,
-  patch: DriftProposedPatch,
-): { steps: IntentStep[]; description: string } {
-  const next = steps.slice();
-
-  switch (patch.action) {
-    case 'insert_before': {
-      if (!patch.insertStep) throw new Error('insert_before patch without insertStep');
-      // Generate fresh UUID for the new step. Existing ids stay intact
-      // downstream so compiled plans / evidence keyed on step id survive.
-      const newStep: IntentStep = {
-        id: randomUUID(),
-        type: patch.insertStep.type as IntentStep['type'],
-        description: patch.insertStep.description,
-        ...(patch.insertStep.value !== undefined ? { value: patch.insertStep.value } : {}),
-      };
-      next.splice(idx, 0, newStep);
-      return {
-        steps: next,
-        description: `Inserted step at index ${idx}: ${newStep.type} — ${newStep.description}`,
-      };
-    }
-
-    case 'replace_selector': {
-      if (!patch.newSelector) throw new Error('replace_selector patch without newSelector');
-      if (idx < 0 || idx >= next.length) throw new StepOutOfBoundsError();
-      const existing = next[idx];
-      next[idx] = {
-        ...existing,
-        // New selector rides in bindingHints — that's the path downstream
-        // resolvers prefer over raw CSS strings embedded in description.
-        bindingHints: {
-          ...(existing.bindingHints || {}),
-          // Cast: bindingHints.selector isn't a declared field on the
-          // BindingHints interface for every kind, but is tolerated by
-          // the compiled-plan builder. Keeps the patch minimal.
-          ...(patch.newSelector ? { selector: patch.newSelector } : {}),
-        } as IntentStep['bindingHints'],
-      };
-      return {
-        steps: next,
-        description: `Replaced selector on step ${idx}: ${patch.newSelector}`,
-      };
-    }
-
-    case 'delete_step': {
-      if (idx < 0 || idx >= next.length) throw new StepOutOfBoundsError();
-      const removed = next.splice(idx, 1)[0];
-      return {
-        steps: next,
-        description: `Deleted step ${idx}: ${removed?.type ?? ''} — ${removed?.description ?? ''}`,
-      };
-    }
-
-    case 'update_value': {
-      if (idx < 0 || idx >= next.length) throw new StepOutOfBoundsError();
-      const existing = next[idx];
-      const nextValue = patch.insertStep?.value ?? '';
-      next[idx] = { ...existing, value: nextValue };
-      return {
-        steps: next,
-        description: `Updated value on step ${idx}: "${nextValue}"`,
-      };
-    }
-
-    default: {
-      const _exhaustive: never = patch.action;
-      throw new Error(`Unknown patch action: ${String(_exhaustive)}`);
-    }
+  if (flowId) {
+    await cache
+      .delByPattern(`qait:cache:ptree:flow:${flowId}:*`)
+      .catch((err: unknown) => {
+        logger.warn('[DOCTOR_APPLY] Flow cache invalidation failed (non-fatal)', {
+          testCaseId,
+          flowId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Typed errors so the controller can map cleanly to HTTP codes.
 // Named `Apply*` to avoid colliding with the common `NotFoundError` exported
-// from `@/types` (which is already imported by the regression controller).
+// from `@/types` (already imported by the regression controller).
 // ─────────────────────────────────────────────────────────────────────────────
 
 export class ApplyNotFoundError extends Error {

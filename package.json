@@ -25,6 +25,8 @@
     "chat-eval:credential-proof": "ts-node -r tsconfig-paths/register src/scripts/chat-eval/product-credential-proof.ts",
     "chat-eval:fixture:serve": "node src/scripts/chat-eval/fixture/server.js",
     "eval-api-flow-baseline": "ts-node -r tsconfig-paths/register src/scripts/api-flow-baseline.ts",
+    "doctor:run-now": "ts-node -r tsconfig-paths/register src/scripts/doctor-run-now.ts",
+    "doctor:dryrun": "ts-node -r tsconfig-paths/register src/scripts/doctor-dryrun.ts",
     "lite:analyze": "ts-node -r tsconfig-paths/register src/scripts/lite-analyze/cli.ts",
     "cost-report": "ts-node -r tsconfig-paths/register src/scripts/cost-report/index.ts",
     "create-test-users": "ts-node -r tsconfig-paths/register scripts/create-test-users.ts",

@@ -270,6 +270,22 @@ class WebSocketRedisSubscriber {
           }
           break;
 
+        // Regression Doctor finished analyzing a run. Published from the WORKER
+        // (regression-doctor.job.ts), so it can only reach a client through
+        // here — the controller's own apply/dismiss emits run in the API
+        // process and never touch this bridge. Without this case the event
+        // fell into `default`, and the panel that started the analysis sat on
+        // "Analyzing…" forever while the findings were already in the database.
+        case 'regression:doctor:ready':
+          if (target?.userId) {
+            wsService.emitToUser(target.userId, 'regression:doctor:ready', payload);
+          } else {
+            logger.warn('[WS_REDIS_SUB] regression:doctor:ready without a target userId', {
+              runId: payload?.runId,
+            });
+          }
+          break;
+
         // ── Exploration events ──
         case 'exploration:progress':
           wsService.emitExplorationProgress(payload);
