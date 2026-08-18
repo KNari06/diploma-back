@@ -135,6 +135,69 @@ Map populated MANUALLY by ops (no auto-provision) — see qait-infra
 
 ---
 
+## Regression Doctor — proposed fixes for failed steps
+
+```
+user clicks "Analyze failures" in the run report
+→ POST /api/v1/regression/runs/:runId/doctor/analyze   (regression.controller.ts)
+→ QueueManager.addRegressionDoctorJob()
+→ regression-doctor.job.ts
+→ collectFailedSteps()   (../services/regression-doctor/failed-step-collector.ts)
+   → test_executions (failed) → tests.executed_steps → first failing step
+   → matched to intent_test_cases.steps_json BY STEP ID
+→ analyzeFailedStep()    (../services/regression-doctor/step-fix-agent.ts)
+   → verdict test_fix | app_bug | unclear, patch only for test_fix
+→ INSERT regression_doctor_findings → WS `regression:doctor:ready`
+→ user clicks Apply → POST /regression/doctor/findings/:id/apply → apply.service.ts
+```
+
+**It is NEVER enqueued automatically.** One vision call per failed test means a
+nightly suite that fails for an environmental reason would bill for findings
+nobody asked for, so `recomputeRunStatus` deliberately does not start it. The
+only producer is the REST endpoint above.
+
+**Re-clicking is safe.** `addRegressionDoctorJob` reuses the `doctor-${runId}`
+job id: a job still waiting or active returns `alreadyRunning` instead of
+duplicating, and a job merely sitting in the completed set (this queue keeps 25)
+is removed first — otherwise BullMQ would refuse the id and "Analyze again"
+would silently do nothing. The job itself skips every step that already has a
+finding, so a second analysis only pays for what is new.
+
+**The job's return value is the only record that an analysis happened.** Zero
+findings and never-analyzed are the same empty table, so the run report would
+redraw its idle prompt after a completed analysis and look like the button did
+nothing. `GET /runs/:runId/doctor` therefore also returns
+`QueueManager.getRegressionDoctorJobStatus(runId)`, which reads the retained
+`doctor-<runId>` job: its `returnvalue` carries `findingsCreated`, `skipped` and
+`skipReasons` (the per-reason counts from the collector), and the panel uses
+them to say what it looked at and why it proposed nothing. Best-effort — a null
+degrades the wording, never the request. Anything added to that return value
+must stay JSON-serializable, since BullMQ is the storage.
+
+**The collector retries for the trace.** `tests.executed_steps` is drained from
+Redis to Postgres in the test job's `finally`, so a user who clicks the moment a
+run turns red can beat the write. `failed-step-collector.ts` re-reads empty
+traces at 0/2s/4s — the same race `../services/kb/auto-learn.service.ts` guards
+against.
+
+**A runtime step id is not always an authored step id.** Resource-prologue steps
+are injected by `mobile-test-run.job.ts`; inlined preconditions become
+`pre_<src>_<id>`; linked test cases become `link_<tc>_<id>` (and linking runs on
+mobile). The collector accepts an exact `steps_json[].id` match only — there is
+deliberately no positional fallback, because an index from one test case
+addresses a different step in another.
+
+**An applied patch must invalidate what the resolver reads first.**
+`bindingHints.label || placeholder || description` is the runner's resolution
+order and `compiled` short-circuits ahead of all of it with no staleness cutoff,
+so `patch-applier.ts` replaces the hints wholesale and drops the compiled plan.
+The write goes straight to `steps_json` rather than through
+`IntentTestCaseService.update()`, whose V16 merge would re-hydrate the compiled
+plan it just dropped — which is why the apply path reproduces that service's
+side effects (`markNegativesStale`, flow-cache invalidation) by hand.
+
+---
+
 ## Scheduled cron
 
 ```

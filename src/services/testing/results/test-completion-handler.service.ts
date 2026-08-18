@@ -1598,25 +1598,11 @@ export class TestCompletionHandlerService {
           });
         }
 
-        // Phase-1: Enqueue Regression Doctor job for drift aggregation.
-        //
-        // Conditions (all must hold):
-        //   • run status is 'failed' (no drift to aggregate on a passing run)
-        //   • at least 2 failed tests — a single failure has nothing to
-        //     cross-compare against. Doctor's value is in GROUPING.
-        //
-        // Non-blocking fire-and-forget. Idempotency is guaranteed by the
-        // `doctor-${runId}` jobId inside addRegressionDoctorJob — if this
-        // hook fires twice (e.g. retry), BullMQ silently rejects the
-        // duplicate instead of running the LLM twice.
-        if (!suppressSideEffects && finalStatus === 'failed' && failed >= 2) {
-          this.maybeEnqueueRegressionDoctor(run, failed).catch(err => {
-            logger.warn('[TEST_COMPLETION] Failed to enqueue Regression Doctor (non-fatal)', {
-              runId: run.id,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          });
-        }
+        // The Regression Doctor is NOT enqueued here. It costs one vision call
+        // per failed test, and a nightly suite that fails for an environmental
+        // reason would burn that on every run without anyone asking. It is
+        // started explicitly from the run report instead —
+        // POST /regression/runs/:runId/doctor/analyze.
       }
     } catch (error) {
       logger.error('[TEST_COMPLETION] Error recomputing run status', {
@@ -1757,37 +1743,4 @@ export class TestCompletionHandlerService {
     }
   }
 
-  /**
-   * Phase-1: Enqueue the Regression Doctor job for drift aggregation.
-   *
-   * We do NOT pre-filter on "tests classified as drift" here because the
-   * per-test Bug Inspector (ai-analysis) runs in parallel with this hook
-   * and may not have written all its results yet. Instead Doctor's own
-   * handler fetches `test_results.ai_summary` rows under the run, filters
-   * by `failureClassification === 'test_drift'` inside the job, and
-   * exits silently if fewer than 2 drift-classified results are ready.
-   *
-   * Consequence: a small races where Doctor runs before some per-test
-   * analyses finish → it sees fewer drift rows than ideal → may miss a
-   * pattern. Acceptable trade-off: simpler flow than building a
-   * "wait for all ai-analysis done" signal. The `failed >= 2` guard in
-   * the caller already prevents the "1 test failed, nothing to group"
-   * case that would be the common false-trigger.
-   */
-  private static async maybeEnqueueRegressionDoctor(
-    run: any,
-    failedCount: number,
-  ): Promise<void> {
-    // Lazy import to avoid loading BullMQ queue module when tests don't need it.
-    const { QueueManager } = await import('@/config/infrastructure/queues');
-    await QueueManager.addRegressionDoctorJob({
-      runId: run.id,
-      projectId: run.project_id,
-      userId: run.user_id,
-    });
-    logger.info('[TEST_COMPLETION] Regression Doctor enqueued', {
-      runId: run.id,
-      failedCount,
-    });
-  }
 }

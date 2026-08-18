@@ -17,6 +17,7 @@ import {
   getPlanHealth,
   regenerateNegatives,
   setNegativeEnabled,
+  analyzeRunFailures,
   getRunDoctorFindings,
   getRunExecutions,
   getRunReport,
@@ -582,6 +583,35 @@ router.post('/runs/:runId/share', requireAuth, createShareLink);
  *         description: Forbidden
  */
 router.get('/runs/:runId/doctor', requireAuth, getRunDoctorFindings);
+
+/**
+ * @swagger
+ * /api/v1/regression/runs/{runId}/doctor/analyze:
+ *   post:
+ *     tags: [Regression]
+ *     summary: Start the Regression Doctor for a run
+ *     description: |
+ *       Queues the analysis that proposes a fix for the first failing step of
+ *       each failed test. **Manual on purpose** — it costs one vision call per
+ *       failed test, so it never runs automatically when a regression finishes.
+ *
+ *       Safe to call again: steps that already have a finding are skipped, and
+ *       a job still in flight returns `alreadyRunning` instead of duplicating.
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: runId
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       202:
+ *         description: Analysis queued (or already in flight)
+ *       403:
+ *         description: Run belongs to another user
+ *       404:
+ *         description: Run not found
+ */
+router.post('/runs/:runId/doctor/analyze', requireAuth, analyzeRunFailures);
 
 /**
  * @swagger

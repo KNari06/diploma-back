@@ -47,7 +47,25 @@ export interface PersistLLMCallInput {
   durationMs?: number;
 }
 
-/** Flatten a messages array into a single readable string for storage. */
+/**
+ * Flatten a messages array into a single readable string for storage.
+ *
+ * Vision parts are replaced by a placeholder instead of being serialised. A
+ * multimodal message carries its images as `image_url` data URLs — the
+ * Regression Doctor inlines up to two screenshots at ~4 MB of base64 each — and
+ * stringifying those only to `clamp()` them away afterwards would run
+ * `JSON.stringify` and every redaction regex across ~8 MB per call, per
+ * finding. The bytes are also worthless in a text store: nobody reads base64
+ * out of a log column.
+ */
+function serializePart(part: unknown): string {
+  if (typeof part === 'string') return part;
+  const type = (part as { type?: string } | null)?.type;
+  if (type === 'text') return String((part as { text?: unknown }).text ?? '');
+  if (type === 'image_url') return '[image]';
+  return type ? `[${type}]` : '';
+}
+
 function serializePrompt(prompt: PersistLLMCallInput['prompt']): string {
   if (!prompt) return '';
   if (typeof prompt === 'string') return prompt;
@@ -56,9 +74,11 @@ function serializePrompt(prompt: PersistLLMCallInput['prompt']): string {
       .map((m) => {
         const role = (m as { role?: string }).role ?? 'unknown';
         const content = (m as { content?: unknown }).content;
-        const text =
-          typeof content === 'string' ? content : JSON.stringify(content ?? '');
-        return `[${role}] ${text}`;
+        if (typeof content === 'string') return `[${role}] ${content}`;
+        if (Array.isArray(content)) {
+          return `[${role}] ${content.map(serializePart).filter(Boolean).join(' ')}`;
+        }
+        return `[${role}] ${JSON.stringify(content ?? '')}`;
       })
       .join('\n');
   } catch {

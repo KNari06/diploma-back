@@ -95,3 +95,22 @@ Per-negative + regenerate routes are NOT plan-scoped, so they authorize via proj
 |---|---|
 | `db/intent-test-case.db.ts` | All `intent_test_cases` reads/writes (create / owner-scoped get / internal get / project list + count / dependency-closure + name resolution / steps_json read+write / owner update / delete / mark-negatives-stale) plus the `projects.workspace_id` access-check read and the `regression_plan_items` cleanup delete. Query-builder factories — each returns the awaitable Supabase query, so the service keeps its existing error-handling, logging, and merge logic |
 | `intent-test-case.service.ts` | Orchestration only: precondition DFS, the V16/V27 step-merge + compiled-plan invalidation, the `canWriteTestCase` access gate (owner OR workspace member), cache invalidation, and row → `IntentTestCase` mapping (`mapToIntentTestCase`). No `supabaseAdmin` import |
+
+## Regression Doctor domain (fourth db/ example)
+
+`src/services/regression-doctor/` splits its queries by direction, because the
+read and write paths have no query in common and different lifetimes — one runs
+in a background job, the other behind a user click:
+
+| File | What it holds |
+|---|---|
+| `db/regression-doctor.db.ts` | READ path for analysis: failed executions of a run (`test_executions`, which is the only table linking a run to BOTH the execution and the authored `test_case_id`), the `tests.executed_steps` trace, authored test cases, Bug Inspector summaries from both results tables, and the finding INSERT |
+| `db/regression-doctor-apply.db.ts` | WRITE path: finding load, `steps_json` optimistic write (`updated_at` gate, reports rows written), snapshot insert/delete, finding status flips, negatives-stale reuse |
+| `failed-step-collector.ts` | Run → "this step of this test case broke": first failing step per failed test, matched to `steps_json` by id only, with the finalize-race retry and the injected-id guards |
+| `step-fix-agent.ts` / `step-fix-prompt.ts` / `screenshot-inline.ts` | One LLM call per failing step: the call + validation, the prompt, and the screenshot inlining respectively |
+| `patch-applier.ts` | Pure steps-in/steps-out patching for the three actions, including the `bindingHints` + `compiled` invalidation that makes a fix take effect at replay |
+
+**`tests` has no `intent_test_case_id`.** The run → authored-case link is
+`test_executions.test_case_id`; the executed test's id lives inside
+`test_executions.result->>'testId'`. The Doctor's first implementation selected
+`tests(intent_test_case_id)` and therefore threw on its first query.

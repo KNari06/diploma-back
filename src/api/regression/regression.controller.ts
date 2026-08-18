@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { env } from '@/config/environment/env';
+import { QueueManager } from '@/config/infrastructure/queues';
 import { supabaseAdmin } from '@/db/supabase';
 import { cache } from '@/utils/core/redis-cache';
 import { ExecutionService } from '@/services/testing/executions/execution.service';
@@ -15,6 +16,7 @@ import {
   ApplyNotFoundError,
 } from '@/services/regression-doctor/apply.service';
 import { revertDoctorFinding } from '@/services/regression-doctor/revert.service';
+import { readAnalysis } from '@/services/regression-doctor/analysis-record';
 import { FullTestDataService } from '@/services/testing/ui/manual/full-test-data.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import {
@@ -1463,6 +1465,70 @@ export async function getSharedReport(req: Request, res: Response): Promise<void
 }
 
 /**
+ * Start the Regression Doctor for a run — the ONLY way it ever runs.
+ *
+ * POST /api/v1/regression/runs/:runId/doctor/analyze
+ *
+ * Deliberately manual. The analysis costs one vision call per failed test, so
+ * running it on every finished regression would bill a nightly suite for
+ * failures nobody has looked at yet. The user asks for it from the run report.
+ *
+ * Re-clicking is safe and cheap: the job skips every step that already has a
+ * finding, so a second analysis only pays for what is new. A job still in
+ * flight returns 202 with `alreadyRunning`, not a duplicate.
+ */
+export async function analyzeRunFailures(
+  req: AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    const { runId } = req.params;
+    if (!runId || typeof runId !== 'string') {
+      res.status(400).json({ success: false, error: 'runId is required' });
+      return;
+    }
+    const userId = getUserId(req);
+
+    const { data: run } = await supabaseAdmin
+      .from('regression_runs')
+      .select('id, user_id, project_id, status')
+      .eq('id', runId)
+      .maybeSingle();
+
+    if (!run) {
+      res.status(404).json({ success: false, error: 'Run not found' });
+      return;
+    }
+    if (run.user_id !== userId) {
+      res.status(403).json({ success: false, error: 'Forbidden' });
+      return;
+    }
+
+    const { queued, alreadyRunning } = await QueueManager.addRegressionDoctorJob({
+      runId,
+      projectId: run.project_id,
+      userId: run.user_id,
+    });
+
+    logger.info('[REGRESSION_API] Regression Doctor requested', {
+      runId,
+      userId,
+      queued,
+      alreadyRunning,
+    });
+
+    res.status(202).json({
+      success: true,
+      data: { runId, queued, alreadyRunning },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to start Regression Doctor', { error });
+    handleControllerError(res, error, 'Failed to start analysis');
+  }
+}
+
+/**
  * List Regression Doctor findings for a specific run.
  *
  * GET /api/v1/regression/runs/:runId/doctor
@@ -1513,9 +1579,23 @@ export async function getRunDoctorFindings(
       throw new Error(`Failed to fetch findings: ${error.message}`);
     }
 
+    // Whether an analysis has ever run for this run. Zero findings alone cannot
+    // say so, and a panel that cannot tell the two apart looks broken after an
+    // analysis that legitimately had nothing to propose.
+    //
+    // The durable record first, the queue only as a fallback: the job carries
+    // the same numbers but is evicted after 25 completions queue-wide, and an
+    // analysis that has aged out must not read as one that never happened. The
+    // fallback still covers runs analyzed before the record existed, and an
+    // in-flight job (which has no record yet) so the panel keeps waiting
+    // instead of flipping to "nothing to fix" mid-run.
+    const analysis =
+      (await readAnalysis(runId)) ?? (await QueueManager.getRegressionDoctorJobStatus(runId));
+
     res.json({
       success: true,
       data: findings || [],
+      analysis,
       timestamp: new Date(),
     });
   } catch (error) {

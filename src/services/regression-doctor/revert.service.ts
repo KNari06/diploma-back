@@ -1,49 +1,40 @@
 /**
  * ─────────────────────────────────────────────────────────────────────────────
- * Regression Doctor — Revert service (Phase-2 Slice B, follow-up)
+ * Regression Doctor — Revert service
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * Closes the Apply → "changed my mind" → Revert loop. Reads the snapshots
- * written during the original Bulk Apply and restores each test case's
- * `steps_json` to `steps_before` — the exact pre-apply state, byte for
- * byte.
- *
- * Why a separate service (not inline in the controller):
- *   • Same per-test-case mutex as apply — SHARED (imported from
- *     apply.service) so an Apply+Revert race on the same test case
- *     serialises correctly.
- *   • Same per-test failure isolation + typed return shape as apply, so
- *     the UI can render a mixed summary ("Reverted 13 / Skipped 2").
- *   • Keeps controller thin.
+ * written during Apply and restores each test case's `steps_json` to
+ * `steps_before` — the exact pre-apply state, byte for byte.
  *
  * Key correctness rules:
  *
- *  1. **Refuse to revert manual edits.** If the user edited a test case
- *     AFTER Apply (i.e. `steps_json !== snapshot.steps_after`), we must
- *     NOT blindly overwrite with `steps_before` — that would discard the
- *     user's manual work. We skip with `modified_after_apply` and leave
- *     it to the user.
+ *  1. **Refuse to revert manual edits.** If the user edited a test case AFTER
+ *     Apply (current `steps_json` !== `snapshot.steps_after`), restoring
+ *     `steps_before` would discard their work. We skip with
+ *     `modified_after_apply` and leave it to them.
  *
- *  2. **Optimistic concurrency.** Same `updated_at` gate as apply. If
- *     something else is writing the test in parallel, we back off.
+ *  2. **Optimistic concurrency.** Same `updated_at` gate as apply.
  *
- *  3. **Snapshot cleanup on success.** After a successful revert, the
- *     snapshot is semantically stale — it records an apply that no
- *     longer exists. We delete it. A future re-Apply of the finding will
- *     create fresh snapshots. Skipped snapshots stay intact so the
- *     audit trail reflects "we tried to revert but couldn't".
+ *  3. **Snapshot cleanup on success.** A reverted snapshot documents an apply
+ *     that no longer exists, so the row is deleted. Skipped snapshots stay, so
+ *     the audit trail still shows "we tried and couldn't".
  *
- *  4. **Finding state machine.** After revert, the finding flips to
- *     `'open'` iff ≥1 test was reverted AND 0 snapshots remain. If some
- *     snapshots remain (partial revert), the finding stays `'applied'`
- *     so the user sees "partial — some tests still patched".
- *     `applied_at` / `applied_by` are cleared only on a full revert to
- *     keep semantics consistent ("no longer applied").
+ *  4. **Finding state machine.** After revert the finding flips to `'open'` iff
+ *     ≥1 test was reverted AND no snapshots remain. A partial revert stays
+ *     `'applied'` so the UI can show "some tests are still patched".
+ *
+ *  5. **Same side effects as apply.** Restoring steps is a `steps_json` write
+ *     like any other: negatives derived from this case go stale again, and the
+ *     flow-tree cache must be dropped.
+ *
+ * Shares the per-test-case mutex with apply (imported, not re-declared) so an
+ * Apply and a Revert on one test case serialise instead of racing.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import {
   ApplyAccessError,
@@ -51,6 +42,17 @@ import {
   ApplyNotFoundError,
   withTestCaseMutex,
 } from './apply.service';
+import {
+  countSnapshotsForFinding,
+  deleteApplySnapshot,
+  getFindingForRevert,
+  getSnapshotsForFinding,
+  getTestCaseForApply,
+  markFindingOpen,
+  markNegativesStaleForTestCase,
+  updateStepsJsonIfUnchanged,
+  type SnapshotRow,
+} from './db/regression-doctor-apply.db';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -60,9 +62,8 @@ export interface RevertFindingInput {
   findingId: string;
   userId: string;
   /**
-   * Optional subset of snapshot ids to revert. When omitted, every
-   * snapshot attached to the finding is attempted. Unknown ids silently
-   * dropped via intersection with the finding's snapshot list.
+   * Optional subset of snapshot ids. When omitted, every snapshot attached to
+   * the finding is attempted. Unknown ids are dropped by intersection.
    */
   snapshotIds?: string[];
 }
@@ -83,7 +84,7 @@ export interface RevertFindingResult {
   totalRequested: number;
   results: PerSnapshotOutcome[];
   findingStatus: 'open' | 'applied';
-  /** Count of snapshots still attached to the finding after the run. */
+  /** Snapshots still attached to the finding after the run. */
   remainingSnapshots: number;
 }
 
@@ -97,15 +98,8 @@ export async function revertDoctorFinding(
   const { findingId, userId, snapshotIds } = input;
 
   // ── 1. Load + validate the finding ────────────────────────────────────────
-  const { data: finding, error: findingErr } = await supabaseAdmin
-    .from('regression_doctor_findings')
-    .select('id, user_id, status, applied_at')
-    .eq('id', findingId)
-    .maybeSingle();
+  const finding = await getFindingForRevert(findingId);
 
-  if (findingErr) {
-    throw new Error(`Failed to load finding: ${findingErr.message}`);
-  }
   if (!finding) {
     throw new ApplyNotFoundError('Finding not found');
   }
@@ -113,29 +107,19 @@ export async function revertDoctorFinding(
     throw new ApplyAccessError('Finding not owned by user');
   }
   if (finding.status !== 'applied') {
-    // Can only revert what was applied. Anything else (open / dismissed
-    // / resolved) has no snapshots to act on.
+    // Only an applied finding has snapshots to act on.
     throw new ApplyConflictError(`Finding is ${finding.status}, not applied`);
   }
 
   // ── 2. Load snapshots ─────────────────────────────────────────────────────
-  const { data: snapRows, error: snapErr } = await supabaseAdmin
-    .from('regression_doctor_apply_snapshots')
-    .select('id, test_case_id, steps_before, steps_after')
-    .eq('finding_id', findingId);
-
-  if (snapErr) {
-    throw new Error(`Failed to load snapshots: ${snapErr.message}`);
-  }
-  const snapshots = Array.isArray(snapRows) ? snapRows : [];
+  const snapshots = await getSnapshotsForFinding(findingId);
   if (snapshots.length === 0) {
     throw new ApplyConflictError(
       'Finding has no snapshots to revert (likely applied on an older version that did not track them)',
     );
   }
 
-  // Intersect requested subset with the snapshots we actually have.
-  const allIds = new Set(snapshots.map((s) => s.id as string));
+  const allIds = new Set(snapshots.map((s) => s.id));
   const requestedIds =
     Array.isArray(snapshotIds) && snapshotIds.length > 0
       ? snapshotIds.filter((id) => allIds.has(id))
@@ -147,18 +131,15 @@ export async function revertDoctorFinding(
 
   // ── 3. Revert each snapshot ───────────────────────────────────────────────
   const results: PerSnapshotOutcome[] = [];
-  const byId = new Map(snapshots.map((s) => [s.id as string, s]));
+  const byId = new Map(snapshots.map((s) => [s.id, s] as const));
 
   for (const snapshotId of requestedIds) {
     const snap = byId.get(snapshotId);
-    if (!snap) continue; // defensive; can't happen after intersection
+    if (!snap) continue; // defensive; cannot happen after the intersection
 
     try {
-      const outcome = await withTestCaseMutex(snap.test_case_id as string, () =>
-        revertOneSnapshot({
-          snapshot: snap,
-          userId,
-        }),
+      const outcome = await withTestCaseMutex(snap.test_case_id, () =>
+        revertOneSnapshot({ snapshot: snap, userId }),
       );
       results.push(outcome);
     } catch (err) {
@@ -170,7 +151,7 @@ export async function revertDoctorFinding(
       });
       results.push({
         snapshotId,
-        testCaseId: snap.test_case_id as string,
+        testCaseId: snap.test_case_id,
         status: 'error',
         message: err instanceof Error ? err.message : String(err),
       });
@@ -178,60 +159,33 @@ export async function revertDoctorFinding(
   }
 
   // ── 4. Re-count surviving snapshots + decide finding state ────────────────
-  // Reverts delete the snapshot row. The finding goes back to 'open' ONLY
-  // if every snapshot was reverted; a partial revert leaves the finding
-  // marked 'applied' so the UI can signal "some tests still patched".
-  const { data: remainingSnapRows, error: remainingErr } = await supabaseAdmin
-    .from('regression_doctor_apply_snapshots')
-    .select('id')
-    .eq('finding_id', findingId);
+  const { count, error: remainingErr } = await countSnapshotsForFinding(findingId);
 
   if (remainingErr) {
-    // Non-fatal for the per-test outcomes the user sees; log and assume
-    // partial so we don't falsely clear applied_*.
+    // Non-fatal for the per-test outcomes the user sees. Assume partial so we
+    // never falsely clear `applied_*`.
     logger.error('[DOCTOR_REVERT] Failed to re-count snapshots', {
       findingId,
-      error: remainingErr.message,
+      error: remainingErr,
     });
   }
-  const remainingSnapshots = Array.isArray(remainingSnapRows)
-    ? remainingSnapRows.length
-    : snapshots.length;
+  const remainingSnapshots = count ?? snapshots.length;
 
   const anyReverted = results.some((r) => r.status === 'reverted');
   let findingStatus: 'open' | 'applied' = 'applied';
 
   if (anyReverted && remainingSnapshots === 0) {
-    const { error: updErr } = await supabaseAdmin
-      .from('regression_doctor_findings')
-      .update({
-        status: 'open',
-        applied_at: null,
-        applied_by: null,
-      })
-      .eq('id', findingId)
-      .eq('status', 'applied'); // only touch if nobody changed it mid-flight
-
-    if (updErr) {
-      logger.error('[DOCTOR_REVERT] Failed to flip finding back to open', {
-        findingId,
-        error: updErr.message,
-      });
-      // The per-test rows DID get reverted; the status is just stale.
-      // We stay pessimistic and report 'applied' so the caller doesn't
-      // assume a clean state.
+    const { error } = await markFindingOpen(findingId);
+    if (error) {
+      logger.error('[DOCTOR_REVERT] Failed to flip finding back to open', { findingId, error });
+      // The rows DID get reverted; only the status is stale. Stay pessimistic
+      // so the caller doesn't assume a clean state.
     } else {
       findingStatus = 'open';
     }
   }
 
-  return {
-    findingId,
-    totalRequested: requestedIds.length,
-    results,
-    findingStatus,
-    remainingSnapshots,
-  };
+  return { findingId, totalRequested: requestedIds.length, results, findingStatus, remainingSnapshots };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -239,27 +193,17 @@ export async function revertDoctorFinding(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function revertOneSnapshot(params: {
-  snapshot: { id: string; test_case_id: string; steps_before: unknown; steps_after: unknown };
+  snapshot: SnapshotRow;
   userId: string;
 }): Promise<PerSnapshotOutcome> {
   const { snapshot, userId } = params;
-  const testCaseId = snapshot.test_case_id;
-  const snapshotId = snapshot.id;
+  const { id: snapshotId, test_case_id: testCaseId } = snapshot;
 
   // ── Load current test state ───────────────────────────────────────────────
-  const { data: row, error: readErr } = await supabaseAdmin
-    .from('intent_test_cases')
-    .select('id, user_id, steps_json, updated_at')
-    .eq('id', testCaseId)
-    .maybeSingle();
+  const { row, error: readErr } = await getTestCaseForApply(testCaseId);
 
   if (readErr) {
-    return {
-      snapshotId,
-      testCaseId,
-      status: 'error',
-      message: `read failed: ${readErr.message}`,
-    };
+    return { snapshotId, testCaseId, status: 'error', message: `read failed: ${readErr}` };
   }
   if (!row) {
     return { snapshotId, testCaseId, status: 'skipped', reason: 'test_case_missing' };
@@ -268,66 +212,71 @@ async function revertOneSnapshot(params: {
     return { snapshotId, testCaseId, status: 'skipped', reason: 'access_denied' };
   }
 
-  // ── Refuse to revert if the user has edited the test since apply ─────────
-  // We compare the CURRENT steps_json against `steps_after`. If they
-  // differ, the user modified the file after apply and blindly writing
-  // `steps_before` would silently destroy their work.
-  // Byte-identical JSON check — same technique as `applyToOneTestCase`
-  // uses to detect `already_patched`.
-  const currentJson = JSON.stringify(row.steps_json);
-  const afterJson = JSON.stringify(snapshot.steps_after);
-  if (currentJson !== afterJson) {
-    return {
-      snapshotId,
-      testCaseId,
-      status: 'skipped',
-      reason: 'modified_after_apply',
-    };
+  // ── Refuse to revert over a manual edit ───────────────────────────────────
+  // Byte-identical comparison against what Apply wrote. Anything else means the
+  // user has since edited the case, and `steps_before` would destroy that.
+  if (JSON.stringify(row.steps_json) !== JSON.stringify(snapshot.steps_after)) {
+    return { snapshotId, testCaseId, status: 'skipped', reason: 'modified_after_apply' };
   }
-
-  const beforeUpdatedAt = row.updated_at as string;
-  const stepsBefore = snapshot.steps_before as IntentStep[];
 
   // ── Optimistic write: restore steps_before ────────────────────────────────
-  const { data: updated, error: updErr } = await supabaseAdmin
-    .from('intent_test_cases')
-    .update({ steps_json: stepsBefore })
-    .eq('id', testCaseId)
-    .eq('updated_at', beforeUpdatedAt)
-    .select('id');
+  const { written, error: updErr } = await updateStepsJsonIfUnchanged({
+    testCaseId,
+    steps: snapshot.steps_before as IntentStep[],
+    expectedUpdatedAt: row.updated_at,
+  });
 
   if (updErr) {
-    return {
-      snapshotId,
-      testCaseId,
-      status: 'error',
-      message: `write failed: ${updErr.message}`,
-    };
+    return { snapshotId, testCaseId, status: 'error', message: `write failed: ${updErr}` };
   }
-  if (!updated || updated.length === 0) {
-    // Race — someone wrote to this row after our read. Bail; don't
-    // delete the snapshot (we haven't actually reverted).
+  if (written === 0) {
+    // Race — someone wrote after our read. Don't delete the snapshot: we have
+    // not actually reverted anything.
     return { snapshotId, testCaseId, status: 'skipped', reason: 'concurrent_edit' };
   }
 
   // ── Snapshot cleanup ──────────────────────────────────────────────────────
-  // The apply-operation this snapshot documented no longer exists. We
-  // drop the row so a future re-Apply doesn't see a stale "already
-  // applied" record.
-  const { error: delErr } = await supabaseAdmin
-    .from('regression_doctor_apply_snapshots')
-    .delete()
-    .eq('id', snapshotId);
-
+  const { error: delErr } = await deleteApplySnapshot(snapshotId);
   if (delErr) {
-    // The revert ITSELF succeeded — the DB write landed. Snapshot
-    // cleanup failure is cosmetic (orphan row). Log and carry on so
-    // the user sees the revert as successful.
+    // The revert itself succeeded — the write landed. An orphan snapshot row is
+    // cosmetic, so the user still sees a successful revert.
     logger.warn('[DOCTOR_REVERT] Snapshot cleanup failed (non-fatal)', {
       snapshotId,
-      error: delErr.message,
+      error: delErr,
     });
   }
 
+  await runPostRevertSideEffects({ testCaseId, flowId: row.flow_id });
+
   return { snapshotId, testCaseId, status: 'reverted' };
+}
+
+/**
+ * Same best-effort side effects as apply — a revert is a `steps_json` write
+ * like any other, and the negatives / flow cache do not care which direction
+ * the steps moved.
+ */
+async function runPostRevertSideEffects(params: {
+  testCaseId: string;
+  flowId: string | null;
+}): Promise<void> {
+  const { testCaseId, flowId } = params;
+
+  const { error } = await markNegativesStaleForTestCase(testCaseId).catch((err) => ({
+    count: null,
+    error: err instanceof Error ? err.message : String(err),
+  }));
+  if (error) {
+    logger.warn('[DOCTOR_REVERT] Failed to mark negatives stale (non-fatal)', { testCaseId, error });
+  }
+
+  if (flowId) {
+    await cache.delByPattern(`qait:cache:ptree:flow:${flowId}:*`).catch((err: unknown) => {
+      logger.warn('[DOCTOR_REVERT] Flow cache invalidation failed (non-fatal)', {
+        testCaseId,
+        flowId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
 }

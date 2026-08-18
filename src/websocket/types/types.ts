@@ -255,6 +255,13 @@ export interface ServerToClientEvents {
   'regression:doctor:ready': (data: {
     runId: string;
     findingsCount: number;
+    /**
+     * True when the analysis ended in an error rather than a verdict. The event
+     * is emitted on BOTH outcomes on purpose: the panel's spinner is cleared
+     * only by this event, so a job that throws and stays silent leaves
+     * "Analyzing…" on screen forever.
+     */
+    failed?: boolean;
     timestamp: string;
   }) => void;
 

@@ -1,392 +1,279 @@
 /**
- * Unit tests for the pure parts of the Regression Doctor apply service.
+ * Unit tests for `applyDoctorFinding`.
  *
- * We deliberately test the *pure* helpers only — `applyPatch` and
- * `locateTargetStep`. The DB-touching `applyDoctorFinding` entry point
- * is exercised by integration tests (Supabase-backed) because the
- * meaningful behaviour it adds over the pure core is concurrency +
- * RLS semantics, both of which require a real (or well-mocked) DB.
- *
- * Goals:
- *   • Prove the four patch actions produce correct step arrays.
- *   • Prove the target-step resolver falls back in the documented order
- *     (text match → tag+text match → targetStepIndex → null).
- *   • Prove StepOutOfBoundsError fires on invalid indexes.
- *   • Lock down insertStep UUID generation — the caller relies on the
- *     new step having a non-empty `id` so downstream compiled plans
- *     don't key on `undefined`.
+ * Mocked at the `db/` boundary, per the repo's testing rules — the previous
+ * suite stood up a 600-line in-memory Supabase fake, which the rules
+ * specifically forbid and which made the concurrency cases hard to read. With a
+ * db/ sublayer, "the user edited the row between our read and our write" is one
+ * mock return value.
  */
 
-import {
-  applyPatch,
-  locateTargetStep,
-  StepOutOfBoundsError,
-} from '../apply.service';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
-import type { DriftProposedPatch } from '../drift-agent';
+import type { StepPatch } from '../types';
 
-// ─── Helpers ────────────────────────────────────────────────────────────
-const makeStep = (overrides: Partial<IntentStep> = {}): IntentStep => ({
-  id: `step-${Math.random().toString(36).slice(2, 8)}`,
-  type: 'click' as IntentStep['type'],
-  description: 'Click login',
+jest.mock('../db/regression-doctor-apply.db');
+jest.mock('@/utils/core/redis-cache', () => ({
+  cache: { delByPattern: jest.fn().mockResolvedValue(undefined) },
+}));
+
+import * as db from '../db/regression-doctor-apply.db';
+import { cache } from '@/utils/core/redis-cache';
+import {
+  applyDoctorFinding,
+  ApplyAccessError,
+  ApplyConflictError,
+  ApplyNotFoundError,
+} from '../apply.service';
+
+const mockDb = db as jest.Mocked<typeof db>;
+
+const PATCH: StepPatch = {
+  action: 'update_element',
+  reason: 'renamed in 2.3',
+  description: 'the Support entry',
+  bindingHints: { label: 'Поддержка' },
+};
+
+const finding = (overrides: Partial<db.FindingForApplyRow> = {}): db.FindingForApplyRow => ({
+  id: 'finding-1',
+  user_id: 'user-1',
+  project_id: 'project-1',
+  status: 'open',
+  verdict: 'test_fix',
+  test_case_id: 'tc-1',
+  step_id: 'step-1',
+  proposed_patch: PATCH,
+  affected_test_ids: ['tc-1'],
   ...overrides,
 });
 
-const makeSteps = (): IntentStep[] => [
-  makeStep({ id: 's1', type: 'fill' as IntentStep['type'], description: 'Fill email' }),
-  makeStep({ id: 's2', type: 'fill' as IntentStep['type'], description: 'Fill password' }),
-  makeStep({ id: 's3', type: 'click' as IntentStep['type'], description: 'Click login' }),
-];
-
-// Minimal finding shape accepted by locateTargetStep.
-// Note: we check `'target_element_key' in overrides` (not `??`) so that
-// callers can explicitly pass `null` to test the null-key branch without
-// being silently coerced back to the default.
-const makeFinding = (overrides: {
-  target_element_key?: string | null;
-  url_pattern?: string;
-} = {}) => ({
-  target_element_key:
-    'target_element_key' in overrides
-      ? (overrides.target_element_key as string | null)
-      : 'button:Click login',
-  url_pattern: overrides.url_pattern ?? '/login',
+const testCase = (overrides: Partial<db.TestCaseForApplyRow> = {}): db.TestCaseForApplyRow => ({
+  id: 'tc-1',
+  user_id: 'user-1',
+  project_id: 'project-1',
+  flow_id: 'flow-1',
+  steps_json: [
+    { id: 'step-1', type: 'click', description: 'the old entry' } as IntentStep,
+  ],
+  updated_at: '2026-08-13T10:00:00Z',
+  ...overrides,
 });
 
-// ─── locateTargetStep ───────────────────────────────────────────────────
-describe('locateTargetStep', () => {
-  const basePatch: DriftProposedPatch = {
-    action: 'replace_selector',
-    targetStepIndex: 2,
-    newSelector: '#login-btn',
-    reason: 'Button selector moved',
-  };
+beforeEach(() => {
+  jest.clearAllMocks();
 
-  it('returns null for empty steps array', () => {
-    expect(locateTargetStep([], makeFinding(), basePatch)).toBeNull();
+  mockDb.getFindingForApply.mockResolvedValue(finding());
+  mockDb.getTestCaseForApply.mockResolvedValue({ row: testCase(), error: null });
+  mockDb.insertApplySnapshot.mockResolvedValue({ id: 'snapshot-1', error: null });
+  mockDb.updateStepsJsonIfUnchanged.mockResolvedValue({ written: 1, error: null });
+  mockDb.deleteApplySnapshot.mockResolvedValue({ error: null });
+  mockDb.markFindingApplied.mockResolvedValue({ written: 1, error: null });
+  mockDb.markNegativesStaleForTestCase.mockResolvedValue({ count: 0, error: null });
+});
+
+describe('validation', () => {
+  it('rejects a finding that does not exist', async () => {
+    mockDb.getFindingForApply.mockResolvedValue(null);
+    await expect(applyDoctorFinding({ findingId: 'x', userId: 'user-1' })).rejects.toThrow(
+      ApplyNotFoundError,
+    );
   });
 
-  it('matches by targetElementKey text (primary path)', () => {
-    const steps = makeSteps();
-    const idx = locateTargetStep(
-      steps,
-      makeFinding({ target_element_key: 'button:Click login' }),
-      basePatch,
+  it('rejects a finding owned by someone else', async () => {
+    mockDb.getFindingForApply.mockResolvedValue(finding({ user_id: 'someone-else' }));
+    await expect(applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' })).rejects.toThrow(
+      ApplyAccessError,
     );
-    expect(idx).toBe(2);
   });
 
-  it('matches case-insensitively on text', () => {
-    const steps = makeSteps();
-    const idx = locateTargetStep(
-      steps,
-      makeFinding({ target_element_key: 'button:CLICK LOGIN' }),
-      basePatch,
+  it('rejects a finding that was already applied', async () => {
+    mockDb.getFindingForApply.mockResolvedValue(finding({ status: 'applied' }));
+    await expect(applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' })).rejects.toThrow(
+      ApplyConflictError,
     );
-    expect(idx).toBe(2);
   });
 
-  it('respects bindingHints.tag when present and mismatching', () => {
-    // Step has bindingHints.tag='a' but we look for 'button' → no text-match
-    // should be accepted because the tag filter rejects it. Falls back to
-    // targetStepIndex which points to step 2 (valid).
-    const steps = makeSteps();
-    steps[2].bindingHints = { tag: 'a' } as IntentStep['bindingHints'];
-    const idx = locateTargetStep(
-      steps,
-      makeFinding({ target_element_key: 'button:Click login' }),
-      basePatch,
+  it('refuses to apply a finding that blames the application', async () => {
+    // Applying "a fix" to a real bug is how the bug stops being reported.
+    mockDb.getFindingForApply.mockResolvedValue(
+      finding({ verdict: 'app_bug', proposed_patch: PATCH }),
     );
-    // With text-match rejected by tag, fallback = targetStepIndex = 2.
-    expect(idx).toBe(2);
+    await expect(applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' })).rejects.toThrow(
+      /app_bug/,
+    );
   });
 
-  it('accepts bindingHints.tag match when present', () => {
-    const steps = makeSteps();
-    steps[2].bindingHints = { tag: 'button' } as IntentStep['bindingHints'];
-    const idx = locateTargetStep(
-      steps,
-      makeFinding({ target_element_key: 'button:Click login' }),
-      basePatch,
+  it('rejects a finding that identifies no step', async () => {
+    mockDb.getFindingForApply.mockResolvedValue(finding({ step_id: null }));
+    await expect(applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' })).rejects.toThrow(
+      ApplyConflictError,
     );
-    expect(idx).toBe(2);
-  });
-
-  it('falls back to targetStepIndex when text does not match', () => {
-    const steps = makeSteps();
-    const idx = locateTargetStep(
-      steps,
-      makeFinding({ target_element_key: 'button:Solve captcha' }),
-      { ...basePatch, targetStepIndex: 1 },
-    );
-    expect(idx).toBe(1);
-  });
-
-  it('returns null when both text and fallback fail', () => {
-    const steps = makeSteps();
-    const idx = locateTargetStep(
-      steps,
-      makeFinding({ target_element_key: 'button:Solve captcha' }),
-      { ...basePatch, targetStepIndex: 99 },
-    );
-    expect(idx).toBeNull();
-  });
-
-  it('allows insert_before to target index === length (append)', () => {
-    const steps = makeSteps();
-    const patch: DriftProposedPatch = {
-      action: 'insert_before',
-      targetStepIndex: steps.length, // 3 on a 3-element array
-      insertStep: { type: 'click', description: 'Extra step' },
-      reason: 'append',
-    };
-    const idx = locateTargetStep(
-      steps,
-      makeFinding({ target_element_key: 'button:Does not exist' }),
-      patch,
-    );
-    expect(idx).toBe(steps.length);
-  });
-
-  it('does NOT allow other actions to target index === length', () => {
-    const steps = makeSteps();
-    const patch: DriftProposedPatch = {
-      action: 'replace_selector',
-      targetStepIndex: steps.length,
-      newSelector: '#foo',
-      reason: 'bad',
-    };
-    const idx = locateTargetStep(
-      steps,
-      makeFinding({ target_element_key: 'button:Does not exist' }),
-      patch,
-    );
-    expect(idx).toBeNull();
-  });
-
-  it('tolerates null target_element_key and uses fallback only', () => {
-    const steps = makeSteps();
-    const idx = locateTargetStep(
-      steps,
-      makeFinding({ target_element_key: null }),
-      { ...basePatch, targetStepIndex: 0 },
-    );
-    expect(idx).toBe(0);
   });
 });
 
-// ─── applyPatch ─────────────────────────────────────────────────────────
-describe('applyPatch', () => {
-  describe('insert_before', () => {
-    it('splices a new step at the given index and generates an id', () => {
-      const steps = makeSteps();
-      const patch: DriftProposedPatch = {
-        action: 'insert_before',
-        targetStepIndex: 2,
-        insertStep: { type: 'click', description: 'Solve captcha' },
-        reason: 'captcha added',
-      };
+describe('happy path', () => {
+  it('writes the patched steps and marks the finding applied', async () => {
+    const result = await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
 
-      const { steps: out, description } = applyPatch(steps, 2, patch);
-
-      expect(out).toHaveLength(steps.length + 1);
-      expect(out[2].type).toBe('click');
-      expect(out[2].description).toBe('Solve captcha');
-      expect(typeof out[2].id).toBe('string');
-      expect(out[2].id.length).toBeGreaterThan(0);
-      // Original step that was at index 2 is now at 3.
-      expect(out[3].id).toBe('s3');
-      expect(description).toMatch(/Inserted step at index 2/);
-    });
-
-    it('preserves existing step ids around the insert point', () => {
-      const steps = makeSteps();
-      const patch: DriftProposedPatch = {
-        action: 'insert_before',
-        targetStepIndex: 1,
-        insertStep: { type: 'click', description: 'Accept cookies' },
-        reason: 'cookies banner',
-      };
-      const { steps: out } = applyPatch(steps, 1, patch);
-      expect(out[0].id).toBe('s1');
-      expect(out[2].id).toBe('s2');
-      expect(out[3].id).toBe('s3');
-    });
-
-    it('includes value on the inserted step when supplied', () => {
-      const steps = makeSteps();
-      const patch: DriftProposedPatch = {
-        action: 'insert_before',
-        targetStepIndex: 0,
-        insertStep: { type: 'fill', description: 'OTP', value: '123456' },
-        reason: 'OTP step added',
-      };
-      const { steps: out } = applyPatch(steps, 0, patch);
-      expect(out[0].value).toBe('123456');
-    });
-
-    it('throws when insertStep is missing', () => {
-      const steps = makeSteps();
-      const patch = {
-        action: 'insert_before',
-        targetStepIndex: 0,
-        reason: 'bad',
-      } as unknown as DriftProposedPatch;
-      expect(() => applyPatch(steps, 0, patch)).toThrow(/insertStep/);
-    });
+    expect(result.findingStatus).toBe('applied');
+    expect(result.results).toEqual([
+      expect.objectContaining({ testCaseId: 'tc-1', status: 'applied' }),
+    ]);
+    expect(mockDb.updateStepsJsonIfUnchanged).toHaveBeenCalledWith(
+      expect.objectContaining({ testCaseId: 'tc-1', expectedUpdatedAt: '2026-08-13T10:00:00Z' }),
+    );
   });
 
-  describe('replace_selector', () => {
-    it('writes newSelector into bindingHints and keeps other fields', () => {
-      const steps = makeSteps();
-      const patch: DriftProposedPatch = {
-        action: 'replace_selector',
-        targetStepIndex: 2,
-        newSelector: '#primary-login',
-        reason: 'Selector renamed',
-      };
-      const { steps: out, description } = applyPatch(steps, 2, patch);
-      expect(out).toHaveLength(steps.length); // length unchanged
-      expect(out[2].id).toBe('s3'); // id preserved
-      expect(out[2].description).toBe('Click login'); // description preserved
-      const hints = out[2].bindingHints as { selector?: string } | undefined;
-      expect(hints?.selector).toBe('#primary-login');
-      expect(description).toMatch(/Replaced selector on step 2/);
-    });
+  it('snapshots the pre-apply steps before writing', async () => {
+    await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
 
-    it('merges with existing bindingHints without clobbering other keys', () => {
-      const steps = makeSteps();
-      steps[2].bindingHints = { tag: 'button', role: 'button' } as IntentStep['bindingHints'];
-      const patch: DriftProposedPatch = {
-        action: 'replace_selector',
-        targetStepIndex: 2,
-        newSelector: '#login',
-        reason: 'ok',
-      };
-      const { steps: out } = applyPatch(steps, 2, patch);
-      const hints = out[2].bindingHints as {
-        tag?: string;
-        role?: string;
-        selector?: string;
-      };
-      expect(hints.tag).toBe('button');
-      expect(hints.role).toBe('button');
-      expect(hints.selector).toBe('#login');
-    });
-
-    it('throws StepOutOfBoundsError on negative index', () => {
-      const steps = makeSteps();
-      const patch: DriftProposedPatch = {
-        action: 'replace_selector',
-        targetStepIndex: -1,
-        newSelector: '#x',
-        reason: 'bad',
-      };
-      expect(() => applyPatch(steps, -1, patch)).toThrow(StepOutOfBoundsError);
-    });
-
-    it('throws StepOutOfBoundsError on index === length', () => {
-      const steps = makeSteps();
-      const patch: DriftProposedPatch = {
-        action: 'replace_selector',
-        targetStepIndex: steps.length,
-        newSelector: '#x',
-        reason: 'bad',
-      };
-      expect(() => applyPatch(steps, steps.length, patch)).toThrow(
-        StepOutOfBoundsError,
-      );
-    });
-
-    it('throws when newSelector is missing', () => {
-      const steps = makeSteps();
-      const patch = {
-        action: 'replace_selector',
-        targetStepIndex: 2,
-        reason: 'bad',
-      } as unknown as DriftProposedPatch;
-      expect(() => applyPatch(steps, 2, patch)).toThrow(/newSelector/);
-    });
+    const snapshotCall = mockDb.insertApplySnapshot.mock.calls[0][0];
+    expect(snapshotCall.steps_before[0].description).toBe('the old entry');
+    expect(snapshotCall.steps_after[0].description).toBe('the Support entry');
+    expect(mockDb.insertApplySnapshot.mock.invocationCallOrder[0]).toBeLessThan(
+      mockDb.updateStepsJsonIfUnchanged.mock.invocationCallOrder[0],
+    );
   });
 
-  describe('delete_step', () => {
-    it('removes the step at the given index', () => {
-      const steps = makeSteps();
-      const patch: DriftProposedPatch = {
-        action: 'delete_step',
-        targetStepIndex: 1,
-        reason: 'legacy step gone',
-      };
-      const { steps: out, description } = applyPatch(steps, 1, patch);
-      expect(out).toHaveLength(steps.length - 1);
-      expect(out[0].id).toBe('s1');
-      expect(out[1].id).toBe('s3');
-      expect(description).toMatch(/Deleted step 1/);
-    });
-
-    it('throws StepOutOfBoundsError on index === length', () => {
-      const steps = makeSteps();
-      const patch: DriftProposedPatch = {
-        action: 'delete_step',
-        targetStepIndex: steps.length,
-        reason: 'bad',
-      };
-      expect(() => applyPatch(steps, steps.length, patch)).toThrow(
-        StepOutOfBoundsError,
-      );
-    });
+  it('marks derived negative tests stale', async () => {
+    // Negatives are generated by mutating the parent's steps; patching the
+    // parent without this leaves them asserting against a step that is gone.
+    await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+    expect(mockDb.markNegativesStaleForTestCase).toHaveBeenCalledWith('tc-1');
   });
 
-  describe('update_value', () => {
-    it('replaces the value on the step, preserving id and description', () => {
-      const steps = makeSteps();
-      const patch: DriftProposedPatch = {
-        action: 'update_value',
-        targetStepIndex: 0,
-        insertStep: { type: 'fill', description: '', value: 'new@example.com' },
-        reason: 'placeholder change',
-      };
-      const { steps: out, description } = applyPatch(steps, 0, patch);
-      expect(out[0].id).toBe('s1');
-      expect(out[0].description).toBe('Fill email');
-      expect(out[0].value).toBe('new@example.com');
-      expect(description).toMatch(/Updated value on step 0/);
-    });
-
-    it('falls back to empty string when no value is supplied', () => {
-      const steps = makeSteps();
-      const patch: DriftProposedPatch = {
-        action: 'update_value',
-        targetStepIndex: 0,
-        reason: 'clear field',
-      };
-      const { steps: out } = applyPatch(steps, 0, patch);
-      expect(out[0].value).toBe('');
-    });
-
-    it('throws StepOutOfBoundsError on bad index', () => {
-      const steps = makeSteps();
-      const patch: DriftProposedPatch = {
-        action: 'update_value',
-        targetStepIndex: 99,
-        reason: 'bad',
-      };
-      expect(() => applyPatch(steps, 99, patch)).toThrow(StepOutOfBoundsError);
-    });
+  it('invalidates the flow-tree cache', async () => {
+    await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+    expect(cache.delByPattern).toHaveBeenCalledWith('qait:cache:ptree:flow:flow-1:*');
   });
 
-  describe('immutability', () => {
-    it('never mutates the input steps array', () => {
-      const steps = makeSteps();
-      const snapshot = JSON.stringify(steps);
-      const patch: DriftProposedPatch = {
-        action: 'delete_step',
-        targetStepIndex: 1,
-        reason: 'ok',
-      };
-      applyPatch(steps, 1, patch);
-      expect(JSON.stringify(steps)).toBe(snapshot);
+  it('still reports success when a best-effort side effect fails', async () => {
+    mockDb.markNegativesStaleForTestCase.mockRejectedValue(new Error('redis down'));
+    const result = await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+    expect(result.results[0].status).toBe('applied');
+  });
+});
+
+describe('per-test outcomes', () => {
+  it('skips a test case the user does not own', async () => {
+    mockDb.getTestCaseForApply.mockResolvedValue({
+      row: testCase({ user_id: 'someone-else' }),
+      error: null,
     });
+    const result = await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+    expect(result.results[0]).toMatchObject({ status: 'skipped', reason: 'access_denied' });
+  });
+
+  it('skips a test case whose steps no longer contain the finding step', async () => {
+    mockDb.getTestCaseForApply.mockResolvedValue({
+      row: testCase({ steps_json: [{ id: 'other-step', type: 'click', description: 'x' } as IntentStep] }),
+      error: null,
+    });
+    const result = await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+    expect(result.results[0]).toMatchObject({ status: 'skipped', reason: 'no_step_matched' });
+    expect(mockDb.updateStepsJsonIfUnchanged).not.toHaveBeenCalled();
+  });
+
+  it('skips a patch that does not fit the step type', async () => {
+    mockDb.getFindingForApply.mockResolvedValue(
+      finding({
+        proposed_patch: {
+          action: 'update_assertion',
+          reason: 'x',
+          assertionText: 'something',
+        } as StepPatch,
+      }),
+    );
+    const result = await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+    expect(result.results[0]).toMatchObject({ status: 'skipped', reason: 'patch_not_applicable' });
+  });
+
+  it('reports a concurrent edit instead of overwriting the user', async () => {
+    mockDb.updateStepsJsonIfUnchanged.mockResolvedValue({ written: 0, error: null });
+    const result = await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+    expect(result.results[0]).toMatchObject({ status: 'skipped', reason: 'concurrent_edit' });
+  });
+
+  it('deletes the orphaned snapshot after a concurrent edit', async () => {
+    mockDb.updateStepsJsonIfUnchanged.mockResolvedValue({ written: 0, error: null });
+    await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+    expect(mockDb.deleteApplySnapshot).toHaveBeenCalledWith('snapshot-1');
+  });
+
+  it('does not claim an applied transition another request performed', async () => {
+    mockDb.markFindingApplied.mockResolvedValue({ written: 0, error: null });
+    const result = await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+    expect(result.results[0].status).toBe('applied');
+    expect(result.findingStatus).toBe('open');
+  });
+
+  it('leaves the finding open when every test case was skipped', async () => {
+    mockDb.updateStepsJsonIfUnchanged.mockResolvedValue({ written: 0, error: null });
+    const result = await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+    expect(result.findingStatus).toBe('open');
+    expect(mockDb.markFindingApplied).not.toHaveBeenCalled();
+  });
+
+  it('detects a patch that is already present', async () => {
+    mockDb.getTestCaseForApply.mockResolvedValue({
+      row: testCase({
+        steps_json: [
+          {
+            id: 'step-1',
+            type: 'click',
+            description: 'the Support entry',
+            bindingHints: { label: 'Поддержка' },
+          } as IntentStep,
+        ],
+      }),
+      error: null,
+    });
+    const result = await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+    expect(result.results[0]).toMatchObject({ status: 'skipped', reason: 'already_patched' });
+  });
+
+  it('keeps going when one test case fails', async () => {
+    mockDb.getFindingForApply.mockResolvedValue(
+      finding({ affected_test_ids: ['tc-1', 'tc-2'] }),
+    );
+    mockDb.getTestCaseForApply
+      .mockResolvedValueOnce({ row: null, error: 'boom' })
+      .mockResolvedValueOnce({ row: testCase({ id: 'tc-2' }), error: null });
+
+    const result = await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+
+    expect(result.results).toHaveLength(2);
+    expect(result.results[0].status).toBe('error');
+    expect(result.results[1].status).toBe('applied');
+    expect(result.findingStatus).toBe('applied');
+  });
+});
+
+describe('subset selection', () => {
+  it('drops ids that are not part of the finding', async () => {
+    // Stale client state must never reach an unrelated test case.
+    const result = await applyDoctorFinding({
+      findingId: 'finding-1',
+      userId: 'user-1',
+      testCaseIds: ['tc-1', 'tc-not-affected'],
+    });
+    expect(result.totalRequested).toBe(1);
+    expect(mockDb.getTestCaseForApply).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a selection that intersects to nothing', async () => {
+    await expect(
+      applyDoctorFinding({
+        findingId: 'finding-1',
+        userId: 'user-1',
+        testCaseIds: ['tc-not-affected'],
+      }),
+    ).rejects.toThrow(ApplyConflictError);
+  });
+
+  it('applies to its own test case even when affected_test_ids is empty', async () => {
+    mockDb.getFindingForApply.mockResolvedValue(finding({ affected_test_ids: [] }));
+    const result = await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+    expect(result.results[0]).toMatchObject({ testCaseId: 'tc-1', status: 'applied' });
   });
 });

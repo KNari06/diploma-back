@@ -747,42 +747,107 @@ export class QueueManager {
   }
 
   /**
-   * Add Regression Doctor job — ONE per completed regression run.
+   * Add a Regression Doctor job for a run. Started by the user from the run
+   * report, never automatically — it costs one vision call per failed test.
    *
-   * Idempotency: `jobId` = `doctor-${runId}` so a duplicate enqueue from
-   * the completion hook (e.g. BullMQ retry after status flip) is a no-op
-   * rather than a duplicate LLM run. BullMQ refuses to add two jobs with
-   * the same id.
+   * **One job id per run, reused across triggers.** `doctor-${runId}` keeps two
+   * clicks from analysing the same run twice in parallel. But BullMQ also
+   * refuses an id that is merely SITTING in the completed set (this queue keeps
+   * 25), which would make "Analyze again" silently do nothing after the first
+   * run. So a finished job with that id is removed first, and only a job that
+   * is still waiting or active blocks the new one — reported to the caller as
+   * `alreadyRunning` so the UI can say so instead of pretending it queued.
    *
-   * Priority: lower than per-test AI analysis (priority=10 here vs 5 for
-   * aiAnalysisQueue) because the per-test jobs must complete BEFORE
-   * Doctor runs — otherwise Doctor sees partial ai_summary.driftSignals.
-   * The completion hook is what actually enforces ordering; priority is
-   * just belt-and-suspenders.
+   * Re-analysis is cheap by design: the job skips every step that already has a
+   * finding, so a second click only pays for what is genuinely new.
+   *
+   * Priority: lower than per-test AI analysis (10 here vs 5 for
+   * aiAnalysisQueue) so the per-test Bug Inspector goes first — the Doctor
+   * reads its verdict as supporting context (it no longer depends on it).
    */
   static async addRegressionDoctorJob(params: {
     runId: string;
     projectId: string;
     userId: string;
-  }) {
+  }): Promise<{ queued: boolean; alreadyRunning: boolean }> {
+    const jobId = `doctor-${params.runId}`;
+
     try {
-      const job = await regressionDoctorQueue.add(
-        'regression-doctor',
-        params,
-        {
-          priority: 10,
-          jobId: `doctor-${params.runId}`,
-        },
-      );
+      const existing = await regressionDoctorQueue.getJob(jobId);
+      if (existing) {
+        const state = await existing.getState();
+        if (state === 'active' || state === 'waiting' || state === 'delayed') {
+          logger.info('[QUEUE] Regression Doctor already in flight', {
+            runId: params.runId,
+            state,
+          });
+          return { queued: false, alreadyRunning: true };
+        }
+        // Completed or failed — the id is only holding a slot in history.
+        await existing.remove();
+      }
+
+      const job = await regressionDoctorQueue.add('regression-doctor', params, {
+        priority: 10,
+        jobId,
+      });
 
       logQueueEvent('added', job.id!, {
         queue: QUEUE_NAMES.REGRESSION_DOCTOR,
         runId: params.runId,
       });
-      return job;
+      return { queued: true, alreadyRunning: false };
     } catch (error) {
       logger.error('Failed to add Regression Doctor job:', error);
       throw handleQueueError(error);
+    }
+  }
+
+  /**
+   * State of the last Regression Doctor analysis for a run, or null if this run
+   * has never been analyzed (or its job has aged out of the retained history).
+   *
+   * The run report needs to distinguish "analyzed, found nothing" from "never
+   * analyzed" — they look identical when the only evidence is an empty findings
+   * table. Nothing persists that distinction, but the completed job already
+   * carries it: `addRegressionDoctorJob` pins the id to `doctor-<runId>` and the
+   * queue retains the last 25 completed jobs, so the run's own job IS the record.
+   * Best-effort by design — a null here degrades the panel's wording, nothing more.
+   */
+  static async getRegressionDoctorJobStatus(runId: string): Promise<{
+    state: string;
+    findingsCreated: number | null;
+    skipped: number | null;
+    skipReasons: Record<string, number> | null;
+    cappedOut: number | null;
+    finishedAt: string | null;
+  } | null> {
+    try {
+      const job = await regressionDoctorQueue.getJob(`doctor-${runId}`);
+      if (!job) return null;
+
+      const state = await job.getState();
+      const result = (job.returnvalue ?? {}) as {
+        findingsCreated?: number;
+        skipped?: number;
+        skipReasons?: Record<string, number>;
+        cappedOut?: number;
+      };
+
+      return {
+        state,
+        findingsCreated: result.findingsCreated ?? null,
+        skipped: result.skipped ?? null,
+        skipReasons: result.skipReasons ?? null,
+        cappedOut: result.cappedOut ?? null,
+        finishedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
+      };
+    } catch (error) {
+      logger.warn('[QUEUE] Could not read Regression Doctor job status', {
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
     }
   }
 
