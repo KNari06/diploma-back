@@ -193,6 +193,20 @@ export interface MobileIntentStepOptions {
    * Flutter-only effect; native typing is always per-key.
    */
   typeMode?: 'auto' | 'human' | 'instant';
+  /**
+   * "This step NAVIGATES" — recorded, not authored. Set to `true` by
+   * `MobileStepApplyService` when the runner reports that applying this step in
+   * the editor CHANGED the screen; the runner's wrong-element-tap guard then
+   * fails a later run in which the same tap changes nothing, instead of leaving
+   * a green step and a run that fails at whatever ai_check first notices the
+   * wrong screen.
+   *
+   * Never written `false`: absent means "we have not learned that it navigates"
+   * and keeps the guard's pre-existing lenient behaviour, which is also the
+   * migration path for every step authored before this existed. Mirror of the
+   * runner's IntentStepOptions.expectsTransition.
+   */
+  expectsTransition?: boolean;
   scrollDirection?: 'up' | 'down' | 'left' | 'right';
   scrollAmount?: number;
   /** Natural-language description of a scrollable container to scroll INSIDE
@@ -394,6 +408,15 @@ export interface MobileStepResult {
    * and a pixel guess.
    */
   visionMode?: boolean;
+  /**
+   * Did the step CHANGE the screen? `true`/`false` = the runner's signal ran and
+   * answered (native stability engine, or the WebView DOM comparison);
+   * `undefined` = it never ran. Read on the apply path to record
+   * `options.expectsTransition`; on a regression run it is evidence only —
+   * writing the flag from a run whose tap MISSED would teach the step that it
+   * does not navigate, which is the failure the flag exists to end.
+   */
+  transitionDetected?: boolean;
   /**
    * How many times the runner DISPATCHED this step to the device. Absent when 1
    * (the normal case). `> 1` means a retry path re-sent a command that had
