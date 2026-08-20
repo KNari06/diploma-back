@@ -41,3 +41,41 @@ export function searchFlowsByProjectQuery(params: {
     .order('name', { ascending: true })
     .limit(limit);
 }
+
+/**
+ * Ids of the test cases belonging to a flow.
+ *
+ * Needed because `intent_test_cases.flow_id` is `ON DELETE SET NULL`: deleting
+ * a flow does not remove its test cases, it orphans them (`flow_id = NULL`).
+ * The tree is built from modules → flows → test cases, so an orphan vanishes
+ * from the UI while still being returned by project-wide reads such as the
+ * dependency picker's `listByProject`. The service reads these ids first so it
+ * can delete the rows explicitly.
+ *
+ * Not `user_id`-scoped: the caller has already verified flow ownership, and a
+ * row whose owner drifted from the flow's owner must still be cleaned up
+ * rather than silently left behind.
+ */
+export function selectTestCaseIdsForFlowQuery(flowId: string) {
+  return supabaseAdmin
+    .from('intent_test_cases')
+    .select('id')
+    .eq('flow_id', flowId)
+    .is('deleted_at', null);
+}
+
+/**
+ * Soft-delete every test case belonging to a flow.
+ *
+ * A tombstone rather than a DELETE: these rows are still referenced by
+ * regression plans, run history, traces and Jira links, and dropping them
+ * would break that history. `deleted_at` hides them from the product while
+ * keeping the references resolvable — and makes the delete reversible.
+ */
+export function softDeleteTestCasesForFlowQuery(flowId: string) {
+  return supabaseAdmin
+    .from('intent_test_cases')
+    .update({ deleted_at: new Date().toISOString() })
+    .eq('flow_id', flowId)
+    .is('deleted_at', null);
+}

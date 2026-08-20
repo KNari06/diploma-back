@@ -86,6 +86,79 @@ export async function updateModuleRow(
   return mapModuleRow(data);
 }
 
+/**
+ * Test case ids owned by any of `moduleIds`, resolved through their flows.
+ *
+ * `intent_test_cases.flow_id` is ON DELETE SET NULL while
+ * `test_flows.module_id` is ON DELETE CASCADE, so deleting a module wipes its
+ * flows in the database and leaves their test cases behind with a NULL
+ * flow_id. Those orphans vanish from the repository tree (modules → flows →
+ * test cases) yet keep surfacing in project-wide reads such as the dependency
+ * picker. The service resolves the ids up front so it can delete the rows
+ * before the cascade erases the link.
+ *
+ * Two hops rather than a join: the ids feed a delete that must not depend on
+ * the flow rows still existing.
+ */
+export async function getTestCaseIdsForModules(moduleIds: string[]): Promise<string[]> {
+  if (moduleIds.length === 0) return [];
+
+  const { data: flowRows, error: flowError } = await supabaseAdmin
+    .from('test_flows')
+    .select('id')
+    .in('module_id', moduleIds);
+
+  if (flowError) {
+    logger.error('[MODULE_DB] Failed to read flows for modules', { error: flowError });
+    throw new Error(`Failed to read module flows: ${flowError.message}`);
+  }
+
+  const flowIds = (flowRows || []).map((r: any) => r.id);
+  if (flowIds.length === 0) return [];
+
+  const { data: caseRows, error: caseError } = await supabaseAdmin
+    .from('intent_test_cases')
+    .select('id')
+    .in('flow_id', flowIds)
+    .is('deleted_at', null);
+
+  if (caseError) {
+    logger.error('[MODULE_DB] Failed to read test cases for modules', { error: caseError });
+    throw new Error(`Failed to read module test cases: ${caseError.message}`);
+  }
+
+  return (caseRows || []).map((r: any) => r.id);
+}
+
+/**
+ * Soft-delete test cases by id.
+ *
+ * A tombstone rather than a DELETE: these rows are still referenced by
+ * regression plans, run history, traces and Jira links, and dropping them
+ * would break that history. `deleted_at` hides them from the product while
+ * keeping the references resolvable — and makes the delete reversible.
+ *
+ * Regression plan items are deliberately left alone for the same reason: the
+ * row they point at still exists, so the plan stays readable instead of
+ * silently losing entries.
+ */
+export async function softDeleteTestCasesByIds(testCaseIds: string[]): Promise<void> {
+  if (testCaseIds.length === 0) return;
+
+  const { error } = await supabaseAdmin
+    .from('intent_test_cases')
+    .update({ deleted_at: new Date().toISOString() })
+    .in('id', testCaseIds)
+    .is('deleted_at', null);
+
+  if (error) {
+    logger.error('[MODULE_DB] Failed to soft-delete test cases', {
+      error, count: testCaseIds.length,
+    });
+    throw new Error(`Failed to delete module test cases: ${error.message}`);
+  }
+}
+
 /** Delete a module by id (subtree + flows cascade via FKs). */
 export async function deleteModuleRow(id: string, userId: string): Promise<void> {
   const { error } = await supabaseAdmin
