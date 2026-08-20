@@ -232,6 +232,12 @@ export class RegressionTestQueryService {
   /**
    * List intent test cases for a project (newest first), optionally filtered by
    * platform. Surfaces the query error so the caller can throw.
+   *
+   * Excludes soft-deleted rows: this is a project-wide read with no flow join,
+   * so unlike the run-selection queries (which filter by `flow_id`, and a
+   * tombstoned row's flow_id has been nulled by the SET NULL fk) it would
+   * otherwise offer test cases whose flow or folder the user already deleted —
+   * and let them be added to a new regression plan.
    */
   static async listByProject(
     projectId: string,
@@ -241,7 +247,8 @@ export class RegressionTestQueryService {
     let query = supabaseAdmin
       .from('intent_test_cases')
       .select('*')
-      .eq('project_id', projectId);
+      .eq('project_id', projectId)
+      .is('deleted_at', null);
 
     if (platform) {
       query = query.eq('platform', platform);

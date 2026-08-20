@@ -12,7 +12,12 @@ import type {
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 import { normaliseVariantOverride, normaliseHostOverride } from '@/services/mobile/project-mobile-app.helper';
-import { searchFlowsByProjectQuery } from './db/flow.db';
+import {
+  searchFlowsByProjectQuery,
+  selectTestCaseIdsForFlowQuery,
+  softDeleteTestCasesForFlowQuery,
+} from './db/flow.db';
+import { emitTestCaseMutated } from '@/websocket/helpers/project-mutation-emit';
 
 /**
  * Service for managing test flows
@@ -370,6 +375,49 @@ export class FlowService {
       });
     }
 
+    // Soft-delete this flow's test cases BEFORE the flow row.
+    //
+    // `intent_test_cases.flow_id` is ON DELETE SET NULL, so dropping the flow
+    // first would orphan them (`flow_id = NULL`) — invisible in the tree
+    // (modules → flows → test cases) yet still returned by project-wide reads,
+    // which is how deleted-looking tests kept being offered as "Run before"
+    // dependencies. Marking them must therefore happen while they can still be
+    // found by flow.
+    //
+    // A tombstone, not a DELETE: these rows are referenced by regression plans,
+    // run history, traces and Jira links, so removing them would break that
+    // history. `deleted_at` hides them and stays reversible.
+    const projectIdForEmit = (flow as any)?.test_modules?.project_id as string | undefined;
+    const { data: caseRows, error: caseReadError } = await selectTestCaseIdsForFlowQuery(id);
+
+    if (caseReadError) {
+      logger.warn('[FLOW_SERVICE] Failed to read test cases for deleted flow', {
+        error: caseReadError, id,
+      });
+    }
+
+    const testCaseIds = (caseRows || []).map((row: { id: string }) => row.id);
+
+    if (testCaseIds.length > 0) {
+      // Plan items that reference these test cases are deliberately left in
+      // place: the rows they point at still exist (tombstoned, not dropped), so
+      // the plan stays readable instead of silently losing entries.
+      const { error: caseDeleteError } = await softDeleteTestCasesForFlowQuery(id);
+
+      if (caseDeleteError) {
+        // Do not proceed: deleting the flow now would orphan these rows, which
+        // is the exact bug this block exists to prevent.
+        logger.error('[FLOW_SERVICE] Failed to soft-delete test cases for flow', {
+          error: caseDeleteError, id, count: testCaseIds.length,
+        });
+        throw new Error(`Failed to delete flow test cases: ${caseDeleteError.message}`);
+      }
+
+      logger.info('[FLOW_SERVICE] Soft-deleted test cases belonging to flow', {
+        id, count: testCaseIds.length,
+      });
+    }
+
     const { error } = await supabaseAdmin
       .from('test_flows')
       .delete()
@@ -388,9 +436,18 @@ export class FlowService {
     await cache.delByPattern(`qait:cache:ptree:flow:${id}:*`);
 
     // Invalidate plans cache — deleting a flow removes its regression_plan_items as side-effect
-    const projectId = (flow as any)?.test_modules?.project_id;
+    const projectId = projectIdForEmit;
     if (projectId) {
       await cache.delByPattern(`qait:cache:plans:proj:${projectId}:*`);
+    }
+
+    // Tell open editors to drop each deleted test case from their caches — the
+    // dependency picker reads a project-wide list that the flow-level event
+    // does not cover, so without this it keeps offering them until a reload.
+    if (projectId) {
+      for (const testCaseId of testCaseIds) {
+        emitTestCaseMutated({ projectId, action: 'deleted', id: testCaseId, flowId: id });
+      }
     }
 
     return true;

@@ -10,6 +10,14 @@
  */
 
 import { supabaseAdmin } from '@/db/supabase';
+
+/**
+ * Soft-delete invariant: a row with a non-NULL `deleted_at` is a tombstone —
+ * kept so regression plans, run history and traces that reference it stay
+ * intact, but never surfaced to the product. Project-wide reads (the ones
+ * backing the dependency picker) filter it out; single-row reads by id do not,
+ * so an existing reference can still resolve a name.
+ */
 import type { IntentStep } from '../preview.types';
 
 // ── projects (access check) ──────────────────────────────────────────────────
@@ -135,7 +143,8 @@ export function countTestCaseRowsForProject(projectId: string, userId: string, f
     .from('intent_test_cases')
     .select('id', { count: 'exact', head: true })
     .eq('project_id', projectId)
-    .eq('user_id', userId);
+    .eq('user_id', userId)
+    .is('deleted_at', null);
   if (flowId) q = q.eq('flow_id', flowId);
   return q;
 }
@@ -152,7 +161,8 @@ export function listTestCaseDataForProject(
     .from('intent_test_cases')
     .select('*, test_flows(name, module_id, test_modules(name))')
     .eq('project_id', projectId)
-    .eq('user_id', userId);
+    .eq('user_id', userId)
+    .is('deleted_at', null);
   if (flowId) q = q.eq('flow_id', flowId);
   return q.order('updated_at', { ascending: false }).range(offset, offset + limit - 1);
 }

@@ -14,6 +14,7 @@ import {
   type TestModule,
   type UpdateTestModuleParams,
 } from '@/types/testing.types';
+import { emitTestCaseMutated } from '@/websocket/helpers/project-mutation-emit';
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 
@@ -153,13 +154,73 @@ export class ModuleService {
     // Fetch project_id before delete for cache invalidation.
     const projectId = await moduleDb.getModuleProjectId(id, userId);
 
+    // Soft-delete the subtree's test cases BEFORE the module row.
+    //
+    // `test_modules.parent_module_id` and `test_flows.module_id` are both
+    // ON DELETE CASCADE, so removing this module wipes every descendant folder
+    // and their flows inside the database — bypassing FlowService.delete. But
+    // `intent_test_cases.flow_id` is ON DELETE SET NULL, so those flows' test
+    // cases survive with a NULL flow_id: invisible in the tree, still returned
+    // by project-wide reads, still offerable as "Run before" dependencies.
+    // Collect the whole subtree first — the cascade reaches every level, so
+    // covering only direct children would still orphan deeper ones.
+    //
+    // A tombstone, not a DELETE: these rows are referenced by regression plans,
+    // run history, traces and Jira links, so removing them would break that
+    // history. `deleted_at` hides them and stays reversible.
+    const moduleIds = await this.collectSubtreeIds(id, userId);
+    const testCaseIds = await moduleDb.getTestCaseIdsForModules(moduleIds);
+
+    if (testCaseIds.length > 0) {
+      // Throws on failure, so the module row is left intact — proceeding would
+      // orphan exactly the rows this guards against.
+      await moduleDb.softDeleteTestCasesByIds(testCaseIds);
+      logger.info('[MODULE_SERVICE] Soft-deleted test cases belonging to module subtree', {
+        id, modules: moduleIds.length, testCases: testCaseIds.length,
+      });
+    }
+
     await moduleDb.deleteModuleRow(id, userId);
 
     if (projectId) {
       await this.invalidateTreeCache(projectId);
     }
 
+    // Tell open editors to drop each deleted test case — the dependency picker
+    // reads a project-wide list that no module- or flow-level event covers.
+    if (projectId) {
+      for (const testCaseId of testCaseIds) {
+        emitTestCaseMutated({ projectId, action: 'deleted', id: testCaseId });
+      }
+    }
+
     return true;
+  }
+
+  /**
+   * Every module id in a subtree, root included. Breadth-first with a visited
+   * set — the same guard `computeSubtreeHeight` uses, so corrupt data with a
+   * parent cycle cannot spin here.
+   */
+  private static async collectSubtreeIds(rootId: string, userId: string): Promise<string[]> {
+    const visited = new Set<string>([rootId]);
+    let frontier = [rootId];
+
+    while (frontier.length > 0) {
+      const next: string[] = [];
+      for (const moduleId of frontier) {
+        const children = await moduleDb.getChildModuleIds(moduleId, userId);
+        for (const child of children) {
+          if (!visited.has(child)) {
+            visited.add(child);
+            next.push(child);
+          }
+        }
+      }
+      frontier = next;
+    }
+
+    return [...visited];
   }
 
   /**
