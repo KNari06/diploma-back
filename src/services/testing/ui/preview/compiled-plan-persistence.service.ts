@@ -1,6 +1,7 @@
 import { logger } from '@/utils/core/logger';
 import { IntentTestCaseService } from './intent-test-case.service';
 import type { MobileIntentStep, MobileRunStepsResponse } from '@/services/mobile/mobile-runner.types';
+import { withExpectsTransition } from '@/services/mobile/expects-transition';
 import type { IntentStep } from './preview.types';
 
 /**
@@ -51,21 +52,39 @@ export class CompiledPlanPersistenceService {
       const PROVEN_RESOLVED_VIA = new Set<string>(['compiled', 'compiled_fast_path', 'cache']);
 
       for (const result of runResult.steps) {
-        if (!result.compiledPlan) continue;
         // Runner can flag a plan as stale post-dispatch (VTE caught text in
         // wrong field, or foreground mismatch with no relaunch). Skip
         // persistence — the plan is "successful at dispatch level" but
         // points at the wrong element. Saving it locks in the bug.
-        if (result.planStaleReason) {
+        const planIsStale = !!result.planStaleReason;
+        if (planIsStale) {
           logger.debug('[MOBILE-TEST] Skipping plan persist — runner flagged stale', {
             stepId: result.stepId,
             reason: result.planStaleReason,
           });
-          continue;
         }
         const planIsProven =
           result.resolvedVia !== undefined && PROVEN_RESOLVED_VIA.has(result.resolvedVia);
-        if (!result.success && !planIsProven) continue;
+        const savePlan = !!result.compiledPlan && !planIsStale && (result.success || planIsProven);
+
+        // "This step navigates", recorded from a run.
+        //
+        // Deliberately NOT gated on `result.compiledPlan`. A WebView tap returns
+        // from `executeCommand` before the compiled-plan builder ever runs, so
+        // it has no plan — and WebView taps are precisely the steps this signal
+        // exists to protect. Gating on the plan would have armed everything
+        // EXCEPT the case that motivated the feature.
+        //
+        // Recording from a regression run (not just an editor apply) is safe
+        // because the write is one-way: `withExpectsTransition` only acts on a
+        // `true`, and `true` means "the screen changed when this step ran and
+        // passed" — positive evidence, whatever dispatched it. The direction
+        // that would be unsafe is writing `false` from a run whose tap MISSED,
+        // and nothing here can do that. See the ADR
+        // `20260820-regression-runs-may-record-expects-transition.md`.
+        const saveTransition = result.transitionDetected === true && result.success;
+
+        if (!savePlan && !saveTransition) continue;
         const original = originalById.get(result.stepId);
         if (!original) continue;
 
@@ -75,8 +94,13 @@ export class CompiledPlanPersistenceService {
         // IntentStep is the structural superset used across web and mobile.
         const enriched: IntentStep = {
           ...(original as unknown as IntentStep),
-          compiled: result.compiledPlan as unknown as IntentStep['compiled'],
+          ...(savePlan ? { compiled: result.compiledPlan as unknown as IntentStep['compiled'] } : {}),
         };
+
+        if (saveTransition) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          enriched.options = withExpectsTransition(original.options, true) as any;
+        }
 
         if (result.evidence) {
           enriched.evidence = {
@@ -94,7 +118,7 @@ export class CompiledPlanPersistenceService {
       }
 
       if (enrichedSteps.size === 0) {
-        logger.debug('[MOBILE-TEST] No compiled plans to persist', { intentTestCaseId });
+        logger.debug('[MOBILE-TEST] Nothing to persist from this run', { intentTestCaseId });
         return;
       }
 
