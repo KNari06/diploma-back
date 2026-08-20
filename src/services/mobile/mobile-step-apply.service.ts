@@ -19,6 +19,7 @@
 import { getMobileRunnerClientForSession } from './session-runner-routing';
 import { RESOLVE_DISPATCH_TIMEOUT_MS } from './mobile-runner-client';
 import type { MobileCompiledPlan } from './mobile-runner.types';
+import { withExpectsTransition } from './expects-transition';
 import { buildTriggerFiredPayload, type TriggerFiredPayload } from '@/services/testing/ui/preview/web-trigger-engine';
 import { logger } from '@/utils/core/logger';
 
@@ -428,18 +429,30 @@ export class MobileStepApplyService {
           // request the runner had already completed, and the `catch` below
           // then re-ran the whole step against the screen the first tap had
           // already navigated to. See `RESOLVE_DISPATCH_TIMEOUT_MS`.
-          await client.executeBatchCommands(sessionId, commands, {
+          const batch = await client.executeBatchCommands(sessionId, commands, {
             userId,
             timeoutMs: RESOLVE_DISPATCH_TIMEOUT_MS,
           });
           const durationMs = Date.now() - applyStart;
+
+          // The runner reports, per command, whether the action CHANGED the
+          // screen. This response used to be discarded, which is why the
+          // first apply — the one moment a human confirms the step did the
+          // right thing — taught the system nothing. Read the LAST command that
+          // answered: a type step is dispatched as [tap, type_text] and it is
+          // the type, not the focus tap, whose effect matters.
+          const batchTransition = (Array.isArray(batch?.results) ? batch.results : [])
+            .map((r) => (r as { transitionDetected?: boolean } | null)?.transitionDetected)
+            .filter((t): t is boolean => typeof t === 'boolean')
+            .pop();
 
           const appliedStep = {
             id: stepDraft.id || `apply_${Date.now()}`,
             type: stepType,
             description,
             value: stepDraft.value,
-            options: stepDraft.options,
+            // Record "this step navigates" when the runner just watched it do so.
+            options: withExpectsTransition(stepDraft.options, batchTransition),
             bindingHints: {
               ...(stepDraft.intentStep?.bindingHints || stepDraft.bindingHints || {}),
               ...(lintResult.elementText ? { label: lintResult.elementText } : {}),
@@ -610,7 +623,8 @@ export class MobileStepApplyService {
           type: stepType,
           description,
           value: stepDraft.value,
-          options: stepDraft.options,
+          // Record "this step navigates" when the runner just watched it do so.
+          options: withExpectsTransition(stepDraft.options, stepResult?.transitionDetected),
           bindingHints: intentStep.bindingHints || {},
           evidence: {
             resolvedVia: stepResult!.resolvedVia,
@@ -638,6 +652,9 @@ export class MobileStepApplyService {
         screenshot: stepResult?.screenshot,
         resolvedVia: stepResult?.resolvedVia,
         durationMs: stepResult?.durationMs,
+        ...(stepResult?.transitionDetected !== undefined
+          ? { transitionDetected: stepResult.transitionDetected }
+          : {}),
         // Only attach when the runner actually emitted warnings, so the
         // frontend can do a truthy-check rather than a length-check.
         ...(stepResult?.warnings && stepResult.warnings.length > 0
