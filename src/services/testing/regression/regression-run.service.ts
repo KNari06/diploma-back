@@ -895,7 +895,17 @@ export class RegressionRunService {
     // has nothing left to find. Only the FILTERED result is sliced to
     // safeLimit, matching the caller's requested page size.
     const fetchLimit = planId ? MAX_LIST_LIMIT : safeLimit;
-    const { data: allRuns, error } = await listRunsByProject(projectId, fetchLimit);
+
+    // Plan membership only feeds the filter below, so it resolves alongside
+    // the run fetch rather than after it — and via `getMemberTestCaseIds`,
+    // not `expandPlan`: this needs ids, not names/platforms/ordering, and
+    // the full expansion is the expensive call of the two.
+    const [{ data: allRuns, error }, memberTestCaseIds] = await Promise.all([
+      listRunsByProject(projectId, fetchLimit),
+      planId
+        ? this.planMemberTestCaseIds(planId, projectId, userId)
+        : Promise.resolve(new Set<string>()),
+    ]);
 
     if (error) {
       throw new Error(`Failed to list runs: ${(error as any)?.message}`);
@@ -905,10 +915,6 @@ export class RegressionRunService {
 
     let runs = allRuns;
     if (planId) {
-      const plan = await RegressionPlanService.getById(planId, userId);
-      const memberTestCaseIds = plan && plan.projectId === projectId
-        ? new Set((await RegressionPlanService.expandPlan(planId)).map((tc) => tc.testCaseId))
-        : new Set<string>();
       runs = allRuns
         .filter((r: any) => r.plan_id === planId || memberTestCaseIds.has(r.intent_test_case_id))
         .slice(0, safeLimit);
@@ -1009,6 +1015,34 @@ export class RegressionRunService {
         platformBreakdown: breakdownMap.get(run.id) || emptyBreakdown(),
       };
     });
+  }
+
+  /**
+   * Test-case ids that count as "belonging to" a plan, for the runs-list
+   * filter. Empty when the plan is missing or lives in another project —
+   * the same guard the caller used to apply inline.
+   */
+  private static async planMemberTestCaseIds(
+    planId: string,
+    projectId: string,
+    userId: string,
+  ): Promise<Set<string>> {
+    try {
+      const plan = await RegressionPlanService.getById(planId, userId);
+      if (!plan || plan.projectId !== projectId) return new Set<string>();
+
+      return await RegressionPlanService.getMemberTestCaseIds(planId);
+    } catch (err) {
+      // Membership only widens this list to ad-hoc runs of the plan's test
+      // cases. A read failure degrades to plan-triggered runs only — the page
+      // still renders, which is what it did before membership resolution
+      // could throw. The dispatch path (`runPlan`) does NOT swallow.
+      logger.warn('[REGRESSION_RUN] Plan membership lookup failed — listing plan-triggered runs only', {
+        planId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return new Set<string>();
+    }
   }
 
   /**

@@ -52,6 +52,76 @@ function normaliseRunStatus(s: string): RunStatus {
   return s as RunStatus;
 }
 
+/** Row shapes used by the batched plan expansion below. */
+type FlowRow = { id: string; module_id: string | null };
+type UiCaseRow = { id: string; name: string; platform: string | null; flow_id: string | null };
+type ApiCaseRow = { id: string; name: string; flow_id: string | null };
+
+/** Order-preserving de-dup for the id lists fed to `.in(...)` filters. */
+function uniq(ids: string[]): string[] {
+  return [...new Set(ids)];
+}
+
+/**
+ * PostgREST answers an unbounded select with at most `db-max-rows` (1000 on
+ * this project) and reports no error when it truncates — so a batched read
+ * MUST page explicitly. Silent truncation here would drop test cases from an
+ * expanded plan, i.e. a run that quietly skips tests.
+ */
+const SELECT_PAGE_SIZE = 1000;
+
+/**
+ * Ids per `.in(...)` filter. The batched reads replaced one query per flow
+ * with one query per plan, so the id list is now unbounded — 500 uuids would
+ * put ~19 KB of filter into the query string, past what proxies accept.
+ */
+const IN_CHUNK_SIZE = 100;
+
+/** The slice of the Supabase builder `selectAllIn` needs. */
+type PagedQuery = {
+  range: (from: number, to: number) => PromiseLike<{ data: unknown[] | null; error: unknown }>;
+};
+
+/**
+ * Run an `.in(ids)` select to completion: ids chunked, each chunk paged until
+ * a short page arrives. Chunks run concurrently, pages within a chunk in order.
+ *
+ * Throws on a query error rather than returning what it has. These reads feed
+ * `runPlan`'s dispatch list, and a half-read plan looks exactly like a smaller
+ * plan — the caller must be able to tell "no test cases" from "the read broke".
+ */
+async function selectAllIn<T>(
+  ids: string[],
+  label: string,
+  build: (chunk: string[]) => PagedQuery,
+): Promise<T[]> {
+  if (ids.length === 0) return [];
+
+  const chunks: string[][] = [];
+  for (let i = 0; i < ids.length; i += IN_CHUNK_SIZE) chunks.push(ids.slice(i, i + IN_CHUNK_SIZE));
+
+  const perChunk = await Promise.all(
+    chunks.map(async (chunk) => {
+      const rows: T[] = [];
+      for (let from = 0; ; from += SELECT_PAGE_SIZE) {
+        const { data, error } = await build(chunk).range(from, from + SELECT_PAGE_SIZE - 1);
+
+        if (error) {
+          logger.error(`[REGRESSION_PLAN_SERVICE] ${label} failed`, { error, idCount: chunk.length, from });
+          throw new Error(`${label} failed: ${(error as { message?: string })?.message ?? 'unknown error'}`);
+        }
+
+        const page = (data || []) as T[];
+        rows.push(...page);
+        if (page.length < SELECT_PAGE_SIZE) break;
+      }
+      return rows;
+    }),
+  );
+
+  return perChunk.flat();
+}
+
 /**
  * Service for managing regression plans
  * Plans define custom test sets for regression testing
@@ -1132,7 +1202,6 @@ export class RegressionPlanService {
    */
   static async expandPlan(planId: string): Promise<ExpandedTestCase[]> {
     const items = await this.getItems(planId);
-    const expandedCases: ExpandedTestCase[] = [];
 
     logger.info('[REGRESSION_PLAN_SERVICE] Expanding plan', {
       planId,
@@ -1140,31 +1209,109 @@ export class RegressionPlanService {
       items: items.map((i) => ({ itemType: i.itemType, moduleId: i.moduleId, flowId: i.flowId, testCaseId: i.testCaseId })),
     });
 
+    // Resolution is batched, not per-item. The previous shape walked items
+    // sequentially and issued 3 queries per flow (flow → intent_test_cases →
+    // api_test_configs); a plan of 4 modules + 7 flows (43 flows total) cost
+    // 133 serial round trips — ~46s against a remote Supabase, paid by every
+    // caller including the regressions page's runs list. Everything below is
+    // two waves of parallel `.in(...)` queries regardless of plan size.
+    const moduleIds = uniq(items.filter((i) => i.itemType === 'module' && i.moduleId).map((i) => i.moduleId!));
+    const directFlowIds = uniq(items.filter((i) => i.itemType === 'flow' && i.flowId).map((i) => i.flowId!));
+    const uiCaseItemIds = uniq(items.filter((i) => i.itemType === 'test_case' && i.testCaseId && i.testCaseType === 'ui').map((i) => i.testCaseId!));
+    const apiCaseItemIds = uniq(items.filter((i) => i.itemType === 'test_case' && i.testCaseId && i.testCaseType === 'api').map((i) => i.testCaseId!));
+
+    // Wave 1 — everything resolvable straight from the item rows.
+    const [flowsByModule, directFlowRows, uiCaseRows, apiCaseRows] = await Promise.all([
+      this.fetchFlowsByModules(moduleIds),
+      this.fetchFlowRows(directFlowIds),
+      this.fetchUiCasesByIds(uiCaseItemIds),
+      this.fetchApiCasesByIds(apiCaseItemIds),
+    ]);
+
+    // module → flows (fetch order preserved, same as the old per-module loop)
+    const moduleFlowIds = new Map<string, string[]>();
+    for (const id of moduleIds) moduleFlowIds.set(id, []);
+    const flowModule = new Map<string, string | undefined>();
+    for (const row of flowsByModule) {
+      moduleFlowIds.get(row.module_id!)?.push(row.id);
+      flowModule.set(row.id, row.module_id || undefined);
+    }
+    for (const row of directFlowRows) flowModule.set(row.id, row.module_id || undefined);
+
+    const allFlowIds = uniq([...flowsByModule.map((f) => f.id), ...directFlowIds]);
+
+    // Flows referenced only by a test_case item — their module context is not
+    // known until the case rows come back, hence the second wave.
+    const caseFlowIds = uniq(
+      [...uiCaseRows, ...apiCaseRows]
+        .map((c) => c.flow_id)
+        .filter((id): id is string => !!id && !flowModule.has(id)),
+    );
+
+    // Wave 2
+    const [flowCases, caseFlowRows] = await Promise.all([
+      this.fetchCasesByFlows(allFlowIds),
+      this.fetchFlowRows(caseFlowIds),
+    ]);
+    for (const row of caseFlowRows) flowModule.set(row.id, row.module_id || undefined);
+
+    const expandFlowFromCache = (flowId: string): ExpandedTestCase[] => {
+      const moduleId = flowModule.get(flowId);
+      const cases: ExpandedTestCase[] = [];
+      for (const tc of flowCases.ui.get(flowId) || []) {
+        cases.push({
+          testCaseId: tc.id,
+          testType: 'ui',
+          moduleId,
+          flowId,
+          name: tc.name,
+          platform: tc.platform || undefined,
+        });
+      }
+      for (const tc of flowCases.api.get(flowId) || []) {
+        cases.push({
+          testCaseId: tc.id,
+          testType: 'api',
+          moduleId,
+          flowId,
+          name: tc.name,
+        });
+      }
+      return cases;
+    };
+
+    // Assemble in plan-item order — dispatch order is user-visible, so this
+    // must match the old sequential walk exactly.
+    const expandedCases: ExpandedTestCase[] = [];
     for (const item of items) {
       switch (item.itemType) {
         case 'module':
           if (item.moduleId) {
-            const moduleCases = await this.expandModule(item.moduleId);
+            const moduleCases = (moduleFlowIds.get(item.moduleId) || []).flatMap(expandFlowFromCache);
             logger.info('[REGRESSION_PLAN_SERVICE] Expanded module', { moduleId: item.moduleId, testCaseCount: moduleCases.length });
             expandedCases.push(...moduleCases);
           }
           break;
         case 'flow':
           if (item.flowId) {
-            const flowCases = await this.expandFlow(item.flowId);
-            logger.info('[REGRESSION_PLAN_SERVICE] Expanded flow', { flowId: item.flowId, testCaseCount: flowCases.length });
-            expandedCases.push(...flowCases);
+            const flowCasesForItem = expandFlowFromCache(item.flowId);
+            logger.info('[REGRESSION_PLAN_SERVICE] Expanded flow', { flowId: item.flowId, testCaseCount: flowCasesForItem.length });
+            expandedCases.push(...flowCasesForItem);
           }
           break;
         case 'test_case':
           if (item.testCaseId && item.testCaseType) {
-            const testCase = await this.getTestCaseInfo(
-              item.testCaseId,
-              item.testCaseType
-            );
-            if (testCase) {
+            const row = item.testCaseType === 'ui'
+              ? uiCaseRows.find((c) => c.id === item.testCaseId)
+              : apiCaseRows.find((c) => c.id === item.testCaseId);
+            if (row) {
               expandedCases.push({
-                ...testCase,
+                testCaseId: row.id,
+                testType: item.testCaseType,
+                moduleId: row.flow_id ? flowModule.get(row.flow_id) : undefined,
+                flowId: row.flow_id || undefined,
+                name: row.name,
+                platform: item.testCaseType === 'ui' ? (row as UiCaseRow).platform || undefined : undefined,
                 parameters: item.parametersOverride,
               });
             }
@@ -1204,142 +1351,115 @@ export class RegressionPlanService {
   }
 
   /**
-   * Expand a module to its test cases
+   * Member test-case IDs of a plan — the cheap subset of `expandPlan` for
+   * callers that only need "does this id belong to the plan", such as the
+   * runs list filtering ad-hoc runs of a plan's test cases. Skips names,
+   * platforms, ordering and negative-toggle resolution.
+   *
+   * Negatives are included by SOURCE (all of them, stale or toggled-off
+   * alike) rather than through the toggle resolver: a run that already
+   * happened shouldn't disappear from history because someone later
+   * disabled its negative.
    */
-  private static async expandModule(moduleId: string): Promise<ExpandedTestCase[]> {
-    // Get all flows in module
-    const { data: flows } = await supabaseAdmin
-      .from('test_flows')
-      .select('id')
-      .eq('module_id', moduleId);
+  static async getMemberTestCaseIds(planId: string): Promise<Set<string>> {
+    const items = await this.getItems(planId);
 
-    const cases: ExpandedTestCase[] = [];
-    for (const flow of flows || []) {
-      const flowCases = await this.expandFlow(flow.id);
-      cases.push(...flowCases);
+    const moduleIds = uniq(items.filter((i) => i.itemType === 'module' && i.moduleId).map((i) => i.moduleId!));
+    const directFlowIds = uniq(items.filter((i) => i.itemType === 'flow' && i.flowId).map((i) => i.flowId!));
+    const directCaseIds = uniq(items.filter((i) => i.itemType === 'test_case' && i.testCaseId).map((i) => i.testCaseId!));
+
+    const moduleFlows = await this.fetchFlowsByModules(moduleIds);
+    const flowIds = uniq([...moduleFlows.map((f) => f.id), ...directFlowIds]);
+
+    const flowCases = await this.fetchCasesByFlows(flowIds);
+
+    const ids = new Set<string>(directCaseIds);
+    const uiIds: string[] = [];
+    for (const rows of flowCases.ui.values()) {
+      for (const r of rows) { ids.add(r.id); uiIds.push(r.id); }
+    }
+    for (const rows of flowCases.api.values()) {
+      for (const r of rows) ids.add(r.id);
     }
 
-    return cases;
-  }
-
-  /**
-   * Expand a flow to its test cases
-   */
-  private static async expandFlow(flowId: string): Promise<ExpandedTestCase[]> {
-    const cases: ExpandedTestCase[] = [];
-
-    // Get flow info for module context
-    const { data: flow } = await supabaseAdmin
-      .from('test_flows')
-      .select('module_id')
-      .eq('id', flowId)
-      .maybeSingle();
-
-    const moduleId = flow?.module_id;
-
-    // Get UI test cases from intent_test_cases (unified table)
-    // Include cases that have replay data: commands, graph_ref, OR steps_json
-    const { data: uiCases, error: uiError } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('id, name, platform')
-      .eq('flow_id', flowId)
-      .not('status', 'eq', 'archived');
-
-    if (uiError) {
-      logger.error('[REGRESSION_PLAN_SERVICE] Failed to query intent_test_cases for flow', { flowId, error: uiError });
-    }
-
-    for (const tc of uiCases || []) {
-      cases.push({
-        testCaseId: tc.id,
-        testType: 'ui',
-        moduleId,
-        flowId,
-        name: tc.name,
-        platform: tc.platform || undefined,
+    // Ad-hoc runs of a negative test case carry the negative's own id.
+    try {
+      const { listNegativesBySources } = await import('@/services/testing/negative/db/negative.db');
+      const negatives = await listNegativesBySources(uniq([...uiIds, ...directCaseIds]));
+      for (const neg of negatives) ids.add(neg.id);
+    } catch (err) {
+      logger.error('[REGRESSION_PLAN_SERVICE] Failed to include negatives in plan membership, continuing without', {
+        planId,
+        error: err instanceof Error ? err.message : String(err),
       });
     }
 
-    // Get API test cases
-    const { data: apiCases, error: apiError } = await supabaseAdmin
-      .from('api_test_configs')
-      .select('id, name')
-      .eq('flow_id', flowId);
-
-    if (apiError) {
-      logger.error('[REGRESSION_PLAN_SERVICE] Failed to query api_test_configs for flow', { flowId, error: apiError });
-    }
-
-    for (const tc of apiCases || []) {
-      cases.push({
-        testCaseId: tc.id,
-        testType: 'api',
-        moduleId,
-        flowId,
-        name: tc.name,
-      });
-    }
-
-    return cases;
+    return ids;
   }
 
-  /**
-   * Get test case info
-   */
-  private static async getTestCaseInfo(
-    testCaseId: string,
-    testType: 'ui' | 'api'
-  ): Promise<ExpandedTestCase | null> {
-    // Split query by test type to satisfy Supabase typed client
-    let id: string | undefined;
-    let name: string | undefined;
-    let flowId: string | undefined;
-    let platform: string | undefined;
+  /** Flows belonging to the given modules, in DB order. */
+  private static async fetchFlowsByModules(moduleIds: string[]): Promise<FlowRow[]> {
+    return selectAllIn<FlowRow>(moduleIds, 'flows-for-modules', (chunk) =>
+      supabaseAdmin.from('test_flows').select('id, module_id').in('module_id', chunk),
+    );
+  }
 
-    if (testType === 'ui') {
-      const { data } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, name, flow_id, platform')
-        .eq('id', testCaseId)
-        .maybeSingle();
-      if (!data) return null;
-      id = data.id;
-      name = data.name;
-      flowId = data.flow_id || undefined;
-      platform = data.platform || undefined;
-    } else {
-      const { data } = await supabaseAdmin
-        .from('api_test_configs')
-        .select('id, name, flow_id')
-        .eq('id', testCaseId)
-        .maybeSingle();
-      if (!data) return null;
-      id = data.id;
-      name = data.name;
-      flowId = data.flow_id || undefined;
+  /** Flow rows by id — used only for their module context. */
+  private static async fetchFlowRows(flowIds: string[]): Promise<FlowRow[]> {
+    return selectAllIn<FlowRow>(flowIds, 'flows-by-id', (chunk) =>
+      supabaseAdmin.from('test_flows').select('id, module_id').in('id', chunk),
+    );
+  }
+
+  /** UI + API test cases of the given flows, grouped by flow id. */
+  private static async fetchCasesByFlows(
+    flowIds: string[],
+  ): Promise<{ ui: Map<string, UiCaseRow[]>; api: Map<string, ApiCaseRow[]> }> {
+    const ui = new Map<string, UiCaseRow[]>();
+    const api = new Map<string, ApiCaseRow[]>();
+    if (flowIds.length === 0) return { ui, api };
+
+    const [uiRows, apiRows] = await Promise.all([
+      selectAllIn<UiCaseRow>(flowIds, 'ui-cases-for-flows', (chunk) =>
+        supabaseAdmin
+          .from('intent_test_cases')
+          .select('id, name, platform, flow_id')
+          .in('flow_id', chunk)
+          .not('status', 'eq', 'archived'),
+      ),
+      selectAllIn<ApiCaseRow>(flowIds, 'api-cases-for-flows', (chunk) =>
+        supabaseAdmin.from('api_test_configs').select('id, name, flow_id').in('flow_id', chunk),
+      ),
+    ]);
+
+    for (const row of uiRows) {
+      if (!row.flow_id) continue;
+      const arr = ui.get(row.flow_id) || [];
+      arr.push(row);
+      ui.set(row.flow_id, arr);
+    }
+    for (const row of apiRows) {
+      if (!row.flow_id) continue;
+      const arr = api.get(row.flow_id) || [];
+      arr.push(row);
+      api.set(row.flow_id, arr);
     }
 
-    // Get module_id from flow
-    let moduleId: string | undefined;
+    return { ui, api };
+  }
 
-    if (flowId) {
-      const { data: flow } = await supabaseAdmin
-        .from('test_flows')
-        .select('module_id')
-        .eq('id', flowId)
-        .maybeSingle();
+  /** UI test cases by id (test_case plan items). */
+  private static async fetchUiCasesByIds(ids: string[]): Promise<UiCaseRow[]> {
+    return selectAllIn<UiCaseRow>(ids, 'ui-cases-by-id', (chunk) =>
+      supabaseAdmin.from('intent_test_cases').select('id, name, platform, flow_id').in('id', chunk),
+    );
+  }
 
-      moduleId = flow?.module_id;
-    }
-
-    return {
-      testCaseId: id!,
-      testType,
-      moduleId,
-      flowId,
-      name: name!,
-      platform,
-    };
+  /** API test cases by id (test_case plan items). */
+  private static async fetchApiCasesByIds(ids: string[]): Promise<ApiCaseRow[]> {
+    return selectAllIn<ApiCaseRow>(ids, 'api-cases-by-id', (chunk) =>
+      supabaseAdmin.from('api_test_configs').select('id, name, flow_id').in('id', chunk),
+    );
   }
 
   // =========================================================================
