@@ -217,6 +217,28 @@ export interface WarmupData {
    * default to 'android' in the comparison.
    */
   hostPlatform?: 'android' | 'ios';
+  /**
+   * Set on a Flutter entry from the moment the session is created until
+   * `attachFlutter` has actually returned. While true the entry describes a
+   * session that is NOT yet a Flutter session — the host is booted and the APK
+   * may be installed, but no Dart VM Service is connected.
+   *
+   * Why a persisted flag rather than a try/catch: the entry is deliberately
+   * written BEFORE prep so concurrent callers can find the new session, and
+   * every failure path deletes it again. That is exception-safe, not
+   * CRASH-safe. On 2026-08-21 the API was OOM-killed (exit 137) between
+   * install and attach four times; SIGKILL runs no catch block, so the entry
+   * survived with `platform: 'flutter'` while the runner-side session was a
+   * plain Android one. The reuse gate compared the request against the entry,
+   * saw flutter==flutter, and skipped re-prep — handing the editor a session
+   * that could never resolve a Flutter widget. A Point pick then returned the
+   * FlutterView's container class, `FrameLayout`, as the step's INTENT.
+   *
+   * The flag inverts that default: an entry that never reached attach reads as
+   * unusable, so a crash costs one recreate instead of a session that fails
+   * confusingly much later.
+   */
+  flutterAttachPending?: boolean;
   createdAt: string;
   /** Package name currently installed on the emulator */
   installedPackage?: string;
@@ -854,6 +876,13 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // for Flutter, so nothing would correct the host. Legacy entries with
           // no recorded host default to 'android'.
           || (isFlutter && (existing.hostPlatform ?? 'android') !== flutterHostPlatform)
+          // Flutter entry whose attach never completed (the process died
+          // between create and attachFlutter). It reports platform='flutter'
+          // and the right host, so neither check above catches it, but the
+          // runner-side session is still a plain host session. Reusing it
+          // skips re-prep and the editor gets a session that cannot resolve a
+          // widget. Recreate instead.
+          || (isFlutter && existing.flutterAttachPending === true)
         ) {
           // Platform mismatch — the cached session's platform (and, for Flutter,
           // its host) must match the requested one, in BOTH directions:
@@ -873,6 +902,15 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             requestedPlatform: platform,
             cachedHost: existing.hostPlatform ?? null,
             requestedHost: isFlutter ? flutterHostPlatform : null,
+            // Which of the three gates fired. Without this the new case is
+            // indistinguishable in the logs from a genuine platform switch,
+            // and "how often does a warmup die before attach" is exactly the
+            // number worth watching after this change.
+            reason: existing.platform !== platform
+              ? 'platform_mismatch'
+              : (isFlutter && (existing.hostPlatform ?? 'android') !== flutterHostPlatform)
+                ? 'host_mismatch'
+                : 'flutter_attach_never_completed',
           });
           await redisConnection.del(redisKey);
           clearSessionRunnerBinding(existing.sessionId).catch(() => {});
@@ -1183,6 +1221,9 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       // Record the Flutter host so a later warmup that flipped the host toggle
       // recreates instead of reusing the wrong-host session (reuse gate above).
       ...(isFlutter ? { hostPlatform: flutterHostPlatform } : {}),
+      // Cleared only once attachFlutter returns, below. If the process dies
+      // before then, this is what stops the next warmup reusing the session.
+      ...(isFlutter ? { flutterAttachPending: true } : {}),
       createdAt: new Date().toISOString(),
       // Audit BUG-1 fix: persist the selector so the next warmup can
       // detect "user wants a different device" and invalidate the
@@ -1335,6 +1376,41 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           ...(err instanceof MobileRunnerError ? { code: err.code } : {}),
         });
         return;
+      }
+
+      // Attach returned — the entry now describes a real Flutter session and
+      // may be reused. Re-READ rather than rewriting the object built earlier:
+      // prepApp updates the same key with installedPackage / appStoragePath,
+      // and echoing a stale copy would silently drop those.
+      //
+      // Guarded on sessionId: a concurrent warmup may already have replaced
+      // this entry with its own session, and clearing the flag on THAT one
+      // would vouch for an attach that never happened for it.
+      try {
+        const raw = await redisConnection.get(`${WARMUP_PREFIX}${projectId}:${userId}`);
+        if (raw) {
+          const current = JSON.parse(raw) as WarmupData;
+          if (current.sessionId === session.sessionId) {
+            delete current.flutterAttachPending;
+            // KEEPTTL: the entry's lifetime is anchored to when the session was
+            // created, not to when attach happened. Re-setting EX here would
+            // silently extend every Flutter session's cache window.
+            await redisConnection.set(
+              `${WARMUP_PREFIX}${projectId}:${userId}`,
+              JSON.stringify(current),
+              'KEEPTTL',
+            );
+          }
+        }
+      } catch (err) {
+        // Non-fatal: the session IS attached and usable right now. A stuck flag
+        // costs one unnecessary recreate on the next warmup, which is the safe
+        // direction to fail in.
+        logger.warn('[MOBILE_SESSION] could not clear flutterAttachPending after attach', {
+          sessionId: session.sessionId,
+          projectId,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
     // App launched on the fresh session; warmup is about to respond and the
