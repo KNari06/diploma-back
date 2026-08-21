@@ -11,8 +11,14 @@ jest.mock('../db/regression-doctor-apply.db');
 jest.mock('@/utils/core/redis-cache', () => ({
   cache: { delByPattern: jest.fn().mockResolvedValue(undefined) },
 }));
+// Owner OR project member; the membership half is tested in the shared
+// project-access service. Default here: not a member.
+jest.mock('@/services/core/project-access.service', () => ({
+  hasProjectAccess: jest.fn().mockResolvedValue(false),
+}));
 
 import * as db from '../db/regression-doctor-apply.db';
+import { hasProjectAccess } from '@/services/core/project-access.service';
 import { revertDoctorFinding } from '../revert.service';
 import { ApplyAccessError, ApplyConflictError, ApplyNotFoundError } from '../apply.service';
 
@@ -42,9 +48,11 @@ const testCase = (overrides: Partial<db.TestCaseForApplyRow> = {}): db.TestCaseF
 beforeEach(() => {
   jest.clearAllMocks();
 
+  (hasProjectAccess as jest.Mock).mockResolvedValue(false);
   mockDb.getFindingForRevert.mockResolvedValue({
     id: 'finding-1',
     user_id: 'user-1',
+    project_id: 'project-1',
     status: 'applied',
   });
   mockDb.getSnapshotsForFinding.mockResolvedValue([snapshot()]);
@@ -64,10 +72,11 @@ describe('validation', () => {
     );
   });
 
-  it('rejects a finding owned by someone else', async () => {
+  it('rejects a finding owned by someone outside the project', async () => {
     mockDb.getFindingForRevert.mockResolvedValue({
       id: 'finding-1',
       user_id: 'someone-else',
+      project_id: 'project-1',
       status: 'applied',
     });
     await expect(revertDoctorFinding({ findingId: 'finding-1', userId: 'user-1' })).rejects.toThrow(
@@ -79,6 +88,7 @@ describe('validation', () => {
     mockDb.getFindingForRevert.mockResolvedValue({
       id: 'finding-1',
       user_id: 'user-1',
+      project_id: 'project-1',
       status: 'open',
     });
     await expect(revertDoctorFinding({ findingId: 'finding-1', userId: 'user-1' })).rejects.toThrow(
@@ -91,6 +101,31 @@ describe('validation', () => {
     await expect(revertDoctorFinding({ findingId: 'finding-1', userId: 'user-1' })).rejects.toThrow(
       ApplyConflictError,
     );
+  });
+});
+
+describe('workspace access', () => {
+  // Deliberate product call: a workspace member may revert a teammate's apply.
+  // The snapshot model supports it, and the same member could already undo the
+  // change by hand in the editor (canWriteTestCase = owner OR member), so
+  // refusing here would only make the audited path harder than the unaudited one.
+  it("lets a workspace member revert a teammate's apply", async () => {
+    (hasProjectAccess as jest.Mock).mockResolvedValue(true);
+    mockDb.getFindingForRevert.mockResolvedValue({
+      id: 'finding-1',
+      user_id: 'teammate',
+      project_id: 'project-1',
+      status: 'applied',
+    });
+    mockDb.getTestCaseForApply.mockResolvedValue({
+      row: testCase({ user_id: 'teammate' }),
+      error: null,
+    });
+
+    const result = await revertDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+
+    expect(result.results[0]).toMatchObject({ status: 'reverted' });
+    expect(hasProjectAccess).toHaveBeenCalledWith('project-1', 'user-1');
   });
 });
 

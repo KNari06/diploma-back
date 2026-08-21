@@ -55,6 +55,7 @@ import {
   UnsupportedPatchError,
 } from './patch-applier';
 import type { StepPatch } from './types';
+import { canActOnDoctorRow } from './doctor-access.service';
 
 // Per-test-case in-memory mutex — same pattern as intent-test-case.service.ts.
 // Exported so the revert service reuses the SAME map: an Apply and a Revert on
@@ -99,7 +100,7 @@ export type PerTestOutcome =
 export type SkipReason =
   | 'concurrent_edit'       // updated_at changed between read and write
   | 'test_case_missing'     // row not found
-  | 'access_denied'         // user doesn't own it
+  | 'access_denied'         // not the owner and not a member of the project's workspace
   | 'no_step_matched'       // the finding's step id is not in this test case
   | 'patch_not_applicable'  // e.g. assertion patch on a non-ai_check step
   | 'already_patched';      // resulting steps are byte-identical
@@ -125,8 +126,8 @@ export async function applyDoctorFinding(input: ApplyFindingInput): Promise<Appl
   if (!finding) {
     throw new ApplyNotFoundError('Finding not found');
   }
-  if (finding.user_id !== userId) {
-    throw new ApplyAccessError('Finding not owned by user');
+  if (!(await canActOnDoctorRow(finding, userId))) {
+    throw new ApplyAccessError('Finding not accessible to user');
   }
   if (finding.status !== 'open') {
     throw new ApplyConflictError(`Finding is ${finding.status}`);
@@ -267,7 +268,7 @@ async function applyToOneTestCase(params: {
   if (!row) {
     return { testCaseId, status: 'skipped', reason: 'test_case_missing' };
   }
-  if (row.user_id !== userId) {
+  if (!(await canActOnDoctorRow(row, userId))) {
     return { testCaseId, status: 'skipped', reason: 'access_denied' };
   }
 
