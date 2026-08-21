@@ -406,6 +406,13 @@ export interface CreateTestFlowParams {
   priority?: Priority;
   preconditions?: any[];
   expectedResult?: string;
+  /**
+   * The Create-test dialog's "Goal" — what this test is for, in the user's own
+   * words. Only set here when the flow has NO initial test case (api flows);
+   * otherwise it lands on `intent_test_cases.description`, which is the row the
+   * authoring agent reads. See `createFlow`.
+   */
+  description?: string;
   /** Mobile-only flow variant override. null/blank = inherit. */
   mobileVariantLabel?: string | null;
 }

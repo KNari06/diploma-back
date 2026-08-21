@@ -22,7 +22,7 @@ import {
   NO_SESSION_REPLY,
 } from './shared';
 import { MobileBlackboard } from './blackboard';
-import { buildRunBeforeLine } from './prompts';
+import { buildOpenTestCaseBlock } from './open-test-case-block';
 import { runMobileAgentPipeline } from './pipeline';
 import { emitMobileAgentThinking } from './progress';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
@@ -106,56 +106,6 @@ async function buildMobileHistory(
       error: err instanceof Error ? err.message : String(err),
     });
     return [];
-  }
-}
-
-/**
- * Build the OPEN TEST CASE system block from a saved test case's existing
- * steps so the agent extends the flow rather than duplicating it. Owner-scoped
- * read; best-effort — any failure (not found / no access / no steps) returns
- * null and the turn proceeds without the block. Caps the summary so a long
- * test doesn't blow the prompt budget.
- */
-async function buildOpenTestCaseBlock(
-  testCaseId: string | undefined,
-  userId: string,
-): Promise<string | null> {
-  if (!testCaseId) return null;
-  try {
-    // Lazy import: pulling IntentTestCaseService at module top drags the
-    // Supabase client into the graph, which throws at import time without env
-    // vars (breaks handler.test.ts). Dynamic import keeps the handler test-
-    // loadable — same pattern resolveProjectId uses for supabaseAdmin.
-    const { IntentTestCaseService } = await import(
-      '@/services/testing/ui/preview/intent-test-case.service'
-    );
-    const tc = await IntentTestCaseService.getById(testCaseId, userId);
-    const steps = Array.isArray(tc?.stepsJson) ? tc!.stepsJson : [];
-    if (!tc || steps.length === 0) return null;
-    const MAX_STEPS = 40;
-    const shown = steps.slice(0, MAX_STEPS);
-    const lines = shown.map((s: any, i: number) => {
-      const type = String(s?.type ?? 'step');
-      const desc = String(s?.description ?? '').slice(0, 120);
-      return `${i + 1}. ${type}${desc ? ` — ${desc}` : ''}`;
-    });
-    if (steps.length > MAX_STEPS) lines.push(`… (+${steps.length - MAX_STEPS} more)`);
-    const body =
-      `Test case "${tc.name ?? testCaseId}" already has ${steps.length} step(s):\n` +
-      lines.join('\n');
-    return (
-      '## OPEN TEST CASE (the editor is scoped to this saved test)\n' +
-      'These steps ALREADY exist. When the user asks to add/change steps, EXTEND ' +
-      'this flow — do not re-author steps it already has.\n' +
-      buildRunBeforeLine(tc.resolvedDependencies) +
-      wrapUntrusted(body)
-    );
-  } catch (err) {
-    logger.debug('[MOBILE_AGENT] buildOpenTestCaseBlock skipped', {
-      testCaseId,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
   }
 }
 
