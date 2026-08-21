@@ -584,7 +584,18 @@ export class CommandExecutor {
         }
       }
 
-      const formatted = SnapshotCollector.format(snapshot);
+      // Redact ONCE, here, so both consumers of this string inherit it: the
+      // blackboard (embedded verbatim in the Planner / Executor / Reviewer
+      // prompts and kept in round history) and this command's own `output`,
+      // which goes straight back to the model as the tool result and into the
+      // JSONL trace. An app that renders a credential back ("Welcome back,
+      // <email>") would otherwise ship it on every subsequent round.
+      //
+      // This was the one sink in its family that was missed — vision insight,
+      // console errors and assert_text actual already redact (CLAUDE.md
+      // invariant #10). Identity when no credentials are configured, so
+      // exploration is unaffected.
+      const formatted = this.redactCredentials(SnapshotCollector.format(snapshot));
 
       // Update blackboard with current page state (all agents can read)
       this.blackboard.setCurrentSnapshot(formatted, snapshot.url, snapshot);
