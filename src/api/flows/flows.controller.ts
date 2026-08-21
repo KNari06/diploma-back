@@ -37,7 +37,7 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function createFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { moduleId, name, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings, mobileVariantLabel, hostPlatform, environmentResourceId } = req.body;
+    const { moduleId, name, goal, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings, mobileVariantLabel, hostPlatform, environmentResourceId } = req.body;
 
     // Validate moduleId required
     if (!moduleId) {
@@ -51,6 +51,16 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
     }
 
     const userId = getUserId(req);
+
+    // The dialog's "Goal" — the user's own statement of what this test is for.
+    // It has exactly one home: the row that represents the test. That is the
+    // initial `intent_test_cases` row when one is created (the case the
+    // authoring agent opens on), and the flow itself for an api flow, where no
+    // test case exists yet. Never both — a duplicated string is a string that
+    // drifts. Bounded because it is free text from a textarea.
+    const MAX_GOAL_CHARS = 2000;
+    const testGoal =
+      typeof goal === 'string' && goal.trim() ? goal.trim().slice(0, MAX_GOAL_CHARS) : null;
 
     // Get module info (includes project_id and platform_key)
     const module = await ModuleService.getById(moduleId, userId);
@@ -164,6 +174,8 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
       priority,
       preconditions,
       expectedResult,
+      // Only when there will be no test case to carry it (see MAX_GOAL_CHARS above).
+      ...(testGoal && !(isWebTestCase || isMobilePlatform) ? { description: testGoal } : {}),
       ...(mobileVariantLabel !== undefined ? { mobileVariantLabel } : {}),
     });
 
@@ -214,6 +226,7 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
           tags: tags || [],
           priority: priority || null,
           expected_result: expectedResult || null,
+          description: testGoal,
           depends_on: [],
         };
 
@@ -306,6 +319,7 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
             flowId: flow.id,
             platform: isMobilePlatform ? platform : 'web',
             hasBaseUrl: !!sanitizedBaseUrl,
+            hasGoal: !!testGoal,
           });
         }
     } else {

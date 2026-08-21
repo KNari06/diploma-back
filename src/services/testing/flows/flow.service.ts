@@ -41,6 +41,7 @@ export class FlowService {
       priority,
       preconditions,
       expectedResult,
+      description,
       mobileVariantLabel,
     } = params;
     const normalizedVariant = normaliseVariantOverride(mobileVariantLabel);
@@ -67,6 +68,7 @@ export class FlowService {
         priority: priority || null,
         preconditions: preconditions || [],
         expected_result: expectedResult || null,
+        description: description || null,
         mobile_variant_label: normalizedVariant,
       })
       .select('*')
