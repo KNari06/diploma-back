@@ -65,17 +65,22 @@ export async function getFindingForApply(findingId: string): Promise<FindingForA
 
 export async function getFindingForRevert(
   findingId: string,
-): Promise<{ id: string; user_id: string; status: string } | null> {
+): Promise<{ id: string; user_id: string; project_id: string | null; status: string } | null> {
   const { data, error } = await supabaseAdmin
     .from('regression_doctor_findings')
-    .select('id, user_id, status, applied_at')
+    // `project_id` is part of the access check (owner OR workspace member) —
+    // without it a teammate's revert would be denied for a finding they can
+    // otherwise read and apply.
+    .select('id, user_id, project_id, status, applied_at')
     .eq('id', findingId)
     .maybeSingle();
 
   if (error) {
     throw new Error(`Failed to load finding: ${error.message}`);
   }
-  return (data as { id: string; user_id: string; status: string }) ?? null;
+  return (
+    (data as { id: string; user_id: string; project_id: string | null; status: string }) ?? null
+  );
 }
 
 export async function getTestCaseForApply(testCaseId: string): Promise<{

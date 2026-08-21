@@ -109,6 +109,21 @@ in a background job, the other behind a user click:
 | `failed-step-collector.ts` | Run → "this step of this test case broke": first failing step per failed test, matched to `steps_json` by id only, with the finalize-race retry and the injected-id guards |
 | `step-fix-agent.ts` / `step-fix-prompt.ts` / `screenshot-inline.ts` | One LLM call per failing step: the call + validation, the prompt, and the screenshot inlining respectively |
 | `patch-applier.ts` | Pure steps-in/steps-out patching for the three actions, including the `bindingHints` + `compiled` invalidation that makes a fix take effect at replay |
+| `doctor-access.service.ts` | The single access rule for every Doctor surface: `canActOnDoctorRow(row, userId)` — owner OR project-workspace member via `hasProjectAccess` |
+
+**Doctor endpoints authorize by PROJECT ACCESS, not bare `user_id`** — same
+treatment as the negative-test routes above, and for the same reason. A nightly
+regression is triggered by one member (or by the scheduler under that member's
+id), so bare ownership made every finding it produced unreadable and unappliable
+to the rest of the workspace — single-player on a shared suite. It was also
+inconsistent rather than stricter: the editor's `canWriteTestCase` already lets
+a workspace member edit `steps_json` by hand, which is exactly the write an
+apply performs. Every check (controller reads, analyze, dismiss, snapshots;
+service-level apply/revert at both the finding and the per-test-case row) goes
+through `canActOnDoctorRow`, which short-circuits on owner first — so it can
+only widen — and falls back to owner-only when the row carries no `project_id`.
+A workspace member may also revert a teammate's apply; `applied_by` records the
+applier, which stays correct and becomes more useful.
 
 **`tests` has no `intent_test_case_id`.** The run → authored-case link is
 `test_executions.test_case_id`; the executed test's id lives inside

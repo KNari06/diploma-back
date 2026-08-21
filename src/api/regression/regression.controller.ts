@@ -17,6 +17,7 @@ import {
 } from '@/services/regression-doctor/apply.service';
 import { revertDoctorFinding } from '@/services/regression-doctor/revert.service';
 import { readAnalysis } from '@/services/regression-doctor/analysis-record';
+import { canActOnDoctorRow } from '@/services/regression-doctor/doctor-access.service';
 import { FullTestDataService } from '@/services/testing/ui/manual/full-test-data.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import {
@@ -1499,7 +1500,7 @@ export async function analyzeRunFailures(
       res.status(404).json({ success: false, error: 'Run not found' });
       return;
     }
-    if (run.user_id !== userId) {
+    if (!(await canActOnDoctorRow(run, userId))) {
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }
@@ -1550,13 +1551,12 @@ export async function getRunDoctorFindings(
     }
     const userId = getUserId(req);
 
-    // Ownership check — users can only see findings for runs they own.
-    // We verify via regression_runs.user_id rather than relying solely on
-    // RLS so we can return a clean 404 instead of an empty array when
-    // the user doesn't own the run.
+    // Access check — owner OR a member of the project's workspace. We verify
+    // in the controller rather than relying solely on RLS so we can return a
+    // clean 404 instead of an empty array when the run is not visible.
     const { data: run } = await supabaseAdmin
       .from('regression_runs')
-      .select('id, user_id')
+      .select('id, user_id, project_id')
       .eq('id', runId)
       .maybeSingle();
 
@@ -1564,7 +1564,7 @@ export async function getRunDoctorFindings(
       res.status(404).json({ success: false, error: 'Run not found' });
       return;
     }
-    if (run.user_id !== userId) {
+    if (!(await canActOnDoctorRow(run, userId))) {
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }
@@ -1630,12 +1630,12 @@ export async function dismissDoctorFinding(
 
     const userId = getUserId(req);
 
-    // Verify ownership before update. We query + check instead of relying
-    // on RLS so a wrong-owner attempt gets a clean 404 rather than a
-    // silent 0-rows update.
+    // Verify access before update. We query + check instead of relying on RLS
+    // so an unauthorized attempt gets a clean 404/403 rather than a silent
+    // 0-rows update.
     const { data: finding } = await supabaseAdmin
       .from('regression_doctor_findings')
-      .select('id, user_id, status')
+      .select('id, user_id, project_id, status')
       .eq('id', findingId)
       .maybeSingle();
 
@@ -1643,7 +1643,7 @@ export async function dismissDoctorFinding(
       res.status(404).json({ success: false, error: 'Finding not found' });
       return;
     }
-    if (finding.user_id !== userId) {
+    if (!(await canActOnDoctorRow(finding, userId))) {
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }
@@ -1927,12 +1927,12 @@ export async function getDoctorFindingSnapshots(
 
     const userId = getUserId(req);
 
-    // Ownership check via the parent finding. Explicit query keeps the
+    // Access check via the parent finding. Explicit query keeps the
     // 404 / 403 response semantics clean — RLS alone would return an
     // empty array in both cases and the UI can't tell them apart.
     const { data: finding } = await supabaseAdmin
       .from('regression_doctor_findings')
-      .select('id, user_id')
+      .select('id, user_id, project_id')
       .eq('id', findingId)
       .maybeSingle();
 
@@ -1940,7 +1940,7 @@ export async function getDoctorFindingSnapshots(
       res.status(404).json({ success: false, error: 'Finding not found' });
       return;
     }
-    if (finding.user_id !== userId) {
+    if (!(await canActOnDoctorRow(finding, userId))) {
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }

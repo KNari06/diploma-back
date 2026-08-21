@@ -36,6 +36,7 @@
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
+import { canActOnDoctorRow } from './doctor-access.service';
 import {
   ApplyAccessError,
   ApplyConflictError,
@@ -103,8 +104,8 @@ export async function revertDoctorFinding(
   if (!finding) {
     throw new ApplyNotFoundError('Finding not found');
   }
-  if (finding.user_id !== userId) {
-    throw new ApplyAccessError('Finding not owned by user');
+  if (!(await canActOnDoctorRow(finding, userId))) {
+    throw new ApplyAccessError('Finding not accessible to user');
   }
   if (finding.status !== 'applied') {
     // Only an applied finding has snapshots to act on.
@@ -208,7 +209,7 @@ async function revertOneSnapshot(params: {
   if (!row) {
     return { snapshotId, testCaseId, status: 'skipped', reason: 'test_case_missing' };
   }
-  if (row.user_id !== userId) {
+  if (!(await canActOnDoctorRow(row, userId))) {
     return { snapshotId, testCaseId, status: 'skipped', reason: 'access_denied' };
   }
 

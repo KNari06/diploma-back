@@ -15,9 +15,15 @@ jest.mock('../db/regression-doctor-apply.db');
 jest.mock('@/utils/core/redis-cache', () => ({
   cache: { delByPattern: jest.fn().mockResolvedValue(undefined) },
 }));
+// The access rule is owner OR project member; the membership half belongs to
+// the shared project-access service and is tested there. Default: not a member.
+jest.mock('@/services/core/project-access.service', () => ({
+  hasProjectAccess: jest.fn().mockResolvedValue(false),
+}));
 
 import * as db from '../db/regression-doctor-apply.db';
 import { cache } from '@/utils/core/redis-cache';
+import { hasProjectAccess } from '@/services/core/project-access.service';
 import {
   applyDoctorFinding,
   ApplyAccessError,
@@ -69,6 +75,69 @@ beforeEach(() => {
   mockDb.deleteApplySnapshot.mockResolvedValue({ error: null });
   mockDb.markFindingApplied.mockResolvedValue({ written: 1, error: null });
   mockDb.markNegativesStaleForTestCase.mockResolvedValue({ count: 0, error: null });
+  (hasProjectAccess as jest.Mock).mockResolvedValue(false);
+});
+
+describe('workspace access', () => {
+  // A nightly regression is triggered by one member (or by the scheduler under
+  // that member's id). Bare ownership made every finding it produced invisible
+  // and unappliable to the rest of the team, which is the normal case for a
+  // shared suite. The editor already lets a workspace member edit steps_json by
+  // hand — the same write this performs — so ownership was inconsistent, not
+  // stricter.
+
+  it('lets a workspace member apply a teammate\u2019s finding', async () => {
+    (hasProjectAccess as jest.Mock).mockResolvedValue(true);
+    mockDb.getFindingForApply.mockResolvedValue(finding({ user_id: 'teammate' }));
+    mockDb.getTestCaseForApply.mockResolvedValue({
+      row: testCase({ user_id: 'teammate' }),
+      error: null,
+    });
+
+    const result = await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+
+    expect(result.results[0]).toMatchObject({ status: 'applied' });
+    expect(hasProjectAccess).toHaveBeenCalledWith('project-1', 'user-1');
+  });
+
+  it('records the applier, not the owner, in applied_by', async () => {
+    (hasProjectAccess as jest.Mock).mockResolvedValue(true);
+    mockDb.getFindingForApply.mockResolvedValue(finding({ user_id: 'teammate' }));
+    mockDb.getTestCaseForApply.mockResolvedValue({
+      row: testCase({ user_id: 'teammate' }),
+      error: null,
+    });
+
+    await applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' });
+
+    expect(mockDb.markFindingApplied).toHaveBeenCalledWith({
+      findingId: 'finding-1',
+      userId: 'user-1',
+    });
+  });
+
+  it('still denies a stranger with no project access', async () => {
+    (hasProjectAccess as jest.Mock).mockResolvedValue(false);
+    mockDb.getFindingForApply.mockResolvedValue(finding({ user_id: 'teammate' }));
+
+    await expect(
+      applyDoctorFinding({ findingId: 'finding-1', userId: 'stranger' }),
+    ).rejects.toThrow(ApplyAccessError);
+  });
+
+  it('falls back to owner-only when the row carries no project_id', async () => {
+    // Older findings pre-date the column being populated. Fail closed on the
+    // unknown rather than letting the membership check open them up.
+    (hasProjectAccess as jest.Mock).mockResolvedValue(true);
+    mockDb.getFindingForApply.mockResolvedValue(
+      finding({ user_id: 'teammate', project_id: null as unknown as string }),
+    );
+
+    await expect(
+      applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' }),
+    ).rejects.toThrow(ApplyAccessError);
+    expect(hasProjectAccess).not.toHaveBeenCalled();
+  });
 });
 
 describe('validation', () => {
@@ -79,7 +148,7 @@ describe('validation', () => {
     );
   });
 
-  it('rejects a finding owned by someone else', async () => {
+  it('rejects a finding owned by someone outside the project', async () => {
     mockDb.getFindingForApply.mockResolvedValue(finding({ user_id: 'someone-else' }));
     await expect(applyDoctorFinding({ findingId: 'finding-1', userId: 'user-1' })).rejects.toThrow(
       ApplyAccessError,
