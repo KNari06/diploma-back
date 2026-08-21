@@ -43,12 +43,43 @@ import { redactPii } from '@/services/chat/pii-redactor';
  * Value charset stops at `&`, whitespace, quotes and `#` so we don't eat the
  * next param or surrounding text.
  */
+// `\b` does not fire between `_` and a letter, so a compound param name is only
+// caught if it is spelled out here: `id_token=` and `authToken=` slipped past
+// while the bare `token=` was masked. Compounds are listed explicitly rather
+// than loosened to `(?<![A-Za-z0-9])` — that boundary would also swallow every
+// benign `error_code=` / `status_code=` in a persisted debug log, which is the
+// signal those logs exist for. Longest alternatives first.
 const URL_TOKEN_RE =
-  /\b(token|api[_-]?key|access[_-]?token|refresh[_-]?token|session|sig|signature|password|secret|auth|key|code)=([^&\s"'#]+)/gi;
+  /\b(access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|oauth[_-]?token|api[_-]?key|token|session|signature|sig|password|secret|auth|key|code)=([^&\s"'#]+)/gi;
 
 export function redactUrlTokens(input: string): string {
   if (!input || typeof input !== 'string') return typeof input === 'string' ? input : '';
   return input.replace(URL_TOKEN_RE, (_m, key: string) => `${key}=<redacted:urltoken>`);
+}
+
+/**
+ * Mask the credential-bearing parts of a URL that is itself the evidence —
+ * a failing request line, a page address in a bug report — where the host and
+ * path are the whole point and must stay readable.
+ *
+ * Deliberately narrower than `redactForPersist`: it does NOT run `redactPii`,
+ * whose shape rules (OTP = any 4-8 digits, loose phone, Luhn card) would mask
+ * ordinary numeric path segments like `/v1/orders/12345` and turn a repro
+ * pointer into noise. What it does cover is where URL secrets actually live:
+ *
+ *   1. userinfo — `https://user:pa55@host/` (RFC 3986; browsers strip it from
+ *      the address bar, so it is easy to forget it survives in a log line).
+ *   2. sensitive query / fragment params — `?access_token=…`, `#id_token=…`,
+ *      via the shared `redactUrlTokens` key list.
+ *
+ * A token sitting in a PATH segment rather than a query param is not covered;
+ * that shape needs a per-API rule and no caller has one yet.
+ */
+const URL_USERINFO_RE = /(\b[a-z][a-z0-9+.-]*:\/\/)[^/?#\s@]+@/gi;
+
+export function redactUrlForEvidence(input: string): string {
+  if (!input || typeof input !== 'string') return typeof input === 'string' ? input : '';
+  return redactUrlTokens(input.replace(URL_USERINFO_RE, '$1<redacted:userinfo>@'));
 }
 
 /**

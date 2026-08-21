@@ -35,10 +35,21 @@ const KEYWORD =
   '(password|passwd|passcode|pin|otp|token|secret|api[_-]?key|auth[a-z_]*|credential[s]?)';
 // Separator: `=`, `:`, or whitespace + "is" + whitespace.
 const SEP = '\\s*(?:[:=]|\\bis\\b)\\s*';
+// Auth scheme: `Authorization: Bearer <token>` puts a word between the
+// separator and the real secret. Without this the VALUE rule below matches
+// `Bearer` (6+ alphanumerics), reports success, and leaves the token itself in
+// the clear — the exact shape a failing request's log line carries.
+const SCHEME = '((?:Bearer|Basic|Token|Digest|JWT|ApiKey)\\s+)?';
 // Value: optionally quoted; ≥6 alphanumeric OR contains a digit/special char.
 const VALUE = `["']?((?:[A-Za-z0-9]{6,80})|(?:[^\\s"',.;!?]*[\\d!@#$%^&*+\\-_/\\\\][^\\s"',.;!?]{2,80}))["']?`;
 
-const SENSITIVE_ASSIGNMENT_RE = new RegExp(`\\b${KEYWORD}\\b${SEP}${VALUE}`, 'gi');
+const SENSITIVE_ASSIGNMENT_RE = new RegExp(`\\b${KEYWORD}\\b${SEP}${SCHEME}${VALUE}`, 'gi');
+
+// A bare `Bearer <token>` with no `Authorization:` label in front of it — the
+// shape a fetch/axios error message prints. Runs AFTER the assignment rule and
+// is idempotent against its output (`[REDACTED]` has no 8-char run of the
+// token charset at the start).
+const BEARER_TOKEN_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 
 // ─── Bare-shape secrets ──────────────────────────────────────────────────
 // Some credentials arrive WITHOUT a keyword separator — a user pastes the raw
@@ -59,7 +70,9 @@ const SLACK_WEBHOOK_RE = /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/_-]+
 export function redactCredentials(input: string): string {
   if (!input || typeof input !== 'string') return typeof input === 'string' ? input : '';
   return input
-    .replace(SENSITIVE_ASSIGNMENT_RE, (_match, label) => `${label}: [REDACTED]`)
+    .replace(SENSITIVE_ASSIGNMENT_RE, (_match, label, scheme) =>
+      `${label}: ${scheme ? `${scheme.trim()} ` : ''}[REDACTED]`)
+    .replace(BEARER_TOKEN_RE, 'Bearer [REDACTED]')
     .replace(TELEGRAM_BOT_TOKEN_RE, '[REDACTED_TELEGRAM_TOKEN]')
     .replace(SLACK_WEBHOOK_RE, '[REDACTED_SLACK_WEBHOOK]');
 }

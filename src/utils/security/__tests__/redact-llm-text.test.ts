@@ -32,8 +32,30 @@ describe('redactForPersist', () => {
     const jwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQabcdef';
     const out = redactForPersist(`contact john@acme.com bearer ${jwt}`);
     expect(out).toContain('<redacted:email>');
-    expect(out).toContain('<redacted:jwt>');
+    // Presented as a bearer credential, the credential rule claims it before
+    // the PII shape rule sees it — so the marker is `Bearer [REDACTED]` rather
+    // than `<redacted:jwt>`. Either way the type stays legible to the model and
+    // the value never survives, which is what this asserts.
+    expect(out).toContain('Bearer [REDACTED]');
     expect(out).not.toContain('john@acme.com');
+    expect(out).not.toContain(jwt);
+  });
+
+  it('masks compound token param names, and leaves benign compounds alone', () => {
+    const out = redactForPersist(
+      'GET /cb?id_token=zzz999secret&authToken=aaa111secret&error_code=422&page=2',
+    );
+    expect(out).not.toContain('zzz999secret');
+    expect(out).not.toContain('aaa111secret');
+    // `\b` widened to a bare "not alphanumeric" boundary would have eaten this,
+    // which is the signal a persisted debug log exists for.
+    expect(out).toContain('error_code=422');
+    expect(out).toContain('page=2');
+  });
+
+  it('masks a JWT that is NOT presented as a bearer token, by shape', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQabcdef';
+    const out = redactForPersist(`response body: {"id_token":"${jwt}"}`);
     expect(out).not.toContain(jwt);
   });
 
