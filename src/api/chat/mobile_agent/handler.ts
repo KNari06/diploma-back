@@ -503,7 +503,11 @@ export async function handleMobileAgent(
     // steps so the agent EXTENDS the flow instead of re-authoring it (the
     // duplicate-vs-extend gap). Best-effort + owner-scoped; never blocks the
     // turn on a read failure.
-    const openTestCaseBlock = await buildOpenTestCaseBlock(params.testCaseId, userId);
+    const openTestCase = await buildOpenTestCaseBlock(params.testCaseId, userId);
+    const openTestCaseBlock = openTestCase?.block ?? null;
+    // Forwarded separately from the block: the block is now emitted for a
+    // goal-only case too, so it can no longer stand in for "has steps".
+    const openTestCaseHasSteps = openTestCase?.hasSteps ?? false;
 
     // APP MAP — the project's OTHER saved mobile tests, so the agent grounds
     // multi-screen authoring in this app's known screens instead of inventing
@@ -530,7 +534,7 @@ export async function handleMobileAgent(
     // saved, so it contains only earlier turns — no dupe of the current goal.
     const history = await buildMobileHistory(chatSessionId, userId, chatStore);
 
-    const pipelineOpts = { abortSignal, snapshot, openTestCaseBlock, appKnowledgeBlock, appSkeletonBlock, history };
+    const pipelineOpts = { abortSignal, snapshot, openTestCaseBlock, openTestCaseHasSteps, appKnowledgeBlock, appSkeletonBlock, history };
     const result = trackingSessionId && workspaceId
       ? await withAIContext(
           { workspaceId, userId, operationType: 'chat', sessionId: trackingSessionId ?? undefined },

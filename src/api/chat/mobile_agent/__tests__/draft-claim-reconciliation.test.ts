@@ -4,7 +4,7 @@
  * a false positive burns a round. The recorded live failures are the floor.
  */
 
-import { replyClaimsStepRevision } from '../draft-claim-reconciliation';
+import { hasRevisableArtifact, replyClaimsStepRevision } from '../draft-claim-reconciliation';
 
 describe('replyClaimsStepRevision', () => {
   // Verbatim from the JanaPost TC-31 session that motivated this — the agent
@@ -58,5 +58,35 @@ describe('replyClaimsStepRevision', () => {
     expect(replyClaimsStepRevision('')).toBe(false);
     expect(replyClaimsStepRevision('   ')).toBe(false);
     expect(replyClaimsStepRevision(undefined)).toBe(false);
+  });
+});
+
+
+/**
+ * The structural half of the gate. Both halves have to hold for the nudge to
+ * fire, so this is what keeps the text predicate above from being consulted on
+ * a turn where there is nothing to revise in the first place.
+ */
+describe('hasRevisableArtifact', () => {
+  it('is true when a draft is cached for this chat', () => {
+    expect(hasRevisableArtifact({ hasCachedDraft: true, openTestCaseHasSteps: false })).toBe(true);
+  });
+
+  it('is true when the open test case has saved steps', () => {
+    expect(hasRevisableArtifact({ hasCachedDraft: false, openTestCaseHasSteps: true })).toBe(true);
+  });
+
+  // The regression this predicate was extracted for. The gate used to key off
+  // "an OPEN TEST CASE block exists", which held only while that block was
+  // withheld at zero steps. Once it started carrying a saved goal, a goal-only
+  // case — nothing authored, nothing to revise — started qualifying and burned
+  // one LLM round on every plan-describing turn. Measured against production
+  // data at the time: 666 of 1905 saved test cases were in exactly that state.
+  it('is FALSE for an open test case that has a goal but no steps', () => {
+    expect(hasRevisableArtifact({ hasCachedDraft: false, openTestCaseHasSteps: false })).toBe(false);
+  });
+
+  it('is false in a fresh workspace chat with nothing open and nothing cached', () => {
+    expect(hasRevisableArtifact({ hasCachedDraft: false, openTestCaseHasSteps: false })).toBe(false);
   });
 });

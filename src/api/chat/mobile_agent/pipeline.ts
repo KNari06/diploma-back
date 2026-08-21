@@ -30,6 +30,7 @@ import { MobileDraftStepsCache } from '@/services/testing/mobile/mobile-draft-st
 import {
   DRAFT_CLAIM_NUDGE,
   DRAFT_OFFER_NUDGE,
+  hasRevisableArtifact,
   replyClaimsStepRevision,
   replyOffersDraftInsteadOfEmitting,
 } from './draft-claim-reconciliation';
@@ -142,8 +143,19 @@ export interface RunMobileAgentPipelineOpts {
    * of its existing steps. Injected as a system block so the agent EXTENDS the
    * open flow ("add a logout after login") instead of re-authoring it from
    * scratch (duplicate). Null/undefined = no open test case (workspace scope).
+   *
+   * NOTE: the block's PRESENCE no longer implies the test case has steps — it
+   * is also emitted for a saved goal on a case with none. Anything that needs
+   * "is there something to revise" must read `openTestCaseHasSteps`, not this.
    */
   openTestCaseBlock?: string | null;
+  /**
+   * Whether the open test case actually has saved steps. Split out from the
+   * block itself because the two questions came apart: the block is now emitted
+   * for a goal-only case (zero steps), so its presence stopped being a proxy
+   * for "there is an authored artifact here".
+   */
+  openTestCaseHasSteps?: boolean;
   /**
    * APP MAP — a formatted summary of the project's OTHER saved mobile tests
    * (known flows/screens of the app under test). Injected as a system block so
@@ -248,19 +260,27 @@ export async function runMobileAgentPipeline(
   let draftOfferNudged = false;
   // Is there anything to REVISE — i.e. an artifact a step-level claim could
   // contradict? Either a draft is cached for this chat, or the editor is scoped
-  // to a saved test case that already has steps (`buildOpenTestCaseBlock`
-  // returns null at 0 steps). Both matter: `mobile_create_test_case` consumes
-  // the cache entry (it re-sets it right after, but a 30-min TTL expiry or a
-  // process restart still leaves it cold), and a user revising a SAVED test
-  // case may never have had a cached draft in this session at all.
+  // to a saved test case that already has STEPS. Both matter:
+  // `mobile_create_test_case` consumes the cache entry (it re-sets it right
+  // after, but a 30-min TTL expiry or a process restart still leaves it cold),
+  // and a user revising a SAVED test case may never have had a cached draft in
+  // this session at all.
+  //
+  // Read `openTestCaseHasSteps`, NOT the block. This used to key off
+  // `!!openTestCaseBlock`, which was equivalent only while the block was
+  // withheld at 0 steps. Once the block started carrying a saved goal, that
+  // equivalence broke and a goal-only case with nothing to revise began
+  // qualifying — re-admitting exactly the case this gate exists to exclude.
   //
   // Be honest about how much this filters: with a saved test case open — the
   // common case — it is true for every turn. It rules out the fresh-workspace
   // chat where the agent is describing a plan rather than revising anything;
   // the rest of the precision comes from `replyClaimsStepRevision`.
-  const hasRevisableDraft =
-    (!!blackboard.chatSessionId && !!MobileDraftStepsCache.get(blackboard.chatSessionId)) ||
-    !!opts?.openTestCaseBlock;
+  const hasRevisableDraft = hasRevisableArtifact({
+    hasCachedDraft:
+      !!blackboard.chatSessionId && !!MobileDraftStepsCache.get(blackboard.chatSessionId),
+    openTestCaseHasSteps: !!opts?.openTestCaseHasSteps,
+  });
 
   while (round < MAX_TOOL_ROUNDS) {
     round++;

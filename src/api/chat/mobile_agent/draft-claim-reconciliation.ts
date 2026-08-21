@@ -142,3 +142,26 @@ export const DRAFT_OFFER_NUDGE =
   'longer applies: the walk you performed counts, including from a previous ' +
   'turn on this same device session. If you genuinely cannot draft, say exactly ' +
   'which screen or element blocked you — do not offer.';
+
+/**
+ * Is there an artifact a step-level claim could actually contradict?
+ *
+ * The structural half of the draft-claim gate, extracted so it can be pinned by
+ * a test. It used to be an inline expression keyed on whether the OPEN TEST CASE
+ * block existed at all, which was equivalent to "the case has steps" only while
+ * that block was withheld at zero steps. When the block started carrying a saved
+ * goal, the equivalence broke silently: a goal-only case — nothing authored,
+ * nothing to revise — began qualifying, re-admitting the plan-describing turn
+ * this gate exists to exclude, and burning one LLM round each time.
+ *
+ * Nothing here reads the block. If a future change makes the block appear in yet
+ * another situation, this predicate is unaffected by construction.
+ */
+export function hasRevisableArtifact(input: {
+  /** A draft is cached for this chat session. */
+  hasCachedDraft: boolean;
+  /** The open test case has SAVED STEPS — not merely a goal, and not merely an open case. */
+  openTestCaseHasSteps: boolean;
+}): boolean {
+  return input.hasCachedDraft || input.openTestCaseHasSteps;
+}
