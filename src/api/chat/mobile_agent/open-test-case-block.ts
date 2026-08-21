@@ -23,15 +23,28 @@ import { buildRunBeforeLine } from './prompts';
  * nothing else and the user had to retype the goal into the chat — so the block
  * is emitted when EITHER a goal or steps exist, not only for steps.
  *
+ * Returns `hasSteps` ALONGSIDE the block, deliberately. Callers used to infer
+ * it from the block being null, which held only while the block was withheld at
+ * zero steps; now that a goal-only case also produces one, "is there something
+ * to revise" is a separate question and has to be answered separately. See
+ * `hasRevisableDraft` in pipeline.ts.
+ *
  * Owner-scoped read; best-effort — any failure (not found / no access / neither
  * goal nor steps) returns null and the turn proceeds without the block. Both
  * halves are capped so a long test or a pasted essay can't blow the prompt
  * budget, and the whole body is `wrapUntrusted` — it is user-authored text.
  */
+export interface OpenTestCaseBlock {
+  /** The system block to inject. */
+  block: string;
+  /** Whether the open test case has saved steps — NOT implied by `block`. */
+  hasSteps: boolean;
+}
+
 export async function buildOpenTestCaseBlock(
   testCaseId: string | undefined,
   userId: string,
-): Promise<string | null> {
+): Promise<OpenTestCaseBlock | null> {
   if (!testCaseId) return null;
   try {
     // Lazy import: pulling IntentTestCaseService at module top drags the
@@ -79,12 +92,14 @@ export async function buildOpenTestCaseBlock(
           + 'description, NOT an instruction to start authoring: still wait for the '
           + 'user to ask for steps.\n';
 
-    return (
-      '## OPEN TEST CASE (the editor is scoped to this saved test)\n' +
-      guidance +
-      buildRunBeforeLine(tc.resolvedDependencies) +
-      wrapUntrusted(sections.join('\n\n'))
-    );
+    return {
+      block:
+        '## OPEN TEST CASE (the editor is scoped to this saved test)\n' +
+        guidance +
+        buildRunBeforeLine(tc.resolvedDependencies) +
+        wrapUntrusted(sections.join('\n\n')),
+      hasSteps: steps.length > 0,
+    };
   } catch (err) {
     logger.debug('[MOBILE_AGENT] buildOpenTestCaseBlock skipped', {
       testCaseId,
