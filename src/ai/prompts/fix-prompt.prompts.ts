@@ -18,9 +18,11 @@ export interface FixPromptInput {
   actualResult?: string;
   reproSteps?: string[];
   rootCauseHint?: string;            // from aiSummary.rootCauseStep / failure classification
-  // Bounded, NOT redacted — raw console lines and full request URLs (query
-  // string included) straight off the run. They reach every surface the
-  // resulting prompt does, which now includes auto-filed Jira issues.
+  // Bounded AND scrubbed by DeveloperFixPromptService before they get here —
+  // console lines through `redactForPersist`, request URLs through
+  // `redactUrlForEvidence` (userinfo + sensitive query params). They reach
+  // every surface the resulting prompt does, which includes auto-filed Jira
+  // issues, so anything added to this shape must be scrubbed at the same point.
   consoleErrors?: string[];
   networkErrors?: string[];          // e.g. "POST /api/checkout → 500"
   screenshotUrl?: string;

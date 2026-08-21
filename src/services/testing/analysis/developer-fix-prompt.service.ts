@@ -11,6 +11,7 @@
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { buildFixPromptMessages, type FixPromptInput } from '@/ai/prompts/fix-prompt.prompts';
 import { logger } from '@/utils/core/logger';
+import { redactForPersist, redactUrlForEvidence } from '@/utils/security/redact-llm-text';
 import type { AISummary, BugReport } from '@/types';
 
 const MAX_CONSOLE = 3;
@@ -35,7 +36,7 @@ export class DeveloperFixPromptService {
         bugTitle: bug.title || 'Bug',
         bugDescription: bug.description || '',
         severity: bug.severity || 'medium',
-        pageUrl: params.pageUrl || params.testResult?.url,
+        pageUrl: redactUrlForEvidence(params.pageUrl || params.testResult?.url || '') || undefined,
         failingSelector: bug.domSelector,
         expectedResult: bug.expectedResult,
         actualResult: bug.actualResult,
@@ -77,24 +78,38 @@ export class DeveloperFixPromptService {
     return parts.length ? parts.join(', ') : undefined;
   }
 
-  /** Bounded console error lines (strings only). */
+  /**
+   * Bounded console error lines (strings only), scrubbed.
+   *
+   * `redactForPersist` is the full treatment here — a console line is free-form
+   * text where `Authorization: Bearer …`, an echoed password assignment, an
+   * email or a raw JWT are the realistic leaks, and losing an incidental digit
+   * run to over-redaction costs nothing. The URL-shaped evidence below gets the
+   * narrower scrub instead, because there the path IS the signal.
+   */
   private static consoleErrors(testResult: any): string[] | undefined {
     const errs = Array.isArray(testResult?.errors) ? testResult.errors : [];
     const out = errs
       .map((e: any) => (typeof e === 'string' ? e : e?.message || e?.text || ''))
       .filter((s: string) => !!s)
-      .slice(0, MAX_CONSOLE);
+      .slice(0, MAX_CONSOLE)
+      .map((s: string) => redactForPersist(s));
     return out.length ? out : undefined;
   }
 
-  /** Bounded network-failure summaries "METHOD url → status" for non-2xx calls. */
+  /**
+   * Bounded network-failure summaries "METHOD url → status" for non-2xx calls,
+   * with the URL scrubbed of userinfo and sensitive query params. The failing
+   * request is often an auth call, so `?access_token=eyJ…` in the query string
+   * is the single most likely secret on this channel.
+   */
   private static networkErrors(testResult: any): string[] | undefined {
     const logs = Array.isArray(testResult?.network_logs)
       ? testResult.network_logs
       : Array.isArray(testResult?.networkLogs) ? testResult.networkLogs : [];
     const out = logs
       .filter((n: any) => typeof n?.status === 'number' && n.status >= 400)
-      .map((n: any) => `${(n.method || 'GET').toUpperCase()} ${n.url || ''} → ${n.status}`.trim())
+      .map((n: any) => `${(n.method || 'GET').toUpperCase()} ${redactUrlForEvidence(n.url || '')} → ${n.status}`.trim())
       .slice(0, MAX_NETWORK);
     return out.length ? out : undefined;
   }
