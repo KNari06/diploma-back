@@ -629,6 +629,12 @@ export interface ServerToClientEvents {
   'preview:pick:result': (data: PreviewPickResultPayload) => void;
   'preview:pick:lint': (data: PreviewPickLintPayload) => void;
 
+  // Step checkpoint (server -> client). `state` announces whether a
+  // one-step-back restore point exists; `restored` answers a restore request.
+  // Restores the browser's cookies/localStorage/URL only — never server state.
+  'preview:checkpoint:state': (data: PreviewCheckpointStatePayload) => void;
+  'preview:checkpoint:restored': (data: PreviewCheckpointRestoredPayload) => void;
+
   // Preview interactive control responses
   'preview:viewport': (data: PreviewViewportPayload) => void;
   'preview:mouse:result': (data: PreviewMouseResultPayload) => void;
@@ -2192,6 +2198,45 @@ export interface PreviewHoverOverlaySetRequest {
  * Pick state echo (server -> client). Confirms enter/exit and carries the
  * server-side reason on auto-exit (timeout, navigation, mutex preempt).
  */
+/**
+ * Whether a one-step-back restore point exists for this session, and which
+ * step it precedes. Emitted right after every single-step apply captures one
+ * (or fails to), and again after a restore consumes it.
+ *
+ * No storage payload is sent — the snapshot holds live auth cookies and stays
+ * server-side. The client only needs to know it can offer the control.
+ */
+export interface PreviewCheckpointStatePayload {
+  /**
+   * REQUIRED for filtering: the run loop announces via `emitToUser`, which
+   * reaches every socket the user has, so a second editor tab must be able to
+   * tell whether this checkpoint belongs to its own preview session.
+   */
+  previewSessionId: string;
+  available: boolean;
+  /** The URL the browser will return to. */
+  url?: string;
+  /** The step the checkpoint precedes — the UI labels the control with it. */
+  stepId?: string;
+  stepLabel?: string;
+  capturedAt?: number;
+}
+
+/**
+ * Outcome of a `preview:checkpoint:restore` request.
+ *
+ * `no_checkpoint` / `session_gone` mean the control should disappear;
+ * `restore_failed` keeps the checkpoint alive server-side so the author can
+ * retry rather than losing their only way back.
+ */
+export type PreviewCheckpointRestoredPayload =
+  | { ok: true; url: string }
+  | {
+      ok: false;
+      reason: 'no_checkpoint' | 'session_gone' | 'restore_failed';
+      message: string;
+    };
+
 export interface PreviewPickStatePayload {
   previewSessionId: string;
   active: boolean;
