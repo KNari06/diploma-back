@@ -32,6 +32,15 @@ import { diagnoseStepBlocker, actOnDiagnosis } from './step-blocker-diagnosis.se
 import { waitForPageInteractive } from './page-interactive.utils';
 import { checkAndHandleWebOverlayTrigger, buildTriggerFiredPayload, type WebTriggerFireResult } from './web-trigger-engine';
 import { sanitizeTriggers } from '@/services/mobile/trigger-validation.util';
+import { captureCheckpoint } from './preview-checkpoint.service';
+
+/**
+ * Step types that cannot change cookies, localStorage or the URL, so a step
+ * checkpoint taken before them would be byte-identical to the one already
+ * held. Mostly the synthetic waits `injectAutoWaitForSteps` prepends, which
+ * would otherwise roughly double the number of snapshots a run takes.
+ */
+const NON_MUTATING_STEP_TYPES = new Set(['wait_for', 'timeout', 'store']);
 
 /** Base timeout for run setup (navigation, init). */
 /**
@@ -1987,6 +1996,36 @@ export class PreviewRunService {
         const expectsNavigation = !!peekNext
           && peekNext.type === 'wait_for'
           && !!peekNext.options?.urlMatcher?.changedFrom;
+
+        // Snapshot the browser before this step touches it, so "back to the
+        // state before the last executed step" also works for a full run — the
+        // run loop calls applyStep directly and never passes through the
+        // `preview:step:apply` WS handler that captures for a single step.
+        //
+        // Captured here rather than inside applyStep on purpose: applyStep is
+        // re-entered by the retry paths below, and a re-capture there would
+        // move the restore point to "before the last attempt" — past the state
+        // the first attempt had already changed.
+        //
+        // Skipped for step types that cannot touch cookies, storage or the URL
+        // (pure waits, timeouts): the snapshot before such a step is identical
+        // to the one already held, so taking it again only costs a CDP
+        // round-trip per step and leaves the restore point on a step the author
+        // cannot meaningfully "go back before".
+        //
+        // Raced against the abort signal like every other awaited call in this
+        // loop — `storageState()` has no timeout of its own, and a wedged CDP
+        // would otherwise park the loop outside cancellation's reach.
+        if (!NON_MUTATING_STEP_TYPES.has(interpolatedStep.type)) {
+          const runCheckpoint = await raceAbort(
+            captureCheckpoint(previewSessionId, userId, {
+              id: step.id,
+              label: step.description,
+            }),
+            signal,
+          );
+          webSocketService.emitToUser(userId, 'preview:checkpoint:state', runCheckpoint);
+        }
 
         try {
           // V14: Record step start for telemetry

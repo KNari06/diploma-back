@@ -52,6 +52,7 @@ Element resolution and auto-healing serve all three.
 
 | File | Purpose |
 |---|---|
+| [preview-checkpoint.service.ts](preview-checkpoint.service.ts) | One-step-back restore point for the live browser: snapshots `storageState` (cookies + localStorage) + URL + the open tab set before every step, restores them on request. Captured in TWO places because the run loop bypasses the WS handler — `preview:step:apply` (single step) and `preview-run.service` (per step, before the retry paths so a retry can't move the restore point). Restore REPLACES (clearCookies + `localStorage.clear()` before re-seeding) and closes tabs the step opened via `PreviewSessionService.closeTab`. ONE checkpoint per session, consumed on restore. Capture is fail-open end to end — a snapshot problem must never abort the run. Restores the BROWSER only: server-side effects are not undone, and the UI copy must keep saying so. |
 | [html-context.service.ts](html-context.service.ts) | Builds compact page-structure context (scene summary) for LLM prompts. |
 | [preview-video-stream.service.ts](preview-video-stream.service.ts) | CDP screencast for live video. Owns the **screencast** CDP session — do NOT piggyback `CdpSnapshotService` on it (100% freeze measured). |
 | [preview-dirty-observer.service.ts](preview-dirty-observer.service.ts) | (Phase 2/3) Event-driven `preview:page` trigger. In-page `MutationObserver` (animation-filtered, throttled, `subtree:true`) signals real DOM changes via `exposeFunction` → server collects+emits on change instead of polling. Re-injects on `framenavigated`, re-armed on page switch, torn down in `stopPreviewStreams` + on page close. Flag-gated (`PREVIEW_DIRTY_OBSERVER` / `_SHADOW`, default OFF). When active+driving, the periodic DOM tick downshifts to `DOM_UPDATE_SAFETY_NET_INTERVAL_MS` (the tick stays as the backstop for cross-origin iframes / text-only mutations). When OFF, never started → behaviour unchanged. |
@@ -138,6 +139,7 @@ Element resolution and auto-healing serve all three.
 | `preview:apply-resource` / `:save-login` | Test resources (auth fixture apply) |
 | `preview:pick:start` / `:cancel` | Enter / exit one-shot Pick element mode |
 | `preview:hover-overlay:set` | FE flips in-page hover outline mode (`navigation` / `recording` / `off`) when navigation mode toggles |
+| `preview:checkpoint:restore` | Put the live browser back to the state captured before the last executed step |
 
 ### Server → Client
 | Event | Meaning |
@@ -153,6 +155,8 @@ Element resolution and auto-healing serve all three.
 | `preview:run:progress` / `:complete` | Run loop status |
 | `preview:auth:required` | Login wall detected |
 | `preview:page:load-error` | Active tab landed on a browser load-failure page (`chrome-error://chromewebdata/` etc.). Network blip / DNS / TLS / site outage. Carries `{ url, message }`. Emitted from `preview.handler.ts` after `applyStep` AND from `preview-run.service.ts` after each successful apply when the destination is a browser error page. Frontend shows a network-error toast; run loop short-circuits at the step that caused the bad navigation (NOT the next step). Detection logic centralized in [page-load-error.util.ts](page-load-error.util.ts). |
+| `preview:checkpoint:state` | Whether a one-step-back restore point exists (`available`, `url?`, `stepId?`, `stepLabel?`). Emitted after every capture attempt and after a restore consumes one. No storage payload — the snapshot holds live auth cookies and stays server-side |
+| `preview:checkpoint:restored` | Restore outcome: `{ ok: true, url }` or `{ ok: false, reason, message }`. `restore_failed` keeps the checkpoint so the author can retry |
 | `preview:pick:state` | Pick mode entered or exited (`active: boolean`, `reason?`) |
 | `preview:pick:result` | One-shot picker result — identity + description + suggested action. Emitted IMMEDIATELY after the probe (no LLM wait). |
 | `preview:pick:lint` | Follow-up dry-run lint verdict (5-10s after `:result`). Carries only `{ status, confidence, message }`. May not fire if lint failed / timed out / session closed. |

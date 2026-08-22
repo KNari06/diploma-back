@@ -1803,6 +1803,17 @@ export class PreviewSessionService {
       AuthoringCreditsService.clearSession(sessionId);
     } catch { /* non-critical — dedup set is bounded per session anyway */ }
 
+    // Drop the step checkpoint. It holds a full storageState blob (live auth
+    // cookies) plus strong Page references, so leaving it behind pins the very
+    // pages this teardown is closing. Cleared HERE rather than only in the WS
+    // handler's stopPreviewStreams, because TTL eviction reaches stopSession
+    // directly and never goes through that path. Dynamic import: the checkpoint
+    // service imports this one.
+    try {
+      const { clearCheckpoint } = await import('./preview-checkpoint.service');
+      clearCheckpoint(sessionId);
+    } catch { /* non-critical — checkpoint is in-memory only */ }
+
     // Safety-net: close and upload editor trace (idempotent — no-op if already closed)
     try {
       const { EditorTraceService } = await import('./editor-trace.service');

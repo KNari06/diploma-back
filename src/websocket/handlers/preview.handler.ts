@@ -29,6 +29,12 @@ import {
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
 import { detectPageLoadError } from '@/services/testing/ui/preview/page-load-error.util';
+import {
+  captureCheckpoint,
+  restoreCheckpoint,
+  getCheckpointInfo,
+  clearCheckpoint,
+} from '@/services/testing/ui/preview/preview-checkpoint.service';
 import { collectSecretValues, redactWithValues } from '@/utils/interpolation/redact-secrets';
 import { buildStepRedactor } from '@/utils/interpolation/redact-step';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -1403,6 +1409,10 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
  * Stop all preview streams for a session
  */
 const stopPreviewStreams = async (previewSessionId: string): Promise<void> => {
+  // Drop the step checkpoint first — it holds the session's live auth cookies,
+  // and the browser it belongs to is going away.
+  clearCheckpoint(previewSessionId);
+
   // Stop DOM update interval
   const domInterval = activeDomUpdateIntervals.get(previewSessionId);
   if (domInterval) {
@@ -2144,6 +2154,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       // Editor trace: log step apply request (getOrCreate ensures trace file exists even without recording)
       const applyTrace = EditorTraceService.getOrCreate(previewSessionId, ensuredUserId);
       applyTrace.writeStepApplyRequest(stepDraft);
+
+      // Snapshot the browser BEFORE the step touches it, so the author can get
+      // back to this exact page + session if the step goes somewhere unwanted.
+      // Fail-open: `captureCheckpoint` swallows its own errors and simply
+      // reports "unavailable" — a snapshot problem must never block the apply.
+      const checkpointInfo = await captureCheckpoint(previewSessionId, ensuredUserId, {
+        id: typeof stepDraft.id === 'string' ? stepDraft.id : undefined,
+        label: typeof stepDraft.description === 'string' ? stepDraft.description : undefined,
+      });
+      socket.emit('preview:checkpoint:state', checkpointInfo);
 
       const result = await PreviewStepApplyService.applyStep({
         previewSessionId,
@@ -7005,6 +7025,63 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       logger.error('[PREVIEW_PICK] cancel handler error', {
         socketId: socket.id,
         error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Step checkpoint (preview-checkpoint.service.ts)
+  //
+  // 'preview:checkpoint:restore' puts the live browser back to the cookies /
+  // localStorage / URL captured just before the last single-step apply. The
+  // checkpoint itself is taken in the 'preview:step:apply' handler above.
+  //
+  // This restores the BROWSER only — server-side effects of the step are not
+  // undone and cannot be. The UI wording reflects that; do not relabel it as
+  // "undo step".
+  // ═══════════════════════════════════════════════════════════════════════════
+  socket.on('preview:checkpoint:restore' as any, async (data: { previewSessionId?: string }) => {
+    // Every exit path emits: the FE latches a "restoring" flag on send and only
+    // clears it on `:restored`, so a silent return spins the control forever
+    // (CLAUDE.md hard invariant #2).
+    const refuse = (reason: 'no_checkpoint' | 'session_gone', message: string) => {
+      socket.emit('preview:checkpoint:restored', { ok: false, reason, message });
+    };
+
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) {
+        refuse('session_gone', 'Not authenticated');
+        return;
+      }
+
+      const { previewSessionId } = data || {};
+      if (!previewSessionId) {
+        refuse('no_checkpoint', 'previewSessionId is required');
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        refuse('session_gone', 'Preview session is no longer available');
+        socket.emit('preview:checkpoint:state', { available: false, previewSessionId });
+        return;
+      }
+
+      const result = await restoreCheckpoint(previewSessionId, ensuredUserId);
+      socket.emit('preview:checkpoint:restored', result);
+      socket.emit('preview:checkpoint:state', getCheckpointInfo(previewSessionId));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error('[PREVIEW_CHECKPOINT] restore handler error', {
+        socketId: socket.id,
+        error: message,
+      });
+      socket.emit('preview:checkpoint:restored', {
+        ok: false,
+        reason: 'restore_failed',
+        message,
       });
     }
   });
