@@ -408,6 +408,14 @@ const envSchema = z.object({
   // deploy flips this AND ops provisions a dedicated container + DB row.
   DEDICATED_MOBILE_EMULATOR_ENABLED: z.string().transform(v => v === 'true').default('false'),
 
+  // Make a runner-reported command failure during app prep fatal rather than
+  // warn-only. The runner answers 200 with `{success:false}` for a thrown
+  // handler, so a failed install / failed `pm clear` used to read as success
+  // and the run continued against stale app state. Default OFF — ships in
+  // shadow mode so the real failure rate is measurable before a throw starts
+  // failing runs at SETUP. See config/features/mobile-prep-strict-results.ts.
+  MOBILE_PREP_STRICT_RESULTS: z.string().transform(v => v === 'true').default('false'),
+
   // Credential-bound test authoring (ADR-0023). The chat agent may author a
   // LOGIN test against a saved `secret`: the user names the login, the server
   // injects the real values for the live authoring run, and the steps freeze
