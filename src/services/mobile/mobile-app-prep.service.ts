@@ -48,6 +48,8 @@ import { logger } from '@/utils/core/logger';
 import { WARMUP_PREFIX, WARMUP_TTL, PENDING_INSTALL_PREFIX, type WarmupData } from '@/api/mobile/session.controller';
 import { getProjectMobileApp, buildMobileAppSettingsPatch, DEFAULT_VARIANT_LABEL } from '@/services/mobile/project-mobile-app.helper';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { MobilePrepStrictResultsFeature } from '@/config/features/mobile-prep-strict-results';
+import { findRunnerBatchFailure, type RunnerBatchFailure } from '@/services/mobile/runner-batch-result';
 
 /**
  * Stage labels recognised by the editor's loading-bar component. The worker
@@ -195,6 +197,47 @@ export class MobileAppPrepService {
       });
       return false;
     }
+  }
+
+  /**
+   * Apply this service's POLICY to a runner batch response: warn, or fail.
+   *
+   * Detection lives in `findRunnerBatchFailure` so every other
+   * `executeBatchCommands` caller can reuse it; only the warn-vs-throw choice
+   * is app-prep's own. See that module for why a failed command arrives as an
+   * HTTP 200 body rather than a rejection.
+   *
+   * Gated by `MOBILE_PREP_STRICT_RESULTS` — warn-only until the real failure
+   * rate on live traffic is known. See the feature flag for why.
+   */
+  private static assertBatchSucceeded(
+    raw: unknown,
+    context: { sessionId: string; projectId: string; label: string; commands: string[] },
+  ): RunnerBatchFailure | null {
+    const failure = findRunnerBatchFailure(raw, context.commands);
+    if (!failure) return null;
+
+    if (MobilePrepStrictResultsFeature.isEnabled()) {
+      // Carry the identifying fields IN THE MESSAGE, not just in a log field:
+      // this string is what lands in `test_executions.error_message`, and
+      // without the session id there is nothing to correlate against the
+      // runner's own logs — the exact correlation that was missing while
+      // diagnosing the 2026-08-24 stale-state run.
+      throw new Error(
+        `[MOBILE_APP_PREP] runner command '${failure.command}' failed during app prep `
+        + `(step '${context.label}', session ${context.sessionId}, project ${context.projectId}): ${failure.error}`,
+      );
+    }
+
+    logger.warn('[MOBILE_APP_PREP] runner command reported failure — NOT failing prep (shadow mode)', {
+      sessionId: context.sessionId,
+      projectId: context.projectId,
+      label: context.label,
+      command: failure.command,
+      error: failure.error,
+      hint: 'set MOBILE_PREP_STRICT_RESULTS=true to make this fatal',
+    });
+    return failure;
   }
 
   /**
@@ -367,6 +410,38 @@ export class MobileAppPrepService {
         timings[label] = (timings[label] ?? 0) + (Date.now() - start);
       }
     };
+
+    /**
+     * Timed batch dispatch that also CHECKS the runner's answer.
+     *
+     * Every mutating command in this service goes through here. The bare
+     * `client.executeBatchCommands` resolves happily on a command that failed
+     * (see `assertBatchSucceeded`), so calling it directly is the bug shape
+     * this wrapper exists to prevent — `isPackageOnDevice` is the one
+     * deliberate exception, since it treats any failure as "not installed"
+     * and falls through to a full install, which is the safe direction.
+     */
+    let lastBatchFailure: RunnerBatchFailure | null = null;
+    const batch = async (
+      label: string,
+      commands: Array<Record<string, unknown>>,
+      timeoutMs: number,
+    ): Promise<unknown> => {
+      const res = await time(label, () => client.executeBatchCommands(
+        sessionId,
+        commands,
+        { timeoutMs, userId },
+      ));
+      // Throws in strict mode; in shadow mode it warns and hands back the
+      // failure so the caller can still avoid acting on a broken result.
+      lastBatchFailure = MobileAppPrepService.assertBatchSucceeded(res, {
+        sessionId,
+        projectId,
+        label,
+        commands: commands.map((c) => String(c.type)),
+      });
+      return res;
+    };
     let branchTaken = 'unknown';
 
     // Nudge the UI past "boot emulator" as soon as install logic starts.
@@ -514,18 +589,18 @@ export class MobileAppPrepService {
         // 2026-07-06: this is what kept "Password login (flutter)" stuck on
         // a logged-in screen across every dispatch — see LESSONS.md L-0009).
         if (skipLaunch) {
-          await time('branch1_close_only', () => client.executeBatchCommands(sessionId, [
+          await batch('branch1_close_only', [
             { type: 'close_app', params: { packageName: cachedPackage, hard: true } },
-          ], { timeoutMs: 60_000, userId }));
+          ], 60_000);
         } else {
           // 60s budget: pm clear 5–15s + cold am start with first-launch dex
           // opt 10–20s = ~15-35s typical. Tighter than the legacy 90s so the
           // user sees a clear failure faster when the runner is wedged
           // (circuit breaker now propagates failure within ~30s).
-          await time('branch1_close_launch', () => client.executeBatchCommands(sessionId, [
+          await batch('branch1_close_launch', [
             { type: 'close_app', params: { packageName: cachedPackage, hard: true } },
             { type: 'launch_app', params: { packageName: cachedPackage } },
-          ], { timeoutMs: 60_000, userId }));
+          ], 60_000);
         }
         // Branch 1 already required `warmup.appStoragePath === effectiveStoragePath`
         // and verified the package on-device, so this is a confirmed identity —
@@ -611,17 +686,17 @@ export class MobileAppPrepService {
         // wipe runs regardless of skipLaunch — see branch 1's comment for
         // why (attachFlutter's own relaunch never clears data on its own).
         if (skipLaunch) {
-          await time('branch2_close_only', () => client.executeBatchCommands(sessionId, [
+          await batch('branch2_close_only', [
             { type: 'close_app', params: { packageName: knownPackage, hard: true } },
-          ], { timeoutMs: 60_000, userId }));
+          ], 60_000);
         } else {
           // Keeps the prep contract consistent: every successful prep
           // leaves the app in a freshly-data-wiped state regardless of
           // which install branch fired. Same 60s budget as branch 1.
-          await time('branch2_close_launch', () => client.executeBatchCommands(sessionId, [
+          await batch('branch2_close_launch', [
             { type: 'close_app', params: { packageName: knownPackage, hard: true } },
             { type: 'launch_app', params: { packageName: knownPackage } },
-          ], { timeoutMs: 60_000, userId }));
+          ], 60_000);
         }
 
         // Restore Redis cache so the next prep skips this branch too.
@@ -675,7 +750,7 @@ export class MobileAppPrepService {
     const shouldUninstallOld = !!oldPackage;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const installResult = await time('runner_install', () => client.executeBatchCommands(sessionId, [
+    const installResult = await batch('runner_install', [
       {
         type: 'install_app',
         params: {
@@ -692,12 +767,42 @@ export class MobileAppPrepService {
       // failing-fast 60s sooner than the legacy 240s when the runner is
       // genuinely wedged. The circuit breaker in AdbClient now propagates
       // hung-emulator failures within ~30s independently of this timeout.
-    ], { timeoutMs: 180_000, userId })) as any;
+    ], 180_000) as any;
 
     // Runner wraps every command result as { success, data, durationMs, ... }.
     // The install handler returns { installed, packageName } inside `data`.
     const detected = installResult?.results?.[0]?.data?.packageName as string | undefined;
     const packageName = explicitPackage || detected;
+
+    // Explicit hard reset, exactly as branches 1 and 2 do it — do NOT lean on
+    // `install_app`'s own `clearData` / `uninstallOldPackage` to leave the app
+    // wiped. Two ways that trust was misplaced:
+    //
+    //   1. Both of those steps are wrapped in `.catch()` inside the runner's
+    //      install handler (step-dispatcher.ts), so a failed `pm uninstall` or
+    //      `pm clear` is swallowed and `install_app` still reports success.
+    //   2. `uninstallOldPackage` is only sent when `warmup.installedPackage`
+    //      exists. A plain Redis eviction is enough to drop it, and then the
+    //      wipe rests entirely on that swallowed `clearData` — while
+    //      `reinstall: true` is `adb install -r`, which PRESERVES app data by
+    //      design. No adb flakiness required to inherit the last run's login.
+    //
+    // This must run BEFORE the launch below: appended after it, we would wipe
+    // and force-stop the app we just started and return as though it were
+    // running. On the Flutter path (`skipLaunch`) the caller launches via
+    // attachFlutter, whose force-stop is process-level and never clears data.
+    //
+    // Skipped when the install itself failed: `packageName` falls back to the
+    // project's configured package, so without this guard a shadow-mode run
+    // would `pm clear` a package the install just failed to put on the device,
+    // throw inside the runner, and emit a SECOND warning attributed to
+    // `close_app` — burying the real install failure in the very logs the
+    // shadow phase exists to measure. In strict mode the install already threw.
+    if (packageName && !lastBatchFailure) {
+      await batch('branch3_hard_reset', [
+        { type: 'close_app', params: { packageName, hard: true } },
+      ], 60_000);
+    }
 
     // Always issue an explicit launch_app — never rely on install's
     // auto-launch. Gives us one deterministic code path regardless of
@@ -709,9 +814,9 @@ export class MobileAppPrepService {
       // Flutter first-run init can briefly exceed 60s; 90s covers the long
       // tail while still failing-fast half as long as the legacy 180s when
       // the launch is truly stuck.
-      await time('runner_launch', () => client.executeBatchCommands(sessionId, [
+      await batch('runner_launch', [
         { type: 'launch_app', params: { packageName } },
-      ], { timeoutMs: 90_000, userId }));
+      ], 90_000);
     }
 
     // Audit fix (Bug #1): install completed but packageName resolution

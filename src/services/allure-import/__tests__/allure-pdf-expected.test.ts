@@ -22,6 +22,12 @@ jest.mock('@/utils/core/logger', () => ({
 }));
 
 jest.mock('@/config/ai/ai-models.config', () => ({
+  // AI_MODELS must be present even though this test never uses it: replacing
+  // the whole module means anything in the import graph that reads it AT LOAD
+  // TIME gets undefined. `intelligent-test-limits.ts` does exactly that
+  // (`coreBrainModel: AI_MODELS.smart`), and it is reachable from the parser
+  // via allure-mapper → module.service → … → snapshot-collector.
+  AI_MODELS: { smart: 'test-model', fast: 'test-model' },
   AI_TASK_MODELS: { allureCsvPdfParse: 'test-model' },
 }));
 
