@@ -17,6 +17,13 @@ import { env } from '@/config/environment/env';
  * straight to fatal would fail a large share of regression runs at SETUP the
  * moment it deploys. Shadow mode measures that first; ops flips the env var
  * once the log volume says what the true rate is.
+ *
+ * **`install_app` is NOT governed by this flag.** It is fatal either way — see
+ * the `alwaysFatal` call site in `MobileAppPrepService`. Shadow mode is for
+ * failures whose consequence is unknown; a refused install has a known and
+ * total one (every subsequent step runs against the wrong build, in whatever
+ * state the last run left it), so there was never anything to measure. The
+ * flag still governs the wipe/launch commands.
  */
 export const MobilePrepStrictResultsFeature = {
   isEnabled(): boolean {
