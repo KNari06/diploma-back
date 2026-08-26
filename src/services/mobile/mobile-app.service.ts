@@ -20,10 +20,13 @@ import {
   getDefaultVariantLabel,
   getFlutterDefaultHost,
   buildMobileAppSettingsPatch,
+  buildSetDefaultVariantPatch,
   buildSetFlutterDefaultHostPatch,
   normaliseHostOverride,
   hasProjectMobileBuild,
   getMaxMobileVariants,
+  shouldPromoteToDefault,
+  variantStoragePlatform,
   DEFAULT_VARIANT_LABEL,
 } from '@/services/mobile/project-mobile-app.helper';
 import {
@@ -377,12 +380,28 @@ export async function finalizeMobileAppUpload(
     metadata as unknown as MobileAppMetadata,
     variantLabel,
   );
+  // A project's FIRST build must be runnable without a second click. When the
+  // platform has no default pointer and an empty default lane, nothing would
+  // resolve this upload — see `shouldPromoteToDefault`.
+  const promoted = shouldPromoteToDefault(
+    project.settings as Record<string, unknown> | undefined,
+    platform,
+    variantLabel,
+  );
+  if (promoted) {
+    Object.assign(settingsPatch, buildSetDefaultVariantPatch(
+      project.settings as Record<string, unknown> | undefined,
+      variantStoragePlatform(platform),
+      variantLabel,
+    ));
+  }
   await ProjectService.updateProject(projectId, userId, { settings: settingsPatch });
 
   logger.info('[MOBILE_APP_SERVICE] App finalized', {
     projectId,
     platform,
     variantLabel,
+    promotedToDefault: promoted,
     source,
     detectedFramework: parsed.framework ?? null,
     buildId: buildRow.id,

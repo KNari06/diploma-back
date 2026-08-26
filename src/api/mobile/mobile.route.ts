@@ -200,9 +200,14 @@ router.put(
 
 /**
  * POST /api/v1/mobile/projects/:projectId/app/probe-driver-extension
- * User-triggered probe — boots an emulator, installs the stored Flutter
- * APK, watches logcat for the Dart VM Service URL. Returns the verdict
- * and persists it on `projects.settings.mobileApp` for later reads.
+ * Body: { platform?, variant? } — absent `variant` targets the lane the
+ * project's default-variant pointer names, i.e. the build a run installs.
+ *
+ * User-triggered probe — boots an emulator, installs THAT build, watches
+ * logcat for the Dart VM Service URL. Returns the verdict and persists it on
+ * the probed build's lane for later reads. Android-only (400 for iOS): the
+ * probe is ADB + logcat, which has no iOS equivalent. 409 while another probe
+ * holds the per-project lock.
  */
 router.post(
   '/projects/:projectId/app/probe-driver-extension',
