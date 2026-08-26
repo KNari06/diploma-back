@@ -455,3 +455,64 @@ export function buildMobileAppSettingsPatch(
 
   return patch;
 }
+
+/**
+ * Should this upload also become the platform's default build?
+ *
+ * A run with no explicit variant resolves through `getDefaultVariantLabel` →
+ * the `mobileDefaultVariant` pointer, falling back to the literal `default`
+ * lane. Nothing sets that pointer except the explicit "make default" action,
+ * so a project whose FIRST build is a named one would resolve to the empty
+ * default lane: the settings page shows a build, and every run reports no
+ * installable binary.
+ *
+ * True only when the platform has nothing to resolve to yet — no pointer AND
+ * an empty default lane. It therefore promotes a first build and never
+ * silently re-points a project that already has a default.
+ */
+export function shouldPromoteToDefault(
+  settings: ProjectSettings | undefined | null,
+  platform: MobilePlatform,
+  variantLabel: string,
+): boolean {
+  if (variantLabel === DEFAULT_VARIANT_LABEL) return false;
+  const lanePlatform = variantStoragePlatform(platform);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const ptr = (settings as any)?.mobileDefaultVariant as MobileDefaultVariantByPlatform | undefined;
+  if (typeof ptr?.[lanePlatform] === 'string' && ptr[lanePlatform]?.trim()) return false;
+  return !getProjectMobileApp(settings, lanePlatform, DEFAULT_VARIANT_LABEL);
+}
+
+/** The driver-extension verdict fields stamped onto a build by the probe. */
+export interface DriverVerdictFields {
+  driverExtensionDetected: string;
+  driverExtensionDetail: string;
+  driverExtensionDetectedAt: string;
+}
+
+/**
+ * Build the settings patch that stamps a driver-extension verdict onto ONE
+ * lane's latest build. Mirrors `buildMobileAppSettingsPatch`'s lane rules:
+ * the default lane also updates the legacy/shard mirror, a named lane only
+ * its registry entry.
+ *
+ * Returns `null` when the lane's current build is no longer the one that was
+ * probed — a re-upload mid-probe makes the verdict stale, and stamping it
+ * would label a new binary with an old build's result. The caller skips the
+ * write. `probedStoragePath` is therefore the identity of the probed build,
+ * NOT just a sanity check.
+ */
+export function buildDriverVerdictPatch(
+  currentSettings: ProjectSettings | undefined | null,
+  platform: MobilePlatform,
+  variantLabel: string,
+  probedStoragePath: string,
+  verdict: DriverVerdictFields,
+): Record<string, unknown> | null {
+  const lanePlatform = variantStoragePlatform(platform);
+  const current = getProjectMobileApp(currentSettings, lanePlatform, variantLabel);
+  if (!current || current.storagePath !== probedStoragePath) return null;
+
+  const updated = { ...current, ...verdict } as MobileAppMetadata;
+  return buildMobileAppSettingsPatch(currentSettings, lanePlatform, updated, variantLabel);
+}

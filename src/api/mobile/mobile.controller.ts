@@ -202,7 +202,10 @@ export async function probeDriverExtension(req: Request, res: Response): Promise
 
   const { projectId } = req.params;
   try {
-    const result = await MobileDriverProbeService.probe(projectId, userId);
+    const result = await MobileDriverProbeService.probe(projectId, userId, {
+      platform: pickPlatformOrUndefined((req.query.platform as string) || req.body?.platform),
+      variantLabel: trimmedString(req.body?.variant),
+    });
     res.json({ success: true, result });
   } catch (err) {
     if (err instanceof MobileDriverProbeError) {
