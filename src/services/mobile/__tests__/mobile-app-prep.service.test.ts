@@ -432,24 +432,42 @@ describe('MobileAppPrepService.prepApp — shadow mode (default)', () => {
     });
   });
 
-  it('warns but does not throw when a command failed, so the rate can be measured first', async () => {
-    redisGet();
+  it('warns but does not throw when a FLAG-GATED command failed, so the rate can be measured first', async () => {
+    // Branch 1: check_package confirms the app, then the hard reset fails.
+    // `close_app` is still governed by MOBILE_PREP_STRICT_RESULTS — only
+    // `install_app` was promoted to always-fatal, so shadow mode must still
+    // let this one through with nothing but a warning.
+    redisGet({ warmup: { appStoragePath: STORAGE_PATH, installedPackage: PACKAGE } });
     const client = {
-      uploadApp: jest.fn().mockResolvedValue({ path: '/runner/app.apk' }),
-      executeBatchCommands: jest.fn().mockResolvedValue({
-        results: [{ success: false, error: 'App file not found: /runner/app.apk' }],
-      }),
+      uploadApp: jest.fn(),
+      executeBatchCommands: jest.fn()
+        .mockResolvedValueOnce({ results: [{ success: true, data: { installed: true } }] })
+        .mockResolvedValueOnce({ results: [{ success: false, error: 'pm clear did not succeed' }] }),
     };
 
     await expect(MobileAppPrepService.prepApp(baseArgs({ client }))).resolves.toBe(PACKAGE);
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining('runner command reported failure'),
-      expect.objectContaining({ command: 'install_app' }),
+      expect.objectContaining({ command: 'close_app' }),
     );
   });
 });
 
-describe('MobileAppPrepService.prepApp — a failed install must not cascade into a bogus wipe', () => {
+/**
+ * A REFUSED install used to be survivable: shadow mode warned, prep skipped the
+ * wipe so as not to `pm clear` a package it might not have placed, and returned
+ * the configured package as though all was well. The caller then ran the test.
+ *
+ * On 2026-08-25 (JanaPost, run e100cf35) that produced the worst possible
+ * outcome — `adb install` was refused with INSTALL_FAILED_UPDATE_INCOMPATIBLE,
+ * the PREVIOUS build stayed on the device with the previous test's session
+ * still live, and `attachFlutter` (process-level force-stop, no data wipe)
+ * relaunched it straight onto a logged-in Home screen. Tests whose first step
+ * expected the login screen failed with messages about missing text fields.
+ *
+ * So `install_app` is now fatal irrespective of MOBILE_PREP_STRICT_RESULTS.
+ */
+describe('MobileAppPrepService.prepApp — a refused install fails prep, it does not test the wrong build', () => {
   const downloadApp = MobileAppStorageService.downloadApp as jest.Mock;
 
   beforeEach(() => {
@@ -461,24 +479,71 @@ describe('MobileAppPrepService.prepApp — a failed install must not cascade int
     });
   });
 
-  it('skips branch 3 hard reset when install_app failed (shadow mode)', async () => {
-    // packageName falls back to the configured package, so without the guard we
-    // would pm clear a package the install never placed — a second warning that
-    // buries the real install failure.
+  function refusedInstallClient() {
+    return {
+      uploadApp: jest.fn().mockResolvedValue({ path: '/runner/app.apk' }),
+      executeBatchCommands: jest.fn().mockResolvedValue({
+        results: [{
+          success: false,
+          error: 'ADB error: Command failed: adb install -r -d /app/uploads/x.apk\n'
+            + 'adb: failed to install /app/uploads/x.apk: Failure '
+            + '[INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package com.aitan.inexport '
+            + 'signatures do not match newer version; ignoring!]',
+        }],
+      }),
+    };
+  }
+
+  it('throws even in SHADOW mode — the flag never governed this command', async () => {
+    redisGet();
+    const client = refusedInstallClient();
+
+    await expect(MobileAppPrepService.prepApp(baseArgs({ skipLaunch: true, client })))
+      .rejects.toThrow(/install_app/);
+
+    // And it stops there: no wipe, no launch, nothing that would read as a
+    // successfully prepared session.
+    const types = client.executeBatchCommands.mock.calls.flatMap((c) => c[1].map((x: any) => x.type));
+    expect(types).toEqual(['install_app']);
+  });
+
+  it('does not record the target build as installed when the install was refused', async () => {
+    // The poisoning half of the 2026-08-25 failure. `rememberInstalledBuild`
+    // used to run regardless, so the NEXT prep saw `identityConfirmed`, took
+    // branch 2 ("relaunch without reinstall") and quietly ran the old build
+    // for the rest of the run — a green result for an app nobody asked for.
+    redisGet();
+
+    await expect(MobileAppPrepService.prepApp(baseArgs({ client: refusedInstallClient() })))
+      .rejects.toThrow();
+
+    const wroteBuildRecord = mockSet.mock.calls.some(
+      (c) => typeof c[0] === 'string' && (c[0] as string).startsWith(INSTALLED_BUILD_KEY_PREFIX),
+    );
+    expect(wroteBuildRecord).toBe(false);
+  });
+
+  it('leaves the branch-3 WIPE flag-gated — alwaysFatal is scoped to install_app', async () => {
+    // The complement of the two cases above, and the guard against someone
+    // hoisting `alwaysFatal` to the batch() default: promoting the wipe/launch
+    // commands is a much bigger behaviour change than this fix intended, and
+    // it must not be possible to make it silently.
     redisGet();
     const client = {
       uploadApp: jest.fn().mockResolvedValue({ path: '/runner/app.apk' }),
-      executeBatchCommands: jest.fn().mockResolvedValue({
-        results: [{ success: false, error: 'App file not found' }],
-      }),
+      executeBatchCommands: jest.fn()
+        // install_app succeeds…
+        .mockResolvedValueOnce({ results: [{ success: true, data: { packageName: PACKAGE } }] })
+        // …and the hard reset that follows it fails.
+        .mockResolvedValueOnce({ results: [{ success: false, error: 'pm clear did not succeed' }] }),
     };
 
-    await MobileAppPrepService.prepApp(baseArgs({ skipLaunch: true, client }));
-
-    const types = client.executeBatchCommands.mock.calls.flatMap((c) => c[1].map((x: any) => x.type));
-    expect(types).toContain('install_app');
-    expect(types).not.toContain('close_app');
-    expect(logger.warn).toHaveBeenCalledTimes(1);
+    await expect(MobileAppPrepService.prepApp(baseArgs({ skipLaunch: true, client })))
+      .resolves.toBe(PACKAGE);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('runner command reported failure'),
+      expect.objectContaining({ command: 'close_app', label: 'branch3_hard_reset' }),
+    );
   });
 
   it('strict-mode error names the session and project so it can be correlated', async () => {

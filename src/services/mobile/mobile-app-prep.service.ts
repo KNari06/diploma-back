@@ -207,17 +207,31 @@ export class MobileAppPrepService {
    * is app-prep's own. See that module for why a failed command arrives as an
    * HTTP 200 body rather than a rejection.
    *
-   * Gated by `MOBILE_PREP_STRICT_RESULTS` — warn-only until the real failure
-   * rate on live traffic is known. See the feature flag for why.
+   * Gated by `MOBILE_PREP_STRICT_RESULTS` for the wipe/launch commands —
+   * warn-only until their real failure rate on live traffic is known. See the
+   * feature flag for why. `install_app` is exempt; see `alwaysFatal` below.
+   *
+   * `alwaysFatal` is the FLOOR under that flag, for a command whose failure
+   * means the device is definitionally not in the state prep promised. The
+   * flag exists to measure failures whose consequence is unknown; there is
+   * nothing to measure about "the app we are about to test is not the app we
+   * were asked to test" — every result from that point on is wrong. See the
+   * `runner_install` call site.
    */
   private static assertBatchSucceeded(
     raw: unknown,
-    context: { sessionId: string; projectId: string; label: string; commands: string[] },
+    context: {
+      sessionId: string;
+      projectId: string;
+      label: string;
+      commands: string[];
+      alwaysFatal?: boolean;
+    },
   ): RunnerBatchFailure | null {
     const failure = findRunnerBatchFailure(raw, context.commands);
     if (!failure) return null;
 
-    if (MobilePrepStrictResultsFeature.isEnabled()) {
+    if (context.alwaysFatal || MobilePrepStrictResultsFeature.isEnabled()) {
       // Carry the identifying fields IN THE MESSAGE, not just in a log field:
       // this string is what lands in `test_executions.error_message`, and
       // without the session id there is nothing to correlate against the
@@ -421,24 +435,29 @@ export class MobileAppPrepService {
      * deliberate exception, since it treats any failure as "not installed"
      * and falls through to a full install, which is the safe direction.
      */
-    let lastBatchFailure: RunnerBatchFailure | null = null;
     const batch = async (
       label: string,
       commands: Array<Record<string, unknown>>,
       timeoutMs: number,
+      opts?: { alwaysFatal?: boolean },
     ): Promise<unknown> => {
       const res = await time(label, () => client.executeBatchCommands(
         sessionId,
         commands,
         { timeoutMs, userId },
       ));
-      // Throws in strict mode; in shadow mode it warns and hands back the
-      // failure so the caller can still avoid acting on a broken result.
-      lastBatchFailure = MobileAppPrepService.assertBatchSucceeded(res, {
+      // Throws in strict mode, and always for an `alwaysFatal` command. In
+      // shadow mode it warns and prep carries on — deliberately, so the
+      // failure rate of the non-fatal commands can be measured before they
+      // are promoted. Nothing branches on the returned failure any more: the
+      // one place that did (branch 3's hard reset) is exactly how a refused
+      // install turned into a test against stale app data.
+      MobileAppPrepService.assertBatchSucceeded(res, {
         sessionId,
         projectId,
         label,
         commands: commands.map((c) => String(c.type)),
+        alwaysFatal: opts?.alwaysFatal,
       });
       return res;
     };
@@ -767,7 +786,16 @@ export class MobileAppPrepService {
       // failing-fast 60s sooner than the legacy 240s when the runner is
       // genuinely wedged. The circuit breaker in AdbClient now propagates
       // hung-emulator failures within ~30s independently of this timeout.
-    ], 180_000) as any;
+    ], 180_000, {
+      // FATAL regardless of MOBILE_PREP_STRICT_RESULTS. Everything downstream
+      // of a refused install is a test of the WRONG BUILD, in whatever state
+      // the previous run left it — `attachFlutter`'s relaunch is process-level
+      // and never wipes data. Shadow mode exists to measure failures whose
+      // blast radius is unknown; this one's is known and total. On 2026-08-25
+      // it produced a run whose tests opened on a logged-in Home screen and
+      // failed on steps that expected the login screen.
+      alwaysFatal: true,
+    }) as any;
 
     // Runner wraps every command result as { success, data, durationMs, ... }.
     // The install handler returns { installed, packageName } inside `data`.
@@ -792,13 +820,15 @@ export class MobileAppPrepService {
     // running. On the Flutter path (`skipLaunch`) the caller launches via
     // attachFlutter, whose force-stop is process-level and never clears data.
     //
-    // Skipped when the install itself failed: `packageName` falls back to the
-    // project's configured package, so without this guard a shadow-mode run
-    // would `pm clear` a package the install just failed to put on the device,
-    // throw inside the runner, and emit a SECOND warning attributed to
-    // `close_app` — burying the real install failure in the very logs the
-    // shadow phase exists to measure. In strict mode the install already threw.
-    if (packageName && !lastBatchFailure) {
+    // No longer conditional on the install having succeeded. It used to be:
+    // a shadow-mode run that reached here after a REFUSED install would
+    // `pm clear` a package the install had failed to put on the device, and
+    // the resulting second warning buried the real one. That guard is what
+    // let a refused install proceed to a test against un-wiped app data
+    // (2026-08-25). The install is now `alwaysFatal`, so a failure throws
+    // above and this line is only ever reached with the target build really
+    // on the device — the ordering guarantee below is what matters again.
+    if (packageName) {
       await batch('branch3_hard_reset', [
         { type: 'close_app', params: { packageName, hard: true } },
       ], 60_000);

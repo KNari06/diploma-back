@@ -13,11 +13,13 @@
  * reported a pass.
  *
  * This module is deliberately POLICY-FREE — it reports what the body says and
- * lets each caller decide whether that is fatal. App prep gates on a flag while
- * the live failure rate is measured; an interactive editor action may prefer to
- * surface the error to the user instead. Every caller of
- * `executeBatchCommands` can adopt it; `src/api/chat/mobile_agent/tools.ts`
- * open-codes the same check today.
+ * lets each caller decide whether that is fatal. App prep splits its policy by
+ * command: `install_app` is always fatal (a refused install means every later
+ * step runs against the wrong build), while the wipe/launch commands stay
+ * gated on `MOBILE_PREP_STRICT_RESULTS` until their live failure rate is
+ * known. An interactive editor action may prefer to surface the error to the
+ * user instead. Every caller of `executeBatchCommands` can adopt it;
+ * `src/api/chat/mobile_agent/tools.ts` open-codes the same check today.
  */
 
 export interface RunnerBatchFailure {
