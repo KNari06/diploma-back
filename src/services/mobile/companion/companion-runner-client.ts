@@ -4,6 +4,7 @@ import type { IMobileRunnerClient } from '../mobile-runner-client';
 import {
   MobileRunnerError,
   type MobileArtifactBundle,
+  type MobileDeviceInventory,
   type MobileExplorationReadiness,
   type MobileExplorationSnapshot,
   type MobileExplorationStartResponse,
@@ -260,6 +261,22 @@ export class CompanionRunnerClient implements IMobileRunnerClient {
     mode: 'pool' | 'classic';
   }> {
     return this.request('GET', '/api/sessions/capacity', { timeoutMs: 5_000 });
+  }
+
+  /**
+   * Companion drives the user's OWN phone, and the install fast path this
+   * feeds is a cell optimisation: it exists to avoid re-uploading a large APK
+   * to a shared emulator we manage. Reporting "no devices" makes the caller
+   * fall through to its normal install, which is the behaviour companion had
+   * before this method existed.
+   *
+   * Answering empty rather than throwing is deliberate — the caller treats an
+   * empty answer as "cannot confirm → reinstall", which is the safe direction.
+   * A throw would have to be caught at every call site to reach the same
+   * place.
+   */
+  async getDeviceBuilds(): Promise<MobileDeviceInventory> {
+    return { collectedAt: new Date().toISOString(), devices: [] };
   }
 
   async executeBatchCommands(

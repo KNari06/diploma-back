@@ -101,6 +101,19 @@ export interface MobileAppBuildRecord extends MobileAppMetadata {
   source: 'manual' | 'ci' | 'webhook';
   /** Named variant lane this build belongs to (default = 'default'). */
   variantLabel: string;
+  /**
+   * What this build turns into ON A DEVICE, observed after it was installed
+   * successfully — never derived from the APK. Both `undefined` until that
+   * first install; `undefined` means UNKNOWN, which callers must treat as
+   * "reinstall", never as a match.
+   *
+   * The pair is checked together on purpose: `versionCode` alone cannot
+   * separate a debug build from a release build of the same version, and
+   * mistaking one for the other is what left a release build in place and
+   * produced FLUTTER_NOT_DETECTED.
+   */
+  signerSha256?: string;
+  observedVersionCode?: number;
 }
 
 /**
@@ -526,6 +539,98 @@ export class MobileAppStorageService {
       return null;
     }
     return data ? this.mapBuildRow(data) : null;
+  }
+
+  /**
+   * Find a build by the storage path the install path actually works with.
+   *
+   * The install decision knows `storagePath`, not a build id — it is resolved
+   * from project settings or a plan's pin. Scoped to the project so one
+   * tenant's path can never read another's row.
+   */
+  static async getBuildByStoragePath(
+    storagePath: string,
+    projectId: string,
+  ): Promise<MobileAppBuildRecord | null> {
+    if (!storagePath || !projectId) return null;
+    const { data, error } = await supabaseAdmin
+      .from('mobile_app_builds')
+      .select('*')
+      .eq('storage_path', storagePath)
+      .eq('project_id', projectId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) {
+      logger.warn('[MOBILE_APP_STORAGE] getBuildByStoragePath failed', {
+        error: error.message,
+        storagePath,
+      });
+      return null;
+    }
+    return data ? this.mapBuildRow(data) : null;
+  }
+
+  /**
+   * Record what a build became on a device, after it installed successfully.
+   *
+   * Called on the install path, so it must never be able to fail that path:
+   * every error is swallowed and logged. Losing the record costs one extra
+   * reinstall next time — surfacing it would cost the user their session.
+   *
+   * Deliberately does NOT overwrite an existing value. The pair is a property
+   * of the artifact, so a second observation should agree; if it ever did not,
+   * silently taking the newer one would paper over the anomaly. The write is
+   * therefore first-observation-wins and the mismatch is logged loudly.
+   */
+  static async recordObservedIdentity(
+    buildId: string,
+    identity: { signerSha256?: string; versionCode?: number },
+  ): Promise<void> {
+    if (!buildId || !identity.signerSha256) return;
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('mobile_app_builds')
+        .select('signer_sha256')
+        .eq('id', buildId)
+        .maybeSingle();
+      if (error) throw new Error(error.message);
+
+      const existing = data?.signer_sha256 as string | null | undefined;
+      if (existing) {
+        if (existing !== identity.signerSha256) {
+          // One storage path produced two different signing certificates.
+          // That is not a cache problem — the artifact behind the path
+          // changed, and something upstream overwrote a build in place.
+          logger.error('[MOBILE_APP_STORAGE] observed signer differs from the one recorded for this build', {
+            buildId,
+            recorded: existing,
+            observed: identity.signerSha256,
+          });
+        }
+        return;
+      }
+
+      const { error: updateError } = await supabaseAdmin
+        .from('mobile_app_builds')
+        .update({
+          signer_sha256: identity.signerSha256,
+          observed_version_code: identity.versionCode ?? null,
+          identity_observed_at: new Date().toISOString(),
+        })
+        .eq('id', buildId);
+      if (updateError) throw new Error(updateError.message);
+
+      logger.info('[MOBILE_APP_STORAGE] recorded device identity for build', {
+        buildId,
+        versionCode: identity.versionCode,
+      });
+    } catch (err: any) {
+      logger.warn('[MOBILE_APP_STORAGE] recordObservedIdentity failed — install unaffected', {
+        buildId,
+        error: err?.message,
+      });
+    }
   }
 
   /**
@@ -1001,6 +1106,10 @@ export class MobileAppStorageService {
       ciRunId: row.ci_run_id ?? null,
       source: row.source ?? 'manual',
       variantLabel: row.variant_label ?? DEFAULT_VARIANT_LABEL,
+      signerSha256: row.signer_sha256 ?? undefined,
+      observedVersionCode: row.observed_version_code != null
+        ? Number(row.observed_version_code)
+        : undefined,
     };
   }
 }

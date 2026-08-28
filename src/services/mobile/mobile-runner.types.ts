@@ -697,6 +697,47 @@ export interface MobileHealthResponse {
   activeSessions: number;
 }
 
+// ── Device inventory (`GET /api/devices/inventory?builds=1`) ────────
+// Mirror of the runner's DeviceInventoryEntry, narrowed to what the
+// install decision reads.
+
+/**
+ * Build identity of one installed package, as the DEVICE reports it.
+ *
+ * `signerSha256` is the SHA-256 of the signing certificate. It is here
+ * because a version number alone cannot tell two builds apart: JanaPost
+ * shipped a release and a debug build both at versionCode 426, differing
+ * only by signing key, and treating them as equal left the release build in
+ * place — Flutter attach then failed with FLUTTER_NOT_DETECTED, since a
+ * release build carries no Dart VM Service.
+ *
+ * Every field is optional: a device that cannot describe a package still
+ * reports it, and "present but unidentified" must read as "reinstall", never
+ * as a match.
+ */
+export interface MobileInstalledBuild {
+  packageName: string;
+  versionCode?: number;
+  versionName?: string;
+  /** Colon-separated uppercase hex, exactly as the device prints it. */
+  signerSha256?: string;
+}
+
+export interface MobileDeviceInventoryEntry {
+  serial: string;
+  state: string;
+  port?: number;
+  packages: string[];
+  agentInstalled: boolean;
+  builds?: MobileInstalledBuild[];
+  error?: string;
+}
+
+export interface MobileDeviceInventory {
+  collectedAt: string;
+  devices: MobileDeviceInventoryEntry[];
+}
+
 // ── UI State (live read of current screen for AI Agent) ─────────────
 // Mirror of the runner's UiStateSnapshot. Kept as a loose shape here
 // because the backend only reads these fields — we don't want to import
