@@ -28,6 +28,7 @@ import type {
   MobileExplorationReadiness,
   MobileExplorationSnapshot,
   MobileAppBriefing,
+  MobileDeviceInventory,
 } from './mobile-runner.types';
 import { MobileRunnerError } from './mobile-runner.types';
 import { mintRunnerUserToken } from './user-token';
@@ -578,6 +579,31 @@ export class MobileRunnerClient {
     mode: 'pool' | 'classic';
   }> {
     return this.request('GET', '/api/sessions/capacity', { timeoutMs: 5000 });
+  }
+
+  /**
+   * Which BUILD sits on each slot of this runner — versionCode plus the
+   * SHA-256 of the signing certificate, read from the device itself.
+   *
+   * Exists so the install path can stop guessing. Whether a reinstall is
+   * needed used to be answerable only from a Redis record of what we last
+   * installed, and that Redis runs with `allkeys-lru` and no volume — the
+   * fact is evictable and does not survive a restart. When it is gone the
+   * code correctly refuses to trust package presence alone and reinstalls,
+   * which for a 324 MB APK is minutes of transfer for an app the device
+   * already had.
+   *
+   * `builds=1` is opt-in on the runner (one `dumpsys package` per package),
+   * so this call costs more than the plain inventory — it belongs on the
+   * install decision, not on a poll loop.
+   *
+   * Short timeout ON PURPOSE: this is an optimisation. A slow or wedged
+   * runner must fall through to the normal install, never delay it.
+   */
+  async getDeviceBuilds(opts?: { timeoutMs?: number }): Promise<MobileDeviceInventory> {
+    return this.request('GET', '/api/devices/inventory?builds=1', {
+      timeoutMs: opts?.timeoutMs ?? 8000,
+    });
   }
 
   // ── Low-level command execution ─────────────────────────────────

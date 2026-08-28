@@ -200,6 +200,117 @@ export class MobileAppPrepService {
   }
 
   /**
+   * Is THIS build — not merely this package — already on the device?
+   *
+   * Confirms only when the device reports a build whose versionCode AND
+   * signing-certificate digest both equal the identity recorded for this
+   * storagePath. Anything short of that returns false and the caller
+   * reinstalls.
+   *
+   * Both halves are load-bearing. Version alone would call a debug and a
+   * release build of the same version equal — JanaPost shipped exactly that
+   * pair at 426 — leave the release build in place, and Flutter attach would
+   * fail with FLUTTER_NOT_DETECTED because a release build carries no Dart VM
+   * Service. The digest is what makes the claim safe to act on.
+   *
+   * The recorded identity comes from a previous successful install of this
+   * same build, not from parsing the APK: these are v2-signed, so the
+   * certificate lives in the APK Signing Block rather than META-INF, and
+   * reproducing the device's digest would mean implementing that format in
+   * the upload path. An observation is exact and cannot drift from what the
+   * device will report next time.
+   *
+   * Never throws. This is an optimisation on the install path — a slow,
+   * wedged or older runner must fall through to a normal install, not fail
+   * the session. `builds` absent (older runner, or the companion client)
+   * simply yields false.
+   */
+  private static async confirmBuildOnDevice(args: {
+    client: IMobileRunnerClient;
+    sessionId: string;
+    projectId: string;
+    packageName: string;
+    storagePath: string;
+  }): Promise<boolean> {
+    const { client, sessionId, projectId, packageName, storagePath } = args;
+    try {
+      const build = await MobileAppStorageService.getBuildByStoragePath(storagePath, projectId);
+      // No recorded identity yet — the first install of this build writes it,
+      // so a project self-heals after one full install instead of paying the
+      // transfer every time.
+      if (!build?.signerSha256) return false;
+
+      const inventory = await client.getDeviceBuilds();
+      const installed = inventory?.devices
+        ?.flatMap((d) => d.builds ?? [])
+        .find((b) => b.packageName === packageName);
+      if (!installed?.signerSha256) return false;
+
+      const signerMatches = installed.signerSha256 === build.signerSha256;
+      const versionMatches = build.observedVersionCode === undefined
+        || installed.versionCode === build.observedVersionCode;
+      const confirmed = signerMatches && versionMatches;
+
+      logger.info('[MOBILE_APP_PREP] device build check', {
+        sessionId,
+        packageName,
+        confirmed,
+        deviceVersionCode: installed.versionCode,
+        expectedVersionCode: build.observedVersionCode,
+        signerMatches,
+      });
+      return confirmed;
+    } catch (err) {
+      logger.debug('[MOBILE_APP_PREP] device build check failed — falling through to install', {
+        sessionId,
+        packageName,
+        error: (err as Error).message,
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Record what the device reports after a build installed successfully, so
+   * the next session can confirm it without re-uploading anything.
+   *
+   * Called after the install has already succeeded, and a failure here must
+   * cost at most one extra reinstall later — never the session the user is
+   * waiting on. Swallows everything.
+   */
+  private static async captureBuildIdentity(args: {
+    client: IMobileRunnerClient;
+    sessionId: string;
+    projectId: string;
+    packageName?: string;
+    storagePath: string;
+  }): Promise<void> {
+    const { client, sessionId, projectId, packageName, storagePath } = args;
+    if (!packageName) return;
+    try {
+      const build = await MobileAppStorageService.getBuildByStoragePath(storagePath, projectId);
+      if (!build || build.signerSha256) return;
+
+      const inventory = await client.getDeviceBuilds();
+      const installed = inventory?.devices
+        ?.flatMap((d) => d.builds ?? [])
+        .find((b) => b.packageName === packageName);
+      if (!installed?.signerSha256) return;
+
+      await MobileAppStorageService.recordObservedIdentity(build.id, {
+        signerSha256: installed.signerSha256,
+        versionCode: installed.versionCode,
+      });
+    } catch (err) {
+      logger.debug('[MOBILE_APP_PREP] could not capture build identity', {
+        sessionId,
+        packageName,
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  /**
    * Apply this service's POLICY to a runner batch response: warn, or fail.
    *
    * Detection lives in `findRunnerBatchFailure` so every other
@@ -681,8 +792,41 @@ export class MobileAppPrepService {
     // whose install writes the record, so a project self-heals after one
     // full install instead of being stuck guessing forever.
     const knownPackage = appPackageOverride || projectAny.packageName;
-    const identityConfirmed = !!recordedStoragePath && recordedStoragePath === effectiveStoragePath;
-    if (!identityConfirmed && knownPackage && !hasPendingInstall && !exactBuildRequested && !buildMismatch) {
+
+    // ── Ask the DEVICE which build it holds ────────────────────────────────
+    // Everything above reasons from Redis. That Redis runs `allkeys-lru` with
+    // no volume, so the record is evictable at any moment and gone after a
+    // restart — and when it is gone the code below correctly refuses to guess
+    // and reinstalls. For a 324 MB APK that was not merely slow: on
+    // 2026-08-28 the backend was OOM-killed partway through the upload (exit
+    // 137 against a 2 GiB limit), three retries in a row, for a build the
+    // device already had.
+    //
+    // This is the one source no cache flush can lose. It confirms only on an
+    // EXACT match of versionCode AND signing certificate against the identity
+    // recorded for this very storagePath — strictly stronger evidence than
+    // `recordedStoragePath`, and the only thing that can satisfy
+    // `exactBuildRequested`.
+    const deviceConfirmed = knownPackage
+      ? await time('device_build_confirm', () => this.confirmBuildOnDevice({
+        client,
+        sessionId,
+        projectId,
+        packageName: knownPackage,
+        storagePath: effectiveStoragePath,
+      }))
+      : false;
+
+    const identityConfirmed = deviceConfirmed
+      || (!!recordedStoragePath && recordedStoragePath === effectiveStoragePath);
+
+    // `exactBuildRequested` no longer blocks the fast path when the DEVICE
+    // confirmed the build: it blocked because package presence cannot tell one
+    // build of a package from another, and a versionCode + signing-certificate
+    // match can. Every other guard is untouched.
+    const exactBuildUnsatisfied = exactBuildRequested && !deviceConfirmed;
+
+    if (!identityConfirmed && knownPackage && !hasPendingInstall && !exactBuildUnsatisfied && !buildMismatch) {
       logger.info('[MOBILE_APP_PREP] no record of which build is installed — forcing full install instead of trusting package presence', {
         sessionId,
         projectId,
@@ -690,7 +834,7 @@ export class MobileAppPrepService {
         target: effectiveStoragePath,
       });
     }
-    if (identityConfirmed && knownPackage && !hasPendingInstall && !exactBuildRequested && !buildMismatch) {
+    if (identityConfirmed && knownPackage && !hasPendingInstall && !exactBuildUnsatisfied && !buildMismatch) {
       const isInstalled = await time('branch2_check_package', () =>
         this.isPackageOnDevice(client, sessionId, userId, knownPackage));
       if (isInstalled) {
@@ -878,6 +1022,20 @@ export class MobileAppPrepService {
     // would leave the next prep just as blind and the fast path could never
     // recover its identity.
     await this.rememberInstalledBuild(installedBuildKey, effectiveStoragePath);
+
+    // Ask the device what that install actually produced and persist it
+    // against the build row. This is the record the next session confirms
+    // against — unlike the Redis entry above it cannot be evicted, which is
+    // the whole reason a project could get stuck reinstalling forever.
+    // Awaited rather than fire-and-forget so a failure is logged in this
+    // request's context; it swallows its own errors.
+    await this.captureBuildIdentity({
+      client,
+      sessionId,
+      projectId,
+      packageName: packageName ?? undefined,
+      storagePath: effectiveStoragePath,
+    });
 
     // Persist packageName to project settings so future preps can use
     // the check_package fast path even after Redis TTL expires. With
