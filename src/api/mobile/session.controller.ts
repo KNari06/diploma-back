@@ -12,6 +12,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import { findRunnerBatchFailure } from '@/services/mobile/runner-batch-result';
 import { env } from '@/config/environment/env';
 import { redisConnection, QueueManager } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient, MobileRunnerClient, resolveRunnerUrlForHost, RESOLVE_DISPATCH_TIMEOUT_MS, type IMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
@@ -3002,11 +3003,39 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
             // post-action stability wait. On the 30s default the client abandons
             // a request the runner has already completed, and the `catch` below
             // re-runs the step against the screen the first tap navigated to.
-            await client.executeBatchCommands(sessionId, commands, {
+            const batch = await client.executeBatchCommands(sessionId, commands, {
               userId,
               timeoutMs: RESOLVE_DISPATCH_TIMEOUT_MS,
             });
             const durationMs = Date.now() - stepStart;
+
+            // Hard invariant #18: a failed runner command comes back as HTTP 200
+            // with `{success:false}` in `results[]`, so awaiting the batch tells
+            // us nothing. This loop used to push `success: true` unconditionally.
+            //
+            // Live on Klara (2026-08-28, editor Run): a `type` step dispatches as
+            // [tap, type_text]. The focus tap failed with "finder found nothing
+            // and no coordinate fallback", the batch stopped there so the
+            // type_text NEVER RAN, and the step was recorded green with the field
+            // still empty. The two steps after it then ran on a screen the test
+            // believed it had filled in, and the whole run reported 6/6 passed.
+            //
+            // A failed command in a step's batch means the step did not do its
+            // job — for an editor Run that is a failed step, full stop.
+            const batchFailure = findRunnerBatchFailure(batch, commands.map((c) => String(c.type)));
+            if (batchFailure) {
+              const errorMsg = batchFailure.error;
+              stepResults.push({ stepId: step.id, success: false, error: errorMsg, durationMs });
+              failedSteps++;
+              if (!isOptional) hardFailed = true;
+              sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs, optional: isOptional });
+              logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} failed (lint path — runner batch)${isOptional ? ' (optional — continuing)' : ''}`, {
+                stepId: step.id, type: rawType, description, durationMs, optional: isOptional,
+                failedCommand: batchFailure.command, commandIndex: batchFailure.index, error: errorMsg,
+              });
+              continue;
+            }
+
             stepResults.push({ stepId: step.id, success: true, durationMs });
             passedSteps++;
             sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'pass', durationMs });
