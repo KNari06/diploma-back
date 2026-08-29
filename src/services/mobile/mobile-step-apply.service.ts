@@ -17,6 +17,7 @@
  */
 
 import { getMobileRunnerClientForSession } from './session-runner-routing';
+import { findRunnerBatchFailure } from '@/services/mobile/runner-batch-result';
 import { RESOLVE_DISPATCH_TIMEOUT_MS } from './mobile-runner-client';
 import type { MobileCompiledPlan } from './mobile-runner.types';
 import { withExpectsTransition } from './expects-transition';
@@ -434,6 +435,37 @@ export class MobileStepApplyService {
             timeoutMs: RESOLVE_DISPATCH_TIMEOUT_MS,
           });
           const durationMs = Date.now() - applyStart;
+
+          // Hard invariant #18, the half this method was missing. It already
+          // reads `batch.results` below — but only for `transitionDetected`,
+          // never for `success` — and then returned `status: 'passed'`
+          // regardless. A `type` step dispatches as [tap, type_text]: when the
+          // focus tap fails the batch stops there, the type_text never runs, and
+          // the author saw a green step over an unchanged field (live on Klara,
+          // 2026-08-28, the same shape as the editor Run loop's copy).
+          const applyFailure = findRunnerBatchFailure(batch, commands.map((c) => String(c.type)));
+          if (applyFailure) {
+            logger.warn('[MOBILE_STEP_APPLY] Runner batch reported a failed command — surfacing as a failed step', {
+              sessionId,
+              failedCommand: applyFailure.command,
+              commandIndex: applyFailure.index,
+              error: applyFailure.error,
+            });
+            // Same shape as the post-dispatch timeout failure below: the step
+            // reached the device and did not do its job. The frontend reads
+            // `stepResult.error` for the red-X badge (see the note on the
+            // link_test_case rejection above), so the message has to be there.
+            return {
+              success: false,
+              stepResult: {
+                success: false,
+                error: applyFailure.error,
+                resolvedVia: lintResult.resolvedVia || 'lint',
+                durationMs,
+              },
+              status: 'failed',
+            };
+          }
 
           // The runner reports, per command, whether the action CHANGED the
           // screen. This response used to be discarded, which is why the
